@@ -10,6 +10,7 @@ from mindroom.tool_system.events import (
     _MAX_TOOL_RESULT_DISPLAY_CHARS,
     _MAX_TOOL_TRACE_EVENTS,
     _TOOL_TRACE_KEY,
+    StreamingToolTracker,
     ToolTraceEntry,
     _format_tool_started,
     build_tool_trace_content,
@@ -316,6 +317,89 @@ def test_complete_pending_tool_block_no_result_marks_completed() -> None:
 
     assert updated == "🔧 `save_file` [1]"
     assert trace.result_preview is None
+
+
+def test_streaming_tool_tracker_records_hidden_pending_and_completion() -> None:
+    """Hidden tool calls should still preserve pending and completed trace state."""
+    tracker = StreamingToolTracker()
+    visible_text, trace_entry = tracker.start(
+        ToolExecution(tool_call_id="call-1", tool_name="save_file", tool_args={"file": "a.py"}),
+    )
+
+    assert visible_text
+    assert len(tracker.pending_tools) == 1
+    pending_tool = tracker.pending_tools[0]
+    assert pending_tool.trace_entry == trace_entry
+
+    completed = tracker.complete(ToolExecution(tool_call_id="call-1", tool_name="save_file", result="ok"))
+
+    assert completed is not None
+    tool_name, result, matched_pending_tool, _ = completed
+    assert matched_pending_tool == pending_tool
+    assert tool_name == "save_file"
+    assert result == "ok"
+    assert tracker.pending_tools == []
+    assert len(tracker.completed_tools) == 1
+    assert tracker.completed_tools[0].result_preview == "ok"
+
+
+def test_streaming_tool_tracker_uses_scope_for_name_fallback_matching() -> None:
+    """Fallback matching by tool name must not cross team/member scopes."""
+    tracker = StreamingToolTracker()
+    _member_msg, member_trace = tracker.start(
+        ToolExecution(tool_name="search", tool_args={"q": "member"}),
+        scope_key="agent:code",
+    )
+    _team_msg, team_trace = tracker.start(ToolExecution(tool_name="search", tool_args={"q": "team"}), scope_key="team")
+
+    completed = tracker.complete(ToolExecution(tool_name="search", result="team result"), scope_key="team")
+
+    assert completed is not None
+    _tool_name, _result, matched_pending_tool, _completed_trace = completed
+    assert matched_pending_tool is not None
+    assert matched_pending_tool.trace_entry == team_trace
+    assert [pending.trace_entry for pending in tracker.pending_tools] == [member_trace]
+
+
+def test_streaming_tool_tracker_prefers_call_id_over_newest_same_named_tool() -> None:
+    """Call IDs should keep same-named concurrent tools paired with their own completion."""
+    tracker = StreamingToolTracker()
+    tracker.start(ToolExecution(tool_call_id="first", tool_name="save_file", tool_args={"file": "a.py"}))
+    first_pending_tool = tracker.pending_tools[0]
+    tracker.start(ToolExecution(tool_call_id="second", tool_name="save_file", tool_args={"file": "b.py"}))
+
+    completed = tracker.complete(ToolExecution(tool_call_id="first", tool_name="save_file", result="saved a"))
+
+    assert completed is not None
+    _tool_name, _result, matched_pending_tool, _completed_trace = completed
+    assert matched_pending_tool == first_pending_tool
+    assert [pending.tool_call_id for pending in tracker.pending_tools] == ["second"]
+
+
+def test_streaming_tool_tracker_updates_visible_trace_slot() -> None:
+    """Visible tool trace snapshots should be converted from started to completed in-place."""
+    tracker = StreamingToolTracker()
+    visible_trace: list[ToolTraceEntry] = []
+    _tool_msg, trace_entry = tracker.start(
+        ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}),
+        tool_index=1,
+    )
+    assert trace_entry is not None
+    visible_trace.append(trace_entry)
+
+    completed = tracker.complete(ToolExecution(tool_name="save_file", result="ok"))
+
+    assert completed is not None
+    _tool_name, _result, pending_tool, completed_trace = completed
+    assert tracker.update_visible_trace_entry(visible_trace, pending_tool, completed_trace) is True
+    assert visible_trace == [
+        ToolTraceEntry(
+            type="tool_call_completed",
+            tool_name="save_file",
+            args_preview="file=a.py",
+            result_preview="ok",
+        ),
+    ]
 
 
 def test_build_tool_trace_content_preserves_all_events_for_v2_indexing() -> None:
