@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from mindroom.credential_policy import credential_service_policy
 from mindroom.credentials import get_runtime_credentials_manager, sync_shared_credentials_to_worker
 from mindroom.tool_system.worker_routing import worker_dir_name
-from mindroom.workers.backend import WorkerBackendError
+from mindroom.workers.backend import WorkerBackendError, effective_idle_status, filter_and_sort_worker_handles
 from mindroom.workers.models import (
     ProgressSink,
     WorkerHandle,
@@ -497,9 +497,7 @@ class KubernetesWorkerBackend:
         handles = [
             self._handle_from_deployment(deployment, now=timestamp) for deployment in self._resources.list_deployments()
         ]
-        if not include_idle:
-            handles = [handle for handle in handles if handle.status != "idle"]
-        return sorted(handles, key=lambda handle: handle.last_used_at, reverse=True)
+        return filter_and_sort_worker_handles(handles, include_idle)
 
     def evict_worker(
         self,
@@ -677,6 +675,4 @@ class KubernetesWorkerBackend:
         if not self._deployment_ready(deployment):
             return "starting"
         last_used_at = resources.parse_annotation_float(annotations, resources.ANNOTATION_LAST_USED_AT, now)
-        if now - last_used_at >= self.idle_timeout_seconds:
-            return "idle"
-        return "ready"
+        return effective_idle_status("ready", last_used_at, self.idle_timeout_seconds, now)

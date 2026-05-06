@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mindroom.tool_system.worker_routing import worker_dir_name
-from mindroom.workers.backend import WorkerBackendError
+from mindroom.workers.backend import WorkerBackendError, effective_idle_status, filter_and_sort_worker_handles
 from mindroom.workers.manager import WorkerManager
 from mindroom.workers.models import ProgressSink, WorkerHandle, WorkerSpec, WorkerStatus
 
@@ -236,9 +236,7 @@ class _LocalWorkerBackend:
                 if (metadata := self._load_metadata(paths)) is not None
             ]
 
-        if not include_idle:
-            handles = [handle for handle in handles if handle.status != "idle"]
-        return sorted(handles, key=lambda handle: handle.last_used_at, reverse=True)
+        return filter_and_sort_worker_handles(handles, include_idle)
 
     def evict_worker(
         self,
@@ -282,7 +280,7 @@ class _LocalWorkerBackend:
                     self._save_metadata(paths, metadata)
                     cleaned_workers.append(self._to_handle(metadata, paths, now=timestamp))
 
-        return sorted(cleaned_workers, key=lambda handle: handle.last_used_at, reverse=True)
+        return filter_and_sort_worker_handles(cleaned_workers, True)
 
     def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
         """Persist one local worker failure."""
@@ -344,9 +342,7 @@ class _LocalWorkerBackend:
             json.dump(asdict(metadata), f, sort_keys=True)
 
     def _effective_status(self, metadata: _LocalWorkerMetadata, now: float) -> WorkerStatus:
-        if metadata.status == "ready" and now - metadata.last_used_at >= self.idle_timeout_seconds:
-            return "idle"
-        return metadata.status
+        return effective_idle_status(metadata.status, metadata.last_used_at, self.idle_timeout_seconds, now)
 
     def _record_failure_locked(
         self,

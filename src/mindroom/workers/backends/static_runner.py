@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from mindroom.tool_system.worker_routing import worker_dir_name
-from mindroom.workers.backend import WorkerBackendError
+from mindroom.workers.backend import WorkerBackendError, effective_idle_status, filter_and_sort_worker_handles
 from mindroom.workers.models import ProgressSink, WorkerHandle, WorkerSpec, WorkerStatus
 
 _DEFAULT_IDLE_TIMEOUT_SECONDS = 1800.0
@@ -120,9 +120,7 @@ class StaticSandboxRunnerBackend:
         timestamp = time.time() if now is None else now
         with self._lock:
             handles = [self._to_handle(metadata, now=timestamp) for metadata in self._workers.values()]
-        if not include_idle:
-            handles = [handle for handle in handles if handle.status != "idle"]
-        return sorted(handles, key=lambda handle: handle.last_used_at, reverse=True)
+        return filter_and_sort_worker_handles(handles, include_idle)
 
     def evict_worker(
         self,
@@ -153,7 +151,7 @@ class StaticSandboxRunnerBackend:
                 if metadata.status == "ready" and self._effective_status(metadata, timestamp) == "idle":
                     metadata.status = "idle"
                     cleaned_workers.append(self._to_handle(metadata, now=timestamp))
-        return sorted(cleaned_workers, key=lambda handle: handle.last_used_at, reverse=True)
+        return filter_and_sort_worker_handles(cleaned_workers, True)
 
     def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
         """Persist one shared-runner worker failure."""
@@ -176,9 +174,7 @@ class StaticSandboxRunnerBackend:
             return self._to_handle(metadata, now=timestamp)
 
     def _effective_status(self, metadata: _StaticWorkerMetadata, now: float) -> WorkerStatus:
-        if metadata.status == "ready" and now - metadata.last_used_at >= self.idle_timeout_seconds:
-            return "idle"
-        return metadata.status
+        return effective_idle_status(metadata.status, metadata.last_used_at, self.idle_timeout_seconds, now)
 
     def _to_handle(self, metadata: _StaticWorkerMetadata, *, now: float) -> WorkerHandle:
         return WorkerHandle(
