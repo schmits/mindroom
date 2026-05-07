@@ -16,7 +16,12 @@ from agno.tools.function import Function, FunctionCall, FunctionExecutionResult
 
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, workspace_home_identity_env
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tools.shell import _process_registry, _workspace_home_contract_env_from_process_env, shell_tools
+from mindroom.tools.shell import (
+    _MAX_OUTPUT_BYTES,
+    _process_registry,
+    _workspace_home_contract_env_from_process_env,
+    shell_tools,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -298,6 +303,82 @@ async def test_run_shell_command_tail_parameter(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_shell_command_truncates_large_output_by_bytes(tmp_path: Path) -> None:
+    """A small line count with very large lines should not return an unbounded result."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    assert entrypoint is not None
+
+    script = "for i in range(120): print(f'{i:03d}:' + 'x' * 1000)"
+    result = await entrypoint([sys.executable, "-c", script], tail=120)
+
+    assert "Output truncated to the last" in result
+    assert "119:" in result
+    assert "000:" not in result
+    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path) -> None:
+    """Large stderr from failed commands should be byte-capped too."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    assert entrypoint is not None
+
+    script = "import sys\nfor i in range(120): print(f'{i:03d}:' + 'x' * 1000, file=sys.stderr)\nsys.exit(1)\n"
+    result = await entrypoint([sys.executable, "-c", script])
+
+    assert result.startswith("Error: [Output truncated to the last")
+    assert "119:" in result
+    assert "000:" not in result
+    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_truncates_many_short_lines_by_rendered_bytes(tmp_path: Path) -> None:
+    """Rendered newline separators should be included in the output byte cap."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    assert entrypoint is not None
+
+    script = "for _ in range(10000): print('xxxxxx')"
+    result = await entrypoint([sys.executable, "-c", script], tail=10000)
+
+    assert result.startswith("[Output truncated to the last")
+    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_truncates_oversized_single_stdout_line(tmp_path: Path) -> None:
+    """Output without newlines should still be retained and byte-capped."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    assert entrypoint is not None
+
+    result = await entrypoint([sys.executable, "-c", "import sys; sys.stdout.write('A' * 100000)"])
+
+    assert result.startswith("[Output truncated to the last")
+    assert "A" * 100 in result
+    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_truncates_oversized_single_stderr_line(tmp_path: Path) -> None:
+    """Oversized stderr lines should be surfaced instead of skipped."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    assert entrypoint is not None
+
+    result = await entrypoint(
+        [sys.executable, "-c", "import sys; sys.stderr.write('B' * 100000); sys.exit(1)"],
+    )
+
+    assert result.startswith("Error: [Output truncated to the last")
+    assert "B" * 100 in result
+    assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
+
+
+@pytest.mark.asyncio
 async def test_run_shell_command_returns_handle_on_timeout(tmp_path: Path) -> None:
     """Command exceeding timeout should return a handle."""
     tool = _get_toolkit(tmp_path)
@@ -433,6 +514,8 @@ async def test_check_shell_command_partial_output(tmp_path: Path) -> None:
 
     status = check_fn(handle)
     assert "RUNNING" in status
+    assert "lines buffered" in status
+    assert "lines so far" not in status
     assert "partial-line" in status
 
     # Clean up

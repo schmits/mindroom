@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import json
 import os
@@ -26,7 +27,6 @@ from mindroom.constants import (
     subprocess_path_with_prepends,
     workspace_home_identity_env,
 )
-from mindroom.logging_config import get_logger
 from mindroom.tool_system.metadata import (
     ConfigField,
     SetupType,
@@ -73,6 +73,8 @@ _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS = frozenset(
 _STALE_RECORD_SECONDS = 600  # 10 minutes
 _MAX_BACKGROUNDED = 16
 _MAX_OUTPUT_LINES = 10_000
+_MAX_OUTPUT_BYTES = 50 * 1024
+_STREAM_READ_CHUNK_BYTES = 8192
 _PROCESS_EXIT_POLL_INTERVAL_SECONDS = 0.05
 _POST_EXIT_READER_GRACE_SECONDS = 0.5
 _SHELL_ARGS_ERROR = '\'args\' must be a flat list of strings. Send args like ["bash", "-lc", "ls"].'
@@ -207,6 +209,70 @@ def _handle_namespace(*, runtime_paths: RuntimePaths, base_dir: Path | None) -> 
 
 
 @dataclass
+class _OutputBuffer:
+    """Bound shell output by both line count and encoded byte size."""
+
+    max_lines: int = _MAX_OUTPUT_LINES
+    max_bytes: int = _MAX_OUTPUT_BYTES
+    chunks: deque[str] = field(default_factory=deque)
+    byte_count: int = 0
+    truncated: bool = False
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) > self.max_bytes:
+            text = encoded[-self.max_bytes :].decode("utf-8", errors="ignore")
+            encoded = text.encode("utf-8", errors="replace")
+            self.truncated = True
+
+        self.chunks.append(text)
+        self.byte_count += len(encoded)
+
+        while self.chunks and self.byte_count > self.max_bytes:
+            removed = self.chunks.popleft()
+            self.byte_count -= len(removed.encode("utf-8", errors="replace"))
+            self.truncated = True
+
+        self._trim_to_max_lines()
+
+    def render(self, *, tail: int | None = None) -> str:
+        output = self._rendered_text()
+        output_lines = output.split("\n") if output else []
+        if tail is not None:
+            output_lines = output_lines[-tail:]
+        output = "\n".join(output_lines)
+        if not self.truncated:
+            return output
+
+        notice = (
+            f"[Output truncated to the last {self.max_bytes} bytes. "
+            "Redirect command output to a file for complete results.]"
+        )
+        return f"{notice}\n{output}" if output else notice
+
+    def __len__(self) -> int:
+        output = self._rendered_text()
+        return len(output.split("\n")) if output else 0
+
+    def _rendered_text(self) -> str:
+        return "".join(self.chunks).rstrip("\n")
+
+    def _trim_to_max_lines(self) -> None:
+        output = self._rendered_text()
+        lines = output.split("\n")
+        if len(lines) <= self.max_lines:
+            return
+
+        output = "\n".join(lines[-self.max_lines :])
+        self.chunks = deque([output])
+        self.byte_count = len(output.encode("utf-8", errors="replace"))
+        self.truncated = True
+
+
+@dataclass
 class _ProcessRecord:
     """Tracks a backgrounded shell process."""
 
@@ -215,8 +281,8 @@ class _ProcessRecord:
     pid: int
     args: list[str]
     process: asyncio.subprocess.Process
-    stdout_buf: deque[str] = field(default_factory=lambda: deque(maxlen=_MAX_OUTPUT_LINES))
-    stderr_buf: deque[str] = field(default_factory=lambda: deque(maxlen=_MAX_OUTPUT_LINES))
+    stdout_buf: _OutputBuffer = field(default_factory=_OutputBuffer)
+    stderr_buf: _OutputBuffer = field(default_factory=_OutputBuffer)
     started_at: float = field(default_factory=time.monotonic)
     tail: int = 100
     finished: bool = False
@@ -390,8 +456,8 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
             except Exception as exc:
                 return f"Error: {exc}"
 
-            stdout_buf: deque[str] = deque(maxlen=_MAX_OUTPUT_LINES)
-            stderr_buf: deque[str] = deque(maxlen=_MAX_OUTPUT_LINES)
+            stdout_buf = _OutputBuffer()
+            stderr_buf = _OutputBuffer()
             background_handle: str | None = None
             background_monitor_task: asyncio.Task[None] | None = None
 
@@ -455,8 +521,8 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
                 raise
 
             if process.returncode != 0:
-                return f"Error: {chr(10).join(stderr_buf)}"
-            return "\n".join(list(stdout_buf)[-tail:])
+                return f"Error: {stderr_buf.render()}"
+            return stdout_buf.render(tail=tail)
 
         def check_shell_command(self, handle: str) -> str:
             """Poll the status of a backgrounded shell command.
@@ -479,18 +545,18 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
             elapsed = time.monotonic() - record.started_at
 
             if record.finished:
-                output = "\n".join(list(record.stdout_buf)[-record.tail :])
-                errors = "\n".join(record.stderr_buf)
+                output = record.stdout_buf.render(tail=record.tail)
+                errors = record.stderr_buf.render()
                 result = f"Status: FINISHED (exit code {record.return_code}, ran for {elapsed:.1f}s)\n"
                 if record.return_code != 0 and errors:
                     result += f"Stderr:\n{errors}\n"
                 result += f"Output:\n{output}"
                 return result
 
-            partial = "\n".join(list(record.stdout_buf)[-50:])
+            partial = record.stdout_buf.render(tail=50)
             return (
                 f"Status: RUNNING (PID {record.pid}, elapsed {elapsed:.1f}s)\n"
-                f"Partial output ({len(record.stdout_buf)} lines so far):\n{partial}"
+                f"Partial output ({len(record.stdout_buf)} lines buffered):\n{partial}"
             )
 
         def kill_shell_command(self, handle: str, force: bool = False) -> str:
@@ -537,22 +603,19 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
     return MindRoomShellTools
 
 
-_log = get_logger(__name__)
-
-
-async def _read_stream(stream: asyncio.StreamReader | None, buf: deque[str]) -> None:
-    """Read lines from an async stream into *buf* until EOF."""
+async def _read_stream(stream: asyncio.StreamReader | None, buf: _OutputBuffer) -> None:
+    """Read bounded chunks from an async stream into *buf* until EOF."""
     if stream is None:
         return
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
-        try:
-            line = await stream.readline()
-        except ValueError:
-            _log.warning("shell: oversized line exceeded StreamReader buffer limit, skipping")
-            continue
-        if not line:
+        chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+        if not chunk:
             break
-        buf.append(line.decode(errors="replace").rstrip("\n"))
+        buf.append(decoder.decode(chunk))
+
+    buf.append(decoder.decode(b"", final=True))
 
 
 async def _cancel_pending_tasks(*tasks: asyncio.Task[None]) -> None:
