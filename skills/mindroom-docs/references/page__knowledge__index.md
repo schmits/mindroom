@@ -35,6 +35,7 @@ Add a knowledge base and assign it to an agent:
 ```yaml
 knowledge_bases:
   docs:
+    description: Product documentation, support notes, and internal operating procedures
     path: ./knowledge_docs
     watch: false
     chunk_size: 5000
@@ -52,7 +53,7 @@ Chat uses the last successfully published index and continues without blocking w
 When a watched file changes, MindRoom marks the published index stale, refreshes in the background, and atomically publishes the replacement when it succeeds.
 When `watch: false`, direct external file edits require explicit reindex, while dashboard/API upload and delete actions still schedule refresh after a successful mutation.
 Knowledge base IDs are the keys under `knowledge_bases`.
-Use a non-empty single path component such as `docs` or `company_docs`, not `""`, `.`, `..`, or names containing `/` or `\`.
+Use a non-empty single path component such as `docs` or `company_docs`, not `""`, `.`, `..`, names containing `/` or `\`, or names containing line breaks.
 
 ## Configuration
 
@@ -61,6 +62,7 @@ Use a non-empty single path component such as `docs` or `company_docs`, not `""`
 ```yaml
 knowledge_bases:
   my_docs:
+    description: Product documentation, support notes, and internal operating procedures
     path: ./knowledge_docs/my_docs   # Folder containing documents
     watch: false                      # Direct external edits require reindex; API mutations still schedule refresh
     chunk_size: 5000                  # Max characters per chunk
@@ -69,6 +71,7 @@ knowledge_bases:
 
 | Field           | Type   | Default            | Description                                                                                                                                                                                                                                                 |
 | --------------- | ------ | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `description`   | string | `""`               | Short description of what the knowledge base contains. Agents see this in the `search_knowledge_base` tool description so they know when the source is relevant                                                                                             |
 | `path`          | string | `./knowledge_docs` | Folder path (relative to the config file directory or absolute)                                                                                                                                                                                             |
 | `watch`         | bool   | `true`             | When true, shared local folders watch filesystem changes and schedule background published-index refresh without blocking reads. When false, direct external edits require explicit reindex; dashboard/API upload and delete actions still schedule refresh |
 | `chunk_size`    | int    | `5000`             | Maximum characters per chunk for text-like files (minimum: `128`)                                                                                                                                                                                           |
@@ -85,6 +88,7 @@ Use `agents.<name>.private.knowledge` when one shared agent definition should in
 ```yaml
 knowledge_bases:
   company_docs:
+    description: Shared company policies, project notes, and operating procedures
     path: ./company_docs
     watch: false
 
@@ -98,6 +102,7 @@ agents:
       root: mind_data
       template_dir: ./mind_template
       knowledge:
+        description: Requester-private notes, preferences, and working memory for this agent
         path: memory
         watch: false
     knowledge_bases: [company_docs]
@@ -120,6 +125,7 @@ Do not point Git-backed private knowledge at `.` or `memory/`, and do not use a 
 | Field                             | Type   | Default | Description                                                                                                                                                             |
 | --------------------------------- | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `private.knowledge.enabled`       | bool   | `true`  | Whether PrivateAgentKnowledge indexing is active for this agent                                                                                                         |
+| `private.knowledge.description`   | string | `""`    | Short description of what the private knowledge contains. Agents see this in the `search_knowledge_base` tool description so they know when the source is relevant      |
 | `private.knowledge.path`          | string | `null`  | Private-root-relative folder to index. Required when `private.knowledge.enabled` is `true`; set `enabled: false` to disable private knowledge                           |
 | `private.knowledge.watch`         | bool   | `true`  | When true, PrivateAgentKnowledge schedules background refresh on access. When false, direct external edits require explicit refresh                                     |
 | `private.knowledge.chunk_size`    | int    | `5000`  | Maximum characters per indexed chunk                                                                                                                                    |

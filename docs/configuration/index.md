@@ -375,9 +375,10 @@ memory:
 # MindRoom auto-installs that optional extra on first use.
 
 # Knowledge base configuration (optional)
-# Keys must be non-empty single path components, so do not use "", ., .., /, or \ in a knowledge base ID.
+# Keys must be non-empty single path components, so do not use "", ., .., /, \, or line breaks in a knowledge base ID.
 knowledge_bases:
   docs:
+    description: Product documentation, support notes, and operating procedures
     path: ./knowledge_docs          # Folder containing documents for this base (Pydantic default)
     watch: false                   # Direct external edits require reindex; API mutations still schedule refresh
     chunk_size: 5000               # Default: 5000 (max characters per indexed chunk)

@@ -11,8 +11,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from agno.knowledge.knowledge import Knowledge
-
 from mindroom.credentials import get_runtime_shared_credentials_manager
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.redaction import embedded_http_userinfo
@@ -22,6 +20,7 @@ from mindroom.knowledge.registry import (
     get_published_index,
     refresh_target_for_published_index_key,
 )
+from mindroom.knowledge_source_descriptions import KnowledgeSourceDescription, KnowledgeWithSourceDescriptions
 from mindroom.logging_config import get_logger
 from mindroom.runtime_protocols import SupportsConfigOrchestrator  # noqa: TC001
 
@@ -29,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from agno.knowledge.document import Document
+    from agno.knowledge.knowledge import Knowledge
     from structlog.stdlib import BoundLogger
 
     from mindroom.config.main import Config
@@ -83,6 +83,23 @@ class _AsyncKnowledgeVectorDb(_KnowledgeVectorDb, Protocol):
         limit: int,
         filters: dict[str, Any] | list[Any] | None = None,
     ) -> list[Document]: ...
+
+
+def _knowledge_source_description(base_id: str, config: Config) -> KnowledgeSourceDescription:
+    """Return configured source metadata for one queryable Knowledge handle."""
+    base_config = config.get_knowledge_base_config(base_id)
+    description = " ".join(base_config.description.split())
+    private_agent = config.get_private_knowledge_base_agent(base_id)
+    if not description and private_agent is not None:
+        description = f"Private knowledge for agent '{private_agent}' scoped to the current requester."
+    return KnowledgeSourceDescription(base_id=base_id, description=description)
+
+
+def _apply_knowledge_metadata(base_id: str, knowledge: Knowledge, config: Config) -> None:
+    """Attach configured source metadata to one queryable Knowledge handle."""
+    source_description = _knowledge_source_description(base_id, config)
+    knowledge.name = base_id
+    knowledge.description = source_description.description or None
 
 
 def _lookup_knowledge_for_base(
@@ -364,6 +381,8 @@ def resolve_agent_knowledge_access(
         if lookup is not None and availability is KnowledgeAvailability.READY:
             availability = _ready_index_effective_availability(lookup, config)
         knowledge = lookup.index.knowledge if lookup is not None and lookup.index is not None else None
+        if knowledge is not None:
+            _apply_knowledge_metadata(base_id, knowledge, config)
         if refresh_scheduler is not None:
             availability = _schedule_refresh_for_availability(
                 refresh_scheduler,
@@ -609,13 +628,22 @@ def _merge_knowledge(agent_name: str, knowledges: list[Knowledge]) -> Knowledge 
         return None
     if len(knowledges) == 1:
         return knowledges[0]
+    queryable_knowledges = [knowledge for knowledge in knowledges if knowledge.vector_db is not None]
     vector_db_sources: list[_KnowledgeVectorDb] = [
-        cast("_KnowledgeVectorDb", knowledge.vector_db) for knowledge in knowledges if knowledge.vector_db is not None
+        cast("_KnowledgeVectorDb", knowledge.vector_db) for knowledge in queryable_knowledges
     ]
     if not vector_db_sources:
         return None
-    return Knowledge(
+    source_descriptions = tuple(
+        KnowledgeSourceDescription(
+            base_id=cast("str", knowledge.name),
+            description=knowledge.description or "",
+        )
+        for knowledge in queryable_knowledges
+    )
+    return KnowledgeWithSourceDescriptions(
         name=f"{agent_name}_multi_knowledge",
         vector_db=_MultiKnowledgeVectorDb(vector_dbs=vector_db_sources),
-        max_results=max(knowledge.max_results for knowledge in knowledges),
+        max_results=max(knowledge.max_results for knowledge in queryable_knowledges),
+        source_descriptions=source_descriptions,
     )
