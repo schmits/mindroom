@@ -45,6 +45,7 @@ from mindroom.thread_utils import (
     get_agents_in_thread,
     get_all_mentioned_agents_in_thread,
     has_multiple_non_agent_users_in_thread,
+    is_router_only_agent_mention,
     should_agent_respond,
     thread_requires_explicit_agent_targeting,
 )
@@ -92,6 +93,15 @@ class _DispatchPlan:
     media_events: list[MediaDispatchEvent] | None = None
     router_event: DispatchEvent | None = None
     ignore_reason: Literal["router"] | None = None
+
+
+_ROUTER_ONLY_MENTION_GUIDANCE = (
+    "🧭 Rules of engagement: mention a specific agent when you want that agent to answer, or mention multiple "
+    "agents when you want them to collaborate. If one human and one agent are already talking in a thread, you "
+    "can keep going without an explicit tag. Once a thread has multiple human users or multiple agent "
+    "participants, explicitly tag the agent or agents you want next. In a new untagged message, automatic routing "
+    "can still choose an agent when appropriate. The router is not a conversational AI agent you can tag directly."
+)
 
 
 @dataclass(frozen=True)
@@ -451,31 +461,46 @@ class TurnPolicy:
         context = dispatch.context
         planning_thread_history = context.planning_thread_history
         requester_user_id = dispatch.requester_user_id
-        if not context.mentioned_agents and not context.has_non_agent_mentions:
-            if context.planning_thread_history_unavailable:
-                self.deps.logger.info("Skipping routing: thread policy history unavailable")
-                return _DispatchPlan(kind="ignore", ignore_reason="router")
-            if context.is_thread and thread_requires_explicit_agent_targeting(
-                planning_thread_history,
-                sender_id=requester_user_id,
-                config=self.deps.runtime.config,
-                runtime_paths=self.deps.runtime_paths,
-            ):
-                self.deps.logger.info("Skipping routing: thread already requires explicit agent targeting")
-                return _DispatchPlan(kind="ignore", ignore_reason="router")
+        if is_router_only_agent_mention(
+            context.mentioned_agents,
+            has_non_agent_mentions=context.has_non_agent_mentions,
+            config=self.deps.runtime.config,
+            runtime_paths=self.deps.runtime_paths,
+        ):
+            plan = _DispatchPlan(
+                kind="respond",
+                response_action=ResponseAction(
+                    kind="reject",
+                    rejection_message=_ROUTER_ONLY_MENTION_GUIDANCE,
+                ),
+            )
+        elif context.mentioned_agents or context.has_non_agent_mentions:
+            plan = _DispatchPlan(kind="ignore", ignore_reason="router")
+        elif context.planning_thread_history_unavailable:
+            self.deps.logger.info("Skipping routing: thread policy history unavailable")
+            plan = _DispatchPlan(kind="ignore", ignore_reason="router")
+        elif context.is_thread and thread_requires_explicit_agent_targeting(
+            planning_thread_history,
+            sender_id=requester_user_id,
+            config=self.deps.runtime.config,
+            runtime_paths=self.deps.runtime_paths,
+        ):
+            self.deps.logger.info("Skipping routing: thread already requires explicit agent targeting")
+            plan = _DispatchPlan(kind="ignore", ignore_reason="router")
+        else:
             available_agents = await self.available_agents_for_sender(room, requester_user_id)
             if len(available_agents) == 1:
                 self.deps.logger.info("Skipping routing: only one agent present")
-                return _DispatchPlan(kind="ignore", ignore_reason="router")
-            return _DispatchPlan(
-                kind="route",
-                router_message=message,
-                extra_content=extra_content,
-                media_events=media_events,
-                router_event=router_event or event,
-            )
-
-        return _DispatchPlan(kind="ignore", ignore_reason="router")
+                plan = _DispatchPlan(kind="ignore", ignore_reason="router")
+            else:
+                plan = _DispatchPlan(
+                    kind="route",
+                    router_message=message,
+                    extra_content=extra_content,
+                    media_events=media_events,
+                    router_event=router_event or event,
+                )
+        return plan
 
     @timed("dispatch_action_resolution")
     async def plan_turn(
