@@ -575,6 +575,7 @@ defaults:
   learning: true                        # Enable Agno Learning
   learning_mode: always                 # "always" or "agentic"
   max_preload_chars: 50000              # Hard cap for preloaded context from context_files
+  tool_output_auto_save_threshold_bytes: 51200  # Auto-save supported tool outputs larger than 50 KiB
   show_stop_button: true                # Show a stop button while agent is responding (global-only, cannot be overridden per-agent)
   num_history_runs: null                # Number of prior runs to include (null = all)
   num_history_messages: null            # Max messages from history (null = use num_history_runs)

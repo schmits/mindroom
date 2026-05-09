@@ -8,6 +8,7 @@ from typing import Any, Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer, model_validator
 
 from mindroom.config.validation import duplicate_items, validate_history_limit_choice
+from mindroom.constants import DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES
 from mindroom.credential_policy import credential_service_policy
 from mindroom.credentials import validate_service_name
 from mindroom.tool_system.worker_routing import WorkerScope  # noqa: TC001
@@ -372,6 +373,14 @@ class DefaultsConfig(BaseModel):
         default=50000,
         ge=1,
         description="Hard cap for extra role preload context loaded from context_files",
+    )
+    tool_output_auto_save_threshold_bytes: int = Field(
+        default=DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES,
+        ge=1,
+        description=(
+            "Supported tool outputs larger than this many bytes are automatically saved to the agent workspace "
+            "and replaced with a compact receipt in the model-visible tool result"
+        ),
     )
     streaming: StreamingConfig = Field(
         default_factory=StreamingConfig,
