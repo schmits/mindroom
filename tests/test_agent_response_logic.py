@@ -1,10 +1,10 @@
 """Tests for agent response decision logic.
 
 This module comprehensively tests all agent response rules:
-1. Mentioned agents always respond
-2. Single agent continues conversation
+1. Mentioned available agents respond
+2. A single eligible responder can continue directly
 3. Multiple agents need explicit mentions
-4. Smart routing for new threads
+4. Smart routing selects among multiple eligible responders
 5. Invited agents behave like native agents
 
 These tests ensure no regressions in the core response logic.
@@ -15,13 +15,24 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
-from mindroom.config.agent import AgentConfig
+from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.matrix.client import ResolvedVisibleMessage
+from mindroom.teams import TeamIntent, TeamOutcome, TeamResolution
 from mindroom.thread_utils import should_agent_respond
+from mindroom.turn_policy import ResponseAction, TurnPolicy, TurnPolicyDeps
 from tests.conftest import bind_runtime_paths, create_mock_room, runtime_paths_for, test_runtime_paths
+from tests.identity_helpers import entity_ids, persist_entity_accounts
+
+
+def _bind_runtime_config(config: Config, runtime_root: Path | None = None) -> Config:
+    runtime_paths = test_runtime_paths(runtime_root or Path(tempfile.mkdtemp()))
+    bound_config = bind_runtime_paths(config, runtime_paths)
+    persist_entity_accounts(bound_config, runtime_paths_for(bound_config))
+    return bound_config
 
 
 def _message(
@@ -44,8 +55,7 @@ class TestAgentResponseLogic:
 
     def setup_method(self) -> None:
         """Set up test config."""
-        runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
-        self.config = bind_runtime_paths(
+        self.config = _bind_runtime_config(
             Config(
                 agents={
                     "calculator": AgentConfig(display_name="Calculator", rooms=["!room:localhost"]),
@@ -57,17 +67,15 @@ class TestAgentResponseLogic:
                 room_models={},
                 models={"default": ModelConfig(provider="ollama", id="test-model")},
             ),
-            runtime_paths,
         )
         self.config.authorization.default_room_access = True
         self.runtime_paths = runtime_paths_for(self.config)
-        # Helper for generating agent IDs with correct domain
         self.domain = self.config.get_domain(self.runtime_paths)
         self.sender = f"@user:{self.domain}"
 
     def agent_id(self, agent_name: str) -> str:
-        """Generate agent Matrix ID with correct domain."""
-        return f"@mindroom_{agent_name}:{self.domain}"
+        """Return the current persisted Matrix ID for a configured entity."""
+        return entity_ids(self.config, self.runtime_paths)[agent_name].full_id
 
     def test_mentioned_agent_always_responds(self) -> None:
         """If an agent is mentioned, it should always respond."""
@@ -120,6 +128,102 @@ class TestAgentResponseLogic:
         )
         assert should_respond is True
 
+    def test_materializable_responder_filter_preserves_team_reject_owner(self) -> None:
+        """Runtime materialization filters concrete agents, not configured team responder bots."""
+        runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
+        config = bind_runtime_paths(
+            Config(
+                agents={
+                    "alpha": AgentConfig(display_name="Alpha"),
+                    "beta": AgentConfig(display_name="Beta"),
+                },
+                teams={"ops": TeamConfig(display_name="Ops", role="Operations", agents=["alpha", "beta"])},
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+            ),
+            runtime_paths,
+        )
+        persist_entity_accounts(config, runtime_paths_for(config))
+        runtime_paths = runtime_paths_for(config)
+        team_id = entity_ids(config, runtime_paths)["ops"]
+        runtime = MagicMock()
+        runtime.config = config
+        runtime.orchestrator = None
+        policy = TurnPolicy(
+            TurnPolicyDeps(
+                runtime=runtime,
+                logger=MagicMock(),
+                runtime_paths=runtime_paths,
+                agent_name="ops",
+                matrix_id=team_id,
+            ),
+        )
+
+        responder_pool = policy.filter_materializable_responders([team_id], {"alpha", "beta"})
+        action = policy.team_response_action(
+            TeamResolution(
+                intent=TeamIntent.EXPLICIT_MEMBERS,
+                requested_members=[team_id],
+                member_statuses=[],
+                eligible_members=[],
+                outcome=TeamOutcome.REJECT,
+                reason="Team request includes no available members.",
+            ),
+            responder_pool,
+        )
+
+        assert responder_pool == [team_id]
+        assert action is not None
+        assert action.kind == "reject"
+        assert action.rejection_message == "Team request includes no available members."
+
+    def test_effective_response_action_does_not_convert_reject_to_configured_team(self) -> None:
+        """Configured-team execution only upgrades individual actions."""
+        runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
+        config = bind_runtime_paths(
+            Config(
+                agents={
+                    "alpha": AgentConfig(display_name="Alpha"),
+                    "beta": AgentConfig(display_name="Beta"),
+                },
+                teams={"ops": TeamConfig(display_name="Ops", role="Operations", agents=["alpha", "beta"])},
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+            ),
+            runtime_paths,
+        )
+        persist_entity_accounts(config, runtime_paths_for(config))
+        runtime_paths = runtime_paths_for(config)
+        team_id = entity_ids(config, runtime_paths)["ops"]
+        runtime = MagicMock()
+        runtime.config = config
+        runtime.orchestrator = None
+        policy = TurnPolicy(
+            TurnPolicyDeps(
+                runtime=runtime,
+                logger=MagicMock(),
+                runtime_paths=runtime_paths,
+                agent_name="ops",
+                matrix_id=team_id,
+            ),
+        )
+        rejection = ResponseAction(
+            kind="reject",
+            form_team=TeamResolution(
+                intent=TeamIntent.EXPLICIT_MEMBERS,
+                requested_members=[team_id],
+                member_statuses=[],
+                eligible_members=[],
+                outcome=TeamOutcome.REJECT,
+                reason="Team request includes no available members.",
+            ),
+            rejection_message="Team request includes no available members.",
+        )
+
+        effective_action = policy.effective_response_action(rejection)
+
+        assert effective_action is rejection
+        assert effective_action.kind == "reject"
+        assert effective_action.rejection_message == "Team request includes no available members."
+
     def test_mentioned_agent_reply_permissions_support_domain_pattern(self) -> None:
         """Per-agent reply patterns should allow domain-scoped sender matching."""
         self.config.authorization.agent_reply_permissions = {
@@ -142,6 +246,8 @@ class TestAgentResponseLogic:
         self.config.authorization.agent_reply_permissions = {
             "calculator": [f"@alice:{self.domain}"],
             "general": [f"@bob:{self.domain}"],
+            "agent1": [f"@bob:{self.domain}"],
+            "research": [f"@bob:{self.domain}"],
         }
         room = create_mock_room("!room:localhost", ["calculator", "general"], self.config)
 
@@ -358,6 +464,75 @@ class TestAgentResponseLogic:
         )
         assert should_respond is True
 
+    def test_thread_continuation_cannot_widen_configured_room_boundary(self) -> None:
+        """Thread ownership must stay inside the configured-room responder boundary."""
+        config = bind_runtime_paths(
+            Config(
+                agents={
+                    "calculator": AgentConfig(display_name="Calculator"),
+                    "research": AgentConfig(display_name="Research", rooms=["!room:localhost"]),
+                },
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+                authorization={
+                    "default_room_access": True,
+                    "agent_reply_permissions": {
+                        "calculator": [f"@bob:{self.domain}"],
+                        "research": [f"@alice:{self.domain}"],
+                    },
+                },
+            ),
+            self.runtime_paths,
+        )
+        persist_entity_accounts(config, runtime_paths_for(config))
+        runtime_paths = runtime_paths_for(config)
+        room = create_mock_room("!room:localhost", ["calculator", "research"], config)
+        thread_history = [
+            _message(sender=self.agent_id("calculator"), body="I can help."),
+            _message(sender=f"@bob:{self.domain}", body="continue"),
+        ]
+
+        should_respond = should_agent_respond(
+            agent_name="calculator",
+            am_i_mentioned=False,
+            is_thread=True,
+            room=room,
+            thread_history=thread_history,
+            config=config,
+            runtime_paths=runtime_paths,
+            sender_id=f"@bob:{self.domain}",
+        )
+
+        assert should_respond is False
+
+    def test_explicit_mention_cannot_widen_configured_room_boundary(self) -> None:
+        """Explicit mentions must stay inside the configured-room responder boundary."""
+        config = bind_runtime_paths(
+            Config(
+                agents={
+                    "calculator": AgentConfig(display_name="Calculator"),
+                    "research": AgentConfig(display_name="Research", rooms=["!room:localhost"]),
+                },
+                models={"default": ModelConfig(provider="ollama", id="test-model")},
+                authorization={"default_room_access": True},
+            ),
+            self.runtime_paths,
+        )
+        persist_entity_accounts(config, runtime_paths_for(config))
+        runtime_paths = runtime_paths_for(config)
+
+        should_respond = should_agent_respond(
+            agent_name="calculator",
+            am_i_mentioned=True,
+            is_thread=False,
+            room=create_mock_room("!room:localhost", ["calculator", "research"], config),
+            thread_history=[],
+            config=config,
+            runtime_paths=runtime_paths,
+            sender_id=f"@bob:{self.domain}",
+        )
+
+        assert should_respond is False
+
     def test_not_in_thread_uses_router(self) -> None:
         """If not in a thread, use router to determine response."""
         should_respond = should_agent_respond(
@@ -557,19 +732,20 @@ class TestAgentResponseLogic:
         assert should_respond
 
     def test_single_agent_takes_ownership_of_empty_thread(self) -> None:
-        """When there's only one agent with access to an empty thread, it takes ownership."""
-        # Only one agent in the room
+        """When an ad-hoc room has one agent with access to an empty thread, it takes ownership."""
+        room = create_mock_room("!adhoc:localhost", ["calculator"], self.config)
+
         should_respond = should_agent_respond(
             agent_name="calculator",
             am_i_mentioned=False,
             is_thread=True,
-            room=create_mock_room("!room:localhost", ["calculator"], self.config),  # Only calculator in room
-            thread_history=[],  # Empty thread
+            room=room,
+            thread_history=[],
             config=self.config,
             runtime_paths=self.runtime_paths,
             sender_id=self.sender,
         )
-        assert should_respond is True  # Single agent takes ownership
+        assert should_respond is True
 
         # Thread with only user messages - single agent should also take ownership
         thread_history = [
@@ -580,17 +756,17 @@ class TestAgentResponseLogic:
             agent_name="calculator",
             am_i_mentioned=False,
             is_thread=True,
-            room=create_mock_room("!room:localhost", ["calculator"], self.config),  # Only calculator
+            room=room,
             thread_history=thread_history,
             config=self.config,
             runtime_paths=self.runtime_paths,
             sender_id=self.sender,
         )
-        assert should_respond is True  # Single agent takes ownership when only users have spoken
+        assert should_respond is True
 
     def test_multiple_non_agent_users_in_thread_require_mentions(self) -> None:
         """Require mention when multiple humans posted in a thread, but allow thread continuity."""
-        room = create_mock_room("!room:localhost", ["calculator"], self.config)
+        room = create_mock_room("!adhoc:localhost", ["calculator"], self.config)
 
         # Thread with two different human senders and no agent yet → require mention
         multi_human_thread = [
@@ -686,7 +862,7 @@ class TestAgentResponseLogic:
 
     def test_multi_human_room_non_thread_auto_responds(self) -> None:
         """Non-thread messages in multi-human rooms auto-respond (single agent)."""
-        room = create_mock_room("!room:localhost", ["calculator"], self.config)
+        room = create_mock_room("!adhoc:localhost", ["calculator"], self.config)
         room.users["@alice:localhost"] = None
         room.users["@bob:localhost"] = None
 
@@ -714,6 +890,7 @@ class TestAgentResponseLogic:
             bot_accounts=["@telegram:localhost"],
         )
         config = bind_runtime_paths(config, test_runtime_paths(Path(tempfile.mkdtemp())))
+        persist_entity_accounts(config, runtime_paths_for(config))
         runtime_paths = runtime_paths_for(config)
         config.authorization.default_room_access = True
         room = create_mock_room("!room:localhost", ["calculator"], config)
@@ -760,7 +937,7 @@ class TestAgentResponseLogic:
             config=self.config,
             runtime_paths=self.runtime_paths,
             mentioned_agents=[
-                self.config.get_ids(runtime_paths_for(self.config))["research"],
+                entity_ids(self.config, runtime_paths_for(self.config))["research"],
             ],  # ResearchAgent is mentioned
             sender_id=self.sender,
         )

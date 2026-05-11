@@ -11,6 +11,7 @@ import pytest
 from mindroom import constants as constants_mod
 from mindroom.config.main import Config
 from mindroom.config.matrix import MindRoomUserConfig
+from mindroom.entity_resolution import mindroom_user_id
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import INTERNAL_USER_ACCOUNT_KEY, _register_user
 from mindroom.orchestrator import _MultiAgentOrchestrator
@@ -165,7 +166,7 @@ class TestUserAccountManagement:
             state = MatrixState.load(runtime_paths=runtime_paths)
 
             assert INTERNAL_USER_ACCOUNT_KEY in state.accounts
-            assert state.accounts[INTERNAL_USER_ACCOUNT_KEY].username == DEFAULT_INTERNAL_USERNAME
+            assert state.accounts[INTERNAL_USER_ACCOUNT_KEY].username == f"{DEFAULT_INTERNAL_USERNAME}_test"
             generated_password = state.accounts[INTERNAL_USER_ACCOUNT_KEY].password
             assert generated_password
             assert generated_password != "user_secure_password"  # noqa: S105
@@ -290,23 +291,40 @@ class TestUserAccountManagement:
             mock_client.set_displayname.assert_called_once_with("Alice Smith")
 
     @pytest.mark.asyncio
-    async def test_ensure_user_account_rejects_changing_existing_username(
+    async def test_ensure_user_account_uses_existing_persisted_identity(
         self,
         tmp_path: Path,
+        mock_matrix_client: tuple[MagicMock, AsyncMock],
     ) -> None:
-        """Internal username cannot be changed after initial account bootstrap."""
+        """Internal user config username is only a proposal when no account exists yet."""
+        mock_context, mock_client = mock_matrix_client
         state = MatrixState()
-        state.add_account(INTERNAL_USER_ACCOUNT_KEY, DEFAULT_INTERNAL_USERNAME, "existing_password")
+        state.add_account(
+            INTERNAL_USER_ACCOUNT_KEY,
+            "actual_mindroom_user",
+            "existing_password",
+            requested_username="alice",
+            domain="matrix.example",
+        )
 
         custom_config = Config(mindroom_user={"username": "alice", "display_name": "Alice Smith"})
 
         runtime_paths = _runtime_paths(tmp_path)
         state.save(runtime_paths=runtime_paths)
-        with patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"):
+        with (
+            patch("mindroom.matrix.users.matrix_client", return_value=mock_context),
+            patch("mindroom.constants.runtime_matrix_homeserver", return_value="http://localhost:8008"),
+        ):
             orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
 
-            with pytest.raises(ValueError, match="cannot be changed"):
-                await orchestrator._ensure_user_account(custom_config)
+            await orchestrator._ensure_user_account(custom_config)
+
+        persisted_state = MatrixState.load(runtime_paths=runtime_paths)
+        account = persisted_state.accounts[INTERNAL_USER_ACCOUNT_KEY]
+        assert account.username == "actual_mindroom_user"
+        assert account.domain == "matrix.example"
+        assert mindroom_user_id(custom_config, runtime_paths) == "@actual_mindroom_user:matrix.example"
+        mock_client.register.assert_not_called()
 
 
 def test_mindroom_user_username_normalizes_single_leading_at() -> None:
@@ -327,17 +345,48 @@ def test_mindroom_user_username_rejects_invalid_characters() -> None:
         Config(mindroom_user={"username": "alice smith", "display_name": "Alice"})
 
 
-def test_mindroom_user_username_rejects_router_collision() -> None:
-    """Internal user localpart must not collide with the router account localpart."""
+def test_mindroom_user_username_rejects_persisted_router_collision(tmp_path: Path) -> None:
+    """Internal user localpart must not collide with the prepared router account localpart."""
+    runtime_paths = _runtime_paths(tmp_path)
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    state.add_account("agent_router", "mindroom_router", TEST_PASSWORD, domain="localhost")
+    state.save(runtime_paths=runtime_paths)
+
     with pytest.raises(ValueError, match="conflicts with router 'router'"):
         Config.model_validate(
             {"mindroom_user": {"username": "mindroom_router", "display_name": "Alice"}},
-            context={"runtime_paths": constants_mod.resolve_runtime_paths(process_env={"MINDROOM_NAMESPACE": ""})},
+            context={"runtime_paths": runtime_paths},
         )
 
 
-def test_mindroom_user_username_rejects_agent_collision() -> None:
-    """Internal user localpart must not collide with configured agent localparts."""
+def test_mindroom_user_username_allows_unprepared_agent_proposal_name(tmp_path: Path) -> None:
+    """Generated account proposals are not reserved runtime identities before provisioning."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = Config.model_validate(
+        {
+            "agents": {
+                "assistant": {
+                    "display_name": "Assistant",
+                    "role": "Test assistant",
+                    "rooms": ["test_room"],
+                },
+            },
+            "mindroom_user": {"username": "mindroom_assistant", "display_name": "Alice"},
+        },
+        context={"runtime_paths": runtime_paths},
+    )
+
+    assert config.mindroom_user is not None
+    assert config.mindroom_user.username == "mindroom_assistant"
+
+
+def test_mindroom_user_username_rejects_persisted_agent_username_collision(tmp_path: Path) -> None:
+    """Internal user localpart must not collide with prepared agent account localparts."""
+    runtime_paths = _runtime_paths(tmp_path)
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    state.add_account("agent_assistant", "actual_assistant", TEST_PASSWORD, domain="localhost")
+    state.save(runtime_paths=runtime_paths)
+
     with pytest.raises(ValueError, match="conflicts with agent 'assistant'"):
         Config.model_validate(
             {
@@ -348,10 +397,35 @@ def test_mindroom_user_username_rejects_agent_collision() -> None:
                         "rooms": ["test_room"],
                     },
                 },
-                "mindroom_user": {"username": "mindroom_assistant", "display_name": "Alice"},
+                "mindroom_user": {"username": "actual_assistant", "display_name": "Alice"},
             },
-            context={"runtime_paths": constants_mod.resolve_runtime_paths(process_env={"MINDROOM_NAMESPACE": ""})},
+            context={"runtime_paths": runtime_paths},
         )
+
+
+def test_mindroom_user_username_allows_prepared_agent_proposal_name(tmp_path: Path) -> None:
+    """Prepared agent accounts reserve their actual localpart, not the original proposal."""
+    runtime_paths = _runtime_paths(tmp_path)
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    state.add_account("agent_assistant", "actual_assistant", TEST_PASSWORD, domain="localhost")
+    state.save(runtime_paths=runtime_paths)
+
+    config = Config.model_validate(
+        {
+            "agents": {
+                "assistant": {
+                    "display_name": "Assistant",
+                    "role": "Test assistant",
+                    "rooms": ["test_room"],
+                },
+            },
+            "mindroom_user": {"username": "mindroom_assistant", "display_name": "Alice"},
+        },
+        context={"runtime_paths": runtime_paths},
+    )
+
+    assert config.mindroom_user is not None
+    assert config.mindroom_user.username == "mindroom_assistant"
 
 
 def test_mindroom_user_none_validates_and_returns_none_id() -> None:
@@ -359,7 +433,7 @@ def test_mindroom_user_none_validates_and_returns_none_id() -> None:
     config = Config()
     assert config.mindroom_user is None
     runtime_paths = constants_mod.resolve_runtime_paths(process_env={"MINDROOM_NAMESPACE": ""})
-    assert config.get_mindroom_user_id(runtime_paths) is None
+    assert mindroom_user_id(config, runtime_paths) is None
 
 
 def test_agent_and_team_names_must_not_overlap() -> None:
@@ -383,3 +457,28 @@ def test_agent_and_team_names_must_not_overlap() -> None:
             },
             models={"default": {"provider": "openai", "id": "gpt-4o-mini"}},
         )
+
+
+@pytest.mark.parametrize("section", ["agents", "teams"])
+@pytest.mark.parametrize("entity_name", [constants_mod.ROUTER_AGENT_NAME, "user"])
+def test_agent_and_team_names_reject_internal_entity_name(section: str, entity_name: str) -> None:
+    """Built-in managed entity account keys are not configurable responder aliases."""
+    config_data = {
+        "agents": {
+            "assistant": {
+                "display_name": "Assistant",
+                "role": "Test assistant",
+            },
+        },
+        "teams": {},
+        "models": {"default": {"provider": "openai", "id": "gpt-4o-mini"}},
+    }
+    config_data[section][entity_name] = {
+        "display_name": entity_name.title(),
+        "role": "Reserved entity",
+    }
+    if section == "teams":
+        config_data[section][entity_name]["agents"] = ["assistant"]
+
+    with pytest.raises(ValueError, match=f"reserved internal entity names: {entity_name}"):
+        Config(**config_data)

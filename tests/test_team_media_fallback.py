@@ -43,7 +43,6 @@ from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import CompactionDecision, CompactionReplyOutcome
 from mindroom.hooks import EnrichmentItem
 from mindroom.knowledge.utils import _KnowledgeResolution
-from mindroom.matrix.identity import MatrixID
 from mindroom.media_inputs import MediaInputs
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
 from mindroom.team_exact_members import (
@@ -63,6 +62,7 @@ from mindroom.teams import (
 from mindroom.timing import DispatchPipelineTiming
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.conftest import bind_runtime_paths, make_visible_message, runtime_paths_for, test_runtime_paths
+from tests.identity_helpers import entity_ids, fixture_entity_matrix_id, persist_entity_accounts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -86,7 +86,7 @@ def _make_test_team(
 
 def _build_test_config() -> Config:
     runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
-    return bind_runtime_paths(
+    config = bind_runtime_paths(
         Config(
             agents={
                 "general": AgentConfig(display_name="GeneralAgent", rooms=["#test:example.org"]),
@@ -94,6 +94,8 @@ def _build_test_config() -> Config:
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
+    return config
 
 
 def _prepared_team_execution_context(
@@ -175,6 +177,7 @@ def test_resolve_live_shared_agent_names_filters_to_running_shared_agents() -> N
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.agent_bots = {
@@ -215,6 +218,7 @@ def test_materialize_exact_team_members_closes_partial_agents_on_failure() -> No
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     built_agent = _make_test_agent("GeneralAgent")
 
     with (
@@ -1061,6 +1065,45 @@ async def test_prepare_bound_team_execution_context_uses_team_renderer_for_trimm
 
 
 @pytest.mark.asyncio
+async def test_prepare_bound_team_execution_context_truncates_long_fallback_messages() -> None:
+    """Fallback provider-native context should keep long messages after capping their bodies."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    fake_agent = _make_test_agent("GeneralAgent")
+    mock_team = _make_test_team(name="General Team")
+    long_body = "x" * 201
+    exact_limit_body = "y" * 200
+
+    prepared = await _prepare_bound_team_execution_context(
+        scope_context=None,
+        agents=[fake_agent],
+        team=mock_team,
+        prompt="Analyze this.",
+        thread_history=[
+            make_visible_message(event_id="event-1", sender="alice", body=long_body),
+            make_visible_message(event_id="event-2", sender="bob", body=exact_limit_body),
+        ],
+        runtime_paths=runtime_paths,
+        config=config,
+        team_name=None,
+        active_model_name=None,
+        active_context_window=None,
+        response_sender_id="@mindroom_team:example.org",
+        thread_history_render_limits=ThreadHistoryRenderLimits(
+            max_messages=30,
+            max_message_length=200,
+            missing_sender_label="Unknown",
+        ),
+    )
+
+    assert tuple((message.role, message.content) for message in prepared.messages) == (
+        ("user", f"alice: {'x' * 199}…"),
+        ("user", f"bob: {exact_limit_body}"),
+        ("user", "Analyze this."),
+    )
+
+
+@pytest.mark.asyncio
 async def test_team_response_scrubs_queued_notices_after_run_exception() -> None:
     """Failed team runs should still remove hidden queued-message notices from history."""
     config = _build_test_config()
@@ -1229,7 +1272,7 @@ async def test_team_response_stream_scrubs_queued_notices_after_stream_exception
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths)["general"]],
+                agent_ids=[entity_ids(config, runtime_paths)["general"]],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
                 orchestrator=orchestrator,
@@ -1823,7 +1866,7 @@ async def test_team_response_stream_raises_cancelled_error_for_team_run_cancelle
         yield TeamRunCancelledEvent(run_id="run-456", reason="Run run-456 was cancelled")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -1903,7 +1946,7 @@ async def test_team_response_stream_records_hidden_interrupted_tool_state() -> N
         yield TeamRunCancelledEvent(run_id="run-456", session_id="session-team-stream", reason="Run cancelled")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -1975,7 +2018,7 @@ async def test_team_response_stream_records_interrupted_snapshot_after_external_
 
     async def consume_stream() -> None:
         team_agent_ids = [
-            MatrixID.from_agent(
+            fixture_entity_matrix_id(
                 "general",
                 config.get_domain(runtime_paths),
                 runtime_paths,
@@ -2030,6 +2073,7 @@ async def test_team_response_stream_preserves_pending_tool_scope_for_same_named_
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths
@@ -2071,12 +2115,12 @@ async def test_team_response_stream_preserves_pending_tool_scope_for_same_named_
         yield TeamRunCancelledEvent(run_id="run-789", session_id="session-team-stream", reason="Run cancelled")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
         ),
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "research",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2160,7 +2204,7 @@ async def test_team_response_stream_preserves_pending_tool_identity_within_membe
         yield TeamRunCancelledEvent(run_id="run-789", session_id="session-team-stream", reason="Run cancelled")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2239,7 +2283,7 @@ async def test_team_response_stream_does_not_retry_after_hidden_tool_progress_on
         yield RunOutput(content="image input is not supported", status=RunStatus.error)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2308,7 +2352,7 @@ async def test_team_response_stream_does_not_retry_after_hidden_tool_progress_on
         yield TeamRunErrorEvent(content="image input is not supported")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2369,7 +2413,7 @@ async def test_team_response_stream_emits_team_run_output_fallback() -> None:
         yield TeamRunOutput(content="Fallback consensus", status=RunStatus.completed)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2429,7 +2473,7 @@ async def test_team_response_stream_marks_successful_event_stream_completed() ->
         yield TeamRunContentEvent(content="Consensus answer.")
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2501,7 +2545,7 @@ async def test_team_response_stream_emits_plain_run_output_fallback_with_team_fo
         )
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2559,7 +2603,7 @@ async def test_team_response_stream_raises_cancelled_error_for_team_run_output_f
         yield TeamRunOutput(content="Run run-789 was cancelled", status=RunStatus.cancelled)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2611,7 +2655,7 @@ async def test_team_response_stream_returns_friendly_error_for_errored_run_outpu
         yield TeamRunOutput(content="validation failed in team", status=RunStatus.error)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2666,7 +2710,7 @@ async def test_team_response_stream_returns_friendly_error_for_errored_plain_run
         yield RunOutput(content="validation failed in team", status=RunStatus.error)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2728,7 +2772,7 @@ async def test_team_response_stream_retries_errored_output_with_fresh_run_id() -
         yield TeamRunOutput(content="Recovered consensus", status=RunStatus.completed)
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2800,7 +2844,7 @@ async def test_team_response_stream_tracks_retry_run_id_after_hard_cancellation(
         yield ""  # pragma: no cover
 
     team_agent_ids = [
-        MatrixID.from_agent(
+        fixture_entity_matrix_id(
             "general",
             config.get_domain(runtime_paths),
             runtime_paths,
@@ -2932,7 +2976,7 @@ async def test_team_response_stream_retry_scrubs_queued_notice_before_second_att
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
                 orchestrator=orchestrator,
@@ -2997,6 +3041,7 @@ async def test_team_response_rejects_missing_materialized_members() -> None:
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3048,7 +3093,7 @@ async def test_team_response_stream_uses_compaction_aware_member_execution() -> 
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
                 orchestrator=orchestrator,
@@ -3105,7 +3150,7 @@ async def test_team_response_stream_prefers_persisted_history_over_thread_contex
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
                 thread_history=[make_visible_message(sender="user", body="Old thread context")],
@@ -3175,7 +3220,7 @@ async def test_team_response_stream_preserves_unseen_matrix_thread_context_with_
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths)["general"]],
+                agent_ids=[entity_ids(config, runtime_paths)["general"]],
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
                 thread_history=[
@@ -3231,7 +3276,7 @@ async def test_team_response_stream_preserves_assistant_context_in_team_prompt()
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
                 orchestrator=orchestrator,
@@ -3270,6 +3315,7 @@ async def test_team_response_rejects_non_running_materialized_members() -> None:
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3306,6 +3352,7 @@ async def test_team_response_rejects_request_time_materialization_failure() -> N
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3347,6 +3394,7 @@ async def test_team_stream_rejects_missing_materialized_members() -> None:
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3358,8 +3406,8 @@ async def test_team_stream_rejects_missing_materialized_members() -> None:
             chunk
             async for chunk in team_response_stream(
                 agent_ids=[
-                    config.get_ids(runtime_paths_for(config))["general"],
-                    config.get_ids(runtime_paths_for(config))["research"],
+                    entity_ids(config, runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))["research"],
                 ],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
@@ -3386,6 +3434,7 @@ async def test_team_stream_rejects_request_time_materialization_failure() -> Non
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3404,8 +3453,8 @@ async def test_team_stream_rejects_request_time_materialization_failure() -> Non
             chunk
             async for chunk in team_response_stream(
                 agent_ids=[
-                    config.get_ids(runtime_paths_for(config))["general"],
-                    config.get_ids(runtime_paths_for(config))["research"],
+                    entity_ids(config, runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))["research"],
                 ],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
@@ -3448,7 +3497,7 @@ async def test_team_stream_retries_without_inline_media_on_setup_error() -> None
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
@@ -3503,7 +3552,7 @@ async def test_team_stream_retries_without_inline_media_on_streamed_run_error() 
         chunks = [
             chunk
             async for chunk in team_response_stream(
-                agent_ids=[config.get_ids(runtime_paths_for(config))["general"]],
+                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
                 turn_recorder=_team_turn_recorder("Analyze this."),
@@ -3562,6 +3611,7 @@ def _build_private_team_orchestrator(*, include_private_member: bool) -> tuple[C
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3616,8 +3666,8 @@ async def test_team_response_stream_rejects_private_agents_even_when_private_mem
             chunk
             async for chunk in team_response_stream(
                 agent_ids=[
-                    config.get_ids(runtime_paths_for(config))["general"],
-                    config.get_ids(runtime_paths_for(config))["calculator"],
+                    entity_ids(config, runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))["calculator"],
                 ],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",
@@ -3645,6 +3695,7 @@ async def test_team_response_rejects_members_that_delegate_to_private_agents() -
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths)
     orchestrator = MagicMock()
     orchestrator.config = config
     orchestrator.runtime_paths = runtime_paths_for(config)
@@ -3729,8 +3780,8 @@ async def test_team_response_stream_ignores_router_in_direct_team_member_list() 
             chunk
             async for chunk in team_response_stream(
                 agent_ids=[
-                    config.get_ids(runtime_paths_for(config))[ROUTER_AGENT_NAME],
-                    config.get_ids(runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))[ROUTER_AGENT_NAME],
+                    entity_ids(config, runtime_paths_for(config))["general"],
                 ],
                 mode=TeamMode.COORDINATE,
                 message="Analyze this.",

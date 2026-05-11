@@ -42,8 +42,10 @@ from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.credentials import CredentialsManager, load_scoped_credentials
+from mindroom.entity_resolution import managed_entity_power_user_ids_for_room
 from mindroom.knowledge import resolve_agent_knowledge_access
 from mindroom.knowledge.availability import KnowledgeAvailability
+from mindroom.matrix.state import MatrixState
 from mindroom.prompts import HIDDEN_TOOL_CALLS_PROMPT, OPENAI_COMPAT_HISTORY_GUIDANCE
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
@@ -64,6 +66,7 @@ from mindroom.tool_system.worker_routing import (
     worker_root_path,
 )
 from mindroom.workspaces import _copy_workspace_template
+from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,10 +83,8 @@ def _runtime_paths(storage_path: Path, *, config_path: Path | None = None) -> Ru
 
 def _test_config() -> Config:
     """Create a self-contained test config with standard agents."""
-    from tests.conftest import bind_runtime_paths  # noqa: PLC0415
-
     runtime_paths = _runtime_paths(Path(tempfile.mkdtemp()))
-    return bind_runtime_paths(
+    return _bind_runtime_paths(
         Config(
             agents={
                 "general": AgentConfig(
@@ -130,7 +131,13 @@ def _bind_runtime_paths(config: Config, runtime_paths: RuntimePaths) -> Config:
     """Bind explicit RuntimePaths to a test config."""
     from tests.conftest import bind_runtime_paths  # noqa: PLC0415
 
-    return bind_runtime_paths(config, runtime_paths)
+    bound_config = bind_runtime_paths(config, runtime_paths)
+    persist_entity_accounts(
+        bound_config,
+        runtime_paths,
+        usernames={alias: f"actual_{alias}" for alias in ["router", *bound_config.agents, *bound_config.teams]},
+    )
+    return bound_config
 
 
 def _create_agent_for_test(agent_name: str, config: Config, **kwargs: object) -> Agent:
@@ -145,6 +152,30 @@ def _create_agent_for_test(agent_name: str, config: Config, **kwargs: object) ->
         execution_identity=execution_identity,
         **kwargs,
     )
+
+
+def test_managed_entity_power_user_ids_for_room_includes_configured_teams(tmp_path: Path) -> None:
+    """Room creation power users should include team bots configured for that room."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _bind_runtime_paths(
+        Config(
+            agents={"general": AgentConfig(display_name="GeneralAgent", rooms=["lobby"])},
+            teams={
+                "ops": TeamConfig(
+                    display_name="OpsTeam",
+                    role="Coordinate operations",
+                    agents=["general"],
+                    rooms=["ops"],
+                ),
+            },
+        ),
+        runtime_paths,
+    )
+
+    assert managed_entity_power_user_ids_for_room("ops", config, runtime_paths) == [
+        "@actual_router:localhost",
+        "@actual_ops:localhost",
+    ]
 
 
 class _TestVectorDb:
@@ -212,6 +243,33 @@ def test_agent_identity_prompt_can_be_overridden_from_config() -> None:
     assert "OpenAI-compatible API" in openai_compat_agent.role
 
 
+def test_agent_identity_prompt_uses_persisted_current_matrix_id(tmp_path: Path) -> None:
+    """Agent identity prompt should describe the live persisted Matrix account ID."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _bind_runtime_paths(
+        Config(
+            agents={
+                "general": AgentConfig(
+                    display_name="GeneralAgent",
+                    role="General assistant",
+                    tools=[],
+                    rooms=["lobby"],
+                ),
+            },
+            models={"default": ModelConfig(provider="openai", id="gpt-4o-mini")},
+        ),
+        runtime_paths,
+    )
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    state.add_account("agent_general", "mindroom_general_oldns", "pw", domain="localhost")
+    state.save(runtime_paths=runtime_paths)
+
+    agent = _create_agent_for_test("general", config)
+
+    assert "@mindroom_general_oldns:localhost" in agent.role
+    assert "@mindroom_general:localhost" not in agent.role
+
+
 def test_create_agent_includes_openai_compat_guidance_only_when_requested() -> None:
     """OpenAI-compatible prompt guidance should be opt-in at agent construction time."""
     config = _test_config()
@@ -238,7 +296,7 @@ def test_create_agent_includes_matrix_reply_targeting_policy() -> None:
 
     assert "## Matrix Reply Targeting" in agent.role
     assert "explicit Matrix mention" in agent.role
-    assert "multi-agent or multi-human" in agent.role
+    assert "multi-agent, multi-team, or multi-human" in agent.role
     assert "not dispatched" in agent.role
     assert "natural-language addressing" in agent.role
 

@@ -1144,7 +1144,7 @@ voice:
 # Internal MindRoom user account (optional, omit for hosted/public profiles)
 # When present, defaults are: username: mindroom_user, display_name: MindRoomUser
 mindroom_user:
-  username: mindroom_user          # Set before first startup (localpart only)
+  username: mindroom_user          # Set before first startup (account-creation request localpart only)
   display_name: MindRoomUser       # Can be changed later
 
 # Matrix room onboarding/discoverability (optional)
@@ -1261,15 +1261,15 @@ prompts:
     Tool calls are hidden from users.
     Answer directly without narrating internal tool use.
   ROUTER_AGENT_SELECTION_PROMPT_TEMPLATE: |
-    Decide which agent should respond to this message.
+    Decide which agent or team should respond to this message.
 
-    Available agents and their capabilities:
+    Available agents and teams:
 
     {agents_info}
 
     User message: {message}
 
-    Return only the agent name.
+    Return only the agent or team name.
 ```
 
 Discover allowed names by inspecting `src/mindroom/prompts.py` or by importing `PROMPT_DEFAULT_NAMES` from `mindroom.prompts`.
@@ -1303,8 +1303,9 @@ Run `mindroom avatars sync --force` to replace existing Matrix room or root-spac
 
 ## Internal User Username
 
-- Configure `mindroom_user.username` with the Matrix localpart you want before first startup.
-- After the account is created, `mindroom_user.username` is locked and cannot be changed in-place.
+- Configure `mindroom_user.username` with the Matrix localpart to request before first startup.
+- After the account is created, `mindroom_user.username` is locked as the account-creation request and cannot be changed in-place.
+- Hosted provisioning can return a different actual Matrix ID; MindRoom persists that actual ID and uses it for runtime authorization.
 - You can safely change `mindroom_user.display_name` at any time.
 
 ## Sections
@@ -2381,7 +2382,8 @@ All modes include the culture description in the agent's context. The difference
 
 # Router Configuration
 
-The router is a built-in system component that handles intelligent message routing and room management. It decides which agent should respond when no specific agent is mentioned, sends welcome messages to new rooms, and manages various system-level tasks.
+The router is a built-in system component that handles intelligent message routing and room management.
+It decides which agent or team should respond when no specific agent or team is mentioned, sends welcome messages to new rooms, and manages various system-level tasks.
 
 ## Configuration
 
@@ -2409,15 +2411,19 @@ Startup thread prewarm is a background, best-effort cache warmup for rooms alrea
 
 ## How Routing Works
 
-When a message arrives in a room without a specific agent mention:
+When a message arrives in a room without a specific agent or team mention, MindRoom first builds the eligible responder candidate set for that sender and room.
 
-1. The router checks if there are configured agents in that room
-2. It analyzes the message content and any recent thread context (up to 3 previous messages)
-3. Based on the available agents' roles, tools, and instructions, it selects the best match
-4. The router posts a message mentioning the selected agent (e.g., "@agent could you help with this?")
-5. The mentioned agent sees the mention and responds in the thread
+1. If the thread already requires explicit targeting, MindRoom stays silent until someone mentions an agent or team
+2. If exactly one eligible responder remains, that agent or team handles the message directly
+3. If multiple eligible responders remain, the router analyzes the message content and any recent thread context (up to 3 previous messages)
+4. Based on the candidate entities' roles, tools, and instructions, it selects the best match
+5. The router posts a message mentioning the selected entity (e.g., "@agent could you help with this?")
+6. The mentioned agent or team sees the mention and responds in the thread
 
-The router uses a structured output schema to ensure consistent routing decisions, including the agent name and reasoning for the selection.
+For configured rooms, routing candidates come only from `agents.<name>.rooms` and `teams.<name>.rooms`, then are filtered by the sender's per-entity reply permissions.
+For ad-hoc rooms accepted through invites, routing candidates come from the sender-visible MindRoom agents and teams currently joined to that room, then are filtered by the same sender permissions.
+
+When multiple responders are eligible, the router uses a structured output schema to ensure consistent routing decisions, including the selected agent or team name and reasoning for the selection.
 
 ## Router Responsibilities
 
@@ -2435,27 +2441,34 @@ The router exclusively handles all commands:
 - `!edit_schedule <id> <task>` - Edit an existing scheduled task
 - `!config <operation>` - Manage configuration
 
-Even in single-agent rooms, commands are always processed by the router.
+Even in single-responder rooms, commands are always processed by the router.
 
 ### Welcome Messages
 
-When the router joins a room with no messages (or only a previous welcome message), it automatically sends a welcome message listing:
+When the router joins a room after an invite, it sends a requester-scoped welcome message.
 
-- All available agents in that room with their descriptions
-- How to interact with agents (mentions, commands)
+That welcome message lists:
+
+- Available agents and teams visible to the inviter with their descriptions
+- How to interact with agents and teams (mentions, commands)
 - Quick command reference
 
+Startup welcomes with no requester list configured room responders when the room is statically configured.
+Startup welcomes for ad-hoc rooms send the general interaction guidance and quick command reference without an available-responder list.
+
 Use `!hi` in any room to see the welcome message again.
+
+The `!hi` welcome lists responders visible to the requester.
 
 ### Room Management
 
 The router creates and manages rooms:
 
 - Creates configured rooms that don't exist yet
-- Invites agents and users to their configured rooms
+- Invites configured agents, teams, and users to their rooms
 - Applies `matrix_room_access` policy for managed rooms (when enabled)
 - Reconciles managed room power levels so the custom thread-tags state event can be written at PL0
-- Generates AI-powered room topics based on configured agents
+- Generates AI-powered room topics based on configured agents and teams
 - Has admin privileges to manage room membership
 - Cleans up orphaned bots on startup
 
@@ -2466,7 +2479,7 @@ That same reconciliation path also updates `m.room.power_levels` for managed roo
 ### Voice Message Processing
 
 Audio events are handled through the shared media pipeline on all bots.
-The router only posts a visible handoff when it must disambiguate between multiple eligible responders in a multi-agent room.
+The router only posts a visible handoff when it must disambiguate between multiple eligible responders in a room.
 When the responder is already clear, normalized audio follows the normal direct agent or team dispatch rules without an extra router message.
 By default, `voice.visible_router_echo: true` also lets the router post the normalized voice text as a display-only message when it is allowed to reply.
 Set `voice.visible_router_echo: false` to suppress that display-only echo.
@@ -2475,7 +2488,8 @@ See [Voice Messages](https://docs.mindroom.chat/voice/) for the detailed dispatc
 
 ### Configuration Confirmations
 
-The router handles interactive configuration changes. When a config change is requested, the router posts a confirmation message with reactions, and only the router processes the confirmation reactions.
+The router handles interactive configuration changes.
+When a config change is requested, the router posts a confirmation message with reactions, and only the router processes the confirmation reactions.
 
 ### Scheduled Task Restoration
 
@@ -2483,25 +2497,29 @@ When the router joins a room, it restores any previously scheduled tasks and pen
 
 ## Routing Behavior Details
 
-### Single-Agent Optimization
+### Single Responder Optimization
 
-When there's only one agent configured in a room, the router skips AI routing entirely. The single agent handles messages directly, which is faster and more efficient.
+When there is only one eligible responder for a room, the router skips AI routing entirely.
+The single responder handles messages directly, which is faster and more efficient.
 
 ### Multi-Human Thread Protection
 
-When multiple human users have posted in a thread, the router and agents require an explicit `@mention` before responding. This prevents agents from injecting themselves into human-to-human conversations.
+When multiple human users have posted in a thread, the router, agents, and teams require an explicit `@mention` before responding.
+This prevents MindRoom entities from injecting themselves into human-to-human conversations.
 
 The rules are:
 
-1. **Mentioned agents always respond** — an explicit `@agent` overrides all other rules.
-2. **Non-thread messages** — agents auto-respond if they're the only agent in the room, regardless of how many humans are present.
-3. **Threads with one human** — normal auto-response behavior applies (the agent continues the conversation).
-4. **Threads with two or more humans** — agents stay silent unless explicitly mentioned.
-5. **Mentioning a non-agent user** — if a message tags only humans (not agents), agents stay silent.
+1. **Mentioned eligible agents or teams respond** — an explicit `@agent` or `@team` bypasses AI routing, but room configuration and reply permissions still apply.
+2. **Non-thread messages** — a single eligible agent or team can auto-respond, regardless of how many humans are present.
+3. **Threads with one human** — normal auto-response behavior applies, so the agent or team continues the conversation.
+4. **Threads with two or more humans** — agents and teams stay silent unless explicitly mentioned.
+5. **Mentioning a non-MindRoom user** — if a message tags only humans or unmanaged users, agents and teams stay silent.
 
 #### Bot accounts
 
-By default, any Matrix user that is not a MindRoom agent counts as a "human" for the rules above. This includes bridge bots (Telegram, Slack, etc.) and other non-MindRoom bots. If a bridge bot relays a message into a thread, it looks like a second human to MindRoom and triggers the mention requirement.
+By default, any Matrix user that is not a MindRoom agent or team counts as a "human" for the rules above.
+This includes bridge bots (Telegram, Slack, etc.) and other non-MindRoom bots.
+If a bridge bot relays a message into a thread, it looks like a second human to MindRoom and triggers the mention requirement.
 
 To prevent this, list those accounts in `bot_accounts`:
 
@@ -2511,24 +2529,27 @@ bot_accounts:
   - "@slackbot:example.com"
 ```
 
-Accounts in this list are treated like MindRoom agents for response logic — their messages and mentions don't count toward the multi-human detection.
+Accounts in this list are treated like MindRoom entities for response logic — their messages and mentions don't count toward the multi-human detection.
 
 ### Routing Fallback
 
-If routing fails (model error, invalid suggestion, etc.), the router sends a helpful error message: "⚠️ I couldn't determine which agent should help with this. Please try mentioning an agent directly with @ or rephrase your request."
+If routing fails (model error, invalid suggestion, etc.), the router sends a helpful error message that asks the user to mention an agent or team directly or rephrase the request.
 
-Users can always mention agents directly with `@agent_name` to bypass routing.
+Users can mention eligible agents or teams directly with `@entity_name` to bypass routing, while configured-room allowlists and reply permissions still decide whether that entity may answer.
 
 ## Note on the Router Agent
 
-The router is always present and cannot be disabled. It automatically joins any room with configured agents. If no `router` section is configured, it uses the default model.
+The router is always present and cannot be disabled.
+It automatically joins any room with configured agents or teams.
+If no `router` section is configured, it uses the default model.
 
 The router account is not a conversational AI agent to tag directly.
-If a message mentions only the router and no other users or agents, the router replies with the rules of engagement instead of answering the prompt.
-Mention a specific agent when you want that agent to answer, or mention multiple agents when you want them to collaborate.
-When one human and one agent are already talking in a thread, continuing without an explicit tag is fine.
-Once a thread has multiple human users or multiple agent participants, tag the agent or agents you want next.
-In a new untagged message, automatic routing can still choose an agent when that is appropriate.
+If a message mentions only the router and no other users, agents, or teams, the router replies with the rules of engagement instead of answering the prompt.
+Mention a specific agent or team when you want that entity to answer.
+Mention multiple agents when you want an ad-hoc collaboration, or mention a configured team directly for its team workflow.
+When one human and one agent or team are already talking in a thread, continuing without an explicit tag is fine.
+Once a thread has multiple human users or multiple agent/team participants, tag the agents or teams you want next.
+In a new untagged message, automatic routing can still choose an agent or team when that is appropriate.
 
 # Toolkit Configuration
 
@@ -7862,7 +7883,7 @@ get_upcoming_bookings(email="alex@example.com")
 
 ## [`scheduler`]
 
-`scheduler` is MindRoom's built-in task scheduler for future messages, reminders, and recurring agent work.
+`scheduler` is MindRoom's built-in task scheduler for future messages, reminders, and recurring agent or team work.
 
 ### What It Does
 
@@ -7870,7 +7891,7 @@ get_upcoming_bookings(email="alex@example.com")
 It reuses the same backend as `!schedule`, `!edit_schedule`, `!list_schedules`, and `!cancel_schedule`.
 By default `schedule()` posts back into the current room or thread scope, while `new_thread=True` schedules a future room-level root message.
 Scheduled tasks are stored in Matrix room state and persist across restarts.
-The scheduler validates mentioned agents against the current room or thread before it saves a task.
+The scheduler validates mentioned agents and teams against the current room or thread before it saves a task.
 If no Matrix room context is available, the tool returns an unavailable error instead of creating a task.
 
 ### Configuration
@@ -8136,7 +8157,9 @@ For [`openclaw_compat`], that means `matrix_message` is added directly and `atta
 
 `subagents` exposes `agents_list()`, `sessions_spawn()`, `sessions_send()`, and `list_sessions()`.
 All four calls return JSON strings with a `status` field, a `tool` field, and operation-specific payload data.
-`agents_list()` returns the configured agent IDs and the current agent name.
+`agents_list()` returns the current agent name plus `agents`, a sorted array of row objects with `name`, `can_delegate`, `can_spawn`, and `description`.
+`name` is the value to pass as `agent_id` when the relevant capability flag allows that operation.
+`can_spawn` means the agent is eligible in the current room, and `can_delegate` means the agent is listed in the caller's `delegate_to` allowlist.
 `sessions_spawn(task, summary, tag, label=None, agent_id=None)` requires a non-empty task plus a normalized summary and tag.
 `sessions_spawn()` posts a fresh room-level Matrix message that mentions the target agent, then treats the resulting event ID as the root of a new isolated session thread.
 After the spawn succeeds, it writes the requested thread summary and tag through the lower-level thread summary and thread tag APIs.
@@ -8145,7 +8168,7 @@ If the post-spawn summary or tag write fails, the spawn still succeeds and the r
 `sessions_send()` sends a follow-up message into an existing tracked session.
 If you omit `session_key`, `sessions_send()` defaults to the current room or thread session key from `create_session_id(room_id, thread_id)`.
 If you pass `label` without `session_key`, `sessions_send()` resolves the most recent in-scope session with that label.
-If you pass `agent_id`, `sessions_send()` prefixes the outgoing message with `@mindroom_<agent_id>` before sending it.
+If you pass `agent_id`, `sessions_send()` prefixes the outgoing message with that agent's current full Matrix ID before sending it.
 Tracked sessions are persisted in `subagents/session_registry.json` under the current runtime storage root.
 `list_sessions()` paginates those tracked sessions with a default `limit` of 50 and a maximum of 200.
 Isolated spawned sessions require thread-capable agents.
@@ -11839,7 +11862,7 @@ Learning data persists in `agents/<name>/learning/<agent>.db` within the agent's
 
 # Voice Messages
 
-MindRoom can surface Matrix voice messages as attachment-aware prompts for agents.
+MindRoom can surface Matrix voice messages as attachment-aware prompts for agents and teams.
 If STT is configured, MindRoom also transcribes the audio and routes it through the normal text pipeline.
 If STT is unavailable, disabled, or fails, the audio still remains available as an attachment and falls back to `🎤 [Attached voice message]`.
 
@@ -11852,10 +11875,10 @@ When a voice message is received:
 3. If STT is configured and succeeds, the audio is transcribed and lightly normalized for mentions and commands.
 4. If STT is unavailable, disabled, or fails, MindRoom falls back to `🎤 [Attached voice message]`.
 5. The normalized text plus attachment metadata is dispatched using the normal routing and thread logic.
-6. If routing is ambiguous in a multi-agent room, the router posts a visible handoff message.
+6. If routing is ambiguous in a multi-responder room, the router posts a visible handoff message.
 7. If `voice.visible_router_echo` is enabled and the router is present and allowed to reply, the router also posts the normalized voice text as a display-only message.
-8. Otherwise, no extra router message is posted and the chosen agent replies directly.
-9. The responding agent receives the original audio attachment alongside the normalized prompt.
+8. Otherwise, no extra router message is posted and the chosen agent or team replies directly.
+9. The responding entity receives the original audio attachment alongside the normalized prompt.
 
 ## Configuration
 
@@ -11931,15 +11954,15 @@ If `api_key` is not set, MindRoom falls back to the `OPENAI_API_KEY` environment
 
 The intelligence component uses an AI model to analyze transcriptions and format them properly:
 
-1. **Agent mentions** - Converts spoken agent names to `@agent` format
-2. **Mention sanitization** - Mentions of agents not available in the current room have their `@` stripped so the agent is not falsely targeted
+1. **Agent and team mentions** - Converts spoken agent or team names to listed `@agent` or `@team` mentions
+2. **Mention sanitization** - Mentions of agents or teams not available in the current room have their `@` stripped so the responder is not falsely targeted
 3. **Command patterns** - Identifies and formats `!command` syntax
 4. **Speculative command rejection** - Commands the AI invents that were not in the original transcription are rejected to prevent false positives
 5. **Smart formatting** - Handles speech recognition errors and natural language variations
 
 ### Intelligence Model
 
-The intelligence model processes raw transcriptions to recognize commands and agent names:
+The intelligence model processes raw transcriptions to recognize commands, agent names, and team names:
 
 ```yaml
 voice:
@@ -11974,48 +11997,48 @@ You can specify a different model for faster or more accurate command recognitio
                                                            └──────┬─────┘
                                                                   ▼
                                                            ┌─────────────┐
-                                                           │ Agent       │
-                                                           │ Responds    │
+                                                           │ Responder   │
+                                                           │ Answers     │
                                                            └─────────────┘
 ```
 
 ## Dispatch Behavior
 
-### Single-agent rooms or explicitly targeted audio
+### Single-responder rooms or explicitly targeted audio
 
-If only one eligible agent is visible, that agent responds directly to the normalized audio event.
-If the audio caption or transcript explicitly mentions an agent, that targeted agent responds directly as well.
+If only one eligible agent or team is visible, that responder answers the normalized audio event directly.
+If the audio caption or transcript explicitly mentions an agent or team, that targeted responder answers directly as well.
 In these cases, the router does not post an extra visible routing handoff.
 The transcript or fallback text is used internally for dispatch, not echoed to the room as a separate message.
-If `voice.visible_router_echo` is enabled, the router still posts a display-only copy of the normalized voice text, but agents ignore that echo and continue responding to the original audio event.
+If `voice.visible_router_echo` is enabled, the router still posts a display-only copy of the normalized voice text, but responders ignore that echo and continue responding to the original audio event.
 
-### Multi-agent rooms where the router must choose
+### Multi-responder rooms where the router must choose
 
-If multiple agents are available and the audio does not already target one of them, the router uses the normalized text to do the usual routing step.
+If multiple agents or teams are available and the audio does not already target one of them, the router uses the normalized text to do the usual routing step.
 The router then posts a normal handoff message such as `@home could you help with this?`.
-The selected agent responds to that router handoff, and the handoff carries the original audio attachment metadata forward.
+The selected agent or team responds to that router handoff, and the handoff carries the original audio attachment metadata forward.
 This is the case where a visible router message appears.
 If `voice.visible_router_echo` is also enabled, the router first posts the normalized voice text as a display-only echo and then posts the normal handoff.
 
 ### No router, or router cannot reply
 
 Audio still works when the router is absent.
-In that case, agents handle the normalized audio directly using the same mention, thread, and permission rules as normal text messages.
+In that case, agents and teams handle the normalized audio directly using the same mention, thread, and permission rules as normal text messages.
 The same direct handling also applies when the router is present but is not allowed to reply to the original sender.
 In these cases, there is no visible router echo because the router does not handle the event.
-If multiple eligible agents remain and the audio does not already target one of them, there is no automatic handoff until the user mentions an agent.
+If multiple eligible responders remain and the audio does not already target one of them, there is no automatic handoff until the user mentions an agent or team.
 
 ### Visibility rule
 
 By default, MindRoom posts a display-only router echo of normalized voice text when the router is allowed to process the event.
-The router handoff message still appears only when the router must disambiguate between multiple eligible responders.
-If the responder is already clear from room shape, thread context, or explicit targeting, the chosen agent replies directly to the original audio event.
-Set `voice.visible_router_echo: false` to suppress the display-only echo without changing which event agents actually answer.
+The router handoff message appears only when the router must disambiguate between multiple eligible responders.
+If the responder is already clear from room shape, thread context, or explicit targeting, the chosen agent or team replies directly to the original audio event.
+Set `voice.visible_router_echo: false` to suppress the display-only echo without changing which event responders actually answer.
 
 ### Attachment access
 
 The original audio is always registered as a context-scoped attachment before dispatch continues.
-That means the responding agent can inspect the file directly, use audio-capable models, or fetch it later with the `attachments` tool.
+That means the responding agent or team can inspect the file directly, use audio-capable models, or fetch it later with the `attachments` tool.
 This is true whether the prompt came from a transcript, a fallback message, or a router handoff.
 
 ## Matrix Integration
@@ -12041,7 +12064,8 @@ Reply-permission checks still use the original human sender, not a later router 
 
 ## Text-to-Speech Tools
 
-MindRoom also supports text-to-speech (TTS) through agent tools. These are separate from voice message transcription and allow agents to generate audio responses:
+MindRoom also supports text-to-speech (TTS) through agent tools.
+These are separate from voice message transcription and allow agents to generate audio responses:
 
 - **OpenAI** - Speech synthesis via `openai` tool
 - **ElevenLabs** - High-quality AI voices and sound effects via `eleven_labs` tool
@@ -12056,39 +12080,40 @@ When STT is unavailable, disabled, or transcription fails, MindRoom falls back t
 
 1. The voice message audio is downloaded and saved locally as an attachment
 2. The normalized text becomes `🎤 [Attached voice message]`
-3. The raw audio is registered as an attachment ID available to agents in the room or thread context
-4. When an agent responds, it automatically receives the raw audio as an Agno `Audio` object
+3. The raw audio is registered as an attachment ID available to agents and teams in the room or thread context
+4. When an agent or team responds, it automatically receives the raw audio as an Agno `Audio` object
 
-This means voice messages still reach agents even without STT.
-Agents with audio-capable models can process the raw audio directly, and tool-using agents can retrieve the file by attachment ID.
+This means voice messages still reach responders even without STT.
+Agents or teams with audio-capable models can process the raw audio directly, and tool-using responders can retrieve the file by attachment ID.
 Attachment IDs in this fallback path use the same context-scoping rules described in [File & Video Attachments](https://docs.mindroom.chat/attachments/).
 
 ## Limitations
 
 - Only OpenAI-compatible STT APIs are supported
 - Audio quality and background noise affect transcription accuracy
-- Without STT, routing has less textual context, so explicit `@mentions` or existing thread context are more reliable in multi-agent rooms
-- Without STT, agents receive raw audio instead of transcription, so the model or tools must support audio inputs to process it
+- Without STT, routing has less textual context, so explicit `@mentions` or existing thread context are more reliable in multi-responder rooms
+- Without STT, responders receive raw audio instead of transcription, so the model or tools must support audio inputs to process it
 
 ## Tips
 
-- **Say the agent name first** - "Hey @assistant, what's the weather?"
+- **Say the agent or team name first** - "Hey @assistant, what's the weather?"
 - **Use display names** - The AI converts spoken names like "HomeAssistant" to the correct `@home` mention
 
 # Image Messages
 
-MindRoom can process images sent to Matrix rooms, passing them to vision-capable AI models for analysis.
+MindRoom can process images sent to Matrix rooms, passing them to vision-capable agents and teams for analysis.
 
 ## Overview
 
 When a user sends an image in a Matrix room:
 
-1. The agent determines whether it should respond (via mention, thread participation, or DM)
+1. The responder determines whether it should answer (via mention, thread participation, or DM)
 2. The image is downloaded and decrypted (if E2E encrypted)
 3. The image is wrapped as an `agno.media.Image` and passed to the AI model
-4. The agent responds with its analysis
+4. The responder replies with its analysis
 
-Image support works automatically for all agents -- no configuration is needed. The AI model must support vision (e.g., Claude, GPT-5.4).
+Image support works automatically for agents and teams -- no configuration is needed.
+The selected model must support vision (e.g., Claude, GPT-5.4).
 
 ## Supported Formats
 
@@ -12113,14 +12138,14 @@ If the declared MIME type in the Matrix event does not match the detected byte s
                                               │
                                               v
                                         ┌─────────────┐
-                                        │ Agent       │
-                                        │ Responds    │
+                                        │ Responder   │
+                                        │ Replies     │
                                         └─────────────┘
 ```
 
 ## Usage
 
-Send an image in a Matrix room and mention the agent in the caption:
+Send an image in a Matrix room and mention the agent or team in the caption:
 
 - **With caption**: `@assistant What does this diagram show?` -- the caption is used as the prompt
 - **Without caption**: The agent receives `[Attached image]` as the prompt and describes what it sees
@@ -12158,26 +12183,26 @@ It detects provider-specific error patterns such as unsupported media type, base
 
 ## Limitations
 
-- **Routing in multi-agent rooms** -- in multi-agent rooms without an `@mention`, the router selects the best agent based on the image caption.
+- **Routing with multiple eligible responders** -- without an `@mention`, the router uses the image caption to select among candidates only when room configuration and reply permissions leave multiple eligible agents or teams.
 - **Bridge mention detection** uses `m.mentions` in the event, falling back to parsing HTML pills from `formatted_body` when `m.mentions` is absent (e.g., mautrix-telegram). Bridges that set neither may not trigger agent responses.
 - **Model support** -- the configured model must support vision. Text-only models will ignore the image or return an error. If the model rejects the image entirely, the [media fallback](#media-fallback) retries without the inline image.
 
 # Attachments
 
-MindRoom can process files, images, audio, and videos sent to Matrix rooms, passing them to agents for analysis or action.
+MindRoom can process files, images, audio, and videos sent to Matrix rooms, passing them to agents and teams for analysis or action.
 Supported attachment kinds: `audio`, `file`, `image`, `video`.
 
 ## Overview
 
 When a user sends a file, image, audio message, or video in a Matrix room:
 
-1. The agent determines whether it should respond (via mention, thread participation, or DM)
+1. The responder determines whether it should answer (via mention, thread participation, or DM)
 2. The media is downloaded and decrypted (if E2E encrypted)
 3. The file is saved locally and registered as a context-scoped attachment
-4. The agent receives the media as an Agno `File`, `Video`, `Audio`, or `Image` object plus an attachment ID it can reference in tool calls
-5. The agent responds with its analysis or takes action on the file
+4. The responder receives the media as an Agno `File`, `Video`, `Audio`, or `Image` object plus an attachment ID it can reference in tool calls
+5. The responder replies with its analysis or takes action on the file
 
-Attachment support works automatically for all agents -- no configuration is needed.
+Attachment support works automatically for agents and teams -- no configuration is needed.
 
 ## How It Works
 
@@ -12189,14 +12214,14 @@ Attachment support works automatically for all agents -- no configuration is nee
                                                                   │
                                                                   v
                                                             ┌─────────────┐
-                                                            │ Agent       │
-                                                            │ Responds    │
+                                                            │ Responder   │
+                                                            │ Replies     │
                                                             └─────────────┘
 ```
 
 ## Usage
 
-Send a file, image, audio message, or video in a Matrix room and mention the agent in the caption:
+Send a file, image, audio message, or video in a Matrix room and mention the agent or team in the caption:
 
 - **With caption**: `@assistant Summarize this document` -- the caption is used as the prompt
 - **Without caption**: The agent receives `[Attached file]`, `[Attached image]`, `[Attached audio]`, or `[Attached video]` as the prompt
@@ -12272,12 +12297,12 @@ Pruning runs opportunistically during new attachment registration.
 
 ## Limitations
 
-- **Routing in multi-agent rooms** -- in multi-agent rooms without an `@mention`, the router selects the best agent based on the file caption.
+- **Routing with multiple eligible responders** -- without an `@mention`, the router uses the file caption to select among candidates only when room configuration and reply permissions leave multiple eligible agents or teams.
 - **Model support** -- the configured model must support file or video inputs for direct analysis. Models that do not can still use the `attachments` tool to inspect and process files via tool calls.
 
 # Chat Commands
 
-MindRoom provides chat commands that users can type in any Matrix room where MindRoom agents are present.
+MindRoom provides chat commands that users can type in any Matrix room where MindRoom agents or teams are present.
 Commands start with `!` and are handled by the router agent.
 
 ## Quick Reference
@@ -12296,7 +12321,7 @@ Commands start with `!` and are handled by the router agent.
 ## Who Handles Commands
 
 The **router** handles all commands exclusively.
-Even in single-agent rooms, commands are always processed by the router, not the agent.
+Even in single-responder rooms, commands are always processed by the router, not the responder.
 Commands work in both main room messages and within threads.
 
 Voice messages that contain commands (e.g., spoken `!schedule`) are recognized after transcription and processed the same way.
@@ -12304,7 +12329,7 @@ Voice messages that contain commands (e.g., spoken `!schedule`) are recognized a
 ## Permission Behavior
 
 Commands are subject to the same authorization rules as normal messages.
-The sender must be authorized to interact with agents in the room (via `global_users`, `room_permissions`, or `default_room_access`).
+The sender must be authorized to interact with MindRoom entities in the room (via `global_users`, `room_permissions`, or `default_room_access`).
 See [Authorization](https://docs.mindroom.chat/authorization/) for details.
 
 For `!config set`, only the user who requested the change can confirm or cancel it via reactions.
@@ -12328,7 +12353,7 @@ Display available commands or get detailed help on a specific topic.
 
 ### `!hi`
 
-Show the welcome message for the current room, listing available agents, their roles and tools, and quick-start instructions.
+Show the welcome message for the current room, listing available agents and teams, their roles and tools, and quick-start instructions.
 
 ```
 !hi
@@ -12337,6 +12362,7 @@ Show the welcome message for the current room, listing available agents, their r
 ### `!schedule`
 
 Schedule a one-time or recurring task using natural language.
+
 Tasks run in the thread where they were created.
 
 ```
@@ -12361,6 +12387,7 @@ Tasks run in the thread where they were created.
 **Conditional workflows (polling-based):**
 
 Conditional requests are converted to recurring cron-based polling schedules.
+
 These are periodic checks, not real event subscriptions.
 
 ```
@@ -12368,10 +12395,12 @@ These are periodic checks, not real event subscriptions.
 !schedule When Bitcoin drops below $40k, @crypto_agent notify me
 ```
 
-Include `@agent_name` in your schedule to target specific agents.
-The scheduler validates that mentioned agents are available in the room before creating the task.
+Include `@agent_name` or `@team_name` in your schedule to target specific responders.
+
+The scheduler validates that mentioned agents and teams are available in the room before creating the task.
 
 Schedules use the timezone from `config.yaml` (defaults to UTC).
+
 See [Scheduling](https://docs.mindroom.chat/scheduling/) for full details.
 
 ### `!list_schedules`
@@ -12406,6 +12435,7 @@ Replace an existing scheduled task with new timing and content.
 ```
 
 The task description is re-parsed to update timing and content.
+
 Schedule type cannot be changed (one-time to recurring or vice versa) -- cancel and recreate instead.
 
 **Aliases:** `!editschedule`, `!edit-schedule`
@@ -12770,7 +12800,9 @@ This is used for structured live rendering where the full document is rebuilt on
 
 # Scheduling
 
-Schedule agents to perform tasks at specific times or intervals using natural language. Tasks run in the thread where they were created.
+Schedule agents or teams to perform tasks at specific times or intervals using natural language.
+
+Tasks run in the thread where they were created.
 
 ## Commands
 
@@ -12798,7 +12830,9 @@ Schedule agents to perform tasks at specific times or intervals using natural la
 **Conditional Workflows (polling-based):**
 
 Conditional or event-like requests are converted to recurring cron-based polling schedules.
-The AI picks an appropriate polling frequency based on urgency, and the condition is embedded in the task message so the agent checks it on each poll cycle.
+
+The AI picks an appropriate polling frequency based on urgency, and the condition is embedded in the task message so the scheduled responder checks it on each poll cycle.
+
 These are **not** real event subscriptions — they are periodic checks.
 
 ```
@@ -12812,7 +12846,9 @@ These are **not** real event subscriptions — they are periodic checks.
 !edit_schedule <task-id> <new-task-description>
 ```
 
-Edits an existing scheduled task by ID. The task description is re-parsed to update timing and content.
+Edits an existing scheduled task by ID.
+
+The task description is re-parsed to update timing and content.
 
 ### List and Cancel Schedules
 
@@ -12826,9 +12862,11 @@ Aliases: `!listschedules`, `!list-schedules`, `!list_schedule`, `!listschedule`,
 
 Use `!help schedule` for detailed inline help on scheduling commands.
 
-## Agent Mentions
+## Agent and Team Mentions
 
-Include `@agent_name` in your schedule to have specific agents respond. The scheduler validates that mentioned agents are available in the room before creating the task.
+Include `@agent_name` or `@team_name` in your schedule to have specific responders answer.
+
+The scheduler validates that mentioned agents and teams are available in the room before creating the task.
 
 ## Timezone
 
@@ -12840,17 +12878,25 @@ timezone: America/Los_Angeles
 
 ## Limitations
 
-- **Schedule type cannot be changed** — editing a one-time task to be recurring (or vice versa) is not supported. Cancel the existing task and create a new one instead.
+- **Schedule type cannot be changed** — editing a one-time task to be recurring (or vice versa) is not supported.
+
+  Cancel the existing task and create a new one instead.
 - **Conditional workflows are polling** — event-like schedules (`If ...`, `When ...`) are converted to recurring cron polls, not real event subscriptions.
 
 ## Persistence
 
 Schedules are stored in Matrix room state and persist across restarts.
+
 New schedules use the live runtime to start their in-memory runners immediately.
+
 Edits are state-only Matrix writes.
+
 Running tasks pick up edited state on their next poll instead of relying on caller-supplied cache or restart hooks.
+
 Past one-time tasks are automatically skipped during restoration.
+
 Only the router restores persisted schedules after startup — individual agents do not restore their own.
+
 On shutdown, the router cancels its in-memory scheduled tasks before exiting.
 
 # Authorization
@@ -12899,7 +12945,7 @@ authorization:
 
 # Optional: configure the internal MindRoom user identity (omit for hosted/public profiles)
 mindroom_user:
-  username: mindroom_user          # Set before first startup (cannot be changed later)
+  username: mindroom_user          # Set before first startup (account-creation request cannot be changed later)
   display_name: MindRoomUser
 
 # Optional: room onboarding/discoverability policy
@@ -12920,7 +12966,9 @@ matrix_room_access:
 
 This means only MindRoom system users (agents, teams, router, and the configured internal user if present) can interact with agents by default.
 
-`mindroom_user.username` is a one-time setting used to create the internal Matrix account. After the account exists, keep the same username and only change `mindroom_user.display_name` for visible name changes.
+`mindroom_user.username` is a one-time account-creation request used to create the internal Matrix account.
+After the account exists, keep the same configured username and only change `mindroom_user.display_name` for visible name changes.
+If hosted provisioning returns a different actual Matrix ID, MindRoom persists and authorizes that actual ID.
 
 For `authorization.room_permissions`, MindRoom accepts these key formats:
 
@@ -12940,7 +12988,7 @@ If you keep `mode: single_user_private` (default), managed rooms remain invite-o
 
 ### Required Service Account Permissions
 
-MindRoom applies room join rules and directory visibility using its managing account (typically the router account, e.g. `@mindroom_router:<domain>`).
+MindRoom applies room join rules and directory visibility using its managing account, typically the router entity's persisted Matrix account.
 
 - The managing account must be joined to the room.
 - The managing account must have enough power to send `m.room.join_rules`.
@@ -12974,7 +13022,8 @@ Examples: `@alice:matrix.org`, `@bob:example.com`, `@admin:company.internal`
 
 Authorization checks are performed in order:
 
-1. **Internal system user** - When `mindroom_user` is configured, `@{mindroom_user.username}:{domain}` is always authorized. When omitted (hosted/public profiles), this check is skipped. Note: the same user ID from a different domain is NOT authorized.
+1. **Internal system user** - When `mindroom_user` is configured and its Matrix account has been prepared, the persisted actual internal user ID is always authorized.
+When omitted (hosted/public profiles), this check is skipped.
 2. **MindRoom agents/teams/router** - Configured agents, teams, and the router are authorized
 3. **Alias resolution** - If the sender matches a bridge alias in `aliases`, it is resolved to the canonical user ID for the remaining checks
 4. **Global users** - Users in `global_users` have access to all rooms
@@ -13005,9 +13054,9 @@ authorization:
 
 In this example, messages from `@telegram_123:example.com` are treated as `@alice:example.com` (global access), and messages from `@telegram_789:example.com` are treated as `@bob:example.com` (access to `!room1:example.com` only).
 
-## Per-Agent Reply Permissions
+## Per-Responder Reply Permissions
 
-Use `authorization.agent_reply_permissions` to restrict which users each agent can reply to.
+Use `authorization.agent_reply_permissions` to restrict which users each responder can reply to.
 
 - The map key is an entity name: agent name, team name, `router`, or `*`.
 - The `*` key is a default rule for entities that do not have an explicit entry.
@@ -13346,7 +13395,7 @@ MindRoom's architecture consists of several key components working together.
 | `agent_policy.py` | Derives canonical execution policies from authored agent config |
 | `workspaces.py` | Agent workspace scaffolding, template seeding, context file resolution |
 | `bot.py` | AgentBot and TeamBot runtime for Matrix event handling |
-| `routing.py` | Intelligent agent selection when no agent is mentioned |
+| `routing.py` | Intelligent agent or team selection when no entity is mentioned |
 | `streaming.py` | Response streaming via progressive message edits |
 | `media_inputs.py` | Shared media-input container passed across bot, teams, and AI layers |
 | `media_fallback.py` | Retries model requests without inline media when models reject media inputs |
@@ -13358,8 +13407,8 @@ MindRoom's architecture consists of several key components working together.
 ## Data Flow
 
 1. **Message arrives** from Matrix homeserver
-2. **Router decides** which agent should handle it (if no explicit mention)
-3. **Agent processes** the message using the Agno runtime
+2. **Responder is resolved** directly when one eligible agent or team remains, otherwise the router selects among candidates
+3. **Selected entity processes** the message using the Agno runtime
 4. **Tools execute** as needed (file operations, API calls, etc.)
 5. **Response sent** back to Matrix room
 6. **Memory updates** asynchronously in background
@@ -13391,12 +13440,13 @@ Streaming behavior is configured in `config.yaml` with `defaults.enable_streamin
 
 ## Agent Users
 
-Each agent gets its own Matrix user with the `mindroom_` prefix:
+Each agent, team, and router has its own Matrix user.
 
-```
-@mindroom_assistant:example.com
-@mindroom_router:example.com  (built-in routing agent)
-```
+The configured alias is the user-facing runtime handle, such as `@assistant` in chat.
+
+Provisioning may request localparts such as `mindroom_assistant` or `mindroom_router`, but persisted Matrix state is authoritative after provisioning and may contain a different username.
+
+For example, a persisted Matrix account such as `@assistant_live:example.com` can become the live assistant account even if the original provisioning request used `mindroom_assistant`.
 
 Users are automatically created during orchestrator startup and credentials are persisted in `mindroom_data/matrix_state.yaml`.
 
@@ -13472,14 +13522,17 @@ Agents set their Matrix presence with status messages containing model and role 
 
 ## Typing Indicators
 
-Agents show typing indicators while processing via `typing_indicator()` context manager. The indicator auto-refreshes at `min(timeout/2, 15)` seconds to remain visible during long operations.
+Agents show typing indicators while processing via `typing_indicator()` context manager.
+The indicator auto-refreshes at `min(timeout/2, 15)` seconds to remain visible during long operations.
 
 ## Mentions
 
 Mentions are parsed via `format_message_with_mentions()` which handles multiple formats:
-- `@calculator` - Short agent name
-- `@mindroom_calculator` - Full username
-- `@mindroom_calculator:localhost` - Full Matrix ID
+- `@calculator` - Stable configured agent or team key
+- `@actual_calculator:localhost` - Current full Matrix ID
+
+Bare Matrix account localparts such as `@actual_calculator` are not runtime handles.
+A generated-looking full Matrix ID such as `@mindroom_calculator:localhost` is not a runtime handle unless it is the current persisted Matrix ID for that agent or team.
 
 Returns content with `m.mentions` and `formatted_body` containing clickable links.
 
@@ -13509,19 +13562,19 @@ This runs automatically — no manual intervention is needed.
 
 ## Identity Management
 
-The `MatrixID` class handles Matrix user ID parsing and agent identification:
+The `MatrixID` class handles Matrix user ID parsing.
+Runtime entity resolution uses the persisted identity registry, keyed by configured alias:
 
 ```python
-mid = MatrixID.parse("@mindroom_assistant:example.com")
-mid.username  # "mindroom_assistant"
+mid = MatrixID.parse("@assistant_live:example.com")
+mid.username  # "assistant_live"
 mid.domain    # "example.com"
-mid.full_id   # "@mindroom_assistant:example.com"
+mid.full_id   # "@assistant_live:example.com"
 
-# Create from agent name
-mid = MatrixID.from_agent("assistant", "example.com", runtime_paths)
-
-# Extract agent name (returns "code" if configured, None otherwise)
-agent_name = extract_agent_name("@mindroom_code:localhost", config, runtime_paths)
+# Resolve the current persisted Matrix ID for a configured alias
+registry = entity_identity_registry(config, runtime_paths)
+assistant_id = registry.current_id("assistant")
+agent_name = registry.current_entity_name_for_user_id(assistant_id.full_id)
 ```
 
 ## Root Space
@@ -13595,7 +13648,10 @@ main() entry
 │ 3. Create "user" │
 │    Matrix account│
 │    (mindroom_user)│
-│ 4. Create bots   │
+│ 4. Prepare       │
+│    entity Matrix │
+│    accounts      │
+│ 5. Create bots   │
 │    for entities  │
 └────────┬─────────┘
          │
@@ -13635,9 +13691,9 @@ main() entry
 **Key details:**
 
 - **Entity order**: Router first, then agents, then teams
-- **Room setup** (`_setup_rooms_and_memberships`): Router creates rooms, invites agents/users, bots join
+- **Room setup** (`_setup_rooms_and_memberships`): Router creates rooms, invites agents, teams, and users, then bots join
 - **Sync loops**: Each bot runs `sync_forever_with_restart()` with automatic retry
-- **Internal user identity**: `mindroom_user.username` is bootstrap-only; only `display_name` should change later
+- **Internal user identity**: `mindroom_user.username` is the account-creation request; runtime authorization uses the persisted actual Matrix ID
 
 ## Hot Reload
 
@@ -13684,7 +13740,7 @@ Event callbacks are wrapped in `_create_task_wrapper()` to run as background tas
 4. Router handles commands exclusively
 5. Extract message context (mentions, thread history, non-agent mention detection)
 6. Skip messages from other agents (unless mentioned)
-7. Router performs AI routing when no agent mentioned and thread doesn't have multiple human participants
+7. Router routes when no agent or team is mentioned and thread doesn't have multiple human participants
 8. Check for team formation or individual response
 9. Generate response and store memory
 
@@ -13692,11 +13748,15 @@ Event callbacks are wrapped in `_create_task_wrapper()` to run as background tas
 The agent edits its own previous reply in place rather than sending a new message.
 Edits from other agents are ignored, and the feature requires that the original response event ID is tracked by the `ResponseTracker`.
 
-**`_on_media_message`**: Handles media events (images, videos, files, and audio). Downloads and decrypts media data, then processes it through the agent. When no agent is mentioned, AI routing is used to select the appropriate agent, similar to text messages.
+**`_on_media_message`**: Handles media events (images, videos, files, and audio).
+Downloads and decrypts media data, then processes it through the selected responder.
+When no agent or team is mentioned, routing selects the appropriate agent or team, similar to text messages.
 
 **`_on_reaction`**: Handles `ReactionEvent` for the interactive Q&A system (e.g., confirming or rejecting agent suggestions) and config confirmation workflows.
 
-**Routing** (when no agent mentioned): Router uses `suggest_agent_for_message()` to pick the best agent based on room configuration and message content. Only routes when multiple agents are available. In threads where multiple non-agent users have posted, routing is skipped entirely — an explicit `@mention` is required. Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
+**Routing** (when no agent or team is mentioned): Router narrows candidates from room configuration or joined MindRoom entities, filters them by sender permissions, lets one remaining candidate answer directly, and uses `suggest_responder_for_message()` only when multiple candidates remain.
+In threads where multiple non-agent users have posted, routing is skipped entirely — an explicit `@mention` is required.
+Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
 
 ## Concurrency
 

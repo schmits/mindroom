@@ -26,7 +26,10 @@ main() entry
 │ 3. Create "user" │
 │    Matrix account│
 │    (mindroom_user)│
-│ 4. Create bots   │
+│ 4. Prepare       │
+│    entity Matrix │
+│    accounts      │
+│ 5. Create bots   │
 │    for entities  │
 └────────┬─────────┘
          │
@@ -66,9 +69,9 @@ main() entry
 **Key details:**
 
 - **Entity order**: Router first, then agents, then teams
-- **Room setup** (`_setup_rooms_and_memberships`): Router creates rooms, invites agents/users, bots join
+- **Room setup** (`_setup_rooms_and_memberships`): Router creates rooms, invites agents, teams, and users, then bots join
 - **Sync loops**: Each bot runs `sync_forever_with_restart()` with automatic retry
-- **Internal user identity**: `mindroom_user.username` is bootstrap-only; only `display_name` should change later
+- **Internal user identity**: `mindroom_user.username` is the account-creation request; runtime authorization uses the persisted actual Matrix ID
 
 ## Hot Reload
 
@@ -115,7 +118,7 @@ Event callbacks are wrapped in `_create_task_wrapper()` to run as background tas
 4. Router handles commands exclusively
 5. Extract message context (mentions, thread history, non-agent mention detection)
 6. Skip messages from other agents (unless mentioned)
-7. Router performs AI routing when no agent mentioned and thread doesn't have multiple human participants
+7. Router routes when no agent or team is mentioned and thread doesn't have multiple human participants
 8. Check for team formation or individual response
 9. Generate response and store memory
 
@@ -123,11 +126,15 @@ Event callbacks are wrapped in `_create_task_wrapper()` to run as background tas
 The agent edits its own previous reply in place rather than sending a new message.
 Edits from other agents are ignored, and the feature requires that the original response event ID is tracked by the `ResponseTracker`.
 
-**`_on_media_message`**: Handles media events (images, videos, files, and audio). Downloads and decrypts media data, then processes it through the agent. When no agent is mentioned, AI routing is used to select the appropriate agent, similar to text messages.
+**`_on_media_message`**: Handles media events (images, videos, files, and audio).
+Downloads and decrypts media data, then processes it through the selected responder.
+When no agent or team is mentioned, routing selects the appropriate agent or team, similar to text messages.
 
 **`_on_reaction`**: Handles `ReactionEvent` for the interactive Q&A system (e.g., confirming or rejecting agent suggestions) and config confirmation workflows.
 
-**Routing** (when no agent mentioned): Router uses `suggest_agent_for_message()` to pick the best agent based on room configuration and message content. Only routes when multiple agents are available. In threads where multiple non-agent users have posted, routing is skipped entirely — an explicit `@mention` is required. Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
+**Routing** (when no agent or team is mentioned): Router narrows candidates from room configuration or joined MindRoom entities, filters them by sender permissions, lets one remaining candidate answer directly, and uses `suggest_responder_for_message()` only when multiple candidates remain.
+In threads where multiple non-agent users have posted, routing is skipped entirely — an explicit `@mention` is required.
+Non-MindRoom bots listed in `bot_accounts` are excluded from this detection.
 
 ## Concurrency
 

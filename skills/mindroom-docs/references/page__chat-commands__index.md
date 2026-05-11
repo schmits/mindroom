@@ -1,6 +1,6 @@
 # Chat Commands
 
-MindRoom provides chat commands that users can type in any Matrix room where MindRoom agents are present.
+MindRoom provides chat commands that users can type in any Matrix room where MindRoom agents or teams are present.
 Commands start with `!` and are handled by the router agent.
 
 ## Quick Reference
@@ -19,7 +19,7 @@ Commands start with `!` and are handled by the router agent.
 ## Who Handles Commands
 
 The **router** handles all commands exclusively.
-Even in single-agent rooms, commands are always processed by the router, not the agent.
+Even in single-responder rooms, commands are always processed by the router, not the responder.
 Commands work in both main room messages and within threads.
 
 Voice messages that contain commands (e.g., spoken `!schedule`) are recognized after transcription and processed the same way.
@@ -27,7 +27,7 @@ Voice messages that contain commands (e.g., spoken `!schedule`) are recognized a
 ## Permission Behavior
 
 Commands are subject to the same authorization rules as normal messages.
-The sender must be authorized to interact with agents in the room (via `global_users`, `room_permissions`, or `default_room_access`).
+The sender must be authorized to interact with MindRoom entities in the room (via `global_users`, `room_permissions`, or `default_room_access`).
 See [Authorization](https://docs.mindroom.chat/authorization/) for details.
 
 For `!config set`, only the user who requested the change can confirm or cancel it via reactions.
@@ -51,7 +51,7 @@ Display available commands or get detailed help on a specific topic.
 
 ### `!hi`
 
-Show the welcome message for the current room, listing available agents, their roles and tools, and quick-start instructions.
+Show the welcome message for the current room, listing available agents and teams, their roles and tools, and quick-start instructions.
 
 ```
 !hi
@@ -60,6 +60,7 @@ Show the welcome message for the current room, listing available agents, their r
 ### `!schedule`
 
 Schedule a one-time or recurring task using natural language.
+
 Tasks run in the thread where they were created.
 
 ```
@@ -84,6 +85,7 @@ Tasks run in the thread where they were created.
 **Conditional workflows (polling-based):**
 
 Conditional requests are converted to recurring cron-based polling schedules.
+
 These are periodic checks, not real event subscriptions.
 
 ```
@@ -91,10 +93,12 @@ These are periodic checks, not real event subscriptions.
 !schedule When Bitcoin drops below $40k, @crypto_agent notify me
 ```
 
-Include `@agent_name` in your schedule to target specific agents.
-The scheduler validates that mentioned agents are available in the room before creating the task.
+Include `@agent_name` or `@team_name` in your schedule to target specific responders.
+
+The scheduler validates that mentioned agents and teams are available in the room before creating the task.
 
 Schedules use the timezone from `config.yaml` (defaults to UTC).
+
 See [Scheduling](https://docs.mindroom.chat/scheduling/) for full details.
 
 ### `!list_schedules`
@@ -129,6 +133,7 @@ Replace an existing scheduled task with new timing and content.
 ```
 
 The task description is re-parsed to update timing and content.
+
 Schedule type cannot be changed (one-time to recurring or vice versa) -- cancel and recreate instead.
 
 **Aliases:** `!editschedule`, `!edit-schedule`

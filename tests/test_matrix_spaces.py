@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import nio
@@ -11,12 +12,22 @@ import yaml
 from mindroom import constants
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.entity_resolution import mindroom_user_id
 from mindroom.matrix import client as matrix_client
 from mindroom.matrix import rooms as matrix_rooms
 from mindroom.matrix.state import MatrixState
-from mindroom.matrix_identifiers import managed_space_alias_localpart, mindroom_namespace
+from mindroom.matrix_identifiers import managed_room_key_from_alias_localpart, managed_space_alias_localpart
 from mindroom.orchestrator import _MultiAgentOrchestrator
-from tests.conftest import bind_runtime_paths, load_config_yaml, orchestrator_runtime_paths, runtime_paths_for
+from tests.conftest import (
+    TEST_PASSWORD,
+    bind_runtime_paths,
+    load_config_yaml,
+    orchestrator_runtime_paths,
+    runtime_paths_for,
+)
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _config_with_runtime_paths(tmp_path, **config_data: object) -> Config:  # noqa: ANN001
@@ -66,16 +77,75 @@ def test_matrix_state_load_is_backward_compatible_without_space_room_id(tmp_path
     assert state.rooms["lobby"].room_id == "!lobby:example.com"
 
 
+@pytest.mark.asyncio
+async def test_ensure_user_in_rooms_uses_managed_login_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The internal user room-join path should share managed Matrix session persistence."""
+    runtime_paths = orchestrator_runtime_paths(tmp_path, config_path=tmp_path / "config.yaml")
+    state = MatrixState.load(runtime_paths=runtime_paths)
+    state.add_account(
+        "agent_user",
+        "requested_internal",
+        TEST_PASSWORD,
+        domain="localhost",
+        device_id="old_device",
+        access_token=TEST_PASSWORD,
+    )
+    state.save(runtime_paths=runtime_paths)
+
+    client = AsyncMock()
+    client.user_id = "@actual_internal:matrix.example"
+    client.close = AsyncMock()
+    login_calls = []
+
+    async def _login_user(
+        _homeserver: str,
+        agent_user: matrix_rooms.AgentMatrixUser,
+        login_runtime_paths: constants.RuntimePaths,
+    ) -> object:
+        login_calls.append(agent_user)
+        updated_state = MatrixState.load(runtime_paths=login_runtime_paths)
+        updated_state.add_account(
+            "agent_user",
+            "actual_internal",
+            agent_user.password,
+            domain="matrix.example",
+            device_id="new_device",
+            access_token=TEST_PASSWORD,
+        )
+        updated_state.save(runtime_paths=login_runtime_paths)
+        return client
+
+    join_room = AsyncMock(return_value=True)
+    monkeypatch.setattr(matrix_rooms, "login_agent_user", _login_user)
+    monkeypatch.setattr(matrix_rooms, "join_room", join_room)
+
+    await matrix_rooms.ensure_user_in_rooms(
+        "http://localhost:8008",
+        {"lobby": "!lobby:localhost"},
+        runtime_paths,
+    )
+
+    assert len(login_calls) == 1
+    assert login_calls[0].user_id == "@requested_internal:localhost"
+    assert login_calls[0].device_id == "old_device"
+    assert login_calls[0].access_token == TEST_PASSWORD
+    join_room.assert_awaited_once_with(client, "!lobby:localhost")
+    client.close.assert_awaited_once()
+
+    persisted = MatrixState.load(runtime_paths=runtime_paths).get_account("agent_user")
+    assert persisted is not None
+    assert persisted.username == "actual_internal"
+    assert persisted.domain == "matrix.example"
+
+
 def test_config_rejects_room_key_that_conflicts_with_root_space_alias() -> None:
     """Managed room keys must not map to the reserved root Space alias."""
     runtime_paths = constants.resolve_runtime_paths()
     reserved_alias = managed_space_alias_localpart(runtime_paths)
-    namespace = mindroom_namespace(runtime_paths)
-    colliding_room_key = (
-        reserved_alias.removesuffix(f"_{namespace}")
-        if namespace and reserved_alias.endswith(f"_{namespace}")
-        else reserved_alias
-    )
+    colliding_room_key = managed_room_key_from_alias_localpart(reserved_alias, runtime_paths) or reserved_alias
 
     with pytest.raises(ValueError, match="reserved root Space alias"):
         Config.model_validate(
@@ -91,12 +161,7 @@ def test_config_allows_colliding_room_key_when_space_disabled() -> None:
     """Colliding room keys should be accepted when the space feature is disabled."""
     runtime_paths = constants.resolve_runtime_paths()
     reserved_alias = managed_space_alias_localpart(runtime_paths)
-    namespace = mindroom_namespace(runtime_paths)
-    colliding_room_key = (
-        reserved_alias.removesuffix(f"_{namespace}")
-        if namespace and reserved_alias.endswith(f"_{namespace}")
-        else reserved_alias
-    )
+    colliding_room_key = managed_room_key_from_alias_localpart(reserved_alias, runtime_paths) or reserved_alias
 
     config = Config.model_validate(
         {
@@ -440,7 +505,7 @@ async def test_orchestrator_ensure_root_space_invites_internal_and_authorized_us
     )
     # Should have invited both the internal user and the authorized owner
     invited_user_ids = {c.args[2] for c in mock_invite.await_args_list}
-    assert orchestrator.config.get_mindroom_user_id(orchestrator.runtime_paths) in invited_user_ids
+    assert mindroom_user_id(orchestrator.config, orchestrator.runtime_paths) in invited_user_ids
     assert "@owner:example.com" in invited_user_ids
     assert "@collaborator:example.com" not in invited_user_ids
 
@@ -486,7 +551,7 @@ async def test_orchestrator_ensure_root_space_skips_existing_members(tmp_path) -
     router_bot = MagicMock()
     router_bot.client = AsyncMock()
     orchestrator.agent_bots[ROUTER_AGENT_NAME] = router_bot
-    internal_user_id = orchestrator.config.get_mindroom_user_id(orchestrator.runtime_paths)
+    internal_user_id = mindroom_user_id(orchestrator.config, orchestrator.runtime_paths)
 
     with (
         patch("mindroom.orchestrator.ensure_root_space", new=AsyncMock(return_value="!space:localhost")),
@@ -575,6 +640,7 @@ async def test_update_config_matrix_space_change_reconciles_without_room_members
             new=AsyncMock(return_value={"lobby": "!room1:localhost"}),
         ) as mock_rooms,
         patch.object(orchestrator, "_ensure_root_space", new=AsyncMock()) as mock_root_space,
+        patch.object(orchestrator, "_sync_event_cache_service", new=AsyncMock()),
         patch.object(orchestrator, "_sync_runtime_support_services", new=AsyncMock()),
     ):
         updated = await orchestrator.update_config()

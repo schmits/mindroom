@@ -21,6 +21,7 @@ from mindroom.constants import (
     STREAM_STATUS_STREAMING,
     RuntimePaths,
 )
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.history import (
     PreparedHistoryState,
     PreparedScopeHistory,
@@ -672,12 +673,15 @@ async def prepare_agent_execution_context(
     compaction_outcomes_collector: list[CompactionOutcome] | None,
     compaction_lifecycle: CompactionLifecycle | None = None,
     current_sender_id: str | None = None,
+    include_openai_compat_guidance: bool = False,
     timing_scope: str | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> _PreparedExecutionContext:
     """Prepare one agent's final prompt and replay plan for the current call."""
-    response_sender_id = config.get_ids(runtime_paths).get(agent_name)
-    response_sender = response_sender_id.full_id if response_sender_id is not None else None
+    response_sender = None
+    if not include_openai_compat_guidance:
+        response_sender_id = entity_identity_registry(config, runtime_paths).current_ids.get(agent_name)
+        response_sender = response_sender_id.full_id if response_sender_id is not None else None
     runtime_model = config.resolve_runtime_model(
         entity_name=agent_name,
         room_id=room_id,

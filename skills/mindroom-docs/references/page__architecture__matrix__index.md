@@ -25,12 +25,13 @@ Streaming behavior is configured in `config.yaml` with `defaults.enable_streamin
 
 ## Agent Users
 
-Each agent gets its own Matrix user with the `mindroom_` prefix:
+Each agent, team, and router has its own Matrix user.
 
-```
-@mindroom_assistant:example.com
-@mindroom_router:example.com  (built-in routing agent)
-```
+The configured alias is the user-facing runtime handle, such as `@assistant` in chat.
+
+Provisioning may request localparts such as `mindroom_assistant` or `mindroom_router`, but persisted Matrix state is authoritative after provisioning and may contain a different username.
+
+For example, a persisted Matrix account such as `@assistant_live:example.com` can become the live assistant account even if the original provisioning request used `mindroom_assistant`.
 
 Users are automatically created during orchestrator startup and credentials are persisted in `mindroom_data/matrix_state.yaml`.
 
@@ -106,14 +107,17 @@ Agents set their Matrix presence with status messages containing model and role 
 
 ## Typing Indicators
 
-Agents show typing indicators while processing via `typing_indicator()` context manager. The indicator auto-refreshes at `min(timeout/2, 15)` seconds to remain visible during long operations.
+Agents show typing indicators while processing via `typing_indicator()` context manager.
+The indicator auto-refreshes at `min(timeout/2, 15)` seconds to remain visible during long operations.
 
 ## Mentions
 
 Mentions are parsed via `format_message_with_mentions()` which handles multiple formats:
-- `@calculator` - Short agent name
-- `@mindroom_calculator` - Full username
-- `@mindroom_calculator:localhost` - Full Matrix ID
+- `@calculator` - Stable configured agent or team key
+- `@actual_calculator:localhost` - Current full Matrix ID
+
+Bare Matrix account localparts such as `@actual_calculator` are not runtime handles.
+A generated-looking full Matrix ID such as `@mindroom_calculator:localhost` is not a runtime handle unless it is the current persisted Matrix ID for that agent or team.
 
 Returns content with `m.mentions` and `formatted_body` containing clickable links.
 
@@ -143,19 +147,19 @@ This runs automatically — no manual intervention is needed.
 
 ## Identity Management
 
-The `MatrixID` class handles Matrix user ID parsing and agent identification:
+The `MatrixID` class handles Matrix user ID parsing.
+Runtime entity resolution uses the persisted identity registry, keyed by configured alias:
 
 ```python
-mid = MatrixID.parse("@mindroom_assistant:example.com")
-mid.username  # "mindroom_assistant"
+mid = MatrixID.parse("@assistant_live:example.com")
+mid.username  # "assistant_live"
 mid.domain    # "example.com"
-mid.full_id   # "@mindroom_assistant:example.com"
+mid.full_id   # "@assistant_live:example.com"
 
-# Create from agent name
-mid = MatrixID.from_agent("assistant", "example.com", runtime_paths)
-
-# Extract agent name (returns "code" if configured, None otherwise)
-agent_name = extract_agent_name("@mindroom_code:localhost", config, runtime_paths)
+# Resolve the current persisted Matrix ID for a configured alias
+registry = entity_identity_registry(config, runtime_paths)
+assistant_id = registry.current_id("assistant")
+agent_name = registry.current_entity_name_for_user_id(assistant_id.full_id)
 ```
 
 ## Root Space

@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Any
 import nio
 
 from mindroom.constants import STREAM_STATUS_KEY
+from mindroom.entity_resolution import current_internal_sender_ids
 from mindroom.matrix.event_info import EventInfo, reply_to_event_id_from_content
-from mindroom.matrix.identity import active_internal_sender_ids
 from mindroom.matrix.message_content import extract_and_resolve_message, extract_edit_body, resolve_event_source_content
 from mindroom.matrix.visible_body import bundled_visible_body_preview, visible_body_from_event_source
 
@@ -137,7 +137,7 @@ def trusted_visible_sender_ids(
     runtime_paths: RuntimePaths,
 ) -> frozenset[str]:
     """Return the trusted internal senders for high-level Matrix read helpers."""
-    return active_internal_sender_ids(config, runtime_paths)
+    return current_internal_sender_ids(config, runtime_paths)
 
 
 def _resolved_trusted_sender_ids(

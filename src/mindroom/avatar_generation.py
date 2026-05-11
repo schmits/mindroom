@@ -22,8 +22,7 @@ from mindroom.error_handling import AvatarGenerationError, AvatarSyncError
 from mindroom.logging_config import get_logger
 from mindroom.matrix.avatar import room_has_avatar, set_room_avatar_from_file
 from mindroom.matrix.identity import MatrixID
-from mindroom.matrix.rooms import get_room_id
-from mindroom.matrix.state import MatrixState, matrix_state_for_runtime
+from mindroom.matrix.state import MatrixAccount, MatrixState, get_room_id, matrix_state_for_runtime
 from mindroom.matrix.users import AgentMatrixUser, login_agent_user
 from mindroom.matrix_identifiers import extract_server_name_from_homeserver
 
@@ -31,8 +30,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import nio
-
-    from mindroom.matrix.state import _MatrixAccount
 
 
 logger = get_logger(__name__)
@@ -234,7 +231,7 @@ async def _generate_avatar(
 
 
 def _build_router_user(
-    router_account: _MatrixAccount,
+    router_account: MatrixAccount,
     runtime_paths: constants.RuntimePaths,
 ) -> AgentMatrixUser:
     """Create the router user object from persisted Matrix state."""
@@ -244,7 +241,7 @@ def _build_router_user(
     )
     return AgentMatrixUser(
         agent_name=ROUTER_AGENT_NAME,
-        user_id=MatrixID.from_username(router_account.username, server_name).full_id,
+        user_id=MatrixID.from_username(router_account.username, router_account.domain or server_name).full_id,
         display_name="Router",
         password=router_account.password,
         access_token=None,
@@ -418,7 +415,7 @@ def _build_avatar_generation_targets(
             _AvatarTarget(
                 entity_type="agents",
                 entity_name="router",
-                role="Intelligent routing and agent selection",
+                role="Intelligent routing and agent or team selection",
             ),
         )
 

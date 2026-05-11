@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, cast
 
 from mindroom import authorization
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.matrix.identity import MatrixID, extract_agent_name
+from mindroom.entity_resolution import entity_identity_registry
+from mindroom.matrix.mentions import resolve_mentioned_user_ids_from_text
 from mindroom.matrix.visible_body import visible_content_from_content
 
 if TYPE_CHECKING:
@@ -18,19 +19,24 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
+    from mindroom.matrix.identity import MatrixID
+
+
 # Matches <a href="https://matrix.to/#/@user:domain">...</a> pills used by bridges.
 # Accepts both single and double quotes (mautrix bridges use single quotes).
 # Requires @localpart:domain format to avoid feeding malformed IDs to MatrixID.parse.
 _MATRIX_PILL_RE = re.compile(r"""href=["']https://matrix\.to/#/(@[^"':]+:[^"']+)["']""")
 
 
-def _extract_mentioned_user_ids(content: dict[str, object]) -> list[str]:
+def _extract_mentioned_user_ids(
+    content: dict[str, object],
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[str]:
     """Extract mentioned user IDs from message content.
 
-    Checks ``m.mentions.user_ids`` first.  When that field is absent or empty
-    (common with bridges like mautrix-telegram), falls back to parsing Matrix
-    HTML pills (``<a href="https://matrix.to/#/@user:domain">``) from
-    ``formatted_body``.
+    Checks ``m.mentions.user_ids`` first. When that field is absent or empty,
+    falls back to Matrix HTML pills and finally raw visible-body mention tokens.
     """
     mentions = content.get("m.mentions")
     user_ids = cast("dict[str, object]", mentions).get("user_ids") if isinstance(mentions, dict) else None
@@ -39,13 +45,20 @@ def _extract_mentioned_user_ids(content: dict[str, object]) -> list[str]:
 
     formatted_body = content.get("formatted_body")
     if isinstance(formatted_body, str):
-        return _MATRIX_PILL_RE.findall(formatted_body)
+        pill_user_ids = _MATRIX_PILL_RE.findall(formatted_body)
+        if pill_user_ids:
+            return pill_user_ids
+
+    body = content.get("body")
+    if isinstance(body, str):
+        return resolve_mentioned_user_ids_from_text(body, config, runtime_paths)
     return []
 
 
 def _is_bot_or_agent(sender: str, config: Config, runtime_paths: RuntimePaths) -> bool:
     """Return True when *sender* is a MindRoom agent **or** listed in ``bot_accounts``."""
-    return bool(extract_agent_name(sender, config, runtime_paths)) or sender in config.bot_accounts
+    registry = entity_identity_registry(config, runtime_paths)
+    return registry.current_entity_name_for_user_id(sender) is not None or sender in config.bot_accounts
 
 
 def is_router_only_agent_mention(
@@ -59,7 +72,8 @@ def is_router_only_agent_mention(
     if has_non_agent_mentions or not mentioned_agents:
         return False
 
-    mentioned_agent_names = {agent.agent_name(config, runtime_paths) for agent in mentioned_agents}
+    registry = entity_identity_registry(config, runtime_paths)
+    mentioned_agent_names = {registry.current_entity_name_for_user_id(agent.full_id) for agent in mentioned_agents}
     return mentioned_agent_names == {ROUTER_AGENT_NAME}
 
 
@@ -78,7 +92,7 @@ def check_agent_mentioned(
     """
     raw_content = event_source.get("content", {})
     content = visible_content_from_content(raw_content) if isinstance(raw_content, dict) else {}
-    all_mentioned_ids = _extract_mentioned_user_ids(content)
+    all_mentioned_ids = _extract_mentioned_user_ids(content, config, runtime_paths)
     mentioned_agents = _agents_from_user_ids(all_mentioned_ids, config, runtime_paths)
     am_i_mentioned = agent_id in mentioned_agents
     has_non_agent_mentions = any(not _is_bot_or_agent(uid, config, runtime_paths) for uid in all_mentioned_ids)
@@ -112,23 +126,19 @@ def get_agents_in_thread(
     """
     agents: list[MatrixID] = []
     seen_ids: set[str] = set()
+    registry = entity_identity_registry(config, runtime_paths)
 
     for msg in thread_history:
         sender = msg.sender
-        agent_name = extract_agent_name(sender, config, runtime_paths)
+        agent_name = registry.current_entity_name_for_user_id(sender, include_router=False)
 
         # Skip router agent and invalid senders
-        if not agent_name or agent_name == ROUTER_AGENT_NAME:
+        if agent_name is None:
             continue
 
         if sender not in seen_ids:
-            try:
-                matrix_id = MatrixID.parse(sender)
-                agents.append(matrix_id)
-                seen_ids.add(sender)
-            except ValueError:
-                # Skip invalid Matrix IDs
-                pass
+            agents.append(registry.current_id(agent_name))
+            seen_ids.add(sender)
 
     return agents
 
@@ -139,11 +149,12 @@ def _agents_from_user_ids(
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
     """Return agent MatrixIDs from a list of raw Matrix user ID strings."""
+    registry = entity_identity_registry(config, runtime_paths)
     agents: list[MatrixID] = []
     for user_id in user_ids:
-        mid = MatrixID.parse(user_id)
-        if mid.agent_name(config, runtime_paths):
-            agents.append(mid)
+        agent_name = registry.current_entity_name_for_user_id(user_id)
+        if agent_name is not None:
+            agents.append(registry.current_id(agent_name))
     return agents
 
 
@@ -173,43 +184,21 @@ def thread_requires_explicit_agent_targeting(
     sender_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
+    available_agents_in_room: Sequence[MatrixID] | None = None,
 ) -> bool:
     """Return whether a thread already has visible ownership or multiple human participants."""
-    sender_visible_agents = authorization.filter_agents_by_sender_permissions(
+    sender_visible_agents = authorization.filter_responders_by_sender_permissions(
         get_agents_in_thread(thread_history, config, runtime_paths),
         sender_id,
         config,
         runtime_paths,
     )
+    if available_agents_in_room is not None:
+        available_agent_ids = {agent.full_id for agent in available_agents_in_room}
+        sender_visible_agents = [agent for agent in sender_visible_agents if agent.full_id in available_agent_ids]
     if sender_visible_agents:
         return True
     return has_multiple_non_agent_users_in_thread(thread_history, config, runtime_paths)
-
-
-def get_configured_agents_for_room(
-    room_id: str,
-    config: Config,
-    runtime_paths: RuntimePaths,
-) -> list[MatrixID]:
-    """Get list of agent MatrixIDs configured for a specific room.
-
-    This returns only agents that have the room in their configuration,
-    not just agents that happen to be present in the room.
-
-    Note: Router agent is excluded as it's not a regular conversation participant.
-    """
-    configured_agents: list[MatrixID] = []
-    config_ids = config.get_ids(runtime_paths)
-    from mindroom.matrix.rooms import resolve_room_aliases  # noqa: PLC0415
-
-    # Check which agents should be in this room
-    for agent_name, agent_config in config.agents.items():
-        if agent_name != ROUTER_AGENT_NAME:
-            resolved_rooms = resolve_room_aliases(agent_config.rooms, runtime_paths)
-            if room_id in resolved_rooms:
-                configured_agents.append(config_ids[agent_name])
-
-    return sorted(configured_agents, key=lambda x: x.full_id)
 
 
 def get_all_mentioned_agents_in_thread(
@@ -226,7 +215,7 @@ def get_all_mentioned_agents_in_thread(
 
     for msg in thread_history:
         content = msg.content
-        user_ids = _extract_mentioned_user_ids(content)
+        user_ids = _extract_mentioned_user_ids(content, config, runtime_paths)
         agents = _agents_from_user_ids(user_ids, config, runtime_paths)
 
         for agent in agents:
@@ -272,6 +261,19 @@ def should_agent_respond(  # noqa: PLR0911
     if not authorization.is_sender_allowed_for_agent_reply(sender_id, agent_name, config, runtime_paths):
         return False
 
+    available_agents = available_agents_in_room
+    if available_agents is None:
+        available_agents = authorization.responder_candidate_entities_from_cached_room(
+            room,
+            sender_id,
+            config,
+            runtime_paths,
+        )
+    agent_matrix_id = entity_identity_registry(config, runtime_paths).current_id(agent_name)
+    available_agent_ids = {agent.full_id for agent in available_agents}
+    if agent_matrix_id.full_id not in available_agent_ids:
+        return False
+
     # Always respond if mentioned
     if am_i_mentioned:
         return True
@@ -279,11 +281,6 @@ def should_agent_respond(  # noqa: PLR0911
     # Never respond if anyone else is explicitly mentioned (agent or not)
     if mentioned_agents or has_non_agent_mentions:
         return False
-
-    available_agents = available_agents_in_room
-    if available_agents is None:
-        available_agents = authorization.get_available_agents_for_sender(room, sender_id, config, runtime_paths)
-    agent_matrix_id = config.get_ids(runtime_paths)[agent_name]
 
     # Non-thread messages: auto-respond if we're the only visible agent in the room.
     if not is_thread:
@@ -294,14 +291,15 @@ def should_agent_respond(  # noqa: PLR0911
         return False
 
     # For threads, continue only if we're the single participating agent
-    # that may reply to this sender.
+    # that may reply to this sender within this room's responder boundary.
     agents_in_thread = get_agents_in_thread(thread_history, config, runtime_paths)
-    agents_in_thread = authorization.filter_agents_by_sender_permissions(
+    agents_in_thread = authorization.filter_responders_by_sender_permissions(
         agents_in_thread,
         sender_id,
         config,
         runtime_paths,
     )
+    agents_in_thread = [agent for agent in agents_in_thread if agent.full_id in available_agent_ids]
     if agents_in_thread:
         return len(agents_in_thread) == 1 and agents_in_thread[0] == agent_matrix_id
 

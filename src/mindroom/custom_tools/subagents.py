@@ -4,17 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
+import nio
 from agno.tools import Toolkit
 
 from mindroom.agent_descriptions import describe_agent
+from mindroom.authorization import (
+    responder_candidate_entities_for_room,
+    responder_candidate_entities_from_cached_room,
+)
 from mindroom.constants import ORIGINAL_SENDER_KEY
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.matrix.client_delivery import send_message_result
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.message_target import MessageTarget
+from mindroom.responder_availability import (
+    filter_materializable_responders,
+    live_responder_entity_names,
+    materializable_agent_names_for_orchestrator,
+)
 from mindroom.thread_summary import (
     THREAD_SUMMARY_MAX_LENGTH,
     normalize_thread_summary_text,
@@ -81,6 +93,15 @@ def _validate_spawn_metadata(summary: object, tag: object) -> tuple[str, str]:
     normalized_summary = _normalize_spawn_summary(summary)
     normalized_tag = normalize_tag_name(tag)
     return normalized_summary, normalized_tag
+
+
+def _validate_spawn_request(task: str, summary: object, tag: object) -> tuple[str, str, str]:
+    normalized_task = task.strip()
+    if not normalized_task:
+        msg = "Task cannot be empty."
+        raise ValueError(msg)
+    normalized_summary, normalized_tag = _validate_spawn_metadata(summary, tag)
+    return normalized_task, normalized_summary, normalized_tag
 
 
 def _registry_path(context: ToolRuntimeContext) -> Path:
@@ -243,6 +264,102 @@ def _threaded_dispatch_error(
     )
 
 
+def _current_agent_mention(context: ToolRuntimeContext, agent_name: str) -> str:
+    matrix_id = entity_identity_registry(context.config, context.runtime_paths).current_id(agent_name)
+    return matrix_id.full_id
+
+
+def _context_room(context: ToolRuntimeContext) -> nio.MatrixRoom:
+    if context.room is not None:
+        return context.room
+    return nio.MatrixRoom(room_id=context.room_id, own_user_id="")
+
+
+def _cached_target_room(context: ToolRuntimeContext, room_id: str) -> nio.MatrixRoom | None:
+    if room_id == context.room_id and context.room is not None:
+        return context.room
+
+    rooms = context.client.rooms
+    if not isinstance(rooms, Mapping):
+        return None
+
+    room = rooms.get(room_id)
+    if isinstance(room, nio.MatrixRoom):
+        return room
+    return None
+
+
+async def _available_subagent_names(context: ToolRuntimeContext, *, room_id: str | None = None) -> list[str]:
+    target_room_id = room_id or context.room_id
+    target_room = _cached_target_room(context, target_room_id)
+    if target_room is not None:
+        candidates = await responder_candidate_entities_for_room(
+            context.client,
+            target_room,
+            context.requester_id,
+            context.config,
+            context.runtime_paths,
+        )
+    elif target_room_id == context.room_id:
+        candidates = await responder_candidate_entities_for_room(
+            context.client,
+            _context_room(context),
+            context.requester_id,
+            context.config,
+            context.runtime_paths,
+        )
+    else:
+        candidates = responder_candidate_entities_from_cached_room(
+            nio.MatrixRoom(room_id=target_room_id, own_user_id=""),
+            context.requester_id,
+            context.config,
+            context.runtime_paths,
+        )
+    materializable_agent_names = materializable_agent_names_for_orchestrator(
+        context.orchestrator,
+        context.config,
+    )
+    candidates = filter_materializable_responders(
+        candidates,
+        context.config,
+        context.runtime_paths,
+        materializable_agent_names=materializable_agent_names,
+        live_entity_names=live_responder_entity_names(context.orchestrator, context.config),
+    )
+    registry = entity_identity_registry(context.config, context.runtime_paths)
+    names: list[str] = []
+    for candidate in candidates:
+        name = registry.current_entity_name_for_user_id(candidate.full_id, include_router=False)
+        if name in context.config.agents:
+            names.append(name)
+    return sorted(dict.fromkeys(names))
+
+
+def _agent_id_error(
+    context: ToolRuntimeContext,
+    *,
+    tool_name: str,
+    agent_id: str | None,
+    available_agents: list[str],
+) -> str | None:
+    if not agent_id:
+        return None
+    available = ", ".join(available_agents) or "(none)"
+    if agent_id not in context.config.agents:
+        return _payload(
+            tool_name,
+            "error",
+            message=f"Unknown agent_id '{agent_id}'. Available agents: {available}.",
+        )
+    if agent_id in available_agents:
+        return None
+    return _payload(
+        tool_name,
+        "error",
+        message=f"Agent '{agent_id}' is not available in this room. Available agents: {available}.",
+    )
+
+
 async def _send_matrix_text(
     context: ToolRuntimeContext,
     *,
@@ -263,7 +380,6 @@ async def _send_matrix_text(
         context.config,
         context.runtime_paths,
         text,
-        sender_domain=context.config.get_domain(context.runtime_paths),
         thread_event_id=thread_id,
         latest_thread_event_id=latest_thread_event_id,
     )
@@ -341,7 +457,7 @@ async def _spawn_session_payload(
     label: str | None,
     target_agent: str,
 ) -> str:
-    spawn_message = f"@mindroom_{target_agent} {task}"
+    spawn_message = f"{_current_agent_mention(context, target_agent)} {task}"
     event_id = await _send_matrix_text(
         context,
         room_id=context.room_id,
@@ -381,6 +497,50 @@ async def _spawn_session_payload(
     if warnings:
         payload_kwargs["warnings"] = warnings
     return _payload("sessions_spawn", "ok", **payload_kwargs)
+
+
+async def _send_session_payload(
+    context: ToolRuntimeContext,
+    *,
+    target_session: str,
+    target_room_id: str,
+    target_thread_id: str | None,
+    outgoing: str,
+    label: str | None,
+    agent_id: str | None,
+) -> str:
+    event_id = await _send_matrix_text(
+        context,
+        room_id=target_room_id,
+        text=outgoing,
+        thread_id=target_thread_id,
+        original_sender=context.requester_id,
+    )
+
+    if event_id is None:
+        return _payload(
+            "sessions_send",
+            "error",
+            session_key=target_session,
+            message="Failed to send message to Matrix.",
+        )
+
+    await asyncio.to_thread(
+        _record_session,
+        context,
+        session_key=target_session,
+        label=label,
+        target_agent=agent_id,
+    )
+
+    return _payload(
+        "sessions_send",
+        "ok",
+        session_key=target_session,
+        room_id=target_room_id,
+        thread_id=target_thread_id,
+        event_id=event_id,
+    )
 
 
 def _record_session(
@@ -503,7 +663,7 @@ class SubAgentsTools(Toolkit):
     async def agents_list(self) -> str:
         """List agents this caller can interact with via delegate or sessions_spawn, with per-tool capability flags.
 
-        Each row reports `can_delegate` (per `agent_config.delegate_to` of the calling agent) and `can_spawn` (currently always true; reserved for a future per-caller spawn allowlist).
+        Each row reports `can_delegate` (per `agent_config.delegate_to` of the calling agent) and `can_spawn` for room-eligible agents.
         """
         context = _get_context()
         if context is None:
@@ -513,14 +673,18 @@ class SubAgentsTools(Toolkit):
         # Missing callers mirror describe_agent's router special case in agent_descriptions.py:19.
         caller_cfg = context.config.agents.get(caller_name)
         delegate_to = set(caller_cfg.delegate_to) if caller_cfg else set()
+        available_agents = await _available_subagent_names(context)
+        spawnable_agents = set(available_agents)
+        agent_names = set(context.config.agents)
+        visible_agents = sorted((delegate_to | spawnable_agents) & agent_names)
         rows = [
             {
                 "name": name,
                 "can_delegate": name in delegate_to,
-                "can_spawn": True,
+                "can_spawn": name in spawnable_agents,
                 "description": describe_agent(name, context.config),
             }
-            for name in sorted(context.config.agents)
+            for name in visible_agents
             if name != caller_name
         ]
         return _payload(
@@ -552,8 +716,26 @@ class SubAgentsTools(Toolkit):
                 target_session = resolved[0]
 
         target_room_id, target_thread_id = _session_key_to_room_thread(target_session)
+        available_agents = await _available_subagent_names(context, room_id=target_room_id)
+        agent_id_error = _agent_id_error(
+            context,
+            tool_name="sessions_send",
+            agent_id=agent_id,
+            available_agents=available_agents,
+        )
+        if agent_id_error is not None:
+            return agent_id_error
+
         target_agent = agent_id or await asyncio.to_thread(_lookup_target_agent, context, target_session)
         target_agent = target_agent or context.agent_name
+        target_agent_error = _agent_id_error(
+            context,
+            tool_name="sessions_send",
+            agent_id=target_agent,
+            available_agents=available_agents,
+        )
+        if target_agent_error is not None:
+            return target_agent_error
 
         thread_dispatch_error = _threaded_dispatch_error(
             context,
@@ -567,39 +749,16 @@ class SubAgentsTools(Toolkit):
 
         outgoing = message.strip()
         if agent_id:
-            outgoing = f"@mindroom_{agent_id} {outgoing}"
+            outgoing = f"{_current_agent_mention(context, agent_id)} {outgoing}"
 
-        event_id = await _send_matrix_text(
+        return await _send_session_payload(
             context,
-            room_id=target_room_id,
-            text=outgoing,
-            thread_id=target_thread_id,
-            original_sender=context.requester_id,
-        )
-
-        if event_id is None:
-            return _payload(
-                "sessions_send",
-                "error",
-                session_key=target_session,
-                message="Failed to send message to Matrix.",
-            )
-
-        await asyncio.to_thread(
-            _record_session,
-            context,
-            session_key=target_session,
+            target_session=target_session,
+            target_room_id=target_room_id,
+            target_thread_id=target_thread_id,
+            outgoing=outgoing,
             label=label,
-            target_agent=agent_id,
-        )
-
-        return _payload(
-            "sessions_send",
-            "ok",
-            session_key=target_session,
-            room_id=target_room_id,
-            thread_id=target_thread_id,
-            event_id=event_id,
+            agent_id=agent_id,
         )
 
     async def sessions_spawn(
@@ -615,16 +774,30 @@ class SubAgentsTools(Toolkit):
         if context is None:
             return _context_error("sessions_spawn")
 
-        normalized_task = task.strip()
-        if not normalized_task:
-            return _payload("sessions_spawn", "error", message="Task cannot be empty.")
-
         try:
-            normalized_summary, normalized_tag = _validate_spawn_metadata(summary, tag)
+            normalized_task, normalized_summary, normalized_tag = _validate_spawn_request(task, summary, tag)
         except (ThreadTagsError, ValueError) as exc:
             return _payload("sessions_spawn", "error", message=str(exc))
 
+        available_agents = await _available_subagent_names(context)
+        agent_id_error = _agent_id_error(
+            context,
+            tool_name="sessions_spawn",
+            agent_id=agent_id,
+            available_agents=available_agents,
+        )
+        if agent_id_error is not None:
+            return agent_id_error
+
         target_agent = agent_id or context.agent_name
+        target_agent_error = _agent_id_error(
+            context,
+            tool_name="sessions_spawn",
+            agent_id=target_agent,
+            available_agents=available_agents,
+        )
+        if target_agent_error is not None:
+            return target_agent_error
         reused_payload = await _maybe_reuse_spawned_session(
             context,
             label=label,

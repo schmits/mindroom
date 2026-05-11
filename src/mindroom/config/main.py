@@ -48,7 +48,9 @@ from mindroom.constants import (
     DEFAULT_WORKER_GRANTABLE_CREDENTIALS,
     ROUTER_AGENT_NAME,
     RuntimePaths,
+    matrix_state_file,
     resolve_config_relative_path,
+    runtime_matrix_homeserver,
 )
 from mindroom.git_urls import credential_free_repo_url
 
@@ -56,7 +58,7 @@ from mindroom.git_urls import credential_free_repo_url
 from mindroom.history.types import HistoryPolicy, ResolvedHistorySettings
 from mindroom.logging_config import get_logger
 from mindroom.matrix_identifiers import (
-    agent_username_localpart,
+    extract_server_name_from_homeserver,
     managed_room_alias_localpart,
     managed_space_alias_localpart,
 )
@@ -69,11 +71,11 @@ from mindroom.tool_system.worker_routing import unsupported_shared_only_integrat
 from mindroom.workspaces import validate_workspace_template_dir
 
 if TYPE_CHECKING:
-    from mindroom.entity_resolution import MatrixID
     from mindroom.tool_system.catalog import ToolValidationInfo
     from mindroom.tool_system.worker_routing import WorkerScope
 
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
+_RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user"})
 _OPENCLAW_COMPAT_PRESET_TOOLS: tuple[str, ...] = (
     "shell",
     "coding",
@@ -84,7 +86,32 @@ _OPENCLAW_COMPAT_PRESET_TOOLS: tuple[str, ...] = (
     "subagents",
     "matrix_message",
 )
+
+
 logger = get_logger(__name__)
+
+
+def _persisted_entity_account_usernames(runtime_paths: RuntimePaths) -> dict[str, str]:
+    state_file = matrix_state_file(runtime_paths=runtime_paths)
+    if not state_file.exists():
+        return {}
+    data = yaml.safe_load(state_file.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        return {}
+    accounts = data.get("accounts")
+    if not isinstance(accounts, dict):
+        return {}
+    usernames: dict[str, str] = {}
+    for account_key, account in accounts.items():
+        if not isinstance(account_key, str) or not account_key.startswith("agent_"):
+            continue
+        if not isinstance(account, dict):
+            continue
+        username = account.get("username")
+        if isinstance(username, str) and username:
+            usernames[account_key] = username
+    return usernames
+
 
 _OPTIONAL_DICT_SECTION_NAMES = (
     "teams",
@@ -429,6 +456,12 @@ class Config(BaseModel):
         overlapping_names = sorted(set(self.agents) & set(self.teams))
         if overlapping_names:
             msg = f"Agent and team names must be distinct, overlapping keys: {', '.join(overlapping_names)}"
+            raise ValueError(msg)
+        reserved_entity_names = sorted((set(self.agents) | set(self.teams)) & _RESERVED_ENTITY_NAMES)
+        if reserved_entity_names:
+            msg = (
+                f"Agent and team names must not use reserved internal entity names: {', '.join(reserved_entity_names)}"
+            )
             raise ValueError(msg)
         for server_id in self.mcp_servers:
             normalize_mcp_server_id(server_id)
@@ -827,17 +860,21 @@ class Config(BaseModel):
         runtime_paths = info.context.get("runtime_paths") if isinstance(info.context, dict) else None
         if runtime_paths is None:
             return self
-        reserved_localparts = {
-            agent_username_localpart(ROUTER_AGENT_NAME, runtime_paths=runtime_paths): f"router '{ROUTER_AGENT_NAME}'",
-            **{
-                agent_username_localpart(agent_name, runtime_paths=runtime_paths): f"agent '{agent_name}'"
-                for agent_name in self.agents
-            },
-            **{
-                agent_username_localpart(team_name, runtime_paths=runtime_paths): f"team '{team_name}'"
-                for team_name in self.teams
-            },
-        }
+        reserved_localparts: dict[str, str] = {}
+        persisted_usernames = _persisted_entity_account_usernames(runtime_paths)
+        entity_names = [ROUTER_AGENT_NAME, *self.agents, *self.teams]
+        for entity_name in entity_names:
+            account_key = f"agent_{entity_name}"
+            persisted_username = persisted_usernames.get(account_key)
+            if persisted_username is None:
+                continue
+            if entity_name == ROUTER_AGENT_NAME:
+                label = f"router '{ROUTER_AGENT_NAME}'"
+            elif entity_name in self.agents:
+                label = f"agent '{entity_name}'"
+            else:
+                label = f"team '{entity_name}'"
+            reserved_localparts[persisted_username] = label
         conflict = reserved_localparts.get(self.mindroom_user.username)
         if conflict:
             msg = f"mindroom_user.username '{self.mindroom_user.username}' conflicts with {conflict} Matrix localpart"
@@ -870,26 +907,8 @@ class Config(BaseModel):
 
     def get_domain(self, runtime_paths: RuntimePaths) -> str:
         """Extract the Matrix domain for one explicit runtime context."""
-        from mindroom.entity_resolution import matrix_domain  # noqa: PLC0415
-
-        return matrix_domain(runtime_paths)
-
-    def get_ids(self, runtime_paths: RuntimePaths) -> dict[str, MatrixID]:
-        """Get MatrixID objects for all agents and teams.
-
-        Returns:
-            Dictionary mapping agent/team names to their MatrixID objects.
-
-        """
-        from mindroom.entity_resolution import entity_matrix_ids  # noqa: PLC0415
-
-        return entity_matrix_ids(self, runtime_paths)
-
-    def get_mindroom_user_id(self, runtime_paths: RuntimePaths) -> str | None:
-        """Get the full Matrix user ID for the configured internal user."""
-        from mindroom.entity_resolution import mindroom_user_id  # noqa: PLC0415
-
-        return mindroom_user_id(self, runtime_paths)
+        homeserver = runtime_matrix_homeserver(runtime_paths)
+        return extract_server_name_from_homeserver(homeserver, runtime_paths)
 
     @classmethod
     def validate_with_runtime(

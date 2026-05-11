@@ -13,6 +13,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.voice_handler import _process_transcription, _sanitize_unavailable_mentions
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
+from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 
 def _voice_config(agent_display_names: dict[str, str]) -> Config:
@@ -28,7 +29,13 @@ def _voice_config(agent_display_names: dict[str, str]) -> Config:
         runtime_paths,
     )
     config.voice.intelligence.model = "test-model"
+    _persist_voice_accounts(config)
     return config
+
+
+def _persist_voice_accounts(config: Config, *, usernames: dict[str, str] | None = None) -> None:
+    runtime_paths = runtime_paths_for(config)
+    persist_entity_accounts(config, runtime_paths, usernames=usernames or actual_entity_usernames(config))
 
 
 async def _process_transcription_for_test(transcription: str, config: Config, **kwargs: object) -> str:
@@ -129,14 +136,44 @@ async def test_voice_prompt_includes_correct_agent_format() -> None:
         await _process_transcription_for_test("test", config)
 
         # Verify the prompt shows the correct format
-        assert "@home or @mindroom_home (spoken as: HomeAssistant)" in captured_prompt
-        assert "@calc or @mindroom_calc (spoken as: Calculator)" in captured_prompt
-        assert "use EXACT agent name after @" in captured_prompt
+        assert "@home or @actual_home:localhost (spoken as: HomeAssistant)" in captured_prompt
+        assert "@calc or @actual_calc:localhost (spoken as: Calculator)" in captured_prompt
+        assert "use an exact listed agent mention after @" in captured_prompt
         assert 'use "@home" NOT "@homeassistant"' in captured_prompt
         assert "NEVER rewrite speech into Matrix bot commands" in captured_prompt
         assert "!schedule" not in captured_prompt
         assert "!help" not in captured_prompt
         assert "!skill" not in captured_prompt
+
+
+@pytest.mark.asyncio
+async def test_voice_prompt_uses_persisted_current_username_drift() -> None:
+    """Voice mention hints should use the live managed Matrix username."""
+    config = _voice_config({"home": "HomeAssistant"})
+    _persist_voice_accounts(config, usernames={"home": "actual_home_live"})
+
+    captured_prompt = None
+
+    async def capture_run(prompt: str, **kwargs: str) -> MagicMock:  # noqa: ARG001
+        nonlocal captured_prompt
+        captured_prompt = prompt
+        mock_resp = MagicMock()
+        mock_resp.content = "@home test"
+        return mock_resp
+
+    with (
+        patch("mindroom.voice_handler.Agent") as mock_agent_class,
+        patch("mindroom.model_loading.get_model_instance") as mock_get_model,
+    ):
+        mock_agent = MagicMock()
+        mock_agent.arun = AsyncMock(side_effect=capture_run)
+        mock_agent_class.return_value = mock_agent
+        mock_get_model.return_value = MagicMock()
+
+        await _process_transcription_for_test("test", config)
+
+    assert "@home or @actual_home_live:localhost (spoken as: HomeAssistant)" in captured_prompt
+    assert "@mindroom_home (spoken as: HomeAssistant)" not in captured_prompt
 
 
 @pytest.mark.asyncio
@@ -174,9 +211,9 @@ async def test_voice_prompt_scopes_agents_to_room_entities() -> None:
             available_team_names=[],
         )
 
-    assert "@openclaw or @mindroom_openclaw (spoken as: OpenClaw)" in captured_prompt
-    assert "@code or @mindroom_code (spoken as: CodeAgent)" not in captured_prompt
-    assert "Available teams (use EXACT team name after @):\n  (none)" in captured_prompt
+    assert "@openclaw or @actual_openclaw:localhost (spoken as: OpenClaw)" in captured_prompt
+    assert "@code or @actual_code:localhost (spoken as: CodeAgent)" not in captured_prompt
+    assert "Available teams (use an exact listed team mention after @):\n  (none)" in captured_prompt
 
 
 @pytest.mark.asyncio
@@ -210,12 +247,96 @@ async def test_voice_transcription_strips_unavailable_entity_mentions() -> None:
     assert result == "code review this"
 
 
+@pytest.mark.asyncio
+async def test_voice_transcription_preserves_bare_persisted_localpart() -> None:
+    """Bare actual Matrix localparts should not be treated as entity mentions."""
+    config = _voice_config(
+        {
+            "openclaw": "OpenClaw",
+            "code": "CodeAgent",
+        },
+    )
+    _persist_voice_accounts(config, usernames={"code": "actual_code_live"})
+
+    with (
+        patch("mindroom.voice_handler.Agent") as mock_agent_class,
+        patch("mindroom.model_loading.get_model_instance") as mock_get_model,
+    ):
+        mock_agent = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = "@actual_code_live review this"
+        mock_agent.arun = AsyncMock(return_value=mock_response)
+        mock_agent_class.return_value = mock_agent
+        mock_get_model.return_value = MagicMock()
+
+        result = await _process_transcription_for_test(
+            "review this",
+            config,
+            available_agent_names=["openclaw"],
+            available_team_names=[],
+        )
+
+    assert result == "@actual_code_live review this"
+
+
+@pytest.mark.asyncio
+async def test_voice_transcription_strips_unavailable_full_persisted_mxid() -> None:
+    """Unavailable full managed Matrix IDs should be sanitized like exact aliases."""
+    config = _voice_config(
+        {
+            "openclaw": "OpenClaw",
+            "code": "CodeAgent",
+        },
+    )
+    _persist_voice_accounts(config, usernames={"code": "actual_code_live"})
+
+    with (
+        patch("mindroom.voice_handler.Agent") as mock_agent_class,
+        patch("mindroom.model_loading.get_model_instance") as mock_get_model,
+    ):
+        mock_agent = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = "@actual_code_live:localhost review this"
+        mock_agent.arun = AsyncMock(return_value=mock_response)
+        mock_agent_class.return_value = mock_agent
+        mock_get_model.return_value = MagicMock()
+
+        result = await _process_transcription_for_test(
+            "review this",
+            config,
+            available_agent_names=["openclaw"],
+            available_team_names=[],
+        )
+
+    assert result == "actual_code_live:localhost review this"
+
+
 @pytest.mark.parametrize(
     ("text", "allowed_entities", "configured_entities", "expected"),
     [
         ("@code review this", {"openclaw"}, {"openclaw", "code"}, "code review this"),
-        ("@mindroom_code review this", {"openclaw"}, {"openclaw", "code"}, "mindroom_code review this"),
-        ("@code:server.com review this", {"openclaw"}, {"openclaw", "code"}, "code:server.com review this"),
+        ("@code. review this", {"openclaw"}, {"openclaw", "code"}, "code. review this"),
+        ("@mindroom_code review this", {"openclaw"}, {"openclaw", "code"}, "@mindroom_code review this"),
+        ("@code:localhost review this", {"openclaw"}, {"openclaw", "code"}, "@code:localhost review this"),
+        ("@code:server.com review this", {"openclaw"}, {"openclaw", "code"}, "@code:server.com review this"),
+        (
+            "@actual_code:localhost. review this",
+            {"openclaw"},
+            {"openclaw", "code"},
+            "actual_code:localhost. review this",
+        ),
+        (
+            "@actual_code:localhost: review this",
+            {"openclaw"},
+            {"openclaw", "code"},
+            "actual_code:localhost: review this",
+        ),
+        (
+            "@mindroom_code:remote.example review this",
+            {"openclaw"},
+            {"openclaw", "code"},
+            "@mindroom_code:remote.example review this",
+        ),
         ("@openclaw review this", {"openclaw"}, {"openclaw", "code"}, "@openclaw review this"),
         ("@unknown review this", {"openclaw"}, {"openclaw", "code"}, "@unknown review this"),
         ("@Code review this", {"openclaw"}, {"openclaw", "code"}, "Code review this"),
@@ -231,10 +352,12 @@ def test_sanitize_unavailable_mentions_direct(
     expected: str,
 ) -> None:
     """Test direct sanitizer behavior for mention edge cases."""
+    config = _voice_config({entity_name: entity_name for entity_name in sorted(configured_entities)})
     result = _sanitize_unavailable_mentions(
         text,
         allowed_entities=allowed_entities,
-        configured_entities=configured_entities,
+        config=config,
+        runtime_paths=runtime_paths_for(config),
     )
     assert result == expected
 

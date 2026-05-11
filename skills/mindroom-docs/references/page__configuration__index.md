@@ -408,7 +408,7 @@ voice:
 # Internal MindRoom user account (optional, omit for hosted/public profiles)
 # When present, defaults are: username: mindroom_user, display_name: MindRoomUser
 mindroom_user:
-  username: mindroom_user          # Set before first startup (localpart only)
+  username: mindroom_user          # Set before first startup (account-creation request localpart only)
   display_name: MindRoomUser       # Can be changed later
 
 # Matrix room onboarding/discoverability (optional)
@@ -525,15 +525,15 @@ prompts:
     Tool calls are hidden from users.
     Answer directly without narrating internal tool use.
   ROUTER_AGENT_SELECTION_PROMPT_TEMPLATE: |
-    Decide which agent should respond to this message.
+    Decide which agent or team should respond to this message.
 
-    Available agents and their capabilities:
+    Available agents and teams:
 
     {agents_info}
 
     User message: {message}
 
-    Return only the agent name.
+    Return only the agent or team name.
 ```
 
 Discover allowed names by inspecting `src/mindroom/prompts.py` or by importing `PROMPT_DEFAULT_NAMES` from `mindroom.prompts`.
@@ -567,8 +567,9 @@ Run `mindroom avatars sync --force` to replace existing Matrix room or root-spac
 
 ## Internal User Username
 
-- Configure `mindroom_user.username` with the Matrix localpart you want before first startup.
-- After the account is created, `mindroom_user.username` is locked and cannot be changed in-place.
+- Configure `mindroom_user.username` with the Matrix localpart to request before first startup.
+- After the account is created, `mindroom_user.username` is locked as the account-creation request and cannot be changed in-place.
+- Hosted provisioning can return a different actual Matrix ID; MindRoom persists that actual ID and uses it for runtime authorization.
 - You can safely change `mindroom_user.display_name` at any time.
 
 ## Sections

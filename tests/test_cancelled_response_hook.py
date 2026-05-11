@@ -53,6 +53,7 @@ from tests.conftest import (
     test_runtime_paths,
     wrap_extracted_collaborators,
 )
+from tests.identity_helpers import entity_ids
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -139,13 +140,11 @@ def _team_bot(tmp_path: Path) -> TeamBot:
         display_name="Team Bot",
         password=TEST_PASSWORD,
     )
-    team_member = config.get_ids(runtime_paths)["code"]
     bot = TeamBot(
         team_user,
         tmp_path,
         config=config,
         runtime_paths=runtime_paths,
-        team_agents=[team_member],
         team_mode="coordinate",
     )
     wrap_extracted_collaborators(bot)
@@ -385,7 +384,7 @@ async def test_team_bot_empty_prompt_emits_cancelled_hook_once(tmp_path: Path) -
                 prompt="   ",
                 user_id="@user:localhost",
             ),
-            team_agents=list(bot.team_agents),
+            team_agents=[entity_ids(bot.config, runtime_paths_for(bot.config))["code"]],
             team_mode=bot.team_mode,
         )
 
@@ -500,7 +499,6 @@ async def test_suppressed_final_delivery_emits_cancelled_hook(
             agent_name="code",
             logger=get_logger("tests.delivery"),
             redact_message_event=AsyncMock(return_value=True),
-            sender_domain="localhost",
             resolver=MagicMock(),
             response_hooks=response_hooks,
         ),
@@ -628,7 +626,6 @@ async def test_deliver_final_delivery_failure_emits_cancelled_hook(
             agent_name="code",
             logger=get_logger("tests.delivery"),
             redact_message_event=AsyncMock(return_value=True),
-            sender_domain="localhost",
             resolver=MagicMock(),
             response_hooks=response_hooks,
         ),
@@ -707,7 +704,6 @@ async def test_final_only_provider_runs_before_response_then_after_response_once
             agent_name="code",
             logger=get_logger("tests.delivery"),
             redact_message_event=AsyncMock(return_value=True),
-            sender_domain="localhost",
             resolver=MagicMock(),
             response_hooks=response_hooks,
         ),
@@ -787,7 +783,6 @@ async def test_suppressed_placeholder_cleanup_failure_returns_typed_outcome_afte
             agent_name="code",
             logger=get_logger("tests.delivery"),
             redact_message_event=AsyncMock(side_effect=redact_message_event),
-            sender_domain="localhost",
             resolver=MagicMock(),
             response_hooks=response_hooks,
         ),
@@ -857,7 +852,6 @@ async def test_suppressed_placeholder_cleanup_exception_returns_typed_outcome_af
             agent_name="code",
             logger=get_logger("tests.delivery"),
             redact_message_event=AsyncMock(side_effect=redact_message_event),
-            sender_domain="localhost",
             resolver=MagicMock(),
             response_hooks=response_hooks,
         ),

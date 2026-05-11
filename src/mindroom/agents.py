@@ -23,9 +23,9 @@ from mindroom.agent_knowledge_descriptions import KnowledgeToolDescribingAgent a
 from mindroom.agent_knowledge_descriptions import knowledge_source_descriptions
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.credentials import get_runtime_credentials_manager
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.hooks import HookRegistry
 from mindroom.logging_config import get_logger
-from mindroom.matrix.identity import MatrixID
 from mindroom.prompt_templates import build_agent_identity_context, render_prompt_template
 from mindroom.runtime_resolution import (
     ResolvedAgentRuntime,
@@ -980,11 +980,7 @@ def _render_agent_identity_context(
         )
         return overridden_identity_context + openai_context
 
-    matrix_id = MatrixID.from_agent(
-        agent_name,
-        config.get_domain(runtime_paths),
-        runtime_paths,
-    ).full_id
+    matrix_id = entity_identity_registry(config, runtime_paths).current_id(agent_name).full_id
     return build_agent_identity_context(
         display_name=display_name,
         matrix_id=matrix_id,
@@ -1364,23 +1360,6 @@ def create_agent(  # noqa: PLR0915, C901, PLR0912
     return agent
 
 
-def get_agent_ids_for_room(
-    room_key: str,
-    config: Config,
-    runtime_paths: constants.RuntimePaths,
-) -> list[str]:
-    """Get all agent Matrix IDs assigned to a specific room."""
-    config_ids = config.get_ids(runtime_paths)
-    # Always include the router agent
-    agent_ids = [config_ids[ROUTER_AGENT_NAME].full_id]
-
-    # Add agents from config
-    for agent_name, agent_cfg in config.agents.items():
-        if room_key in agent_cfg.rooms:
-            agent_ids.append(config_ids[agent_name].full_id)
-    return agent_ids
-
-
 def get_rooms_for_entity(entity_name: str, config: Config) -> list[str]:
     """Get the list of room aliases that an entity (agent/team) should be in.
 
@@ -1412,7 +1391,6 @@ __all__ = [
     "create_agent",
     "describe_agent",
     "ensure_default_agent_workspaces",
-    "get_agent_ids_for_room",
     "get_agent_toolkit_names",
     "get_rooms_for_entity",
     "remove_run_by_event_id",

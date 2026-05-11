@@ -42,6 +42,7 @@ from tests.conftest import (
     unwrap_extracted_collaborator,
     wrap_extracted_collaborators,
 )
+from tests.identity_helpers import entity_ids, persist_entity_accounts
 
 if TYPE_CHECKING:
     from mindroom.matrix.identity import MatrixID
@@ -50,7 +51,9 @@ if TYPE_CHECKING:
 def _runtime_bound_config(config: Config, runtime_root: Path | None = None) -> Config:
     """Return a runtime-bound test config."""
     runtime_paths = test_runtime_paths(runtime_root or Path(tempfile.mkdtemp()))
-    return bind_runtime_paths(config, runtime_paths)
+    bound_config = bind_runtime_paths(config, runtime_paths)
+    persist_entity_accounts(bound_config, runtime_paths_for(bound_config))
+    return bound_config
 
 
 def _message(
@@ -442,6 +445,7 @@ class TestBotTaskRestoration:
                 mock_client = AsyncMock()
                 mock_client.add_event_callback = MagicMock()
                 mock_client.add_response_callback = MagicMock()
+                mock_client.user_id = agent_user.user_id
                 mock_client.device_id = "TEST_DEVICE"
                 mock_client.access_token = TEST_ACCESS_TOKEN
                 mock_client.rooms = {}
@@ -494,6 +498,7 @@ class TestBotTaskRestoration:
                 mock_client = AsyncMock()
                 mock_client.add_event_callback = MagicMock()
                 mock_client.add_response_callback = MagicMock()
+                mock_client.user_id = agent_user.user_id
                 mock_client.device_id = "TEST_DEVICE"
                 mock_client.access_token = TEST_ACCESS_TOKEN
                 mock_client.rooms = {}
@@ -523,7 +528,6 @@ class TestCommandHandling:
                 agents={
                     "calculator": AgentConfig(display_name="Calculator", rooms=["#test:example.org"]),
                     "finance": AgentConfig(display_name="Finance", rooms=["#test:example.org"]),
-                    "router": AgentConfig(display_name="Router", rooms=["#test:example.org"]),
                 },
                 teams={},
                 room_models={},
@@ -885,8 +889,8 @@ class TestCommandHandling:
             is_thread=True,
             thread_id="$thread123",
             mentioned_agents=(
-                [config.get_ids(runtime_paths_for(config))["calculator"]]
-                if "calculator" in config.get_ids(runtime_paths_for(config))
+                [entity_ids(config, runtime_paths_for(config))["calculator"]]
+                if "calculator" in entity_ids(config, runtime_paths_for(config))
                 else []
             ),
         )
@@ -968,14 +972,9 @@ class TestCommandHandling:
                 },
             )
 
-            # Mock interactive.handle_text_response and extract_agent_name
             with (
                 patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-                patch("mindroom.turn_controller.extract_agent_name") as mock_extract,
             ):
-                # Make extract_agent_name return "router" for the router agent sender
-                mock_extract.return_value = "router"
-                # Call _on_message
                 await bot._on_message(room, event)
                 await drain_coalescing(bot)
 
@@ -1103,7 +1102,6 @@ class TestCommandHandling:
 
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-            patch("mindroom.turn_controller.extract_agent_name", return_value="router"),
         ):
             await bot._on_message(room, event)
             await drain_coalescing(bot)
@@ -1211,13 +1209,9 @@ class TestCommandHandling:
 
         with (
             patch("mindroom.bot.interactive") as mock_interactive,
-            patch("mindroom.turn_controller.extract_agent_name") as mock_extract,
             patch("mindroom.response_runner.team_response") as mock_team,
         ):
             mock_interactive.handle_text_response = AsyncMock(return_value=None)
-            mock_extract.side_effect = lambda x, _config, _runtime_paths: (
-                "router" if "router" in x else ("news" if "news" in x else ("research" if "research" in x else None))
-            )
 
             await bot._on_message(room, event)
             await drain_coalescing(bot)
@@ -1343,12 +1337,8 @@ class TestCommandHandling:
 
         with (
             patch("mindroom.bot.interactive") as mock_interactive,
-            patch("mindroom.turn_controller.extract_agent_name") as mock_extract,
         ):
             mock_interactive.handle_text_response = AsyncMock(return_value=None)
-            mock_extract.side_effect = (
-                lambda x, config, runtime_paths: "router" if "router" in x else ("finance" if "finance" in x else None)  # noqa: ARG005
-            )
 
             await bot._on_message(room, event)
             await drain_coalescing(bot)
@@ -1410,14 +1400,9 @@ class TestCommandHandling:
             },
         )
 
-        # Mock interactive.handle_text_response and extract_agent_name
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-            patch("mindroom.turn_controller.extract_agent_name") as mock_extract,
         ):
-            # Make extract_agent_name return "router" for the router agent sender
-            mock_extract.return_value = "router"
-            # Call _on_message
             await bot._on_message(room, event)
             await drain_coalescing(bot)
 
@@ -1641,15 +1626,14 @@ class TestRouterSkipsSingleAgent:
 
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-            patch("mindroom.turn_controller.extract_agent_name", return_value=None),  # User message
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
             # Return only one agent (general)
-            mock_get_available.return_value = [config.get_ids(runtime_paths_for(config))["general"]]
+            mock_get_available.return_value = [entity_ids(config, runtime_paths_for(config))["general"]]
 
             await bot._on_message(room, event)
             await drain_coalescing(bot)
@@ -1659,7 +1643,7 @@ class TestRouterSkipsSingleAgent:
 
         # Verify it logged that it's skipping routing
         info_calls = [call[0][0] for call in bot.logger.info.call_args_list]
-        assert "Skipping routing: only one agent present" in info_calls
+        assert "Skipping routing: only one responder candidate" in info_calls
 
     @pytest.mark.asyncio
     async def test_router_routes_with_multiple_agents(self) -> None:
@@ -1730,17 +1714,16 @@ class TestRouterSkipsSingleAgent:
 
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-            patch("mindroom.turn_controller.extract_agent_name", return_value=None),  # User message
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
             # Return multiple agents
             mock_get_available.return_value = [
-                config.get_ids(runtime_paths_for(config))["general"],
-                config.get_ids(runtime_paths_for(config))["calculator"],
+                entity_ids(config, runtime_paths_for(config))["general"],
+                entity_ids(config, runtime_paths_for(config))["calculator"],
             ]
 
             await bot._on_message(room, event)
@@ -1764,7 +1747,7 @@ class TestRouterSkipsSingleAgent:
 
         # Verify it didn't log about skipping
         info_calls = [call[0][0] for call in bot.logger.info.call_args_list]
-        assert "Skipping routing: only one agent present" not in info_calls
+        assert "Skipping routing: only one responder candidate" not in info_calls
 
     @pytest.mark.asyncio
     async def test_router_requires_mention_with_multiple_non_agent_users_in_thread(self) -> None:
@@ -1835,16 +1818,15 @@ class TestRouterSkipsSingleAgent:
 
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
-            patch("mindroom.turn_controller.extract_agent_name", return_value=None),
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
             mock_get_available.return_value = [
-                config.get_ids(runtime_paths_for(config))["general"],
-                config.get_ids(runtime_paths_for(config))["calculator"],
+                entity_ids(config, runtime_paths_for(config))["general"],
+                entity_ids(config, runtime_paths_for(config))["calculator"],
             ]
             await bot._turn_controller._dispatch_text_message(
                 room,
@@ -1853,7 +1835,7 @@ class TestRouterSkipsSingleAgent:
 
         bot._turn_controller._execute_router_relay.assert_not_called()
         info_calls = [call[0][0] for call in bot.logger.info.call_args_list]
-        assert "Skipping routing: thread already requires explicit agent targeting" in info_calls
+        assert "Skipping routing: thread already requires explicit responder targeting" in info_calls
 
     @pytest.mark.asyncio
     async def test_router_handles_command_even_with_single_agent(self) -> None:
@@ -1913,23 +1895,23 @@ class TestRouterSkipsSingleAgent:
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
-            mock_get_available.return_value = [config.get_ids(runtime_paths_for(config))["general"]]
+            mock_get_available.return_value = [entity_ids(config, runtime_paths_for(config))["general"]]
             await bot._on_message(room, event)
             await drain_coalescing(bot)
 
         # Router should handle the command even with a single agent
-        # This ensures commands work properly in single-agent rooms
+        # This ensures commands work properly in single-responder rooms.
         bot._turn_controller._execute_command.assert_called_once()
         # Router should not send a response for unknown commands (handled by _handle_command)
         bot._send_response.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_router_handles_schedule_command_in_single_agent_room(self) -> None:
-        """Router should handle schedule commands even in single-agent rooms."""
+        """Router should handle schedule commands even in single-responder rooms."""
         # Create router agent
         agent_user = AgentMatrixUser(
             agent_name=ROUTER_AGENT_NAME,
@@ -1985,23 +1967,23 @@ class TestRouterSkipsSingleAgent:
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
-            mock_get_available.return_value = [config.get_ids(runtime_paths_for(config))["general"]]
+            mock_get_available.return_value = [entity_ids(config, runtime_paths_for(config))["general"]]
             await bot._on_message(room, event)
             await drain_coalescing(bot)
 
         # Router MUST handle schedule commands even with a single agent
-        # This is a regression test to ensure commands work in single-agent rooms
+        # This is a regression test to ensure commands work in single-responder rooms.
         bot._turn_controller._execute_command.assert_called_once()
         kwargs = bot._turn_controller._execute_command.call_args.kwargs
         assert kwargs["command"].type.value == "schedule", "Router should handle schedule command"
 
     @pytest.mark.asyncio
     async def test_router_handles_voice_transcription_in_single_agent_room(self) -> None:
-        """Router voice transcriptions should work in single-agent rooms."""
+        """Router voice transcriptions should work in single-responder rooms."""
         # Create router agent
         agent_user = AgentMatrixUser(
             agent_name=ROUTER_AGENT_NAME,
@@ -2069,23 +2051,23 @@ class TestRouterSkipsSingleAgent:
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
             patch("mindroom.turn_policy.get_agents_in_thread") as mock_agents_in_thread,
         ):
-            mock_get_available.return_value = [config.get_ids(runtime_paths_for(config))["general"]]
+            mock_get_available.return_value = [entity_ids(config, runtime_paths_for(config))["general"]]
             mock_agents_in_thread.return_value = []
             await bot._on_message(room, voice_event)
             await drain_coalescing(bot)
 
         # Voice transcriptions should work: router skips routing but doesn't interfere
-        # This is a regression test to ensure voice works in single-agent rooms
+        # This is a regression test to ensure voice works in single-responder rooms.
         assert not bot._turn_controller._execute_router_relay.called, (
-            "Router should skip routing for voice in single-agent room"
+            "Router should skip routing for voice in single-responder room"
         )
         info_calls = [call[0][0] for call in bot.logger.info.call_args_list]
-        assert "Skipping routing: only one agent present" in info_calls
+        assert "Skipping routing: only one responder candidate" in info_calls
 
     @pytest.mark.asyncio
     async def test_router_handles_command_with_multiple_agents(self) -> None:
@@ -2147,13 +2129,13 @@ class TestRouterSkipsSingleAgent:
         with (
             patch("mindroom.turn_controller.interactive.handle_text_response", return_value=None),
             patch(
-                "mindroom.turn_policy.get_available_agents_for_sender_authoritative",
+                "mindroom.turn_policy.responder_candidate_entities_for_room",
                 new_callable=AsyncMock,
             ) as mock_get_available,
         ):
             mock_get_available.return_value = [
-                config.get_ids(runtime_paths_for(config))["general"],
-                config.get_ids(runtime_paths_for(config))["calculator"],
+                entity_ids(config, runtime_paths_for(config))["general"],
+                entity_ids(config, runtime_paths_for(config))["calculator"],
             ]
             await bot._on_message(room, event)
             await drain_coalescing(bot)

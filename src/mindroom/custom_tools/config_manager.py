@@ -12,7 +12,7 @@ from agno.tools import Toolkit
 from pydantic import ValidationError
 
 from mindroom.api.config_lifecycle import validate_and_persist_config_payload
-from mindroom.authorization import get_available_agents_in_room
+from mindroom.authorization import responder_candidate_entities_from_cached_room
 from mindroom.commands.parsing import get_command_help
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import (
@@ -22,6 +22,7 @@ from mindroom.config.main import (
     load_config_or_user_error,
 )
 from mindroom.config.models import AgentLearningMode, ToolConfigEntry
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.logging_config import get_logger
 from mindroom.tool_system.catalog import ToolCategory, ToolStatus, resolved_tool_metadata_for_runtime
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
@@ -434,8 +435,8 @@ class ConfigManagerTools(Toolkit):
 - **Teams**: Groups of agents that collaborate
 - **Tools**: Integrations that give agents capabilities (80+ available)
 - **Memory**: Persistent conversation memory across sessions
-- **Threading**: Agents respond with explicit thread relations, and plain replies inherit thread membership transitively when their reply chain reaches a threaded ancestor
-- **Routing**: Smart agent selection based on message content
+- **Threading**: Responders use explicit thread relations, and plain replies inherit thread membership transitively when their reply chain reaches a threaded ancestor
+- **Routing**: Smart agent or team selection based on message content
 - **Commands**: Special !commands for configuration and control
 """
 
@@ -457,10 +458,17 @@ class ConfigManagerTools(Toolkit):
         if room is None:
             return "Agents in This Room", []
 
+        registry = entity_identity_registry(config, self.runtime_paths)
         available_agent_names = {
             agent_name
-            for matrix_id in get_available_agents_in_room(room, config, self.runtime_paths)
-            if (agent_name := matrix_id.agent_name(config, self.runtime_paths)) is not None
+            for matrix_id in responder_candidate_entities_from_cached_room(
+                room,
+                runtime_context.requester_id,
+                config,
+                self.runtime_paths,
+            )
+            if (agent_name := registry.current_entity_name_for_user_id(matrix_id.full_id, include_router=False))
+            is not None
         }
         agent_entries = [(name, agent) for name, agent in all_agents if name in available_agent_names]
         return "Agents in This Room", agent_entries

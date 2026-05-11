@@ -14,13 +14,14 @@ from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.teams import TeamMode, TeamOutcome, decide_team_formation
 from mindroom.thread_utils import check_agent_mentioned, get_agents_in_thread, get_all_mentioned_agents_in_thread
 from tests.conftest import bind_runtime_paths, make_visible_message, runtime_paths_for, test_runtime_paths
+from tests.identity_helpers import actual_entity_usernames, entity_ids, entity_name_for_id, persist_entity_accounts
 
 
 @pytest.fixture
 def mock_config() -> Config:
     """Create a mock config for testing."""
     runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
-    return bind_runtime_paths(
+    config = bind_runtime_paths(
         Config(
             defaults=DefaultsConfig(),
             agents={
@@ -60,6 +61,17 @@ def mock_config() -> Config:
         ),
         runtime_paths,
     )
+    persist_entity_accounts(
+        config,
+        runtime_paths,
+        usernames=actual_entity_usernames(config),
+    )
+    return config
+
+
+def _entity_user_ids(config: Config) -> dict[str, str]:
+    runtime_paths = runtime_paths_for(config)
+    return {name: matrix_id.full_id for name, matrix_id in entity_ids(config, runtime_paths).items() if matrix_id}
 
 
 class TestAgentOrderPreservation:
@@ -68,14 +80,14 @@ class TestAgentOrderPreservation:
     def test_check_agent_mentioned_preserves_order(self, mock_config: Config) -> None:
         """Test that check_agent_mentioned preserves the order from user_ids."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         event_source = {
             "content": {
                 "m.mentions": {
                     "user_ids": [
-                        f"@mindroom_phone:{domain}",
-                        f"@mindroom_email:{domain}",
-                        f"@mindroom_research:{domain}",
+                        ids["phone"],
+                        ids["email"],
+                        ids["research"],
                     ],
                 },
             },
@@ -84,70 +96,70 @@ class TestAgentOrderPreservation:
         agents, _, _ = check_agent_mentioned(event_source, None, mock_config, runtime_paths)
 
         # Order should be preserved as phone, email, research
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in agents]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents]
         assert agent_names == ["phone", "email", "research"]
 
     def test_get_agents_in_thread_preserves_order(self, mock_config: Config) -> None:
         """Test that get_agents_in_thread preserves order of first participation."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         thread_history = [
-            make_visible_message(sender=f"@mindroom_research:{domain}", body="Starting research"),
-            make_visible_message(sender=f"@mindroom_email:{domain}", body="Sending email"),
-            make_visible_message(sender=f"@mindroom_phone:{domain}", body="Making call"),
-            make_visible_message(sender=f"@mindroom_email:{domain}", body="Another email"),
-            make_visible_message(sender=f"@mindroom_analyst:{domain}", body="Analyzing"),
+            make_visible_message(sender=ids["research"], body="Starting research"),
+            make_visible_message(sender=ids["email"], body="Sending email"),
+            make_visible_message(sender=ids["phone"], body="Making call"),
+            make_visible_message(sender=ids["email"], body="Another email"),
+            make_visible_message(sender=ids["analyst"], body="Analyzing"),
         ]
 
         agents = get_agents_in_thread(thread_history, mock_config, runtime_paths)
 
         # Order should be: research, email, phone, analyst (in order of first appearance)
         # Convert MatrixID objects to agent names for comparison
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in agents]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents]
         assert agent_names == ["research", "email", "phone", "analyst"]
 
     def test_get_agents_in_thread_excludes_router(self, mock_config: Config) -> None:
         """Test that router agent is excluded from thread participants."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         thread_history = [
-            make_visible_message(sender=f"@mindroom_email:{domain}", body="Email"),
-            make_visible_message(sender=f"@mindroom_{ROUTER_AGENT_NAME}:{domain}", body="Routing"),
-            make_visible_message(sender=f"@mindroom_phone:{domain}", body="Phone"),
+            make_visible_message(sender=ids["email"], body="Email"),
+            make_visible_message(sender=ids[ROUTER_AGENT_NAME], body="Routing"),
+            make_visible_message(sender=ids["phone"], body="Phone"),
         ]
 
         agents = get_agents_in_thread(thread_history, mock_config, runtime_paths)
 
         # Router should be excluded
         # Convert MatrixID objects to agent names for comparison
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in agents]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents]
         assert agent_names == ["email", "phone"]
         assert ROUTER_AGENT_NAME not in agent_names
 
     def test_get_all_mentioned_agents_preserves_order(self, mock_config: Config) -> None:
         """Test that get_all_mentioned_agents_in_thread preserves order of first mention."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         thread_history = [
             make_visible_message(
                 body="First message",
                 content={
                     "body": "First message",
-                    "m.mentions": {"user_ids": [f"@mindroom_phone:{domain}", f"@mindroom_email:{domain}"]},
+                    "m.mentions": {"user_ids": [ids["phone"], ids["email"]]},
                 },
             ),
             make_visible_message(
                 body="Second message",
                 content={
                     "body": "Second message",
-                    "m.mentions": {"user_ids": [f"@mindroom_research:{domain}", f"@mindroom_phone:{domain}"]},
+                    "m.mentions": {"user_ids": [ids["research"], ids["phone"]]},
                 },
             ),
             make_visible_message(
                 body="Third message",
                 content={
                     "body": "Third message",
-                    "m.mentions": {"user_ids": [f"@mindroom_analyst:{domain}", f"@mindroom_email:{domain}"]},
+                    "m.mentions": {"user_ids": [ids["analyst"], ids["email"]]},
                 },
             ),
         ]
@@ -156,13 +168,13 @@ class TestAgentOrderPreservation:
 
         # Order should be: phone, email, research, analyst (in order of first mention)
         # Convert MatrixID objects to agent names for comparison
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in agents]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents]
         assert agent_names == ["phone", "email", "research", "analyst"]
 
     def test_no_duplicates_in_mentioned_agents(self, mock_config: Config) -> None:
         """Test that duplicates are removed while preserving order."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         thread_history = [
             make_visible_message(
                 body="Message 1",
@@ -170,9 +182,9 @@ class TestAgentOrderPreservation:
                     "body": "Message 1",
                     "m.mentions": {
                         "user_ids": [
-                            f"@mindroom_email:{domain}",
-                            f"@mindroom_phone:{domain}",
-                            f"@mindroom_email:{domain}",
+                            ids["email"],
+                            ids["phone"],
+                            ids["email"],
                         ],
                     },
                 },
@@ -183,9 +195,9 @@ class TestAgentOrderPreservation:
                     "body": "Message 2",
                     "m.mentions": {
                         "user_ids": [
-                            f"@mindroom_phone:{domain}",
-                            f"@mindroom_research:{domain}",
-                            f"@mindroom_email:{domain}",
+                            ids["phone"],
+                            ids["research"],
+                            ids["email"],
                         ],
                     },
                 },
@@ -196,7 +208,7 @@ class TestAgentOrderPreservation:
 
         # Should have no duplicates, order preserved from first mention
         # Convert MatrixID objects to agent names for comparison
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in agents]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents]
         assert agent_names == ["email", "phone", "research"]
         assert len(agent_names) == len(set(agent_names))  # No duplicates
 
@@ -209,18 +221,18 @@ class TestAgentOrderPreservation:
     def test_order_matters_for_coordinate_mode(self, mock_config: Config) -> None:
         """Test that order preservation is important for sequential execution."""
         runtime_paths = runtime_paths_for(mock_config)
-        domain = mock_config.get_domain(runtime_paths)
+        ids = _entity_user_ids(mock_config)
         event_source1 = {
             "content": {
                 "m.mentions": {
-                    "user_ids": [f"@mindroom_email:{domain}", f"@mindroom_phone:{domain}"],
+                    "user_ids": [ids["email"], ids["phone"]],
                 },
             },
         }
         event_source2 = {
             "content": {
                 "m.mentions": {
-                    "user_ids": [f"@mindroom_phone:{domain}", f"@mindroom_email:{domain}"],
+                    "user_ids": [ids["phone"], ids["email"]],
                 },
             },
         }
@@ -229,8 +241,8 @@ class TestAgentOrderPreservation:
         agents2, _, _ = check_agent_mentioned(event_source2, None, mock_config, runtime_paths)
 
         # Different orders should be preserved
-        agent_names1 = [mid.agent_name(mock_config, runtime_paths) for mid in agents1]
-        agent_names2 = [mid.agent_name(mock_config, runtime_paths) for mid in agents2]
+        agent_names1 = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents1]
+        agent_names2 = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in agents2]
         assert agent_names1 == ["email", "phone"]
         assert agent_names2 == ["phone", "email"]
         assert agent_names1 != agent_names2  # Order matters!
@@ -245,13 +257,13 @@ class TestIntegrationWithTeamFormation:
         runtime_paths = runtime_paths_for(mock_config)
         # When agents are tagged in specific order - use MatrixID objects
         tagged_agents = [
-            mock_config.get_ids(runtime_paths)["phone"],
-            mock_config.get_ids(runtime_paths)["email"],
-            mock_config.get_ids(runtime_paths)["research"],
+            entity_ids(mock_config, runtime_paths)["phone"],
+            entity_ids(mock_config, runtime_paths)["email"],
+            entity_ids(mock_config, runtime_paths)["research"],
         ]  # User tagged in this order
 
         result = await decide_team_formation(
-            agent=mock_config.get_ids(runtime_paths)["email"],  # The agent calling this function
+            agent=entity_ids(mock_config, runtime_paths)["email"],  # The agent calling this function
             tagged_agents=tagged_agents,
             agents_in_thread=[],
             all_mentioned_in_thread=[],
@@ -265,7 +277,7 @@ class TestIntegrationWithTeamFormation:
         # Agents should be in the same order as tagged
         # Convert MatrixID objects to agent names for comparison
         assert result.outcome is TeamOutcome.TEAM
-        agent_names = [mid.agent_name(mock_config, runtime_paths) for mid in result.eligible_members]
+        agent_names = [entity_name_for_id(mid, mock_config, runtime_paths) for mid in result.eligible_members]
         assert agent_names == ["phone", "email", "research"]
         assert result.mode == TeamMode.COORDINATE  # Multiple tagged = coordinate
 

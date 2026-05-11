@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from mindroom.authorization import responder_candidate_entities_for_room
 from mindroom.commands import config_confirmation
 from mindroom.commands.config_commands import handle_config_command
 from mindroom.commands.parsing import Command, CommandType, get_command_help, get_compact_command_entries
-from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths
+from mindroom.entity_resolution import configured_routable_entity_ids_for_room, entity_identity_registry
 from mindroom.handled_turns import HandledTurnState
 from mindroom.logging_config import get_logger
 from mindroom.scheduling import (
@@ -19,17 +20,19 @@ from mindroom.scheduling import (
     list_scheduled_tasks,
     schedule_task,
 )
-from mindroom.thread_utils import check_agent_mentioned, get_configured_agents_for_room
+from mindroom.thread_utils import check_agent_mentioned
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
 
     import nio
     import structlog
 
     from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
     from mindroom.hooks import HookMatrixAdmin
     from mindroom.matrix.conversation_cache import ConversationCacheProtocol, ConversationEventCache
+    from mindroom.matrix.identity import MatrixID
     from mindroom.message_target import MessageTarget
     from mindroom.tool_system.plugins import PluginReloadResult
 
@@ -85,6 +88,7 @@ class CommandHandlerContext:
     send_response: _CommandResponseSender
     reload_plugins: Callable[[], Awaitable[PluginReloadResult]] | None = None
     matrix_admin: HookMatrixAdmin | None = None
+    responder_candidates_for_room: Callable[[nio.MatrixRoom, str], Awaitable[list[MatrixID]]] | None = None
 
 
 def _format_agent_description(agent_name: str, config: Config) -> str:
@@ -111,7 +115,9 @@ def _format_agent_description(agent_name: str, config: Config) -> str:
 
     if agent_name in config.teams:
         team_config = config.teams[agent_name]
-        team_desc = f"Team of {len(team_config.agents)} agents"
+        agent_count = len(team_config.agents)
+        noun = "agent" if agent_count == 1 else "agents"
+        team_desc = f"Team of {agent_count} {noun}"
         if team_config.role:
             return f"{team_config.role} ({team_desc})"
         return team_desc
@@ -119,51 +125,65 @@ def _format_agent_description(agent_name: str, config: Config) -> str:
     return ""
 
 
-def generate_welcome_message(room_id: str, config: Config, runtime_paths: RuntimePaths) -> str:
-    """Generate the welcome message text for a room."""
-    # Get list of configured agents for this room
-    configured_agents = get_configured_agents_for_room(room_id, config, runtime_paths)
-
-    # Build agent list for the welcome message
-    agent_list = []
-    for agent_id in configured_agents:
-        agent_name = agent_id.agent_name(config, runtime_paths)
-        if not agent_name or agent_name == ROUTER_AGENT_NAME:
+def _format_welcome_message(
+    candidate_entities: Iterable[MatrixID],
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> str:
+    """Generate the welcome message text for resolved responder candidates."""
+    entity_list = []
+    candidate_entity_ids = list(candidate_entities)
+    registry = entity_identity_registry(config, runtime_paths) if candidate_entity_ids else None
+    for entity_id in candidate_entity_ids:
+        assert registry is not None
+        entity_name = registry.current_entity_name_for_user_id(entity_id.full_id, include_router=False)
+        if entity_name is None:
             continue
-
-        description = _format_agent_description(agent_name, config)
-        # Always show the agent, with or without description
-        # Use the username with mindroom_ prefix (but without domain) for proper mention parsing
-        agent_entry = f"• **@{agent_id.username}**"
+        description = _format_agent_description(entity_name, config)
+        entity_entry = f"• **@{entity_name}**"
         if description:
-            agent_entry += f": {description}"
-        agent_list.append(agent_entry)
+            entity_entry += f": {description}"
+        entity_list.append(entity_entry)
 
-    # Create welcome message
     welcome_msg = (
         "🎉 **Welcome to MindRoom!**\n\n"
         "I'm your routing assistant, here to help coordinate our team of specialized AI agents. 🤖\n\n"
     )
 
-    if agent_list:
-        welcome_msg += "🧠 **Available agents in this room:**\n"
-        welcome_msg += "\n".join(agent_list)
+    if entity_list:
+        welcome_msg += "🧠 **Available agents and teams in this room:**\n"
+        welcome_msg += "\n".join(entity_list)
         welcome_msg += "\n\n"
 
     quick_commands = "\n".join(get_compact_command_entries(format_code=True))
     welcome_msg += (
         "💬 **How to interact:**\n"
-        "• Mention an agent with @ to get their attention (e.g., @mindroom_assistant)\n"
+        "• Mention an agent or team with @ to get their attention using its configured alias\n"
         "• Use `!help` to see available commands\n"
         "• Agents stay in existing Matrix threads, including compatible plain replies from bridges and non-thread clients\n"
-        "• Multiple agents can collaborate when you mention them together\n"
+        "• Multiple agents can collaborate when you mention them together; mention a team directly for its team workflow\n"
         "• 🎤 Voice messages are automatically transcribed and work perfectly!\n\n"
         "⚡ **Quick commands:**\n"
         f"{quick_commands}\n\n"
-        "✨ Feel free to ask any agent for help or start a conversation!"
+        "✨ Feel free to ask any agent or team for help or start a conversation!"
     )
 
     return welcome_msg
+
+
+async def generate_welcome_message_for_room(
+    client: nio.AsyncClient | None,
+    room: nio.MatrixRoom,
+    sender_id: str | None,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> str:
+    """Generate a welcome message for callers without a live turn-policy candidate source."""
+    if sender_id is None:
+        candidate_entities = configured_routable_entity_ids_for_room(config, room.room_id, runtime_paths)
+    else:
+        candidate_entities = await responder_candidate_entities_for_room(client, room, sender_id, config, runtime_paths)
+    return _format_welcome_message(candidate_entities, config, runtime_paths)
 
 
 def _normalized_response_event_id(raw_response_event_id: str | None) -> str | None:
@@ -213,13 +233,21 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                 response_text = f"❌ Plugin reload failed: {exc}"
 
     elif command.type == CommandType.HI:
-        # Generate the welcome message for this room
-        response_text = generate_welcome_message(room.room_id, context.config, context.runtime_paths)
+        if context.responder_candidates_for_room is None:
+            response_text = await generate_welcome_message_for_room(
+                context.client,
+                room,
+                requester_user_id,
+                context.config,
+                context.runtime_paths,
+            )
+        else:
+            candidate_entities = await context.responder_candidates_for_room(room, requester_user_id)
+            response_text = _format_welcome_message(candidate_entities, context.config, context.runtime_paths)
 
     elif command.type == CommandType.SCHEDULE:
         full_text = command.args["full_text"]
 
-        # Get mentioned agents from the command text
         mentioned_agents, _, _ = check_agent_mentioned(event.source, None, context.config, context.runtime_paths)
 
         _, response_text = await schedule_task(

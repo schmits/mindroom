@@ -2,23 +2,26 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import tempfile
+from pathlib import Path
 
 from mindroom import constants as constants_mod
-from mindroom.config.agent import AgentConfig
+from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.matrix.mentions import format_message_with_mentions, parse_mentions_in_text
+from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, ToolTraceEntry
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 _BOUND_RUNTIME_PATHS: dict[int, constants_mod.RuntimePaths] = {}
 
 
 def _default_runtime_paths() -> constants_mod.RuntimePaths:
+    tmp_path = Path(tempfile.mkdtemp())
     return constants_mod.resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
         process_env={
             "MATRIX_HOMESERVER": "http://localhost:8008",
             "MINDROOM_NAMESPACE": "",
@@ -29,14 +32,26 @@ def _default_runtime_paths() -> constants_mod.RuntimePaths:
 def _bind_config(
     runtime_paths: constants_mod.RuntimePaths,
     agents: dict[str, AgentConfig],
+    teams: dict[str, TeamConfig] | None = None,
 ) -> Config:
     config = Config(
         agents=agents,
+        teams=teams or {},
         models={"default": ModelConfig(provider="ollama", id="test-model")},
     )
     bound = Config.validate_with_runtime(config.authored_model_dump(), runtime_paths)
+    _persist_mentions_accounts(bound, runtime_paths)
     _BOUND_RUNTIME_PATHS[id(bound)] = runtime_paths
     return bound
+
+
+def _persist_mentions_accounts(
+    config: Config,
+    runtime_paths: constants_mod.RuntimePaths,
+    *,
+    usernames: dict[str, str] | None = None,
+) -> None:
+    persist_entity_accounts(config, runtime_paths, usernames=usernames or actual_entity_usernames(config))
 
 
 def _make_config(runtime_paths: constants_mod.RuntimePaths) -> Config:
@@ -61,10 +76,9 @@ def _runtime_paths_for(config: Config) -> constants_mod.RuntimePaths:
 
 def _parse_mentions_in_text(
     text: str,
-    sender_domain: str,
     config: Config,
 ) -> tuple[str, list[str], str]:
-    return parse_mentions_in_text(text, sender_domain, config, _runtime_paths_for(config))
+    return parse_mentions_in_text(text, config, _runtime_paths_for(config))
 
 
 def _format_message_with_mentions(config: Config, text: str, **kwargs: object) -> dict[str, object]:
@@ -79,47 +93,44 @@ class TestMentionParsing:
         config = _make_config(_default_runtime_paths())
 
         text = "Hey @calculator can you help with this?"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "Hey @mindroom_calculator:localhost can you help with this?"
-        assert mentions == ["@mindroom_calculator:localhost"]
+        assert processed == "Hey @actual_calculator:localhost can you help with this?"
+        assert mentions == ["@actual_calculator:localhost"]
 
     def test_parse_multiple_mentions(self) -> None:
         """Test parsing multiple agent mentions."""
         config = _make_config(_default_runtime_paths())
 
         text = "@calculator and @general please work together on this"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert (
-            processed == "@mindroom_calculator:localhost and @mindroom_general:localhost please work together on this"
-        )
-        assert set(mentions) == {"@mindroom_calculator:localhost", "@mindroom_general:localhost"}
+        assert processed == "@actual_calculator:localhost and @actual_general:localhost please work together on this"
+        assert set(mentions) == {"@actual_calculator:localhost", "@actual_general:localhost"}
         assert len(mentions) == 2
 
-    def test_parse_with_full_mention(self) -> None:
-        """Test parsing when full @mindroom_agent format is used."""
+    def test_parse_with_generated_looking_localpart_does_not_resolve(self) -> None:
+        """Generated-looking localparts are not aliases unless configured exactly."""
         config = _make_config(_default_runtime_paths())
 
         text = "Ask @mindroom_calculator for help"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "Ask @mindroom_calculator:localhost for help"
-        assert mentions == ["@mindroom_calculator:localhost"]
+        assert processed == "Ask @mindroom_calculator for help"
+        assert mentions == []
 
-    def test_parse_with_domain(self) -> None:
-        """Test parsing when mention already has domain."""
+    def test_parse_with_generated_looking_full_mxid_stays_literal(self) -> None:
+        """Generated-looking full MXIDs are preserved as explicit literal users."""
         config = _make_config(_default_runtime_paths())
 
-        text = "Ask @mindroom_calculator:matrix.org for help"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        text = "Ask @mindroom_calculator:localhost for help"
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        # Should replace with sender's domain
         assert processed == "Ask @mindroom_calculator:localhost for help"
         assert mentions == ["@mindroom_calculator:localhost"]
 
-    def test_parse_with_namespaced_full_mention(self, tmp_path: Path) -> None:
-        """Full localparts that include namespace suffix should resolve to configured agents."""
+    def test_parse_with_namespaced_generated_localpart_stays_literal(self, tmp_path: Path) -> None:
+        """Generated namespace localparts are not runtime aliases."""
         config_path = tmp_path / "config.yaml"
         config_path.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n", encoding="utf-8")
         runtime_paths = constants_mod.resolve_runtime_paths(
@@ -128,14 +139,14 @@ class TestMentionParsing:
         )
         config = _make_config(runtime_paths)
 
-        text = "Ask @mindroom_calculator_a1b2c3d4:matrix.org for help"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        text = "Ask @mindroom_calculator_a1b2c3d4:localhost for help"
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
         assert processed == "Ask @mindroom_calculator_a1b2c3d4:localhost for help"
         assert mentions == ["@mindroom_calculator_a1b2c3d4:localhost"]
 
     def test_parse_with_unnamespaced_agent_full_mxid_in_namespaced_install(self, tmp_path: Path) -> None:
-        """Explicit agent-shaped MXIDs should still map to local namespaced agents."""
+        """Explicit non-current MXIDs should remain literal in namespaced installs."""
         config_path = tmp_path / "config.yaml"
         config_path.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n", encoding="utf-8")
         runtime_paths = constants_mod.resolve_runtime_paths(
@@ -145,50 +156,69 @@ class TestMentionParsing:
         config = _make_config(runtime_paths)
 
         text = "Ask @mindroom_calculator:matrix.org for help"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "Ask @mindroom_calculator_a1b2c3d4:localhost for help"
-        assert mentions == ["@mindroom_calculator_a1b2c3d4:localhost"]
+        assert processed == "Ask @mindroom_calculator:matrix.org for help"
+        assert mentions == ["@mindroom_calculator:matrix.org"]
 
     def test_custom_domain(self) -> None:
-        """Test with custom sender domain."""
+        """Configured entity mentions should use the current configured Matrix domain."""
         config = _make_config(_default_runtime_paths())
 
         text = "Hey @calculator"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "matrix.org", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "Hey @mindroom_calculator:matrix.org"
-        assert mentions == ["@mindroom_calculator:matrix.org"]
+        assert processed == "Hey @actual_calculator:localhost"
+        assert mentions == ["@actual_calculator:localhost"]
 
     def test_ignore_unknown_mentions(self) -> None:
         """Test that unknown agents are not converted."""
         config = _make_config(_default_runtime_paths())
 
         text = "@calculator is real but @unknown is not"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "@mindroom_calculator:localhost is real but @unknown is not"
-        assert mentions == ["@mindroom_calculator:localhost"]
+        assert processed == "@actual_calculator:localhost is real but @unknown is not"
+        assert mentions == ["@actual_calculator:localhost"]
 
     def test_ignore_user_mentions(self) -> None:
         """Test that user mentions are ignored."""
         config = _make_config(_default_runtime_paths())
 
         text = "@mindroom_user_123 and @calculator"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "@mindroom_user_123 and @mindroom_calculator:localhost"
-        assert mentions == ["@mindroom_calculator:localhost"]
+        assert processed == "@mindroom_user_123 and @actual_calculator:localhost"
+        assert mentions == ["@actual_calculator:localhost"]
+
+    def test_user_like_entity_name_resolves_as_exact_alias(self) -> None:
+        """User-style aliases resolve when the configured entity alias is exact."""
+        runtime_paths = _default_runtime_paths()
+        config = _bind_config(
+            runtime_paths,
+            {
+                "user_123": AgentConfig(display_name="UserLikeAgent"),
+                "calculator": AgentConfig(display_name="Calculator"),
+            },
+        )
+
+        processed, mentions, _markdown = _parse_mentions_in_text(
+            "@user_123 and @calculator",
+            config,
+        )
+
+        assert processed == "@actual_user_123:localhost and @actual_calculator:localhost"
+        assert mentions == ["@actual_user_123:localhost", "@actual_calculator:localhost"]
 
     def test_no_duplicate_mentions(self) -> None:
         """Test that duplicate mentions are handled."""
         config = _make_config(_default_runtime_paths())
 
         text = "@calculator help! @calculator are you there?"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert processed == "@mindroom_calculator:localhost help! @mindroom_calculator:localhost are you there?"
-        assert mentions == ["@mindroom_calculator:localhost"]  # Only one entry
+        assert processed == "@actual_calculator:localhost help! @actual_calculator:localhost are you there?"
+        assert mentions == ["@actual_calculator:localhost"]  # Only one entry
 
     def test_format_message_with_mentions(self) -> None:
         """Test the full content creation with mentions."""
@@ -197,19 +227,212 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "@calculator and @code please help",
-            sender_domain="matrix.org",
             thread_event_id="$thread123",
             latest_thread_event_id="$thread123",  # For thread fallback
         )
 
         assert content["msgtype"] == "m.text"
-        assert content["body"] == "@mindroom_calculator:matrix.org and @mindroom_code:matrix.org please help"
+        assert content["body"] == "@actual_calculator:localhost and @actual_code:localhost please help"
         assert set(content["m.mentions"]["user_ids"]) == {
-            "@mindroom_calculator:matrix.org",
-            "@mindroom_code:matrix.org",
+            "@actual_calculator:localhost",
+            "@actual_code:localhost",
         }
         assert content["m.relates_to"]["event_id"] == "$thread123"
         assert content["m.relates_to"]["rel_type"] == "m.thread"
+
+    def test_format_message_uses_persisted_actual_id(self) -> None:
+        """Alias mentions should use persisted actual Matrix IDs."""
+        config = _make_config(_default_runtime_paths())
+
+        content = _format_message_with_mentions(
+            config,
+            "@calculator please help",
+        )
+
+        assert content["body"] == "@actual_calculator:localhost please help"
+        assert content["m.mentions"]["user_ids"] == ["@actual_calculator:localhost"]
+
+    def test_format_plain_text_does_not_require_prepared_entity_accounts(self) -> None:
+        """Plain text without mention tokens does not need runtime entity identity."""
+        runtime_paths = _default_runtime_paths()
+        config = Config(
+            agents={"calculator": AgentConfig(display_name="Calculator")},
+            models={"default": ModelConfig(provider="ollama", id="test-model")},
+        )
+        config = Config.validate_with_runtime(config.authored_model_dump(), runtime_paths)
+
+        content = format_message_with_mentions(config, runtime_paths, "No mentions here.")
+
+        assert content["body"] == "No mentions here."
+        assert "m.mentions" not in content
+
+    def test_format_message_with_team_mention(self) -> None:
+        """Team aliases should format as Matrix mentions for router handoffs."""
+        runtime_paths = _default_runtime_paths()
+        config = _bind_config(
+            runtime_paths,
+            {"calculator": AgentConfig(display_name="Calculator")},
+            {
+                "ops": TeamConfig(
+                    display_name="Ops Team",
+                    role="Operations escalation team",
+                    agents=["calculator"],
+                ),
+            },
+        )
+
+        content = _format_message_with_mentions(
+            config,
+            "@ops could you help with this?",
+        )
+
+        assert content["body"] == "@actual_ops:localhost could you help with this?"
+        assert content["m.mentions"]["user_ids"] == ["@actual_ops:localhost"]
+        assert (
+            content["formatted_body"] == '<p><a href="https://matrix.to/#/@actual_ops:localhost">@Ops Team</a> '
+            "could you help with this?</p>\n"
+        )
+
+    def test_format_message_with_mentions_uses_persisted_current_username_drift(self, tmp_path: Path) -> None:
+        """Mention formatting should target the live persisted Matrix account ID."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@general could you help with this?",
+        )
+
+        assert content["body"] == "@actual_general_live:localhost could you help with this?"
+        assert content["m.mentions"]["user_ids"] == ["@actual_general_live:localhost"]
+
+    def test_format_message_rejects_stale_generated_username_after_drift(self, tmp_path: Path) -> None:
+        """After username drift, stale generated localparts should not retarget the live account."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@mindroom_general could you help with this?",
+        )
+
+        assert content["body"] == "@mindroom_general could you help with this?"
+        assert "m.mentions" not in content
+
+    def test_format_message_rejects_stale_generated_full_mxid_after_drift(self, tmp_path: Path) -> None:
+        """After username drift, stale generated full MXIDs should stay literal."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@mindroom_general:localhost could you help with this?",
+        )
+
+        assert content["body"] == "@mindroom_general:localhost could you help with this?"
+        assert content["m.mentions"]["user_ids"] == ["@mindroom_general:localhost"]
+
+    def test_format_message_rejects_stale_generated_router_full_mxid_after_drift(self, tmp_path: Path) -> None:
+        """After router username drift, stale generated full MXIDs should stay literal."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_router", "actual_router_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@mindroom_router:localhost could you route this?",
+        )
+
+        assert content["body"] == "@mindroom_router:localhost could you route this?"
+        assert content["m.mentions"]["user_ids"] == ["@mindroom_router:localhost"]
+
+    def test_format_message_keeps_cross_domain_generated_full_mxid_literal_after_drift(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Remote explicit MXIDs should stay literal even when their localpart looks stale locally."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@mindroom_general:matrix.org could you help with this?",
+        )
+
+        assert content["body"] == "@mindroom_general:matrix.org could you help with this?"
+        assert content["m.mentions"]["user_ids"] == ["@mindroom_general:matrix.org"]
+
+    def test_format_message_rejects_bare_persisted_current_localpart(self, tmp_path: Path) -> None:
+        """Bare actual localparts are not runtime aliases."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _make_config(runtime_paths)
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        content = _format_message_with_mentions(
+            config,
+            "@actual_general_live could you help with this?",
+        )
+
+        assert content["body"] == "@actual_general_live could you help with this?"
+        assert "m.mentions" not in content
 
     def test_tool_marker_followed_by_thematic_break_renders_as_paragraph_hr_heading_via_format_message_with_mentions(
         self,
@@ -218,7 +441,7 @@ class TestMentionParsing:
         config = _make_config(_default_runtime_paths())
         text = "Some intro text.\n\n🔧 `run_shell_command` [1]\n---\n\n## Heading after"
 
-        content = _format_message_with_mentions(config, text, sender_domain="matrix.org")
+        content = _format_message_with_mentions(config, text)
 
         assert "🔧 `run_shell_command` [1]\n\n---" in content["body"]
         formatted_body = content["formatted_body"]
@@ -236,7 +459,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Done.",
-            sender_domain="matrix.org",
             tool_trace=trace,
         )
 
@@ -252,7 +474,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Done.",
-            sender_domain="matrix.org",
             tool_trace=trace,
             extra_content={"io.mindroom.ai_run": {"version": 1, "usage": {"total_tokens": 42}}},
         )
@@ -268,7 +489,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Transcription omitted the agent mention.",
-            sender_domain="matrix.org",
             extra_content={"m.mentions": {"user_ids": ["@mindroom_research:matrix.org"]}},
         )
 
@@ -281,7 +501,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Yes, @bas.nijholt:chat-mindroom.example.com -- noted.",
-            sender_domain="matrix.org",
         )
 
         assert content["body"] == "Yes, @bas.nijholt:chat-mindroom.example.com -- noted."
@@ -298,7 +517,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Mind ID is `@mindroom_mind_5ckzneqq:mindroom.chat`.",
-            sender_domain="matrix.org",
         )
 
         assert content["body"] == "Mind ID is @mindroom_mind_5ckzneqq:mindroom.chat."
@@ -316,7 +534,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Ping @alice:matrix.org.",
-            sender_domain="localhost",
         )
 
         assert content["body"] == "Ping @alice:matrix.org."
@@ -333,19 +550,18 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "@calculator please follow up with @bas.nijholt:chat-mindroom.example.com",
-            sender_domain="matrix.org",
         )
 
         assert content["body"] == (
-            "@mindroom_calculator:matrix.org please follow up with @bas.nijholt:chat-mindroom.example.com"
+            "@actual_calculator:localhost please follow up with @bas.nijholt:chat-mindroom.example.com"
         )
         assert content["m.mentions"]["user_ids"] == [
-            "@mindroom_calculator:matrix.org",
+            "@actual_calculator:localhost",
             "@bas.nijholt:chat-mindroom.example.com",
         ]
         assert (
             content["formatted_body"]
-            == '<p><a href="https://matrix.to/#/@mindroom_calculator:matrix.org">@Calculator</a> '
+            == '<p><a href="https://matrix.to/#/@actual_calculator:localhost">@Calculator</a> '
             'please follow up with <a href="https://matrix.to/#/@bas.nijholt:chat-mindroom.example.com">'
             "@bas.nijholt:chat-mindroom.example.com</a></p>\n"
         )
@@ -357,7 +573,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "@bas.nijholt:chat-mindroom.example.com and again @bas.nijholt:chat-mindroom.example.com",
-            sender_domain="matrix.org",
         )
 
         assert content["body"] == (
@@ -378,7 +593,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Please ask @code:matrix.org to review this.",
-            sender_domain="localhost",
         )
 
         assert content["body"] == "Please ask @code:matrix.org to review this."
@@ -388,6 +602,39 @@ class TestMentionParsing:
             == '<p>Please ask <a href="https://matrix.to/#/@code:matrix.org">@code:matrix.org</a> to review this.</p>\n'
         )
 
+    def test_format_message_with_current_managed_full_matrix_id_uses_entity_display(self) -> None:
+        """Full MXIDs only resolve as local entities when they match the persisted managed ID exactly."""
+        config = _make_config(_default_runtime_paths())
+
+        content = _format_message_with_mentions(
+            config,
+            "Please ask @actual_code:localhost to review this.",
+        )
+
+        assert content["body"] == "Please ask @actual_code:localhost to review this."
+        assert content["m.mentions"]["user_ids"] == ["@actual_code:localhost"]
+        assert (
+            content["formatted_body"]
+            == '<p>Please ask <a href="https://matrix.to/#/@actual_code:localhost">@Code</a> to review this.</p>\n'
+        )
+
+    def test_format_message_with_remote_mindroom_matrix_id_keeps_explicit_user(self) -> None:
+        """Remote full MindRoom-like MXIDs should not be retargeted to local entities."""
+        config = _make_config(_default_runtime_paths())
+
+        content = _format_message_with_mentions(
+            config,
+            "@mindroom_code:remote.example please look",
+        )
+
+        assert content["body"] == "@mindroom_code:remote.example please look"
+        assert content["m.mentions"]["user_ids"] == ["@mindroom_code:remote.example"]
+        assert (
+            content["formatted_body"]
+            == '<p><a href="https://matrix.to/#/@mindroom_code:remote.example">@mindroom_code:remote.example</a> '
+            "please look</p>\n"
+        )
+
     def test_format_message_with_uppercase_matrix_user_id_does_not_create_mention(self) -> None:
         """Non-compliant uppercase MXIDs should remain plain text."""
         config = _make_config(_default_runtime_paths())
@@ -395,7 +642,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Please ask @Code:matrix.org to review this.",
-            sender_domain="localhost",
         )
 
         assert content["body"] == "Please ask @Code:matrix.org to review this."
@@ -409,7 +655,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Ping @alice+ops:matrix.org please.",
-            sender_domain="localhost",
         )
 
         assert content["body"] == "Ping @alice+ops:matrix.org please."
@@ -426,7 +671,6 @@ class TestMentionParsing:
         content = _format_message_with_mentions(
             config,
             "Ping @alice:[2001:db8::1] please.",
-            sender_domain="localhost",
         )
 
         assert content["body"] == "Ping @alice:[2001:db8::1] please."
@@ -441,7 +685,7 @@ class TestMentionParsing:
         config = _make_config(_default_runtime_paths())
 
         text = "This has no mentions"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
         assert processed == text
         assert mentions == []
@@ -452,19 +696,12 @@ class TestMentionParsing:
 
         # The regex should require word boundaries
         text = "Use decode@code function"
-        processed, _mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, _mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        # Current implementation might catch this - documenting actual behavior
-        # This is a limitation we should be aware of
-        assert "@mindroom_code:localhost" in processed or processed == text
+        assert processed == text
 
     def test_agent_name_starts_with_mindroom_prefix(self) -> None:
-        """Agent config key starting with 'mindroom_' should be resolved from @mindroom_dev.
-
-        When the config key is ``mindroom_dev`` and the mention is ``@mindroom_dev``,
-        the regex strips the ``mindroom_`` prefix leaving ``dev``.  The code must
-        reconstruct ``mindroom_dev`` and match the config key (ISSUE-098).
-        """
+        """Agent config keys starting with 'mindroom_' resolve only as exact aliases."""
         runtime_paths = _default_runtime_paths()
         config = _bind_config(
             runtime_paths,
@@ -474,15 +711,14 @@ class TestMentionParsing:
             },
         )
 
-        # @mindroom_dev should resolve to agent "mindroom_dev"
         text = "@mindroom_dev can you look at this?"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert mentions == ["@mindroom_mindroom_dev:localhost"]
-        assert processed == "@mindroom_mindroom_dev:localhost can you look at this?"
+        assert mentions == ["@actual_mindroom_dev:localhost"]
+        assert processed == "@actual_mindroom_dev:localhost can you look at this?"
 
-    def test_agent_name_starts_with_mindroom_prefix_full_localpart(self) -> None:
-        """Mentioning @mindroom_mindroom_dev (full localpart) should also work."""
+    def test_generated_localpart_for_prefixed_agent_key_does_not_resolve(self) -> None:
+        """Generated-looking localparts are not aliases for prefixed config keys."""
         runtime_paths = _default_runtime_paths()
         config = _bind_config(
             runtime_paths,
@@ -491,15 +727,40 @@ class TestMentionParsing:
             },
         )
 
-        # @mindroom_mindroom_dev should also resolve (prefix stripped → mindroom_dev)
         text = "@mindroom_mindroom_dev help"
-        processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
-        assert mentions == ["@mindroom_mindroom_dev:localhost"]
-        assert processed == "@mindroom_mindroom_dev:localhost help"
+        assert mentions == []
+        assert processed == "@mindroom_mindroom_dev help"
 
-    def test_namespaced_prefixed_agent_name_with_namespace_suffix(self, tmp_path: Path) -> None:
-        """Namespaced mentions for prefixed config keys should try prefix + stripped candidates."""
+    def test_prefixed_agent_key_alias_survives_persisted_username_drift(self, tmp_path: Path) -> None:
+        """Configured entity keys remain stable mention aliases after username drift."""
+        runtime_paths = constants_mod.resolve_runtime_paths(
+            config_path=tmp_path / "config.yaml",
+            storage_path=tmp_path / "mindroom_data",
+            process_env={
+                "MATRIX_HOMESERVER": "http://localhost:8008",
+                "MINDROOM_NAMESPACE": "",
+            },
+        )
+        config = _bind_config(
+            runtime_paths,
+            {
+                "mindroom_dev": AgentConfig(display_name="DevAgent"),
+            },
+        )
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_account("agent_mindroom_dev", "actual_mindroom_dev_oldns", "pw", domain="localhost")
+        state.save(runtime_paths=runtime_paths)
+
+        text = "@mindroom_dev help"
+        processed, mentions, _markdown = _parse_mentions_in_text(text, config)
+
+        assert mentions == ["@actual_mindroom_dev_oldns:localhost"]
+        assert processed == "@actual_mindroom_dev_oldns:localhost help"
+
+    def test_namespaced_generated_prefixed_agent_name_does_not_resolve(self, tmp_path: Path) -> None:
+        """Namespaced generated localparts do not resolve to configured aliases."""
         config_path = tmp_path / "config.yaml"
         config_path.write_text("agents: {}\nmodels: {}\nrouter:\n  model: default\n", encoding="utf-8")
         runtime_paths = constants_mod.resolve_runtime_paths(
@@ -518,15 +779,14 @@ class TestMentionParsing:
 
         processed, mentions, _markdown = _parse_mentions_in_text(
             "@mindroom_dev_a1b2c3d4 help",
-            "localhost",
             config,
         )
 
-        assert mentions == ["@mindroom_mindroom_dev_a1b2c3d4:localhost"]
-        assert processed == "@mindroom_mindroom_dev_a1b2c3d4:localhost help"
+        assert mentions == []
+        assert processed == "@mindroom_dev_a1b2c3d4 help"
 
-    def test_prefixed_mention_prefers_base_agent_when_both_names_exist(self) -> None:
-        """@mindroom_calculator should still resolve to calculator before mindroom_calculator."""
+    def test_generated_looking_alias_resolves_when_configured_exactly(self) -> None:
+        """@mindroom_calculator resolves only because that exact alias is configured."""
         runtime_paths = _default_runtime_paths()
         config = _bind_config(
             runtime_paths,
@@ -536,19 +796,19 @@ class TestMentionParsing:
             },
         )
 
-        processed, mentions, _markdown = _parse_mentions_in_text("@mindroom_calculator help", "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text("@mindroom_calculator help", config)
 
-        assert mentions == ["@mindroom_calculator:localhost"]
-        assert processed == "@mindroom_calculator:localhost help"
+        assert mentions == ["@actual_mindroom_calculator:localhost"]
+        assert processed == "@actual_mindroom_calculator:localhost help"
 
-    def test_uppercase_prefixed_mentions_are_case_insensitive(self) -> None:
-        """Uppercase @MINDROOM_ prefixes should resolve like lowercase ones."""
+    def test_uppercase_generated_looking_mentions_do_not_resolve_without_exact_alias(self) -> None:
+        """Generated-looking aliases do not resolve through prefix stripping."""
         config = _make_config(_default_runtime_paths())
 
-        processed, mentions, _markdown = _parse_mentions_in_text("@MINDROOM_calculator help", "localhost", config)
+        processed, mentions, _markdown = _parse_mentions_in_text("@MINDROOM_calculator help", config)
 
-        assert mentions == ["@mindroom_calculator:localhost"]
-        assert processed == "@mindroom_calculator:localhost help"
+        assert mentions == []
+        assert processed == "@MINDROOM_calculator help"
 
     def test_case_insensitive_mentions(self) -> None:
         """Test that mentions are case-insensitive."""
@@ -564,14 +824,13 @@ class TestMentionParsing:
         ]
 
         for text, expected_agents in test_cases:
-            _processed, mentions, _markdown = _parse_mentions_in_text(text, "localhost", config)
+            _processed, mentions, _markdown = _parse_mentions_in_text(text, config)
 
             # Extract agent names from the mentioned user IDs
             mentioned_agents = []
             for user_id in mentions:
-                # Extract agent name from user_id like "@mindroom_calculator:localhost"
-                if user_id.startswith("@mindroom_") and ":" in user_id:
-                    agent_name = user_id.split("@mindroom_")[1].split(":")[0]
+                if user_id.startswith("@actual_") and ":" in user_id:
+                    agent_name = user_id.split("@actual_")[1].split(":")[0]
                     mentioned_agents.append(agent_name)
 
             assert mentioned_agents == expected_agents, f"Failed for text: {text}"

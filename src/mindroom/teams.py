@@ -32,9 +32,10 @@ from mindroom.agent_storage import get_team_session
 from mindroom.agents import create_agent
 from mindroom.ai import build_matrix_run_metadata, resolve_run_correlation_id
 from mindroom.ai_run_metadata import build_prepared_history_metadata_content
-from mindroom.authorization import get_available_agents_in_room
+from mindroom.authorization import get_available_responders_in_room
 from mindroom.cancellation import build_cancelled_error
 from mindroom.constants import MATRIX_SEEN_EVENT_IDS_METADATA_KEY, ROUTER_AGENT_NAME
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.error_handling import get_user_friendly_error_message
 from mindroom.execution_preparation import (
     ThreadHistoryRenderLimits,
@@ -61,7 +62,7 @@ from mindroom.llm_request_logging import (
     stream_with_llm_request_log_context,
 )
 from mindroom.logging_config import get_logger
-from mindroom.matrix.rooms import get_room_alias_from_id
+from mindroom.matrix.state import get_room_alias_from_id
 from mindroom.media_fallback import append_inline_media_fallback_prompt, should_retry_without_inline_media
 from mindroom.media_inputs import MediaInputs
 from mindroom.metadata_merge import deep_merge_metadata
@@ -675,7 +676,7 @@ async def decide_team_formation(
     is_first_agent = min(team_agents, key=lambda x: x.username) == agent
     # Only do this AI call for the first agent to avoid duplication
     if use_ai_decision and message and config and is_first_agent:
-        agent_names = [mid.agent_name(config, runtime_paths) or mid.username for mid in team_agents]
+        agent_names = [_team_member_name(mid, config, runtime_paths) for mid in team_agents]
         mode = await _select_team_mode(message, agent_names, config, runtime_paths)
     else:
         # Fallback to hardcoded logic when AI decision is disabled or unavailable
@@ -695,7 +696,13 @@ def _team_member_name(
     """Return the canonical agent name used throughout team resolution."""
     if config is None:
         return agent_id.username
-    return agent_id.agent_name(config, runtime_paths) or agent_id.username
+    return (
+        entity_identity_registry(config, runtime_paths).current_entity_name_for_user_id(
+            agent_id.full_id,
+            include_router=True,
+        )
+        or agent_id.username
+    )
 
 
 def _filter_team_request_members(
@@ -707,8 +714,11 @@ def _filter_team_request_members(
     filtered: list[MatrixID] = []
     for agent_id in agent_ids:
         if config is not None:
-            agent_name = agent_id.agent_name(config, runtime_paths)
-            if agent_name is None or agent_name == ROUTER_AGENT_NAME or agent_name not in config.agents:
+            agent_name = entity_identity_registry(config, runtime_paths).current_entity_name_for_user_id(
+                agent_id.full_id,
+                include_router=False,
+            )
+            if agent_name is None or agent_name not in config.agents:
                 continue
         filtered.append(agent_id)
     return filtered
@@ -775,7 +785,7 @@ def _select_team_request(
 
     available_agents = available_agents_in_room
     if available_agents is None:
-        available_agents = get_available_agents_in_room(room, config, runtime_paths)
+        available_agents = get_available_responders_in_room(room, config, runtime_paths)
     normalized_available_agents = _normalize_team_request_members(available_agents, config, runtime_paths)
     if len(normalized_available_agents) <= 1:
         return _SelectedTeamRequest(None, [])
@@ -843,11 +853,11 @@ def _evaluate_team_members(
 ) -> list[TeamResolutionMember]:
     """Evaluate one status and response capability for each requested member."""
     room_visible_ids: set[str] | None = None
-    if room is not None and config is not None:
+    if sender_visible_agents is None and room is not None and config is not None:
         room_visible_ids = {
             agent_id.full_id
             for agent_id in _normalize_team_request_members(
-                get_available_agents_in_room(room, config, runtime_paths),
+                get_available_responders_in_room(room, config, runtime_paths),
                 config,
                 runtime_paths,
             )
@@ -1916,7 +1926,7 @@ async def team_response_stream(  # noqa: C901, PLR0912, PLR0915
     """
     assert orchestrator.config is not None
     requested_agent_names = _requested_team_agent_names(
-        [mid.agent_name(orchestrator.config, orchestrator.runtime_paths) or mid.username for mid in agent_ids],
+        [_team_member_name(mid, orchestrator.config, orchestrator.runtime_paths) for mid in agent_ids],
     )
     orchestrator.config.assert_team_agents_supported(requested_agent_names)
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] = {}

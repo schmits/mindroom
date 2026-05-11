@@ -38,7 +38,7 @@ MindRoom agents:
 - **Work everywhere** - Via bridges to Slack, Telegram, Discord, WhatsApp, IRC, email
 - **Remember everything** - Persistent memory across all platforms
 - **Collaborate naturally** - Multiple agents working together in threads
-- **Respect boundaries** - You control which agent sees what data
+- **Respect boundaries** - You control which responder sees what data
 
 ## Built on Proven Infrastructure
 
@@ -208,24 +208,24 @@ When running from a source checkout, MindRoom will build the dashboard assets on
 
 In any Matrix client (Element, FluffyChat, etc):
 ```
-You: @mindroom_assistant What can you do?
+You: @assistant What can you do?
 Assistant: I can coordinate our team of specialized agents...
 
-You: @mindroom_research @mindroom_analyst What are the latest AI breakthroughs?
+You: @research @analyst What are the latest AI breakthroughs?
 [Agents collaborate to research and analyze]
 ```
 
-## How Agents Work
+## How Agents and Teams Work
 
-### Agent Response Rules
-Agents respond using Matrix thread relations to keep conversations organized.
+### Responder Rules
+Agents and teams respond using Matrix thread relations to keep conversations organized.
 If your client or bridge only sends plain replies, MindRoom keeps them in an existing thread when the reply chain eventually reaches a threaded ancestor or proven thread root.
 Plain replies that never reach threaded context still stay plain replies.
 
-1. **Mentioned agents always respond** - Tag them to get their attention
-2. **Single agent continues** - One agent in thread? It keeps responding
-3. **Multiple agents collaborate** - They work together, not compete
-4. **Smart routing** - System picks the best agent for new threads
+1. **Mentioned agents and teams respond** - Tag them to get their attention
+2. **Single responder continues** - One agent or team in a thread keeps responding
+3. **Multiple agents collaborate** - Mention multiple agents when you want an ad-hoc collaboration
+4. **Smart routing** - System picks the best agent or team for new threads
 
 ### Available Commands
 
@@ -273,7 +273,7 @@ models:
     id: claude-sonnet-4-6
 
 mindroom_user:
-  username: mindroom_user  # Set this before first run; username is immutable after bootstrap
+  username: mindroom_user  # Set this before first run; the account-creation request is immutable after account creation
   display_name: MindRoomUser
 
 defaults:
@@ -363,7 +363,7 @@ memory:
       model: sentence-transformers/all-MiniLM-L6-v2
 
 mindroom_user:
-  username: mindroom_user  # Set this before first run; username is immutable after bootstrap
+  username: mindroom_user  # Set this before first run; the account-creation request is immutable after account creation
   display_name: MindRoomUser
 
 authorization:
@@ -373,7 +373,9 @@ authorization:
   default_room_access: false
 ```
 
-`mindroom_user.username` can only be set before the internal user account is created. After first startup, change `mindroom_user.display_name` if you only want a different visible name.
+`mindroom_user.username` can only be set before the internal user account is created.
+MindRoom records it as the account-creation username request; if hosted provisioning returns a different actual Matrix ID, runtime authorization uses that persisted actual ID.
+After first startup, change `mindroom_user.display_name` if you only want a different visible name.
 
 ## Deployment Options
 

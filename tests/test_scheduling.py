@@ -37,6 +37,7 @@ from mindroom.scheduling import (
     scheduled_task_read_sort_key,
 )
 from tests.conftest import bind_runtime_paths, make_event_cache_mock
+from tests.identity_helpers import entity_ids, persist_entity_accounts
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -44,6 +45,14 @@ if TYPE_CHECKING:
 
 def _runtime_paths() -> object:
     return resolve_runtime_paths(config_path=Path("config.yaml"), process_env={})
+
+
+def _isolated_runtime_paths(tmp_path: Path) -> object:
+    return resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={},
+    )
 
 
 def _event_cache() -> AsyncMock:
@@ -62,10 +71,24 @@ def _conversation_cache(
     return access
 
 
+def _matrix_room(
+    room_id: str,
+    *,
+    members: tuple[str, ...] = (),
+    members_synced: bool = True,
+) -> nio.MatrixRoom:
+    room = nio.MatrixRoom(room_id=room_id, own_user_id="@mindroom_router:server")
+    for member_id in members:
+        room.add_member(member_id, None, None)
+    room.members_synced = members_synced
+    return room
+
+
 def _scheduling_runtime(
     *,
     client: AsyncMock | None = None,
     config: object | None = None,
+    runtime_paths: object | None = None,
     room: object | None = None,
     conversation_cache: AsyncMock | None = None,
     event_cache: AsyncMock | None = None,
@@ -73,7 +96,7 @@ def _scheduling_runtime(
     return SchedulingRuntime(
         client=client or AsyncMock(),
         config=config or MagicMock(),
-        runtime_paths=_runtime_paths(),
+        runtime_paths=runtime_paths or _runtime_paths(),
         room=room or MagicMock(),
         conversation_cache=conversation_cache or _conversation_cache(),
         event_cache=event_cache or _event_cache(),
@@ -1587,7 +1610,7 @@ async def test_schedule_task_returns_error_when_sender_blocked_from_all_agents()
 
     with (
         patch(
-            "mindroom.scheduling.get_available_agents_for_sender_authoritative",
+            "mindroom.scheduling.responder_candidate_entities_for_room",
             return_value=[],
         ),
         patch(
@@ -1616,7 +1639,7 @@ async def test_schedule_task_blocked_sender_new_thread_returns_error() -> None:
 
     with (
         patch(
-            "mindroom.scheduling.get_available_agents_for_sender_authoritative",
+            "mindroom.scheduling.responder_candidate_entities_for_room",
             return_value=[],
         ),
         patch(
@@ -1638,12 +1661,11 @@ async def test_schedule_task_blocked_sender_new_thread_returns_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_schedule_task_refreshes_room_membership_when_cached_room_has_no_agents() -> None:
-    """Scheduling should recover from empty cached room membership via joined_members."""
+async def test_schedule_task_uses_configured_room_boundary_without_membership_refresh(tmp_path: Path) -> None:
+    """Configured schedule rooms should use the static responder boundary without membership refresh."""
     client = AsyncMock()
-    room = MagicMock(spec=nio.MatrixRoom)
-    room.room_id = "!test:server"
-    room.members_synced = False
+    room = _matrix_room("!test:server", members_synced=False)
+    runtime_paths = _isolated_runtime_paths(tmp_path)
     config = bind_runtime_paths(
         Config(
             agents={
@@ -1655,10 +1677,15 @@ async def test_schedule_task_refreshes_room_membership_when_cached_room_has_no_a
             },
             models={"default": ModelConfig(provider="test", id="test-model")},
         ),
-        _runtime_paths(),
+        runtime_paths,
     )
-    room.users = {f"@mindroom_router:{config.get_domain(_runtime_paths())}": MagicMock()}
-    runtime = _scheduling_runtime(client=client, config=config, room=room)
+    persist_entity_accounts(
+        config,
+        runtime_paths,
+        usernames={"router": "mindroom_router_oldns", "assistant": "mindroom_assistant_oldns"},
+    )
+    room.add_member(f"@mindroom_router_oldns:{config.get_domain(runtime_paths)}", "Router", None)
+    runtime = _scheduling_runtime(client=client, config=config, runtime_paths=runtime_paths, room=room)
     parse_result = ScheduledWorkflow(
         schedule_type="once",
         execute_at=datetime.now(UTC) + timedelta(minutes=5),
@@ -1670,8 +1697,8 @@ async def test_schedule_task_refreshes_room_membership_when_cached_room_has_no_a
     client.joined_members.return_value = nio.JoinedMembersResponse.from_dict(
         {
             "joined": {
-                f"@mindroom_router:{config.get_domain(_runtime_paths())}": {"display_name": "Router"},
-                f"@mindroom_assistant:{config.get_domain(_runtime_paths())}": {"display_name": "Assistant"},
+                f"@mindroom_router_oldns:{config.get_domain(runtime_paths)}": {"display_name": "Router"},
+                f"@mindroom_assistant_oldns:{config.get_domain(runtime_paths)}": {"display_name": "Assistant"},
             },
         },
         room_id="!test:server",
@@ -1689,10 +1716,70 @@ async def test_schedule_task_refreshes_room_membership_when_cached_room_has_no_a
             runtime=runtime,
             room_id="!test:server",
             thread_id=None,
-            scheduled_by=f"@alice:{config.get_domain(_runtime_paths())}",
+            scheduled_by=f"@alice:{config.get_domain(runtime_paths)}",
             full_text="in 5 minutes check logs",
         )
 
     assert task_id == "task1234"
     assert "Scheduled" in message
-    client.joined_members.assert_awaited_once_with("!test:server")
+    client.joined_members.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_schedule_task_rejects_mentions_outside_existing_thread_scope(tmp_path: Path) -> None:
+    """Existing-thread schedules should validate parsed mentions against thread-scoped responders."""
+    client = AsyncMock()
+    room = _matrix_room("!test:server")
+    runtime_paths = _isolated_runtime_paths(tmp_path)
+    config = bind_runtime_paths(
+        Config(
+            agents={
+                "assistant": AgentConfig(display_name="Assistant", role="Test assistant"),
+                "writer": AgentConfig(display_name="Writer", role="Test writer"),
+            },
+            models={"default": ModelConfig(provider="test", id="test-model")},
+        ),
+        runtime_paths,
+    )
+    ids = entity_ids(
+        config,
+        runtime_paths,
+        usernames={"assistant": "actual_assistant", "writer": "actual_writer"},
+    )
+    thread_message = MagicMock()
+    thread_message.sender = ids["assistant"].full_id
+    runtime = _scheduling_runtime(
+        client=client,
+        config=config,
+        runtime_paths=runtime_paths,
+        room=room,
+        conversation_cache=_conversation_cache(thread_history=[thread_message]),
+    )
+    parse_result = ScheduledWorkflow(
+        schedule_type="once",
+        execute_at=datetime.now(UTC) + timedelta(minutes=5),
+        message="@writer check logs",
+        description="check logs",
+        room_id="!test:server",
+        thread_id="$thread",
+    )
+
+    with (
+        patch(
+            "mindroom.scheduling.responder_candidate_entities_for_room",
+            new=AsyncMock(return_value=[ids["assistant"], ids["writer"]]),
+        ),
+        patch("mindroom.scheduling._parse_workflow_schedule", new=AsyncMock(return_value=parse_result)),
+        patch("mindroom.scheduling._save_pending_scheduled_task", new=AsyncMock()) as save_task,
+    ):
+        task_id, message = await schedule_task(
+            runtime=runtime,
+            room_id="!test:server",
+            thread_id="$thread",
+            scheduled_by="@alice:localhost",
+            full_text="in 5 minutes ask writer to check logs",
+        )
+
+    assert task_id is None
+    assert "@writer is not available in this thread" in message
+    save_task.assert_not_awaited()

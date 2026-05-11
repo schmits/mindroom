@@ -14,15 +14,17 @@ import pytest
 import mindroom.tools  # noqa: F401
 from mindroom.agent_descriptions import describe_agent
 from mindroom.config.agent import AgentConfig
-from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME, resolve_runtime_paths
+from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME, RuntimePaths, resolve_runtime_paths
 from mindroom.custom_tools import subagents as subagents_module
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.custom_tools.subagents import SubAgentsTools
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.thread_summary import THREAD_SUMMARY_MAX_LENGTH
 from mindroom.thread_utils import create_session_id, parse_session_id
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from tests.conftest import delivered_matrix_side_effect, make_event_cache_mock
+from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,6 +38,7 @@ EXPECTED_SUBAGENT_TOOL_NAMES = {
 }
 TEST_SUMMARY = "test summary"
 TEST_TAG = "test-tag"
+TEST_SUBAGENT_PASSWORD = "pw"  # noqa: S105
 EXPECTED_SUBAGENTS_DESCRIPTION = (
     "Discover, spawn, and communicate with sub-agent sessions. "
     "`agents_list` reports per-tool capability flags (delegate-aware)."
@@ -47,12 +50,14 @@ def _make_agent_config(
     role: str = "Handle test tasks",
     tools: list[str] | None = None,
     delegate_to: list[str] | None = None,
+    rooms: list[str] | None = None,
 ) -> AgentConfig:
     return AgentConfig(
         display_name="TestAgent",
         role=role,
         tools=list(tools) if tools is not None else ["shell"],
         delegate_to=list(delegate_to) if delegate_to is not None else [],
+        rooms=list(rooms) if rooms is not None else [],
     )
 
 
@@ -68,10 +73,13 @@ def _make_config(
         "research": _make_agent_config(role="Research topics"),
     }
     config.teams = {}
+    config.mindroom_user = None
     config.get_domain = MagicMock(return_value="localhost")
     config.get_entity_thread_mode = MagicMock(return_value=thread_mode)
     config.get_agent_tools = MagicMock(side_effect=lambda agent_name: config.agents[agent_name].tool_names)
     config.render_prompt = MagicMock(return_value="Delegate only to listed agents.")
+    config.authorization.agent_reply_permissions = {}
+    config.authorization.resolve_alias.side_effect = lambda sender_id: sender_id
     return config
 
 
@@ -83,6 +91,7 @@ def _make_context(
     room_id: str = "!room:localhost",
     thread_id: str | None = "$ctx-thread:localhost",
     requester_id: str = "@alice:localhost",
+    room_agent_names: list[str] | None = None,
 ) -> ToolRuntimeContext:
     async def _latest_thread_event_id(
         _room_id: str,
@@ -93,6 +102,9 @@ def _make_context(
         return thread_id
 
     runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
+    effective_config = config or _make_config()
+    _persist_subagent_accounts(effective_config, runtime_paths)
+    room = _make_room(effective_config, runtime_paths, room_id, agent_name, room_agent_names)
     conversation_cache = AsyncMock()
     conversation_cache.get_latest_thread_event_id_if_needed.side_effect = _latest_thread_event_id
     conversation_cache.notify_outbound_message = Mock()
@@ -104,13 +116,42 @@ def _make_context(
         resolved_thread_id=thread_id,
         requester_id=requester_id,
         client=MagicMock(),
-        config=config or _make_config(),
+        config=effective_config,
         runtime_paths=runtime_paths,
         event_cache=make_event_cache_mock(),
         conversation_cache=conversation_cache,
-        room=None,
+        room=room,
         reply_to_event_id=None,
         storage_path=tmp_path,
+    )
+
+
+def _make_room(
+    config: MagicMock,
+    runtime_paths: RuntimePaths,
+    room_id: str,
+    own_agent: str,
+    agent_names: list[str] | None = None,
+) -> nio.MatrixRoom:
+    entity_ids = entity_identity_registry(config, runtime_paths).current_ids
+    room = nio.MatrixRoom(room_id=room_id, own_user_id=entity_ids[own_agent].full_id)
+    for agent_name in agent_names or list(config.agents):
+        room.add_member(entity_ids[agent_name].full_id, config.agents[agent_name].display_name, None)
+    room.members_synced = True
+    return room
+
+
+def _persist_subagent_accounts(
+    config: MagicMock,
+    runtime_paths: RuntimePaths,
+    *,
+    usernames: dict[str, str] | None = None,
+) -> None:
+    persist_entity_accounts(
+        config,
+        runtime_paths,
+        usernames=usernames or actual_entity_usernames(config),
+        password=TEST_SUBAGENT_PASSWORD,
     )
 
 
@@ -167,6 +208,103 @@ async def test_agents_list_payload_structure(tmp_path: Path) -> None:
     assert all(set(row) == {"name", "can_delegate", "can_spawn", "description"} for row in payload["agents"])
     assert all(isinstance(row, dict) for row in payload["agents"])
     assert all(row["can_spawn"] is True for row in payload["agents"])
+
+
+@pytest.mark.asyncio
+async def test_agents_list_uses_current_room_responder_boundary_for_spawn(tmp_path: Path) -> None:
+    """agents_list should mark current-room responders as spawnable."""
+    config = _make_config()
+    ctx = _make_context(tmp_path, config=config, room_agent_names=["openclaw", "code"])
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().agents_list())
+
+    assert payload["status"] == "ok"
+    assert [row["name"] for row in payload["agents"]] == ["code"]
+
+
+@pytest.mark.asyncio
+async def test_agents_list_includes_delegate_only_target(tmp_path: Path) -> None:
+    """agents_list should show delegate targets even when they cannot be spawned in this room."""
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", delegate_to=["research"]),
+            "code": _make_agent_config(role="Write code"),
+            "research": _make_agent_config(role="Research topics"),
+        },
+    )
+    ctx = _make_context(tmp_path, config=config, room_agent_names=["openclaw", "code"])
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().agents_list())
+
+    assert payload["status"] == "ok"
+    rows_by_name = {row["name"]: row for row in payload["agents"]}
+    assert list(rows_by_name) == ["code", "research"]
+    assert rows_by_name["code"]["can_delegate"] is False
+    assert rows_by_name["code"]["can_spawn"] is True
+    assert rows_by_name["research"]["can_delegate"] is True
+    assert rows_by_name["research"]["can_spawn"] is False
+
+
+@pytest.mark.asyncio
+async def test_agents_list_does_not_widen_configured_rooms_to_present_unconfigured_agents(tmp_path: Path) -> None:
+    """agents_list should keep configured-room scope even when other agents are present."""
+    room_id = "!room:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", delegate_to=["code"], rooms=[room_id]),
+            "code": _make_agent_config(role="Write code", rooms=[room_id]),
+            "research": _make_agent_config(role="Research topics"),
+        },
+    )
+    ctx = _make_context(tmp_path, config=config, room_id=room_id, room_agent_names=["openclaw", "code", "research"])
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().agents_list())
+
+    assert payload["status"] == "ok"
+    assert [row["name"] for row in payload["agents"]] == ["code"]
+
+
+@pytest.mark.asyncio
+async def test_agents_list_filters_non_running_configured_room_agents_when_live_state_is_known(
+    tmp_path: Path,
+) -> None:
+    """agents_list spawn discovery should require configured-room and live responder availability."""
+    room_id = "!room:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", rooms=[room_id], delegate_to=[]),
+            "code": _make_agent_config(role="Write code", rooms=[room_id]),
+            "research": _make_agent_config(role="Research topics", rooms=[room_id]),
+            "writer": _make_agent_config(role="Write prose"),
+        },
+    )
+    ctx = _make_context(
+        tmp_path,
+        config=config,
+        room_id=room_id,
+        room_agent_names=["openclaw", "code", "research", "writer"],
+    )
+    ctx = replace(
+        ctx,
+        orchestrator=SimpleNamespace(
+            agent_bots={
+                "openclaw": SimpleNamespace(running=True),
+                "code": SimpleNamespace(running=False),
+                "research": SimpleNamespace(running=True),
+                "writer": SimpleNamespace(running=True),
+            },
+        ),
+    )
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().agents_list())
+
+    assert payload["status"] == "ok"
+    assert [row["name"] for row in payload["agents"]] == ["research"]
+    assert payload["agents"][0]["can_spawn"] is True
 
 
 @pytest.mark.asyncio
@@ -337,6 +475,154 @@ async def test_sessions_send_relays_original_sender(
 
 
 @pytest.mark.asyncio
+async def test_sessions_send_agent_id_uses_current_matrix_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_send should target the live persisted Matrix ID after account drift."""
+    send_mock = AsyncMock(return_value="$evt")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    ctx = _make_context(tmp_path)
+    _persist_subagent_accounts(ctx.config, ctx.runtime_paths, usernames={"code": "actual_code_live"})
+    ctx = replace(ctx, room=_make_room(ctx.config, ctx.runtime_paths, ctx.room_id, ctx.agent_name))
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().sessions_send(message="do it", agent_id="code"))
+
+    assert payload["status"] == "ok"
+    send_mock.assert_awaited_once_with(
+        ctx,
+        room_id=ctx.room_id,
+        text="@actual_code_live:localhost do it",
+        thread_id=ctx.thread_id,
+        original_sender=ctx.requester_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_rejects_unknown_agent_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_send should validate explicit agent_id before Matrix dispatch."""
+    send_mock = AsyncMock(return_value="$evt")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    ctx = _make_context(tmp_path)
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().sessions_send(message="do it", agent_id="missing"))
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "sessions_send"
+    assert payload["message"] == "Unknown agent_id 'missing'. Available agents: code, openclaw, research."
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_rejects_agent_outside_room_responder_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_send should reject explicit agents outside the room responder boundary."""
+    send_mock = AsyncMock(return_value="$evt")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    ctx = _make_context(tmp_path, room_agent_names=["openclaw", "code"])
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().sessions_send(message="do it", agent_id="research"))
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "sessions_send"
+    assert payload["message"] == "Agent 'research' is not available in this room. Available agents: code, openclaw."
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_rejects_agent_available_only_in_caller_room(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_send should validate explicit agents against the target configured room."""
+    send_mock = AsyncMock(return_value="$evt")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    caller_room_id = "!caller:localhost"
+    target_room_id = "!target:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", rooms=[caller_room_id]),
+            "code": _make_agent_config(role="Write code", rooms=[caller_room_id]),
+            "research": _make_agent_config(role="Research topics", rooms=[target_room_id]),
+        },
+    )
+    ctx = _make_context(
+        tmp_path,
+        config=config,
+        room_id=caller_room_id,
+        room_agent_names=["openclaw", "code"],
+    )
+    target_session = create_session_id(target_room_id, "$target-thread:localhost")
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_send(
+                message="do it",
+                session_key=target_session,
+                agent_id="code",
+            ),
+        )
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "sessions_send"
+    assert payload["message"] == "Agent 'code' is not available in this room. Available agents: research."
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_allows_agent_configured_for_target_room(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_send should allow target-room agents even when absent from the caller room."""
+    send_mock = AsyncMock(return_value="$evt")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    caller_room_id = "!caller:localhost"
+    target_room_id = "!target:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", rooms=[caller_room_id]),
+            "code": _make_agent_config(role="Write code", rooms=[caller_room_id]),
+            "research": _make_agent_config(role="Research topics", rooms=[target_room_id]),
+        },
+    )
+    ctx = _make_context(
+        tmp_path,
+        config=config,
+        room_id=caller_room_id,
+        room_agent_names=["openclaw", "code"],
+    )
+    target_session = create_session_id(target_room_id, "$target-thread:localhost")
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_send(
+                message="do it",
+                session_key=target_session,
+                agent_id="research",
+            ),
+        )
+
+    assert payload["status"] == "ok"
+    assert payload["room_id"] == target_room_id
+    send_mock.assert_awaited_once_with(
+        ctx,
+        room_id=target_room_id,
+        text="@actual_research:localhost do it",
+        thread_id="$target-thread:localhost",
+        original_sender=ctx.requester_id,
+    )
+
+
+@pytest.mark.asyncio
 async def test_sessions_send_defaults_to_resolved_thread_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -428,12 +714,19 @@ async def test_sessions_send_checks_target_room_thread_mode(
     """sessions_send should evaluate thread mode using the target room context."""
     send_mock = AsyncMock(return_value="$evt")
     monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
-    config = _make_config()
+    target_room_id = "!target:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", rooms=[target_room_id]),
+            "code": _make_agent_config(role="Write code"),
+            "research": _make_agent_config(role="Research topics"),
+        },
+    )
     config.get_entity_thread_mode.side_effect = lambda _agent_name, _runtime_paths, room_id=None: (
-        "room" if room_id == "!target:localhost" else "thread"
+        "room" if room_id == target_room_id else "thread"
     )
     ctx = _make_context(tmp_path, config=config)
-    target_session = create_session_id("!target:localhost", "$worker-thread:localhost")
+    target_session = create_session_id(target_room_id, "$worker-thread:localhost")
 
     with tool_runtime_context(ctx):
         payload = json.loads(
@@ -451,7 +744,7 @@ async def test_sessions_send_checks_target_room_thread_mode(
     config.get_entity_thread_mode.assert_called_with(
         "openclaw",
         ctx.runtime_paths,
-        room_id="!target:localhost",
+        room_id=target_room_id,
     )
 
 
@@ -548,10 +841,105 @@ async def test_sessions_spawn_relays_original_sender(
     send_mock.assert_awaited_once_with(
         ctx,
         room_id=ctx.room_id,
-        text="@mindroom_openclaw do thing",
+        text="@actual_openclaw:localhost do thing",
         thread_id=None,
         original_sender=ctx.requester_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_uses_current_matrix_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_spawn should target the live persisted Matrix ID after account drift."""
+    send_mock = AsyncMock(return_value="$event")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    _stub_spawn_followups(monkeypatch)
+    ctx = _make_context(tmp_path)
+    _persist_subagent_accounts(ctx.config, ctx.runtime_paths, usernames={"code": "actual_code_live"})
+    ctx = replace(ctx, room=_make_room(ctx.config, ctx.runtime_paths, ctx.room_id, ctx.agent_name))
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_spawn(
+                task="do thing",
+                summary=TEST_SUMMARY,
+                tag=TEST_TAG,
+                agent_id="code",
+            ),
+        )
+
+    assert payload["status"] == "ok"
+    assert payload["target_agent"] == "code"
+    send_mock.assert_awaited_once_with(
+        ctx,
+        room_id=ctx.room_id,
+        text="@actual_code_live:localhost do thing",
+        thread_id=None,
+        original_sender=ctx.requester_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_unknown_agent_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_spawn should validate explicit agent_id before Matrix dispatch."""
+    send_mock = AsyncMock(return_value="$event")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    ctx = _make_context(tmp_path)
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_spawn(
+                task="do thing",
+                summary=TEST_SUMMARY,
+                tag=TEST_TAG,
+                agent_id="missing",
+            ),
+        )
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "sessions_spawn"
+    assert payload["message"] == "Unknown agent_id 'missing'. Available agents: code, openclaw, research."
+    send_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_rejects_agent_outside_configured_room_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sessions_spawn should reject explicit agents outside the configured room boundary."""
+    send_mock = AsyncMock(return_value="$event")
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", send_mock)
+    _stub_spawn_followups(monkeypatch)
+    room_id = "!room:localhost"
+    config = _make_config(
+        agents={
+            "openclaw": _make_agent_config(role="Coordinate work", delegate_to=["code"], rooms=[room_id]),
+            "code": _make_agent_config(role="Write code", rooms=[room_id]),
+            "research": _make_agent_config(role="Research topics"),
+        },
+    )
+    ctx = _make_context(tmp_path, config=config, room_id=room_id, room_agent_names=["openclaw", "code", "research"])
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_spawn(
+                task="do thing",
+                summary=TEST_SUMMARY,
+                tag=TEST_TAG,
+                agent_id="research",
+            ),
+        )
+
+    assert payload["status"] == "error"
+    assert payload["tool"] == "sessions_spawn"
+    assert payload["message"] == "Agent 'research' is not available in this room. Available agents: code, openclaw."
+    send_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

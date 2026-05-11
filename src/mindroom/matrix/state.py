@@ -12,11 +12,12 @@ from pydantic import BaseModel, Field, field_serializer
 from mindroom import constants
 
 
-class _MatrixAccount(BaseModel):
+class MatrixAccount(BaseModel):
     """Represents a Matrix account (user or agent)."""
 
     username: str
     password: str
+    requested_username: str | None = None
     domain: str | None = None
     device_id: str | None = None
     access_token: str | None = None
@@ -39,7 +40,7 @@ class MatrixRoom(BaseModel):
 class MatrixState(BaseModel):
     """Complete Matrix state including accounts and rooms."""
 
-    accounts: dict[str, _MatrixAccount] = Field(default_factory=dict)
+    accounts: dict[str, MatrixAccount] = Field(default_factory=dict)
     rooms: dict[str, MatrixRoom] = Field(default_factory=dict)
     space_room_id: str | None = None
 
@@ -62,7 +63,7 @@ class MatrixState(BaseModel):
         state_file = constants.matrix_state_file(runtime_paths=runtime_paths)
         _write_matrix_state_file(state_file, data)
 
-    def get_account(self, key: str) -> _MatrixAccount | None:
+    def get_account(self, key: str) -> MatrixAccount | None:
         """Get an account by key."""
         return self.accounts.get(key)
 
@@ -72,6 +73,7 @@ class MatrixState(BaseModel):
         username: str,
         password: str,
         *,
+        requested_username: str | None = None,
         domain: str | None = None,
         device_id: str | None = None,
         access_token: str | None = None,
@@ -79,9 +81,17 @@ class MatrixState(BaseModel):
         """Add or update an account."""
         existing_account = self.accounts.get(key)
         effective_domain = domain if domain is not None else existing_account.domain if existing_account else None
-        self.accounts[key] = _MatrixAccount(
+        effective_requested_username = (
+            requested_username
+            if requested_username is not None
+            else existing_account.requested_username
+            if existing_account
+            else None
+        )
+        self.accounts[key] = MatrixAccount(
             username=username,
             password=password,
+            requested_username=effective_requested_username,
             domain=effective_domain,
             device_id=device_id,
             access_token=access_token,
@@ -119,10 +129,42 @@ def matrix_state_for_runtime(runtime_paths: constants.RuntimePaths) -> MatrixSta
     )
 
 
-def managed_account_usernames(runtime_paths: constants.RuntimePaths) -> dict[str, str]:
-    """Return current persisted managed Matrix usernames keyed by state account key."""
-    state = matrix_state_for_runtime(runtime_paths)
-    return {key: account.username for key, account in state.accounts.items() if key.startswith("agent_")}
+def load_rooms(runtime_paths: constants.RuntimePaths) -> dict[str, MatrixRoom]:
+    """Load room state from YAML file.
+
+    Returns an isolated copy of the rooms map so callers may mutate the dict
+    or its ``MatrixRoom`` values without corrupting cached state used by other
+    readers.
+    """
+    return MatrixState.load(runtime_paths=runtime_paths).rooms
+
+
+def _room_aliases(runtime_paths: constants.RuntimePaths) -> dict[str, str]:
+    """Get mapping of room aliases to room IDs."""
+    return matrix_state_for_runtime(runtime_paths).get_room_aliases()
+
+
+def get_room_id(room_key: str, runtime_paths: constants.RuntimePaths) -> str | None:
+    """Get room ID for a given room key/alias."""
+    room = matrix_state_for_runtime(runtime_paths).get_room(room_key)
+    return room.room_id if room else None
+
+
+def resolve_room_aliases(
+    room_list: list[str],
+    runtime_paths: constants.RuntimePaths,
+) -> list[str]:
+    """Resolve room aliases to room IDs."""
+    aliases = _room_aliases(runtime_paths)
+    return [aliases.get(room, room) for room in room_list]
+
+
+def get_room_alias_from_id(room_id: str, runtime_paths: constants.RuntimePaths) -> str | None:
+    """Get room alias from room ID."""
+    for alias, resolved_room_id in _room_aliases(runtime_paths).items():
+        if resolved_room_id == room_id:
+            return alias
+    return None
 
 
 def _matrix_state_cache_key(state_file: Path) -> tuple[Path, int | None, int | None]:
@@ -160,7 +202,7 @@ def _migrate_accounts_to_current_schema(state: MatrixState, *, current_domain: s
     """Normalize persisted accounts to the current on-disk schema."""
     changed = False
     for account in state.accounts.values():
-        if account.domain != current_domain:
+        if account.domain is None:
             account.domain = current_domain
             changed = True
     return changed

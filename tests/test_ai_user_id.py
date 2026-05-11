@@ -64,6 +64,7 @@ from mindroom.constants import (
     resolve_runtime_paths,
 )
 from mindroom.delivery_gateway import DeliveryGateway, DeliveryGatewayDeps, ResponseHookService
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history import PreparedHistoryState, strip_transient_enrichment_from_session
@@ -89,7 +90,6 @@ from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, _KnowledgeResolution
 from mindroom.llm_request_logging import install_llm_request_logging, stream_with_llm_request_log_context
 from mindroom.matrix.cache.thread_history_result import thread_history_result
-from mindroom.matrix.identity import MatrixID
 from mindroom.media_fallback import append_inline_media_fallback_prompt
 from mindroom.media_inputs import MediaInputs
 from mindroom.memory import MemoryPromptParts
@@ -117,7 +117,9 @@ from mindroom.tool_system.worker_routing import (
     stream_with_tool_execution_identity,
     tool_execution_identity,
 )
-from tests.conftest import bind_runtime_paths, make_event_cache_mock, resolve_response_thread_root_for_test
+from tests.conftest import bind_runtime_paths as _bind_runtime_paths
+from tests.conftest import make_event_cache_mock, resolve_response_thread_root_for_test
+from tests.identity_helpers import fixture_entity_matrix_id, persist_entity_accounts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator
@@ -125,7 +127,16 @@ if TYPE_CHECKING:
 
     from agno.knowledge.knowledge import Knowledge
 
+    from mindroom.matrix.identity import MatrixID
+
 T = TypeVar("T")
+
+
+def bind_runtime_paths(config: Config, runtime_paths: RuntimePaths) -> Config:
+    """Bind test runtime paths and persist managed account identities."""
+    bound = _bind_runtime_paths(config, runtime_paths)
+    persist_entity_accounts(bound, runtime_paths)
+    return bound
 
 
 def _stream_outcome(
@@ -167,6 +178,11 @@ def _runtime_paths(tmp_path: Path, *, config_path: Path | None = None) -> Runtim
         config_path=config_path or tmp_path / "config.yaml",
         storage_path=tmp_path,
     )
+
+
+def _entity_alias_for_test(config: Config, runtime_paths: RuntimePaths, matrix_id: MatrixID) -> str:
+    registry = entity_identity_registry(config, runtime_paths)
+    return registry.current_entity_name_for_user_id(matrix_id.full_id) or matrix_id.username
 
 
 def _config() -> Config:
@@ -435,7 +451,7 @@ def _build_response_runner(
             kind="team",
             scope_id=bot.agent_name
             if bot.agent_name in config.teams
-            else f"team_{'+'.join(sorted(mid.agent_name(config, runtime_paths) or mid.username for mid in team_agents))}",
+            else f"team_{'+'.join(sorted(_entity_alias_for_test(config, runtime_paths, mid) for mid in team_agents))}",
         ),
     )
     bot._conversation_state_writer.session_type_for_scope = MagicMock(
@@ -468,7 +484,6 @@ def _build_response_runner(
             agent_name=bot.agent_name,
             logger=bot.logger,
             redact_message_event=AsyncMock(return_value=True),
-            sender_domain="localhost",
             resolver=bot._conversation_resolver,
             response_hooks=response_hook_service,
         ),
@@ -2364,7 +2379,7 @@ async def test_generate_team_response_helper_preserves_raw_prompt_when_model_pro
                 _response_request(prompt="Describe this image", user_id="@alice:localhost", thread_id="$thread-root"),
                 model_prompt="Available attachment IDs: att_1. Use tool calls to inspect or process them.",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -2649,7 +2664,7 @@ async def test_generate_team_response_marks_transient_model_prompt_for_cleanup(
                 _response_request(prompt="Describe this image", user_id="@alice:localhost", thread_id="$thread-root"),
                 model_prompt="Available attachment IDs: att_1. Use tool calls to inspect or process them.",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -2687,7 +2702,7 @@ async def test_generate_team_response_marks_matrix_tool_prompt_context_for_clean
 
         await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -2733,7 +2748,7 @@ async def test_generate_team_response_passes_resolved_correlation_id_to_team_res
                 reply_to_event_id="$original",
                 correlation_id="$edit",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -2797,7 +2812,7 @@ async def test_generate_team_response_strips_transient_model_prompt_from_persist
                 _response_request(prompt="Describe this image", user_id="@alice:localhost", thread_id="$thread-root"),
                 model_prompt="Available attachment IDs: att_1. Use tool calls to inspect or process them.",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -2873,7 +2888,7 @@ async def test_generate_team_response_cleanup_targets_retry_run_id(tmp_path: Pat
                 _response_request(prompt="Describe this image", user_id="@alice:localhost", thread_id="$thread-root"),
                 model_prompt="Available attachment IDs: att_1. Use tool calls to inspect or process them.",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3188,7 +3203,7 @@ async def test_generate_team_response_marks_system_enrichment_for_cleanup(
                 _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
                 system_enrichment_items=(EnrichmentItem(key="weather", text="72F and sunny"),),
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3293,7 +3308,7 @@ async def test_generate_team_response_helper_streaming_emits_session_started_aft
 
         resolution = await coordinator.generate_team_response_helper(
             request,
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3361,7 +3376,7 @@ async def test_generate_team_response_helper_persists_interrupted_history_when_s
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3446,7 +3461,7 @@ async def test_generate_team_response_helper_stream_delivery_failure_with_visibl
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3528,7 +3543,7 @@ async def test_generate_team_response_helper_persists_minimal_interrupted_histor
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3590,7 +3605,7 @@ async def test_generate_team_response_helper_persists_interrupted_history_when_f
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3669,7 +3684,7 @@ async def test_generate_team_response_helper_preserves_visible_stream_when_final
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3723,7 +3738,7 @@ async def test_generate_team_response_helper_preserves_structured_stream_cancel_
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3801,7 +3816,7 @@ async def test_generate_team_response_helper_preserves_visible_stream_on_late_fi
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3850,7 +3865,7 @@ async def test_generate_team_response_helper_routes_placeholder_only_late_failur
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -3970,7 +3985,7 @@ async def test_generate_team_response_helper_persists_original_user_message_for_
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4066,7 +4081,7 @@ async def test_generate_team_response_helper_emits_session_started_after_persist
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4164,7 +4179,7 @@ async def test_generate_team_response_helper_streaming_emits_session_started_aft
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4226,7 +4241,7 @@ async def test_generate_team_response_helper_uses_persisted_team_scope_for_sessi
 
         await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4265,7 +4280,7 @@ async def test_generate_team_response_helper_merges_raw_prompt_into_model_prompt
                 user_id="@alice:localhost",
                 thread_id="$thread-root",
             ),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4345,7 +4360,7 @@ async def test_generate_team_response_helper_uses_delivery_result_failure_reason
 
         resolution = await coordinator.generate_team_response_helper(
             _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
-            team_agents=[MatrixID.from_agent("general", "localhost", runtime_paths)],
+            team_agents=[fixture_entity_matrix_id("general", "localhost", runtime_paths)],
             team_mode="coordinate",
         )
 
@@ -4362,6 +4377,7 @@ class TestUserIdPassthrough:
         """Short prompts must not disappear when they happen to occur inside attachment IDs."""
         config = _config()
         runtime_paths = _runtime_paths(tmp_path)
+        persist_entity_accounts(config, runtime_paths)
 
         memory_prompt, memory_thread_history, model_prompt, model_thread_history = prepare_memory_and_model_context(
             "report",
@@ -4385,6 +4401,7 @@ class TestUserIdPassthrough:
         """Pre-merged timestamped model prompts should not duplicate the raw prompt on reuse."""
         config = _config()
         runtime_paths = _runtime_paths(tmp_path)
+        persist_entity_accounts(config, runtime_paths)
 
         existing_model_prompt = "[2026-03-20 08:15 PDT] report\n\nAvailable attachment IDs: att_report."
 
@@ -4688,6 +4705,8 @@ class TestUserIdPassthrough:
         """The shared agent-build helper should preserve an explicit orchestrator config path."""
         config = _config()
         config_path = tmp_path / "custom-config.yaml"
+        runtime_paths = _runtime_paths(tmp_path, config_path=config_path)
+        persist_entity_accounts(config, runtime_paths)
         mock_agent = MagicMock()
 
         with (
@@ -4701,7 +4720,7 @@ class TestUserIdPassthrough:
             prepared_run = await _prepare_agent_and_prompt(
                 agent_name="general",
                 prompt="test",
-                runtime_paths=_runtime_paths(tmp_path, config_path=config_path),
+                runtime_paths=runtime_paths,
                 config=config,
             )
 
@@ -6666,7 +6685,7 @@ class TestUserIdPassthrough:
         with (
             patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
             patch("mindroom.ai_runtime.cached_agent_run", new_callable=AsyncMock, return_value=mock_run_output),
-            patch("mindroom.matrix.rooms.get_room_alias_from_id", return_value="lobby"),
+            patch("mindroom.matrix.state.get_room_alias_from_id", return_value="lobby"),
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             run_metadata: dict[str, object] = {}
@@ -6732,7 +6751,7 @@ class TestUserIdPassthrough:
 
         with (
             patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
-            patch("mindroom.matrix.rooms.get_room_alias_from_id", return_value="lobby"),
+            patch("mindroom.matrix.state.get_room_alias_from_id", return_value="lobby"),
         ):
             mock_prepare.return_value = _prepared_prompt_result(mock_agent)
             run_metadata: dict[str, object] = {}

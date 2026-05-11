@@ -41,7 +41,9 @@ For [`openclaw_compat`], that means `matrix_message` is added directly and `atta
 
 `subagents` exposes `agents_list()`, `sessions_spawn()`, `sessions_send()`, and `list_sessions()`.
 All four calls return JSON strings with a `status` field, a `tool` field, and operation-specific payload data.
-`agents_list()` returns the configured agent IDs and the current agent name.
+`agents_list()` returns the current agent name plus `agents`, a sorted array of row objects with `name`, `can_delegate`, `can_spawn`, and `description`.
+`name` is the value to pass as `agent_id` when the relevant capability flag allows that operation.
+`can_spawn` means the agent is eligible in the current room, and `can_delegate` means the agent is listed in the caller's `delegate_to` allowlist.
 `sessions_spawn(task, summary, tag, label=None, agent_id=None)` requires a non-empty task plus a normalized summary and tag.
 `sessions_spawn()` posts a fresh room-level Matrix message that mentions the target agent, then treats the resulting event ID as the root of a new isolated session thread.
 After the spawn succeeds, it writes the requested thread summary and tag through the lower-level thread summary and thread tag APIs.
@@ -50,7 +52,7 @@ If the post-spawn summary or tag write fails, the spawn still succeeds and the r
 `sessions_send()` sends a follow-up message into an existing tracked session.
 If you omit `session_key`, `sessions_send()` defaults to the current room or thread session key from `create_session_id(room_id, thread_id)`.
 If you pass `label` without `session_key`, `sessions_send()` resolves the most recent in-scope session with that label.
-If you pass `agent_id`, `sessions_send()` prefixes the outgoing message with `@mindroom_<agent_id>` before sending it.
+If you pass `agent_id`, `sessions_send()` prefixes the outgoing message with that agent's current full Matrix ID before sending it.
 Tracked sessions are persisted in `subagents/session_registry.json` under the current runtime storage root.
 `list_sessions()` paginates those tracked sessions with a default `limit` of 50 and a maximum of 200.
 Isolated spawned sessions require thread-capable agents.

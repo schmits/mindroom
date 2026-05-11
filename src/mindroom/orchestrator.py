@@ -18,7 +18,12 @@ from mindroom.agents import ensure_default_agent_workspaces, get_rooms_for_entit
 from mindroom.approval_transport import ApprovalMatrixTransport
 from mindroom.authorization import is_authorized_sender
 from mindroom.constants import ROUTER_AGENT_NAME
-from mindroom.entity_resolution import configured_bot_usernames_for_room
+from mindroom.entity_resolution import (
+    DuplicateManagedEntityIdentityError,
+    MissingManagedEntityAccountError,
+    configured_bot_user_ids_for_room,
+    entity_identity_registry,
+)
 from mindroom.hooks import (
     EVENT_CONFIG_RELOADED,
     ConfigReloadedContext,
@@ -31,22 +36,27 @@ from mindroom.hooks import (
 from mindroom.knowledge import KnowledgeRefreshScheduler
 from mindroom.knowledge.watch import KnowledgeSourceWatcher
 from mindroom.matrix.client_room_admin import get_joined_rooms, get_room_members, invite_to_room
-from mindroom.matrix.client_session import PermanentMatrixStartupError
 from mindroom.matrix.health import reset_matrix_sync_health
-from mindroom.matrix.identity import MatrixID, managed_account_user_id
+from mindroom.matrix.identity import managed_account_user_id
 from mindroom.matrix.rooms import (
     ensure_all_rooms_exist,
     ensure_root_space,
     ensure_user_in_rooms,
-    load_rooms,
-    resolve_room_aliases,
 )
 from mindroom.matrix.stale_stream_cleanup import (
     InterruptedThread,
     auto_resume_interrupted_threads,
     cleanup_stale_streaming_messages,
 )
-from mindroom.matrix.users import INTERNAL_USER_ACCOUNT_KEY, INTERNAL_USER_AGENT_NAME, create_agent_user
+from mindroom.matrix.state import load_rooms, resolve_room_aliases
+from mindroom.matrix.users import (
+    INTERNAL_USER_ACCOUNT_KEY,
+    INTERNAL_USER_AGENT_NAME,
+    AgentMatrixUser,
+    ManagedAccountProvisioningRequest,
+    create_agent_user,
+    preflight_managed_account_provisioning,
+)
 from mindroom.matrix_identifiers import extract_server_name_from_homeserver
 from mindroom.mcp.manager import MCPServerManager
 from mindroom.mcp.registry import mcp_tool_name
@@ -89,7 +99,6 @@ from .orchestration.runtime import (
     cancel_sync_task,
     cancel_task,
     create_logged_task,
-    create_temp_user,
     is_permanent_startup_error,
     retry_delay_seconds,
     run_with_retry,
@@ -475,7 +484,7 @@ class _MultiAgentOrchestrator:
         """Run one bot start attempt and classify the result."""
         try:
             return bool(await bot.try_start())
-        except PermanentMatrixStartupError:
+        except PermanentStartupError:
             logger.error(  # noqa: TRY400
                 "Bot startup failed permanently; leaving bot disabled until configuration changes",
                 agent_name=entity_name,
@@ -732,14 +741,91 @@ class _MultiAgentOrchestrator:
         """Return configured entity names with the router first."""
         return [ROUTER_AGENT_NAME, *config.agents.keys(), *config.teams.keys()]
 
-    def _create_managed_bot(self, entity_name: str, config: Config) -> AgentBot | TeamBot:
+    @staticmethod
+    def _entity_display_name(config: Config, entity_name: str) -> str:
+        """Return the Matrix display name for one configured managed entity."""
+        if entity_name == ROUTER_AGENT_NAME:
+            return "RouterAgent"
+        if entity_name in config.agents:
+            return config.agents[entity_name].display_name
+        if entity_name in config.teams:
+            return config.teams[entity_name].display_name
+        return entity_name
+
+    async def _prepare_entity_accounts(
+        self,
+        config: Config,
+        entity_names: Iterable[str],
+    ) -> dict[str, AgentMatrixUser]:
+        """Ensure managed Matrix accounts exist before runtime bot construction."""
+        homeserver = constants.runtime_matrix_homeserver(runtime_paths=self.runtime_paths)
+        users: dict[str, AgentMatrixUser] = {}
+        entity_names = tuple(entity_names)
+        self._preflight_account_provisioning(config, entity_names=entity_names, include_internal_user=False)
+
+        async def _prepare_accounts() -> None:
+            nonlocal users
+            prepared_users: dict[str, AgentMatrixUser] = {}
+            for entity_name in entity_names:
+                prepared_users[entity_name] = await create_agent_user(
+                    homeserver,
+                    entity_name,
+                    self._entity_display_name(config, entity_name),
+                    runtime_paths=self.runtime_paths,
+                )
+            self._validate_entity_accounts(config)
+            users = prepared_users
+
+        await run_with_retry(
+            "Preparing managed Matrix accounts",
+            _prepare_accounts,
+            permanent_error_check=is_permanent_startup_error,
+            update_runtime_state=not self.running,
+        )
+        return users
+
+    def _validate_entity_accounts(self, config: Config) -> None:
+        """Validate persisted Matrix identities for all configured runtime entities."""
+        try:
+            entity_identity_registry(config, self.runtime_paths)
+        except (DuplicateManagedEntityIdentityError, MissingManagedEntityAccountError) as exc:
+            raise PermanentStartupError(str(exc)) from exc
+
+    def _preflight_account_provisioning(
+        self,
+        config: Config,
+        *,
+        entity_names: Iterable[str],
+        include_internal_user: bool,
+    ) -> None:
+        """Reject account localpart collisions before any missing account is created."""
+        requests: list[ManagedAccountProvisioningRequest] = []
+        if include_internal_user and config.mindroom_user is not None:
+            requests.append(
+                ManagedAccountProvisioningRequest(
+                    INTERNAL_USER_AGENT_NAME,
+                    username=config.mindroom_user.username,
+                ),
+            )
+        requests.extend(ManagedAccountProvisioningRequest(entity_name) for entity_name in entity_names)
+        preflight_managed_account_provisioning(requests, self.runtime_paths)
+
+    def validate_managed_entity_identities(self) -> None:
+        """Validate persisted managed Matrix identities for the live config."""
+        self._validate_entity_accounts(self._require_config())
+
+    def _create_managed_bot(
+        self,
+        entity_name: str,
+        config: Config,
+        agent_user: AgentMatrixUser,
+    ) -> AgentBot | TeamBot:
         """Create and register one runtime-managed bot."""
-        temp_user = create_temp_user(entity_name, config)
         bot = cast(
             "AgentBot | TeamBot",
             create_bot_for_entity(
                 entity_name,
-                temp_user,
+                agent_user,
                 config,
                 self.runtime_paths,
                 self.storage_path,
@@ -926,8 +1012,11 @@ class _MultiAgentOrchestrator:
         start_sync_tasks: bool,
     ) -> EntityStartResults:
         """Create configured entities and try to start them once."""
-        for entity_name in entity_names:
-            self._create_managed_bot(entity_name, config)
+        if not entity_names:
+            return EntityStartResults()
+        entity_users = await self._prepare_entity_accounts(config, sorted(entity_names))
+        for entity_name in sorted(entity_names):
+            self._create_managed_bot(entity_name, config, entity_users[entity_name])
         return await self._start_entities_once(entity_names, start_sync_tasks=start_sync_tasks)
 
     async def initialize(self) -> None:
@@ -938,14 +1027,17 @@ class _MultiAgentOrchestrator:
 
         config = load_config(self.runtime_paths, tolerate_plugin_load_errors=True)
         hook_registry = self._build_hook_registry(config)
+        entity_names = self._configured_entity_names(config)
+        self._preflight_account_provisioning(config, entity_names=entity_names, include_internal_user=True)
         await self._prepare_user_account(config, update_runtime_state=True)
+        entity_users = await self._prepare_entity_accounts(config, entity_names)
         self.config = config
         self._activate_hook_registry(hook_registry)
         await self._sync_mcp_manager(config)
         await self._sync_event_cache_service(config)
         self._configure_approval_store_transport()
-        for entity_name in self._configured_entity_names(config):
-            self._create_managed_bot(entity_name, config)
+        for entity_name in entity_names:
+            self._create_managed_bot(entity_name, config, entity_users[entity_name])
 
         logger.info("Initialized agent bots", count=len(self.agent_bots))
 
@@ -1144,7 +1236,13 @@ class _MultiAgentOrchestrator:
 
     async def _load_initial_config(self, new_config: Config, hook_registry: HookRegistry) -> bool:
         """Handle config loading before the runtime has an active config."""
+        self._preflight_account_provisioning(
+            new_config,
+            entity_names=self._configured_entity_names(new_config),
+            include_internal_user=True,
+        )
         await self._prepare_user_account(new_config, update_runtime_state=not self.running)
+        await self._prepare_entity_accounts(new_config, self._configured_entity_names(new_config))
         self.config = new_config
         self._activate_hook_registry(hook_registry)
         await self._sync_mcp_manager(new_config)
@@ -1254,7 +1352,7 @@ class _MultiAgentOrchestrator:
                 await self._cancel_bot_start_task(entity_name)
             await stop_entities(entities_to_stop, self.agent_bots, self._sync_tasks)
 
-        entities_to_recreate = plan.entities_to_restart & plan.all_new_entities
+        entities_to_recreate = plan.entities_to_restart & plan.configured_entities
         changed_entities = entities_to_recreate | plan.new_entities
         start_results = await self._create_and_start_entities(
             changed_entities,
@@ -1262,7 +1360,7 @@ class _MultiAgentOrchestrator:
             start_sync_tasks=True,
         )
 
-        removed_restarted_entities = plan.entities_to_restart - plan.all_new_entities
+        removed_restarted_entities = plan.entities_to_restart - plan.configured_entities
         for entity_name in removed_restarted_entities:
             self.agent_bots.pop(entity_name, None)
 
@@ -1314,6 +1412,21 @@ class _MultiAgentOrchestrator:
             room_ids = await self._ensure_rooms_exist()
             await self._ensure_root_space(room_ids)
 
+    async def _prepare_accounts_for_config_update(self, new_config: Config, plan: ConfigUpdatePlan) -> None:
+        """Prepare or validate managed Matrix accounts before publishing a reloaded config."""
+        entities_requiring_account_check = plan.added_entities | (plan.entities_to_restart & plan.configured_entities)
+        self._preflight_account_provisioning(
+            new_config,
+            entity_names=entities_requiring_account_check,
+            include_internal_user=plan.mindroom_user_changed,
+        )
+        if plan.mindroom_user_changed:
+            await self._prepare_user_account(new_config, update_runtime_state=not self.running)
+        if entities_requiring_account_check:
+            await self._prepare_entity_accounts(new_config, entities_requiring_account_check)
+        elif plan.mindroom_user_changed:
+            self._validate_entity_accounts(new_config)
+
     async def update_config(self) -> bool:
         """Reload configuration, restart affected entities, and reconcile room state."""
         new_config = load_config(self.runtime_paths, tolerate_plugin_load_errors=True)
@@ -1333,8 +1446,7 @@ class _MultiAgentOrchestrator:
         if plugin_changes:
             plan = replace(plan, entities_to_restart=plan.entities_to_restart | set(self.agent_bots))
 
-        if plan.mindroom_user_changed:
-            await self._prepare_user_account(new_config, update_runtime_state=not self.running)
+        await self._prepare_accounts_for_config_update(new_config, plan)
 
         if plugin_changes:
             pre_stopped_mcp_entities = await self._apply_plugin_changes_for_config_update(
@@ -1374,7 +1486,7 @@ class _MultiAgentOrchestrator:
             await self._emit_config_reloaded(
                 new_config=new_config,
                 changed_entities=set(),
-                added_entities=plan.new_entities,
+                added_entities=plan.added_entities,
                 removed_entities=plan.removed_entities,
                 plugin_changes=plugin_changes,
             )
@@ -1399,7 +1511,7 @@ class _MultiAgentOrchestrator:
         await self._emit_config_reloaded(
             new_config=new_config,
             changed_entities=changed_entities,
-            added_entities=plan.new_entities,
+            added_entities=plan.added_entities,
             removed_entities=plan.removed_entities,
             plugin_changes=plugin_changes,
         )
@@ -1598,18 +1710,16 @@ class _MultiAgentOrchestrator:
         self,
         room_id: str,
         current_members: set[str],
-        configured_bots: Iterable[str],
-        server_name: str,
+        configured_bot_ids: Iterable[str],
     ) -> None:
         """Invite all configured bots for a room."""
-        for bot_username in configured_bots:
-            bot_user_id = MatrixID.from_username(bot_username, server_name).full_id
+        for bot_user_id in configured_bot_ids:
             await self._invite_user_if_missing(
                 room_id,
                 bot_user_id,
                 current_members,
-                success_message=f"Invited {bot_username} to room {room_id}",
-                failure_message=f"Failed to invite {bot_username} to room {room_id}",
+                success_message=f"Invited {bot_user_id} to room {room_id}",
+                failure_message=f"Failed to invite {bot_user_id} to room {room_id}",
             )
 
     async def _ensure_room_invitations(self) -> None:
@@ -1632,10 +1742,6 @@ class _MultiAgentOrchestrator:
         if not joined_rooms:
             return
 
-        server_name = extract_server_name_from_homeserver(
-            constants.runtime_matrix_homeserver(runtime_paths=self.runtime_paths),
-            runtime_paths=self.runtime_paths,
-        )
         authorized_user_ids = get_authorized_user_ids_to_invite(config)
         authorized_user_ids = await self._invite_internal_user_to_rooms(
             config,
@@ -1644,15 +1750,15 @@ class _MultiAgentOrchestrator:
         )
 
         for room_id in joined_rooms:
-            configured_bots = configured_bot_usernames_for_room(config, room_id, self.runtime_paths)
+            configured_bots = configured_bot_user_ids_for_room(config, room_id, self.runtime_paths)
             if not configured_bots:
                 continue
 
             current_members = await get_room_members(router_bot.client, room_id)
             await self._invite_authorized_users_to_room(room_id, current_members, authorized_user_ids, config)
-            await self._invite_configured_bots_to_room(room_id, current_members, configured_bots, server_name)
+            await self._invite_configured_bots_to_room(room_id, current_members, configured_bots)
 
-        logger.info("Ensured room invitations for all configured agents and authorized users")
+        logger.info("Ensured room invitations for all configured responders and authorized users")
 
     async def stop(self) -> None:
         """Stop all agent bots."""

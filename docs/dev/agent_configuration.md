@@ -108,7 +108,7 @@ Use `provider: "sentence_transformers"` to run embeddings locally inside MindRoo
 
 ## Router Configuration
 
-The router determines which agent should handle a user's request:
+The router determines which agent or team should handle a user's request:
 
 ```yaml
 router:
@@ -159,7 +159,7 @@ agents:
 
 ### Configuration Fields
 
-- **agent_name**: The identifier used for the Matrix account (becomes `@mindroom_<agent_name>:<server>`)
+- **agent_name**: The configured identifier used for agent config and aliases; provisioning may propose a `mindroom_<agent_name>` username when an account is missing, but runtime identity always comes from persisted Matrix account state.
 - **display_name**: A friendly name shown in conversations
 - **role**: A brief description of the agent's purpose
 - **tools**: List of tools the agent can use — plain strings or single-key dicts with inline config overrides (see Available Tools below and [Per-Agent Tool Configuration](../configuration/agents.md#per-agent-tool-configuration))
@@ -565,10 +565,12 @@ agents:
 ## Using Agents in the Multi-Agent System
 
 Each agent has its own Matrix account.
+Persisted Matrix state is the source of truth for each agent's runtime Matrix identity after provisioning or login.
+Generated `mindroom_<agent>` usernames are provisioning proposals only when an account is missing.
 To interact with an agent:
 
-1. **Mention the agent by its Matrix display name or ID**: `@mindroom_agentname:<server>`
-   - Example: `@mindroom_code what is 25 * 4?`
+1. **Mention the agent by its configured name**: `@agentname`
+   - Example: `@code what is 25 * 4?`
 
 2. **In threads**: Agents continue responding based on thread context, but multi-human threads require an explicit current `@mention`
    - Start a thread by replying to any message
@@ -576,7 +578,7 @@ To interact with an agent:
    - Once two or more humans are participating, mention the agent again before expecting a reply
 
 3. **Multiple agents**: You can mention multiple agents in one message
-   - Example: `@mindroom_research @mindroom_code Compare renewable energy trends`
+   - Example: `@research @code Compare renewable energy trends`
 
 ## Tool Requirements
 

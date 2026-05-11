@@ -8,9 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 import nio
 
-from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME
+from mindroom.constants import ORIGINAL_SENDER_KEY
+from mindroom.entity_resolution import (
+    configured_routable_entity_ids_for_room,
+    current_internal_sender_ids,
+    entity_identity_registry,
+)
 from mindroom.logging_config import get_logger
-from mindroom.matrix.identity import MatrixID, active_internal_sender_ids
 from mindroom.matrix.state import matrix_state_for_runtime
 from mindroom.matrix_identifiers import managed_room_key_from_alias_localpart, room_alias_localpart
 
@@ -19,6 +23,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.matrix.identity import MatrixID
 
 
 logger = get_logger(__name__)
@@ -80,7 +85,7 @@ def is_authorized_sender(
 
     """
     # Always allow active internal identities owned by this runtime.
-    if sender_id in active_internal_sender_ids(config, runtime_paths):
+    if sender_id in current_internal_sender_ids(config, runtime_paths):
         return True
 
     # Resolve bridge aliases to canonical user ID before permission checks.
@@ -135,7 +140,7 @@ def is_sender_allowed_for_agent_reply(
 
     # Internal MindRoom participants are not restricted by per-user reply lists.
     # Bridge bot accounts are intentionally not exempt.
-    if sender_id in active_internal_sender_ids(config, runtime_paths):
+    if sender_id in current_internal_sender_ids(config, runtime_paths):
         return True
 
     resolved_sender = config.authorization.resolve_alias(sender_id)
@@ -154,7 +159,7 @@ def get_effective_sender_id_for_reply_permissions(
     transcriptions, scheduled task fires, etc.) and include the original sender
     in event content. For trusted internal senders, use that embedded sender.
     """
-    is_internal_mindroom_sender = sender_id in active_internal_sender_ids(config, runtime_paths)
+    is_internal_mindroom_sender = sender_id in current_internal_sender_ids(config, runtime_paths)
     if not is_internal_mindroom_sender:
         return sender_id
     if not event_source:
@@ -170,57 +175,64 @@ def get_effective_sender_id_for_reply_permissions(
     return sender_id
 
 
-def filter_agents_by_sender_permissions(
-    agents: Sequence[MatrixID],
+def filter_responders_by_sender_permissions(
+    responders: Sequence[MatrixID],
     sender_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Return only agents that may reply to *sender_id* per config rules."""
+    """Return only responders that may reply to *sender_id* per config rules."""
+    registry = entity_identity_registry(config, runtime_paths)
     result: list[MatrixID] = []
-    for agent in agents:
-        name = agent.agent_name(config, runtime_paths)
-        if name and is_sender_allowed_for_agent_reply(sender_id, name, config, runtime_paths):
-            result.append(agent)
+    for responder in responders:
+        name = registry.current_entity_name_for_user_id(responder.full_id, include_router=False)
+        if name is not None and is_sender_allowed_for_agent_reply(sender_id, name, config, runtime_paths):
+            result.append(responder)
     return result
 
 
-def _available_agents_from_member_ids(
+def _available_responders_from_member_ids(
     member_ids: Iterable[str],
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Return non-router agent IDs present in one membership snapshot."""
-    agents: list[MatrixID] = []
+    """Return non-router responder IDs present in one membership snapshot."""
+    registry = entity_identity_registry(config, runtime_paths)
+    responders: list[MatrixID] = []
     for member_id in member_ids:
-        mid = MatrixID.parse(member_id)
-        agent_name = mid.agent_name(config, runtime_paths)
-        if agent_name and agent_name != ROUTER_AGENT_NAME:
-            agents.append(mid)
-    return sorted(agents, key=lambda x: x.full_id)
+        entity_name = registry.current_entity_name_for_user_id(member_id, include_router=False)
+        if entity_name is not None:
+            responders.append(registry.current_id(entity_name))
+    return sorted(responders, key=lambda x: x.full_id)
 
 
-def get_available_agents_in_room(
+def get_available_responders_in_room(
     room: nio.MatrixRoom,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Get list of available agent MatrixIDs in a room.
+    """Get available responder Matrix IDs in a room.
 
-    Note: Router agent is excluded as it's not a regular conversation participant.
+    The router is excluded because it is not a regular conversation participant.
     """
-    return _available_agents_from_member_ids(room.users, config, runtime_paths)
+    return _available_responders_from_member_ids(_joined_member_ids(room), config, runtime_paths)
 
 
-def get_available_agents_for_sender(
+def _joined_member_ids(room: nio.MatrixRoom) -> Iterable[str]:
+    """Return cached room members that are joined rather than merely invited."""
+    invited_user_ids = set(room.invited_users)
+    return (user_id for user_id in room.users if user_id not in invited_user_ids)
+
+
+def _get_available_responders_for_sender(
     room: nio.MatrixRoom,
     sender_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Return room agents that may reply to *sender_id*."""
-    return filter_agents_by_sender_permissions(
-        get_available_agents_in_room(room, config, runtime_paths),
+    """Return room responders that may reply to *sender_id*."""
+    return filter_responders_by_sender_permissions(
+        get_available_responders_in_room(room, config, runtime_paths),
         sender_id,
         config,
         runtime_paths,
@@ -243,6 +255,7 @@ def _apply_authoritative_joined_members(
         cached_user = room.users.get(member.user_id)
         if (
             cached_user is not None
+            and not cached_user.invited
             and cached_user.display_name == member.display_name
             and cached_user.avatar_url == member.avatar_url
         ):
@@ -254,23 +267,23 @@ def _apply_authoritative_joined_members(
     room.members_synced = True
 
 
-async def get_available_agents_for_sender_authoritative(
+async def _get_available_responders_for_sender_authoritative(
     client: nio.AsyncClient,
     room: nio.MatrixRoom,
     sender_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Return sender-visible room agents, refreshing membership while the cache is unsynced."""
-    cached_room_agents = get_available_agents_in_room(room, config, runtime_paths)
-    cached_visible_agents = filter_agents_by_sender_permissions(
-        cached_room_agents,
+    """Return sender-visible room responders, refreshing membership while the cache is unsynced."""
+    cached_room_responders = get_available_responders_in_room(room, config, runtime_paths)
+    cached_visible_responders = filter_responders_by_sender_permissions(
+        cached_room_responders,
         sender_id,
         config,
         runtime_paths,
     )
     if room.members_synced:
-        return cached_visible_agents
+        return cached_visible_responders
 
     response = await client.joined_members(room.room_id)
     if not isinstance(response, nio.JoinedMembersResponse):
@@ -280,16 +293,16 @@ async def get_available_agents_for_sender_authoritative(
             sender_id=sender_id,
             error=str(response),
         )
-        return cached_visible_agents
+        return cached_visible_responders
 
     _apply_authoritative_joined_members(room, response.members)
-    refreshed_room_agents = _available_agents_from_member_ids(
+    refreshed_room_responders = _available_responders_from_member_ids(
         (member.user_id for member in response.members),
         config,
         runtime_paths,
     )
-    refreshed_agents = filter_agents_by_sender_permissions(
-        refreshed_room_agents,
+    refreshed_responders = filter_responders_by_sender_permissions(
+        refreshed_room_responders,
         sender_id,
         config,
         runtime_paths,
@@ -298,7 +311,56 @@ async def get_available_agents_for_sender_authoritative(
         "authoritative_room_membership_refreshed",
         room_id=room.room_id,
         sender_id=sender_id,
-        cached_agent_count=len(cached_room_agents),
-        refreshed_agent_count=len(refreshed_agents),
+        cached_responder_count=len(cached_room_responders),
+        refreshed_responder_count=len(refreshed_responders),
     )
-    return refreshed_agents
+    return refreshed_responders
+
+
+def responder_candidate_entities_from_cached_room(
+    room: nio.MatrixRoom,
+    sender_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[MatrixID]:
+    """Return sender-visible responder candidates without refreshing Matrix membership."""
+    configured_entities = _configured_responder_candidates_for_room(room, sender_id, config, runtime_paths)
+    if configured_entities is not None:
+        return configured_entities
+    return _get_available_responders_for_sender(room, sender_id, config, runtime_paths)
+
+
+def _configured_responder_candidates_for_room(
+    room: nio.MatrixRoom,
+    sender_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[MatrixID] | None:
+    """Return configured-room responder candidates, or None for ad-hoc rooms."""
+    room_alias = room.canonical_alias
+    room_aliases = (room_alias,) if isinstance(room_alias, str) and room_alias else ()
+    configured_entities = configured_routable_entity_ids_for_room(
+        config,
+        room.room_id,
+        runtime_paths,
+        room_aliases=room_aliases,
+    )
+    if not configured_entities:
+        return None
+    return filter_responders_by_sender_permissions(configured_entities, sender_id, config, runtime_paths)
+
+
+async def responder_candidate_entities_for_room(
+    client: nio.AsyncClient | None,
+    room: nio.MatrixRoom,
+    sender_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[MatrixID]:
+    """Return sender-visible responder candidates without widening configured rooms."""
+    configured_entities = _configured_responder_candidates_for_room(room, sender_id, config, runtime_paths)
+    if configured_entities is not None:
+        return configured_entities
+    if client is None:
+        return _get_available_responders_for_sender(room, sender_id, config, runtime_paths)
+    return await _get_available_responders_for_sender_authoritative(client, room, sender_id, config, runtime_paths)

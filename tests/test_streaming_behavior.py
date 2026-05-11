@@ -83,6 +83,7 @@ from tests.conftest import (
     runtime_paths_for,
     test_runtime_paths,
 )
+from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -146,6 +147,7 @@ def _make_bot_with_shared_knowledge(
         ),
         runtime_paths,
     )
+    persist_entity_accounts(config, runtime_paths_for(config))
     bot = AgentBot(
         agent,
         tmp_path,
@@ -228,6 +230,7 @@ class TestStreamingBehavior:
             ),
             runtime_paths,
         )
+        persist_entity_accounts(self.config, runtime_paths_for(self.config))
 
     @pytest.mark.asyncio
     @patch("mindroom.response_runner.ai_response")
@@ -357,16 +360,10 @@ class TestStreamingBehavior:
         with patch("mindroom.conversation_resolver.check_agent_mentioned") as mock_check:
             mock_check.return_value = ([MatrixID.parse("@mindroom_calculator:localhost")], True, False)
 
-            # Debug: let's see what happens
             calc_bot.logger.info("processing_initial_message", body=initial_event.body)
 
-            # Add more logging to understand the flow
-            with patch("mindroom.bot.extract_agent_name") as mock_extract:
-                # Make extract_agent_name return 'helper' for the sender
-                mock_extract.return_value = "helper"
-
-                await calc_bot._on_message(mock_room, initial_event)
-                await drain_coalescing(calc_bot)
+            await calc_bot._on_message(mock_room, initial_event)
+            await drain_coalescing(calc_bot)
 
         assert calc_bot.client.room_send.call_count == 0
         assert mock_ai_response.call_count == 0  # Calculator didn't process anything
@@ -387,11 +384,8 @@ class TestStreamingBehavior:
         # Process final message - calculator SHOULD respond now
         with patch("mindroom.conversation_resolver.check_agent_mentioned") as mock_check:
             mock_check.return_value = ([MatrixID.parse("@mindroom_calculator:localhost")], True, False)
-            with patch("mindroom.bot.extract_agent_name") as mock_extract:
-                # Make extract_agent_name return 'helper' for the sender
-                mock_extract.return_value = "helper"
-                await calc_bot._on_message(mock_room, final_event)
-                await drain_coalescing(calc_bot)
+            await calc_bot._on_message(mock_room, final_event)
+            await drain_coalescing(calc_bot)
 
         assert calc_bot.client.room_send.call_count == 2  # thinking + final
         assert mock_ai_response.call_count == 1
@@ -501,7 +495,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
@@ -555,7 +548,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id="$thread_123",
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -615,7 +607,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id="$thread_123",
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -643,7 +634,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -668,7 +658,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_char_threshold=180,
@@ -693,7 +682,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -710,7 +698,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -771,7 +758,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -798,7 +784,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -828,7 +813,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 update_interval=10.0,
@@ -877,7 +861,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -932,7 +915,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -985,7 +967,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1044,7 +1025,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1105,7 +1085,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1160,7 +1139,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1230,7 +1208,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1278,7 +1255,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1343,7 +1319,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1384,7 +1359,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1425,7 +1399,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1488,7 +1461,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_char_threshold=1,
@@ -1540,7 +1512,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -1571,7 +1542,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1608,7 +1578,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=0.5,
@@ -1639,7 +1608,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1678,7 +1646,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1722,7 +1689,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -1759,7 +1725,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -1787,7 +1752,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -1829,7 +1793,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -1861,7 +1824,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -1892,7 +1854,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=5.0,
@@ -1938,7 +1899,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -1988,7 +1948,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=empty_stream(),
@@ -2056,7 +2015,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id="$thread_root",
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=one_chunk_stream(),
@@ -2215,7 +2173,6 @@ class TestStreamingBehavior:
                 room_id="!stale:localhost",
                 reply_to_event_id="$stale_reply:localhost",
                 thread_id="$stale_thread:localhost",
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 target=target,
@@ -2263,7 +2220,7 @@ class TestStreamingBehavior:
             yield "stream chunk"
 
         async def fake_send_streaming_response(*args: object, **_kwargs: object) -> StreamTransportOutcome:
-            response_stream = args[7]
+            response_stream = args[6]
             chunks = [str(chunk) async for chunk in response_stream]
             body = "".join(chunks)
             return StreamTransportOutcome(
@@ -2384,7 +2341,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
@@ -2440,7 +2396,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=cancelling_stream(),
@@ -2486,7 +2441,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=interrupted_stream(),
@@ -2519,7 +2473,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=cancelling_stream(),
@@ -2556,7 +2509,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=cancelling_stream(),
@@ -2598,7 +2550,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=cancelling_stream(),
@@ -2660,7 +2611,6 @@ class TestStreamingBehavior:
                     room_id="!test:localhost",
                     reply_to_event_id="$original_123",
                     thread_id=None,
-                    sender_domain="localhost",
                     config=self.config,
                     runtime_paths=runtime_paths_for(self.config),
                     response_stream=cancelling_stream(),
@@ -2706,7 +2656,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=failing_stream(),
@@ -2759,7 +2708,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=failing_stream(),
@@ -2824,7 +2772,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -2888,7 +2835,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -2953,7 +2899,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3008,7 +2953,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3081,7 +3025,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3141,7 +3084,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3197,7 +3139,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3225,7 +3166,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths,
             target=target,
@@ -3332,7 +3272,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             update_interval=10.0,
@@ -3376,7 +3315,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -3459,7 +3397,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=_aiter(),
@@ -3534,7 +3471,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=stream(),
@@ -3559,7 +3495,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -3654,7 +3589,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             response_stream=stream(),
@@ -3677,7 +3611,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             show_tool_calls=False,
@@ -3716,7 +3649,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -3757,7 +3689,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -3869,7 +3800,6 @@ class TestStreamingBehavior:
                         room_id="!test:localhost",
                         reply_to_event_id="$original_123",
                         thread_id=None,
-                        sender_domain="localhost",
                         config=self.config,
                         runtime_paths=runtime_paths_for(self.config),
                         response_stream=stream(),
@@ -3883,7 +3813,6 @@ class TestStreamingBehavior:
                     room_id="!test:localhost",
                     reply_to_event_id="$original_123",
                     thread_id=None,
-                    sender_domain="localhost",
                     config=self.config,
                     runtime_paths=runtime_paths_for(self.config),
                     response_stream=stream(),
@@ -3982,7 +3911,6 @@ class TestStreamingBehavior:
                 room_id="!test:localhost",
                 reply_to_event_id="$original_123",
                 thread_id=None,
-                sender_domain="localhost",
                 config=self.config,
                 runtime_paths=runtime_paths_for(self.config),
                 response_stream=failing_stream(),
@@ -4014,7 +3942,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -4055,7 +3982,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -4091,7 +4017,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -4140,7 +4065,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
         )
@@ -4215,7 +4139,6 @@ class TestStreamingBehavior:
                 agent_name="helper",
                 logger=MagicMock(),
                 redact_message_event=AsyncMock(return_value=True),
-                sender_domain="localhost",
                 resolver=MagicMock(),
                 response_hooks=response_hooks,
             ),
@@ -4313,7 +4236,6 @@ class TestStreamingBehavior:
                 agent_name="helper",
                 logger=MagicMock(),
                 redact_message_event=AsyncMock(return_value=True),
-                sender_domain="localhost",
                 resolver=MagicMock(),
                 response_hooks=response_hooks,
             ),
@@ -4413,7 +4335,6 @@ class TestStreamingBehavior:
                 agent_name="helper",
                 logger=MagicMock(),
                 redact_message_event=AsyncMock(return_value=True),
-                sender_domain="localhost",
                 resolver=MagicMock(),
                 response_hooks=response_hooks,
             ),
@@ -4460,7 +4381,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             show_tool_calls=True,
@@ -4503,7 +4423,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             show_tool_calls=False,
@@ -4562,7 +4481,6 @@ class TestStreamingBehavior:
             room_id="!test:localhost",
             reply_to_event_id="$original_123",
             thread_id=None,
-            sender_domain="localhost",
             config=self.config,
             runtime_paths=runtime_paths_for(self.config),
             show_tool_calls=False,
@@ -4642,6 +4560,7 @@ class TestStreamingConfig:
         )
         runtime_paths = test_runtime_paths(Path(tempfile.mkdtemp()))
         config = bind_runtime_paths(config, runtime_paths)
+        persist_entity_accounts(config, runtime_paths)
 
         mock_client = _make_matrix_client_mock()
         mock_response = MagicMock()
@@ -4665,7 +4584,6 @@ class TestStreamingConfig:
             room_id="!r:localhost",
             reply_to_event_id="$orig",
             thread_id=None,
-            sender_domain="localhost",
             config=config,
             runtime_paths=runtime_paths,
             response_stream=empty_stream(),

@@ -113,7 +113,7 @@ Source anchors: `src/mindroom/matrix/rooms.py`, `src/mindroom/topic_generator.py
 Expected outcome: MindRoom creates the room, applies topic and access settings, and invites the expected participants.
 
 - [ ] `ROOM-002` Verify router onboarding in a newly managed room.
-Expected outcome: The router posts a welcome message only in the intended empty-room onboarding scenario and the content reflects the currently available agents and commands.
+Expected outcome: The router posts a welcome message only in the intended empty-room onboarding scenario and the content reflects the currently available agents, teams, and commands.
 
 - [ ] `ROOM-003` Send `!hi` in a managed room after startup.
 Expected outcome: The router reproduces the current welcome guidance without changing room state or duplicating bot setup.
@@ -143,8 +143,8 @@ Expected outcome: The targeted agent responds and no unrelated agent or team con
 - [ ] `MSG-003` Mention one agent by full Matrix ID.
 Expected outcome: Mention resolution still targets the correct agent and produces one response path.
 
-- [ ] `MSG-004` Send a non-command message in a multi-agent room without an explicit mention.
-Expected outcome: The router selects one eligible agent, produces the expected handoff behavior, and the selected agent continues the thread.
+- [ ] `MSG-004` Send a non-command message in a multi-responder room without an explicit mention.
+Expected outcome: The router selects one eligible agent or team, produces the expected handoff behavior, and the selected entity continues the thread.
 
 - [ ] `MSG-005` Send a message in a one-to-one DM room with an agent.
 Expected outcome: The agent responds naturally without requiring a mention and later turns keep the same conversation continuity.
@@ -325,7 +325,7 @@ Expected outcome: Visible router echo behavior matches the configuration without
 - [ ] `MEDIA-010` Exercise voice command intelligence with an explicit spoken help request, an explicit spoken removed-`!skill` request, and a similar non-command question.
 Expected outcome: Explicit help intent can normalize to `!help`, removed `!skill` intent stays an unknown command, and speculative command rewrites are rejected so natural-language queries stay natural language.
 
-- [ ] `MEDIA-011` Speak or inject unavailable agent mentions while voice normalization runs in a room with limited available entities.
+- [ ] `MEDIA-011` Speak or inject unavailable entity mentions while voice normalization runs in a room with limited available entities.
 Expected outcome: Unavailable configured entities lose their `@` mention marker while available room-scoped entities keep valid mentions and dispatch correctly.
 
 - [ ] `MEDIA-012` Send a voice message that becomes a normalized command or threaded follow-up and then inspect later follow-up or attachment-aware handling.
@@ -439,8 +439,8 @@ Expected outcome: The recurring schedule persists and runs repeatedly at the int
 - [ ] `SCH-003` Create a conditional or event-driven schedule.
 Expected outcome: The runtime materializes the condition as a polling or recurring workflow rather than ignoring the condition text.
 
-- [ ] `SCH-004` Mention specific agents inside a schedule request.
-Expected outcome: Schedule creation validates that the mentioned agents are available in the room and rejects impossible targets clearly.
+- [ ] `SCH-004` Mention specific agents or teams inside a schedule request.
+Expected outcome: Schedule creation validates that the mentioned agents or teams are available in the room and rejects impossible targets clearly.
 
 - [ ] `SCH-005` Use list, edit, cancel-one, and cancel-all schedule flows.
 Expected outcome: Schedule APIs and command flows update the same underlying state and later UI or command views reflect the changes immediately.
@@ -474,7 +474,7 @@ Expected outcome: The stream includes standard completion chunks plus inline Min
 Expected outcome: Conversation continuity and sessionful tool behavior persist across requests that share the same session ID.
 
 - [ ] `OAI-006` Send a request to the `auto` model and to a `team/<name>` model.
-Expected outcome: Auto-routing uses the same selection logic as Matrix routing and team models execute the full team workflow instead of degrading to one member.
+Expected outcome: The `auto` model routes among compatible agents, while `team/<name>` executes the full team workflow instead of degrading to one member.
 
 - [ ] `OAI-007` Send a request to an unsupported private or incompatible worker-scoped agent.
 Expected outcome: The API rejects the request with a clear compatibility error instead of exposing a broken or partial execution path.

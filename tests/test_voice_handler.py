@@ -17,11 +17,34 @@ from mindroom.config.main import Config
 from mindroom.config.voice import VoiceConfig, _VoiceLLMConfig, _VoiceSTTConfig
 from mindroom.constants import ATTACHMENT_IDS_KEY
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
+from tests.identity_helpers import persist_actual_entity_accounts
+
+TEST_VOICE_ACCOUNT_PASSWORD = "pw"  # noqa: S105
 
 
 def _runtime_bound_config(config: Config) -> Config:
     """Return a runtime-bound config for voice handler tests."""
-    return bind_runtime_paths(config, test_runtime_paths(Path(tempfile.mkdtemp())))
+    bound = bind_runtime_paths(config, test_runtime_paths(Path(tempfile.mkdtemp())))
+    _persist_voice_handler_accounts(bound)
+    return bound
+
+
+def _persist_voice_handler_accounts(config: Config) -> None:
+    runtime_paths = runtime_paths_for(config)
+    persist_actual_entity_accounts(config, runtime_paths, password=TEST_VOICE_ACCOUNT_PASSWORD)
+
+
+def _matrix_room(
+    room_id: str,
+    *,
+    members: tuple[str, ...] = (),
+    members_synced: bool = True,
+) -> nio.MatrixRoom:
+    room = nio.MatrixRoom(room_id=room_id, own_user_id="@mindroom_router:localhost")
+    for member_id in members:
+        room.add_member(member_id, None, None)
+    room.members_synced = members_synced
+    return room
 
 
 async def _handle_voice_message(
@@ -60,7 +83,6 @@ async def _prepare_voice_message(
     event: nio.RoomMessageAudio | nio.RoomEncryptedAudio,
     config: Config,
     *,
-    sender_domain: str,
     thread_id: str | None,
 ) -> voice_handler._PreparedVoiceMessage | None:
     """Prepare one voice message with the explicit runtime bound to the test config."""
@@ -71,7 +93,6 @@ async def _prepare_voice_message(
         event,
         config,
         runtime_paths=runtime_paths_for(config),
-        sender_domain=sender_domain,
         thread_id=thread_id,
     )
 
@@ -100,6 +121,26 @@ class TestVoiceHandler:
         assert config.voice.stt.provider == "openai"
         assert config.voice.stt.model == "whisper-1"
         assert config.voice.intelligence.model == "default"
+
+    def test_sanitize_unavailable_mentions_uses_exact_aliases(self) -> None:
+        """Voice mention sanitizing should match exact Matrix mention aliases."""
+        config = _runtime_bound_config(
+            Config(
+                agents={
+                    "foo": AgentConfig(display_name="Foo"),
+                    "mindroom_foo": AgentConfig(display_name="Prefixed Foo"),
+                },
+            ),
+        )
+
+        sanitized = voice_handler._sanitize_unavailable_mentions(
+            "@mindroom_foo help @mindroom_mindroom_foo",
+            allowed_entities={"foo"},
+            config=config,
+            runtime_paths=runtime_paths_for(config),
+        )
+
+        assert sanitized == "mindroom_foo help @mindroom_mindroom_foo"
 
     @pytest.mark.asyncio
     async def test_voice_handler_ignores_when_disabled(self) -> None:
@@ -160,15 +201,20 @@ class TestVoiceHandler:
         )
 
         client = AsyncMock()
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.users = {
-            f"@mindroom_openclaw:{config.get_domain(runtime_paths_for(config))}": MagicMock(),
-            f"@mindroom_router:{config.get_domain(runtime_paths_for(config))}": MagicMock(),
-            "@alice:example.com": MagicMock(),
-        }
-        room.members_synced = True
+        domain = config.get_domain(runtime_paths_for(config))
+        room = _matrix_room(
+            "!voice:localhost",
+            members=(
+                f"@actual_openclaw:{domain}",
+                f"@actual_router:{domain}",
+                "@alice:example.com",
+            ),
+        )
         event = MagicMock(spec=nio.RoomMessageAudio)
+        event.event_id = "$voice"
         event.sender = "@alice:example.com"
+        event.body = "voice.ogg"
+        event.source = {"content": {"body": "voice.ogg"}}
 
         with (
             patch(
@@ -237,10 +283,7 @@ class TestVoiceHandler:
         """Failed normalization should not leave stale in-flight task entries behind."""
         config = _runtime_bound_config(Config(authorization={"default_room_access": True}))
         client = AsyncMock()
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!test:server"
-        room.users = {"@alice:example.com": MagicMock()}
-        room.members_synced = True
+        room = _matrix_room("!test:server", members=("@alice:example.com",))
         event = MagicMock(spec=nio.RoomMessageAudio)
         event.event_id = "$voice123"
         event.sender = "@alice:example.com"
@@ -258,7 +301,6 @@ class TestVoiceHandler:
                 room,
                 event,
                 config,
-                sender_domain="example.com",
                 thread_id=None,
             )
 
@@ -274,10 +316,7 @@ class TestVoiceHandler:
         """Canceling one waiter should not cancel the shared normalization task for others."""
         config = _runtime_bound_config(Config(authorization={"default_room_access": True}))
         client = AsyncMock()
-        room = MagicMock(spec=nio.MatrixRoom)
-        room.room_id = "!test:server"
-        room.users = {"@alice:example.com": MagicMock()}
-        room.members_synced = True
+        room = _matrix_room("!test:server", members=("@alice:example.com",))
         event = MagicMock(spec=nio.RoomMessageAudio)
         event.event_id = "$voice123"
         event.sender = "@alice:example.com"
@@ -312,7 +351,6 @@ class TestVoiceHandler:
                     room,
                     event,
                     config,
-                    sender_domain="example.com",
                     thread_id=None,
                 ),
             )
@@ -325,7 +363,6 @@ class TestVoiceHandler:
                     room,
                     event,
                     config,
-                    sender_domain="example.com",
                     thread_id=None,
                 ),
             )

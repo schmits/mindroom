@@ -15,13 +15,14 @@ from agno.media import Audio
 
 from mindroom import model_loading
 from mindroom.attachments import register_audio_attachment
-from mindroom.authorization import get_available_agents_for_sender_authoritative
+from mindroom.authorization import responder_candidate_entities_for_room
 from mindroom.constants import ATTACHMENT_IDS_KEY, ORIGINAL_SENDER_KEY, VOICE_PREFIX, VOICE_RAW_AUDIO_FALLBACK_KEY
 from mindroom.credentials_sync import get_secret_from_env
+from mindroom.entity_resolution import EntityIdentityRegistry, entity_identity_registry
 from mindroom.logging_config import get_logger
+from mindroom.matrix.identity import parse_current_matrix_user_id
 from mindroom.matrix.media import AudioMessageEvent, download_media_bytes, extract_media_caption, media_mime_type
-from mindroom.matrix.mentions import format_message_with_mentions
-from mindroom.matrix_identifiers import agent_username_localpart
+from mindroom.matrix.mentions import format_message_with_mentions, resolve_entity_name_for_mention_localpart
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,8 +34,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 _VOICE_MENTION_PATTERN = re.compile(
-    r"(?<![\w])@(?:(?P<prefix>mindroom_))?(?P<name>[A-Za-z0-9_]+)(?::[A-Za-z0-9.\-]+)?",
+    r"(?<![\w])@(?P<localpart>[A-Za-z0-9._=/+\-]+)(?::(?P<domain>[A-Za-z0-9.\-:\[\]]+))?",
 )
+_VOICE_MENTION_TRAILING_PUNCTUATION = ".,!?:;"
 
 
 @dataclass(frozen=True)
@@ -196,7 +198,6 @@ async def prepare_voice_message(
     config: Config,
     *,
     runtime_paths: RuntimePaths,
-    sender_domain: str,
     thread_id: str | None,
 ) -> _PreparedVoiceMessage | None:
     """Download/register audio and normalize it into a synthetic text event."""
@@ -239,7 +240,6 @@ async def prepare_voice_message(
             config,
             runtime_paths,
             text,
-            sender_domain=sender_domain,
             extra_content=extra_content,
         ),
     )
@@ -403,11 +403,12 @@ async def _process_transcription(
         team_names = available_team_names if available_team_names is not None else list(config.teams.keys())
         agent_display_names = {name: config.agents[name].display_name for name in agent_names if name in config.agents}
         team_display_names = {name: config.teams[name].display_name for name in team_names if name in config.teams}
+        registry = entity_identity_registry(config, runtime_paths)
 
         agent_list = (
             "\n".join(
                 [
-                    f"  - @{name} or @{agent_username_localpart(name, runtime_paths)} (spoken as: {agent_display_names[name]})"
+                    f"  - @{name} or {registry.current_id(name).full_id} (spoken as: {agent_display_names[name]})"
                     for name in agent_names
                 ],
             )
@@ -415,7 +416,12 @@ async def _process_transcription(
             else "  (none)"
         )
         team_list = (
-            "\n".join([f"  - @{name} (spoken as: {team_display_names[name]})" for name in team_names])
+            "\n".join(
+                [
+                    f"  - @{name} or {registry.current_id(name).full_id} (spoken as: {team_display_names[name]})"
+                    for name in team_names
+                ],
+            )
             if team_names
             else "  (none)"
         )
@@ -448,7 +454,8 @@ async def _process_transcription(
             return _sanitize_unavailable_mentions(
                 response.content.strip(),
                 allowed_entities=set(agent_names) | set(team_names),
-                configured_entities=set(config.agents) | set(config.teams),
+                config=config,
+                runtime_paths=runtime_paths,
             )
 
     except Exception as e:
@@ -472,15 +479,16 @@ async def _get_available_entities_for_sender(
     """Return available agent and team names in this room for a specific sender."""
     available_agent_names: list[str] = []
     available_team_names: list[str] = []
+    registry = entity_identity_registry(config, runtime_paths)
 
-    for matrix_id in await get_available_agents_for_sender_authoritative(
+    for matrix_id in await responder_candidate_entities_for_room(
         client,
         room,
         sender_id,
         config,
         runtime_paths,
     ):
-        name = matrix_id.agent_name(config, runtime_paths)
+        name = registry.current_entity_name_for_user_id(matrix_id.full_id, include_router=False)
         if name is None:
             continue
         if name in config.agents:
@@ -495,23 +503,44 @@ def _sanitize_unavailable_mentions(
     text: str,
     *,
     allowed_entities: set[str],
-    configured_entities: set[str],
+    config: Config,
+    runtime_paths: RuntimePaths,
 ) -> str:
     """Strip @ from mentions that target configured but unavailable entities."""
     if not text:
         return text
 
-    configured_by_lower = {name.lower(): name for name in configured_entities}
     allowed_lower = {name.lower() for name in allowed_entities}
+    registry = entity_identity_registry(config, runtime_paths)
 
     def _replace(match: re.Match[str]) -> str:
-        name = match.group("name")
-        configured_name = configured_by_lower.get(name.lower())
+        raw_token = match.group(0)
+        token = raw_token.rstrip(_VOICE_MENTION_TRAILING_PUNCTUATION)
+        trailing_punctuation = raw_token[len(token) :]
+        configured_name = _voice_mention_entity_name(token, registry, config)
         if configured_name is None:
-            return match.group(0)
+            return raw_token
         if configured_name.lower() in allowed_lower:
-            return match.group(0)
+            return raw_token
         # Strip only '@', preserving exact matched token shape (mindroom_ prefix/domain suffix/case).
-        return match.group(0)[1:]
+        return f"{token[1:]}{trailing_punctuation}"
 
     return _VOICE_MENTION_PATTERN.sub(_replace, text)
+
+
+def _voice_mention_entity_name(
+    token: str,
+    registry: EntityIdentityRegistry,
+    config: Config,
+) -> str | None:
+    """Resolve one voice-normalizer mention token using Matrix mention semantics."""
+    body = token[1:]
+    localpart, separator, _domain = body.partition(":")
+    if separator:
+        try:
+            user_id = parse_current_matrix_user_id(token)
+        except ValueError:
+            return None
+        return registry.current_entity_name_for_user_id(user_id, include_router=False)
+
+    return resolve_entity_name_for_mention_localpart(localpart, config)

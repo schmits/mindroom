@@ -20,8 +20,9 @@ from croniter import CroniterError, croniter
 from pydantic import BaseModel, Field
 
 from mindroom import model_loading
-from mindroom.authorization import get_available_agents_for_sender_authoritative
+from mindroom.authorization import responder_candidate_entities_for_room
 from mindroom.constants import ORIGINAL_SENDER_KEY
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.hooks import (
     EVENT_SCHEDULE_FIRED,
     HookRegistry,
@@ -772,8 +773,13 @@ async def _parse_workflow_schedule(
     if current_time is None:
         current_time = datetime.now(UTC)
 
-    assert available_agents, "No agents available for scheduling"
-    agent_list = ", ".join(f"@{a.username}" for a in available_agents)
+    assert available_agents, "No agents or teams available for scheduling"
+    registry = entity_identity_registry(config, runtime_paths)
+    agent_list = ", ".join(
+        f"@{entity_name}"
+        for agent_id in available_agents
+        if (entity_name := registry.current_entity_name_for_user_id(agent_id.full_id, include_router=False)) is not None
+    )
 
     prompt = config.render_prompt(
         "WORKFLOW_SCHEDULE_PARSE_PROMPT_TEMPLATE",
@@ -838,7 +844,6 @@ async def _build_workflow_message_content(
             config,
             runtime_paths,
             message_text,
-            sender_domain=config.get_domain(runtime_paths),
             thread_event_id=None,
         )
     automated_message = (
@@ -856,7 +861,6 @@ async def _build_workflow_message_content(
         config,
         runtime_paths,
         automated_message,
-        sender_domain=config.get_domain(runtime_paths),
         thread_event_id=target.resolved_thread_id,
         latest_thread_event_id=latest_thread_event_id,
     )
@@ -1234,7 +1238,7 @@ async def _validate_agent_mentions(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> _AgentValidationResult:
-    """Validate that all mentioned agents are accessible.
+    """Validate that all mentioned agents or teams are accessible.
 
     Args:
         message: The message that may contain @agent mentions
@@ -1298,7 +1302,6 @@ def _extract_mentioned_agents_from_text(
     """Extract valid agent mentions from scheduling text."""
     _, mentioned_user_ids, _ = parse_mentions_in_text(
         full_text,
-        config.get_domain(runtime_paths),
         config,
         runtime_paths,
     )
@@ -1306,7 +1309,13 @@ def _extract_mentioned_agents_from_text(
 
     for user_id in mentioned_user_ids:
         matrix_id = MatrixID.parse(user_id)
-        if matrix_id.agent_name(config, runtime_paths) and matrix_id not in mentioned_agents:
+        if (
+            entity_identity_registry(config, runtime_paths).current_entity_name_for_user_id(
+                matrix_id.full_id,
+                include_router=False,
+            )
+            and matrix_id not in mentioned_agents
+        ):
             mentioned_agents.append(matrix_id)
 
     return mentioned_agents
@@ -1339,7 +1348,7 @@ async def schedule_task(  # noqa: C901, PLR0911, PLR0912, PLR0915
     if mentioned_agents is None:
         mentioned_agents = _extract_mentioned_agents_from_text(full_text, config, runtime_paths)
 
-    sender_visible_room_agents = await get_available_agents_for_sender_authoritative(
+    sender_visible_room_agents = await responder_candidate_entities_for_room(
         client,
         room,
         scheduled_by,
@@ -1371,7 +1380,7 @@ async def schedule_task(  # noqa: C901, PLR0911, PLR0912, PLR0915
             available_agents = list(sender_visible_room_agents)
 
     if not available_agents:
-        return (None, "❌ No agents in this room are allowed to reply to you.")
+        return (None, "❌ No agents or teams in this room are allowed to reply to you.")
 
     # Parse the workflow request with available agents
     workflow_result = await _parse_workflow_schedule(full_text, config, runtime_paths, available_agents)
@@ -1389,27 +1398,28 @@ async def schedule_task(  # noqa: C901, PLR0911, PLR0912, PLR0915
     if workflow_result.schedule_type == "cron" and not workflow_result.cron_schedule:
         return (None, "❌ Failed to schedule: Recurring task missing cron schedule")
 
-    # Validate that all mentioned agents are accessible
+    # Validate that all mentioned agents or teams are accessible.
     validation_result = await _validate_agent_mentions(
         workflow_result.message,
-        sender_visible_room_agents,
+        available_agents,
         config,
         runtime_paths,
     )
 
     if not validation_result.all_valid:
         scope = "room" if new_thread or not thread_id else "thread"
-        error_msg = "❌ Failed to schedule: The following agents are not available in this "
+        error_msg = "❌ Failed to schedule: The following agents or teams are not available in this "
         error_msg += scope
         error_msg += f": {', '.join(agent.full_id for agent in validation_result.invalid_agents)}"
 
         # Provide helpful suggestions
         suggestions: list[str] = []
+        registry = entity_identity_registry(config, runtime_paths)
         for agent in validation_result.invalid_agents:
-            agent_name = agent.agent_name(config, runtime_paths)
+            agent_name = registry.current_entity_name_for_user_id(agent.full_id, include_router=False)
             if agent_name:
-                # Agent exists but not available in this room/thread
-                suggestions.append(f"{agent.full_id} is not available in this {scope}")
+                # Entity exists but is not available in this room/thread.
+                suggestions.append(f"@{agent_name} is not available in this {scope}")
             else:
                 suggestions.append(f"{agent.full_id} does not exist")
 

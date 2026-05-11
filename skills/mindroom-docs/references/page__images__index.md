@@ -1,17 +1,18 @@
 # Image Messages
 
-MindRoom can process images sent to Matrix rooms, passing them to vision-capable AI models for analysis.
+MindRoom can process images sent to Matrix rooms, passing them to vision-capable agents and teams for analysis.
 
 ## Overview
 
 When a user sends an image in a Matrix room:
 
-1. The agent determines whether it should respond (via mention, thread participation, or DM)
+1. The responder determines whether it should answer (via mention, thread participation, or DM)
 2. The image is downloaded and decrypted (if E2E encrypted)
 3. The image is wrapped as an `agno.media.Image` and passed to the AI model
-4. The agent responds with its analysis
+4. The responder replies with its analysis
 
-Image support works automatically for all agents -- no configuration is needed. The AI model must support vision (e.g., Claude, GPT-5.4).
+Image support works automatically for agents and teams -- no configuration is needed.
+The selected model must support vision (e.g., Claude, GPT-5.4).
 
 ## Supported Formats
 
@@ -36,14 +37,14 @@ If the declared MIME type in the Matrix event does not match the detected byte s
                                               │
                                               v
                                         ┌─────────────┐
-                                        │ Agent       │
-                                        │ Responds    │
+                                        │ Responder   │
+                                        │ Replies     │
                                         └─────────────┘
 ```
 
 ## Usage
 
-Send an image in a Matrix room and mention the agent in the caption:
+Send an image in a Matrix room and mention the agent or team in the caption:
 
 - **With caption**: `@assistant What does this diagram show?` -- the caption is used as the prompt
 - **Without caption**: The agent receives `[Attached image]` as the prompt and describes what it sees
@@ -81,6 +82,6 @@ It detects provider-specific error patterns such as unsupported media type, base
 
 ## Limitations
 
-- **Routing in multi-agent rooms** -- in multi-agent rooms without an `@mention`, the router selects the best agent based on the image caption.
+- **Routing with multiple eligible responders** -- without an `@mention`, the router uses the image caption to select among candidates only when room configuration and reply permissions leave multiple eligible agents or teams.
 - **Bridge mention detection** uses `m.mentions` in the event, falling back to parsing HTML pills from `formatted_body` when `m.mentions` is absent (e.g., mautrix-telegram). Bridges that set neither may not trigger agent responses.
 - **Model support** -- the configured model must support vision. Text-only models will ignore the image or return an error. If the model rejects the image entirely, the [media fallback](#media-fallback) retries without the inline image.
