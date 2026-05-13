@@ -218,6 +218,12 @@ uvx mindroom config init --profile public --provider anthropic
 # Use Codex CLI ChatGPT subscription auth
 uvx mindroom config init --profile public-codex
 
+# Use local Ollama
+uvx mindroom config init --profile public-ollama
+
+# Use local llama.cpp through its OpenAI-compatible server
+uvx mindroom config init --profile llama-cpp
+
 # Use Vertex AI Claude (Google Cloud)
 uvx mindroom config init --profile public-vertexai-anthropic
 ```
@@ -225,6 +231,14 @@ uvx mindroom config init --profile public-vertexai-anthropic
 `public-codex` is the canonical profile name for hosted Matrix with Codex CLI subscription auth.
 The shorter `codex` profile alias is also accepted.
 Run `codex login` before starting MindRoom when using this profile.
+
+`public-ollama` uses local Ollama with `gemma4` by default and also configures `qwen3.6:27b`.
+The shorter `ollama` profile alias is also accepted.
+Run `ollama pull gemma4` and `ollama pull qwen3.6:27b` before starting MindRoom.
+
+`llama-cpp` and `public-llama-cpp` use a local OpenAI-compatible llama.cpp server on `http://localhost:8080/v1`.
+Start `llama-server` with one of the configured Unsloth GGUF refs before starting MindRoom.
+These local provider profiles run entirely locally and do not require real cloud API keys such as `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` unless you switch the config to a remote provider.
 
 `public-vertexai-anthropic` is the canonical profile name for Vertex AI Claude on hosted Matrix.
 Aliases `public-vertexai-claude`, `vertexai-anthropic`, and `vertexai-claude` are also accepted.
@@ -5619,8 +5633,8 @@ The current upstream SDK implementations also honor provider env vars such as `O
 ### What It Does
 
 `openai` exposes `transcribe_audio(audio_path)`, `generate_image(prompt)`, and `generate_speech(text_input)`.
-`transcribe_audio()` expects a local file path and sends it to the configured transcription model, which defaults to `whisper-1`.
-`generate_image()` uses the configured `image_model`, defaults to `dall-e-3`, and returns attached image bytes rather than only a remote URL.
+`transcribe_audio()` expects a local file path and sends it to the configured transcription model, which defaults to `gpt-4o-transcribe`.
+`generate_image()` uses the configured `image_model`, defaults to `gpt-image-2`, and returns attached image bytes rather than only a remote URL.
 The current implementation handles both `gpt-image-*` style models and older DALL-E response formats internally.
 `generate_speech()` uses the configured OpenAI TTS model, voice, and output format and returns an attached audio artifact.
 
@@ -5633,11 +5647,11 @@ The current implementation handles both `gpt-image-*` style models and older DAL
 | `enable_image_generation` | `boolean` | `no` | `true` | Enable `generate_image()`. |
 | `enable_speech_generation` | `boolean` | `no` | `true` | Enable `generate_speech()`. |
 | `all` | `boolean` | `no` | `false` | Enable all three OpenAI media functions. |
-| `transcription_model` | `text` | `no` | `whisper-1` | Model used by `transcribe_audio()`. |
+| `transcription_model` | `text` | `no` | `gpt-4o-transcribe` | Model used by `transcribe_audio()`. |
 | `text_to_speech_voice` | `text` | `no` | `alloy` | Default voice for `generate_speech()`. |
-| `text_to_speech_model` | `text` | `no` | `tts-1` | Default TTS model for `generate_speech()`. |
+| `text_to_speech_model` | `text` | `no` | `gpt-4o-mini-tts` | Default TTS model for `generate_speech()`. |
 | `text_to_speech_format` | `text` | `no` | `mp3` | Output format for generated speech, such as `mp3`, `wav`, or `opus`. |
-| `image_model` | `text` | `no` | `dall-e-3` | Image generation model for `generate_image()`. |
+| `image_model` | `text` | `no` | `gpt-image-2` | Image generation model for `generate_image()`. |
 | `image_quality` | `text` | `no` | `null` | Optional image quality override passed through to the API. |
 | `image_size` | `text` | `no` | `null` | Optional image size override passed through to the API. |
 | `image_style` | `text` | `no` | `null` | Optional image style override passed through to the API. |
@@ -5649,8 +5663,8 @@ agents:
   creator:
     tools:
       - openai:
-          transcription_model: whisper-1
-          image_model: dall-e-3
+          transcription_model: gpt-4o-transcribe
+          image_model: gpt-image-2
           text_to_speech_voice: alloy
 ```
 
@@ -16013,9 +16027,11 @@ Profiles control the template style:
 - `--profile minimal` — bare-minimum config
 - `--profile public` — hosted Matrix (`mindroom.chat`) with prefilled homeserver settings
 - `--profile public-codex` — hosted Matrix with Codex CLI subscription defaults
+- `--profile public-ollama` or `--profile ollama` — hosted Matrix with local Ollama defaults
+- `--profile llama-cpp` or `--profile public-llama-cpp` — hosted Matrix with local llama.cpp OpenAI-compatible defaults
 - `--profile public-vertexai-anthropic` — hosted Matrix with Vertex AI Claude defaults
 
-Provider presets (`--provider`) set the default model: `anthropic`, `codex`, `openai`, `openrouter`, or `vertexai_claude`.
+Provider presets (`--provider`) set the default model: `anthropic`, `codex`, `llama_cpp`, `ollama`, `openai`, `openai_mini`, `openai_nano`, `openrouter`, or `vertexai_claude`.
 
 ```bash
 # Hosted Matrix quickstart (creates ~/.mindroom/config.yaml)
@@ -16026,6 +16042,12 @@ mindroom config init --minimal --provider anthropic
 
 # Hosted Matrix with Codex CLI ChatGPT subscription auth
 mindroom config init --profile public-codex
+
+# Hosted Matrix with Ollama
+mindroom config init --profile public-ollama
+
+# Hosted Matrix with llama.cpp
+mindroom config init --profile llama-cpp
 
 # Hosted Matrix with Vertex AI Claude
 mindroom config init --profile public-vertexai-anthropic
@@ -16038,6 +16060,22 @@ The `public-codex` profile and `--provider codex` preset generate `provider: cod
 They set `extra_kwargs.reasoning_effort: medium`.
 Prompt caching is enabled automatically per active agent session; leave `prompt_cache_key` unset unless you intentionally want to override the derived key.
 Run `codex login` first so MindRoom can read `~/.codex/auth.json`.
+
+The `public-ollama` profile and `ollama` profile alias generate `provider: ollama` with `id: gemma4`, an additional `qwen3_6_27b` model using `qwen3.6:27b`, and `OLLAMA_HOST=http://localhost:11434`.
+Pull both local models before running MindRoom:
+
+```bash
+ollama pull gemma4
+ollama pull qwen3.6:27b
+```
+
+The `llama-cpp` and `public-llama-cpp` profiles generate OpenAI-compatible local server config for Unsloth GGUF models.
+Start llama.cpp with one of the configured model refs before running MindRoom:
+
+```bash
+llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M --host 127.0.0.1 --port 8080
+llama-server -hf unsloth/Qwen3.6-27B-GGUF:UD-Q4_K_XL --host 127.0.0.1 --port 8080
+```
 
 ### config show
 

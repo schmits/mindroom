@@ -17,6 +17,20 @@ import typer
 from rich.console import Console
 
 from mindroom import constants
+from mindroom.model_defaults import (
+    CONFIG_INIT_MODEL_PRESETS,
+    LLAMA_CPP_API_KEY_DEFAULT,
+    LLAMA_CPP_BASE_URL_DEFAULT,
+    LLAMA_CPP_GEMMA,
+    LLAMA_CPP_QWEN,
+    LOCAL_QWEN_CONTEXT_WINDOW,
+    LOCAL_QWEN_PRESET_NAME,
+    OLLAMA_GEMMA,
+    OLLAMA_HOST_DEFAULT,
+    OLLAMA_QWEN,
+    SENTENCE_TRANSFORMERS_DEFAULT,
+    llama_cpp_server_command,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,14 +59,64 @@ _CONFIG_PATH_OPTION: Path | None = typer.Option(
 )
 
 _ConfigInitProfile = Literal["full", "minimal", "public"]
-_ProviderPreset = Literal["anthropic", "codex", "openai", "openrouter", "vertexai_claude"]
+_ProviderPreset = Literal[
+    "anthropic",
+    "codex",
+    "llama_cpp",
+    "ollama",
+    "openai",
+    "openai_mini",
+    "openai_nano",
+    "openrouter",
+    "vertexai_claude",
+]
 
-_DEFAULT_MODEL_PRESETS: dict[_ProviderPreset, tuple[str, str, int]] = {
-    "anthropic": ("anthropic", "claude-sonnet-4-6", 1_000_000),
-    "codex": ("codex", "gpt-5.5", 258_000),
-    "openai": ("openai", "gpt-5.4", 258_000),
-    "openrouter": ("openrouter", "anthropic/claude-sonnet-4.6", 1_000_000),
-    "vertexai_claude": ("vertexai_claude", "claude-sonnet-4-6", 1_000_000),
+_OLLAMA_HOST = OLLAMA_HOST_DEFAULT
+_LLAMA_CPP_BASE_URL = LLAMA_CPP_BASE_URL_DEFAULT
+_LLAMA_CPP_API_KEY = LLAMA_CPP_API_KEY_DEFAULT
+_LOCAL_PROVIDER_ALIASES: dict[str, _ProviderPreset] = {
+    "llama-cpp": "llama_cpp",
+    "llama_cpp": "llama_cpp",
+    "ollama": "ollama",
+}
+_INIT_PROFILE_ALIASES: dict[str, tuple[_ConfigInitProfile, _ProviderPreset | None]] = {
+    "full": ("full", None),
+    "minimal": ("minimal", None),
+    "public": ("public", None),
+    "public-codex": ("public", "codex"),
+    "codex": ("public", "codex"),
+    "public-ollama": ("public", "ollama"),
+    "public-vertexai-anthropic": ("public", "vertexai_claude"),
+    "public-vertexai-claude": ("public", "vertexai_claude"),
+    "vertexai-anthropic": ("public", "vertexai_claude"),
+    "vertexai-claude": ("public", "vertexai_claude"),
+}
+_INIT_PROFILE_ALIASES.update(
+    {alias: ("public", provider_preset) for alias, provider_preset in _LOCAL_PROVIDER_ALIASES.items()},
+)
+_INIT_PROFILE_ALIASES.update(
+    {f"public-{alias}": ("public", provider_preset) for alias, provider_preset in _LOCAL_PROVIDER_ALIASES.items()},
+)
+_PROVIDER_PRESET_ALIASES: dict[str, _ProviderPreset] = {
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "a": "anthropic",
+    "codex": "codex",
+    **_LOCAL_PROVIDER_ALIASES,
+    "openai": "openai",
+    "o": "openai",
+    "openai-mini": "openai_mini",
+    "openai_mini": "openai_mini",
+    "openai-nano": "openai_nano",
+    "openai_nano": "openai_nano",
+    "openrouter": "openrouter",
+    "or": "openrouter",
+    "r": "openrouter",
+    "vertexai_claude": "vertexai_claude",
+    "vertexai": "vertexai_claude",
+    "vertex": "vertexai_claude",
+    "vertexai-anthropic": "vertexai_claude",
+    "vertex-anthropic": "vertexai_claude",
 }
 
 _PUBLIC_HOSTED_ENV_DEFAULTS: tuple[tuple[str, str], ...] = (
@@ -65,7 +129,10 @@ _CANONICAL_INIT_PROFILES: tuple[str, ...] = (
     "full",
     "minimal",
     "public",
+    "llama-cpp",
     "public-codex",
+    "public-ollama",
+    "public-llama-cpp",
     "public-vertexai-anthropic",
 )
 _MATRIX_DELIVERY_TEMPLATE_BLOCK = """\
@@ -200,17 +267,21 @@ def _should_replace_env_file(env_path: Path, *, force: bool) -> bool:
 
 def _config_init_env_hint(selected_profile: _ConfigInitProfile, selected_preset: _ProviderPreset) -> str:
     """Return the env setup hint shown after `mindroom config init`."""
-    if selected_preset == "codex":
-        if selected_profile == "public":
-            return "Run `codex login` before starting MindRoom (Matrix homeserver is prefilled)"
-        return "Set your Matrix homeserver and run `codex login` before starting MindRoom"
-    if selected_preset == "vertexai_claude":
-        if selected_profile == "public":
-            return "Set your Vertex AI project/region and Google auth (Matrix homeserver is prefilled)"
-        return "Set your Matrix homeserver, Vertex AI project/region, and Google auth"
+    hosted_hints: dict[_ProviderPreset, str] = {
+        "codex": "Run `codex login` before starting MindRoom (Matrix homeserver is prefilled)",
+        "vertexai_claude": "Set your Vertex AI project/region and Google auth (Matrix homeserver is prefilled)",
+        "ollama": "Start Ollama and pull the local models (Matrix homeserver is prefilled)",
+        "llama_cpp": "Start llama.cpp server with the local model (Matrix homeserver is prefilled)",
+    }
+    standalone_hints: dict[_ProviderPreset, str] = {
+        "codex": "Set your Matrix homeserver and run `codex login` before starting MindRoom",
+        "vertexai_claude": "Set your Matrix homeserver, Vertex AI project/region, and Google auth",
+        "ollama": "Set your Matrix homeserver, start Ollama, and pull the local models",
+        "llama_cpp": "Set your Matrix homeserver and start llama.cpp server with the local model",
+    }
     if selected_profile == "public":
-        return "Set your API keys (Matrix homeserver is prefilled)"
-    return "Set your API keys and Matrix homeserver"
+        return hosted_hints.get(selected_preset, "Set your API keys (Matrix homeserver is prefilled)")
+    return standalone_hints.get(selected_preset, "Set your API keys and Matrix homeserver")
 
 
 def _print_config_init_next_steps(
@@ -229,6 +300,16 @@ def _print_config_init_next_steps(
         console.print(
             "  [cyan]mindroom connect --pair-code XXXX[/cyan]  "
             "Pair with hosted Matrix (get code from chat.mindroom.chat)",
+        )
+    if selected_preset == "ollama":
+        console.print(f"  [cyan]ollama pull {OLLAMA_GEMMA}[/cyan]         Pull the default local model")
+        console.print(f"  [cyan]ollama pull {OLLAMA_QWEN}[/cyan]   Pull the larger local model option")
+    if selected_preset == "llama_cpp":
+        console.print(
+            f"  [cyan]{llama_cpp_server_command(LLAMA_CPP_GEMMA)}[/cyan]  Start the default local model server",
+        )
+        console.print(
+            f"  [cyan]{llama_cpp_server_command(LLAMA_CPP_QWEN)}[/cyan]  Start the larger local model option",
         )
     console.print("  [cyan]mindroom config edit[/cyan]      Customize your config")
     console.print("  [cyan]mindroom config validate[/cyan]  Verify it's valid")
@@ -352,14 +433,17 @@ def config_init(
         "full",
         "--profile",
         help=(
-            "Template profile: full, minimal, public, public-codex, or public-vertexai-anthropic "
-            "(hosted Matrix with provider defaults)."
+            "Template profile: full, minimal, public, codex, llama-cpp, public-codex, public-ollama, "
+            "public-llama-cpp, or public-vertexai-anthropic (hosted Matrix with provider defaults)."
         ),
     ),
     provider: str | None = typer.Option(
         None,
         "--provider",
-        help="Provider preset for generated config: anthropic, codex, openai, openrouter, or vertexai_claude.",
+        help=(
+            "Provider preset for generated config: anthropic, codex, llama_cpp, ollama, openai, openai_mini, "
+            "openai_nano, openrouter, or vertexai_claude."
+        ),
     ),
 ) -> None:
     """Create a starter config.yaml with example agents and models.
@@ -641,7 +725,8 @@ def _resolve_config_init_selection(
     provider_preset = _normalize_provider_preset(provider) if provider else None
     if provider and provider_preset is None:
         console.print(
-            "[red]Invalid --provider value.[/red] Use: anthropic, codex, openai, openrouter, or vertexai_claude.",
+            "[red]Invalid --provider value.[/red] Use: anthropic, codex, llama_cpp, ollama, openai, "
+            "openai_mini, openai_nano, openrouter, or vertexai_claude.",
         )
         raise typer.Exit(1)
 
@@ -658,18 +743,7 @@ def _resolve_config_init_selection(
 
 def _normalize_init_profile(profile: str) -> tuple[_ConfigInitProfile, _ProviderPreset | None] | None:
     """Normalize `config init --profile` values and profile aliases."""
-    aliases: dict[str, tuple[_ConfigInitProfile, _ProviderPreset | None]] = {
-        "full": ("full", None),
-        "minimal": ("minimal", None),
-        "public": ("public", None),
-        "public-codex": ("public", "codex"),
-        "codex": ("public", "codex"),
-        "public-vertexai-anthropic": ("public", "vertexai_claude"),
-        "public-vertexai-claude": ("public", "vertexai_claude"),
-        "vertexai-anthropic": ("public", "vertexai_claude"),
-        "vertexai-claude": ("public", "vertexai_claude"),
-    }
-    return aliases.get(profile.strip().lower())
+    return _INIT_PROFILE_ALIASES.get(profile.strip().lower())
 
 
 def check_env_keys(config: Config, runtime_paths: RuntimePaths) -> None:
@@ -684,44 +758,35 @@ def check_env_keys(config: Config, runtime_paths: RuntimePaths) -> None:
 
 def _normalize_provider_preset(provider: str) -> _ProviderPreset | None:
     """Normalize provider preset values used by prompts and CLI flags."""
-    normalized = provider.strip().lower()
-    aliases: dict[str, _ProviderPreset] = {
-        "anthropic": "anthropic",
-        "claude": "anthropic",
-        "a": "anthropic",
-        "codex": "codex",
-        "openai": "openai",
-        "o": "openai",
-        "openrouter": "openrouter",
-        "or": "openrouter",
-        "r": "openrouter",
-        "vertexai_claude": "vertexai_claude",
-        "vertexai": "vertexai_claude",
-        "vertex": "vertexai_claude",
-        "vertexai-anthropic": "vertexai_claude",
-        "vertex-anthropic": "vertexai_claude",
-    }
-    return aliases.get(normalized)
+    return _PROVIDER_PRESET_ALIASES.get(provider.strip().lower())
 
 
 def _prompt_provider_preset() -> _ProviderPreset:
     """Prompt the user for a starter provider preset."""
     while True:
         raw_value = typer.prompt(
-            "Choose provider preset [anthropic/codex/openai/openrouter/vertexai_claude]",
+            "Choose provider preset [anthropic/codex/llama_cpp/ollama/openai/openai_mini/openai_nano/"
+            "openrouter/vertexai_claude]",
             default="openai",
             show_default=True,
         )
         provider_preset = _normalize_provider_preset(raw_value)
         if provider_preset is not None:
             return provider_preset
-        console.print("[red]Invalid choice.[/red] Enter anthropic, codex, openai, openrouter, or vertexai_claude.")
+        console.print(
+            "[red]Invalid choice.[/red] Enter anthropic, codex, llama_cpp, ollama, openai, openai_mini, "
+            "openai_nano, openrouter, or vertexai_claude.",
+        )
 
 
 def _model_template_block(provider_preset: _ProviderPreset) -> str:
     """Render the provider-specific YAML fragment for models.default."""
-    provider, model_id, context_window = _DEFAULT_MODEL_PRESETS[provider_preset]
-    lines = [f"provider: {provider}", f"id: {model_id}", f"context_window: {context_window}"]
+    model_preset = CONFIG_INIT_MODEL_PRESETS[provider_preset]
+    lines = [
+        f"provider: {model_preset.provider}",
+        f"id: {model_preset.id}",
+        f"context_window: {model_preset.context_window}",
+    ]
     if provider_preset == "codex":
         lines.extend(
             [
@@ -730,7 +795,40 @@ def _model_template_block(provider_preset: _ProviderPreset) -> str:
                 "  reasoning_effort: medium",
             ],
         )
+    if provider_preset == "ollama":
+        lines.append(f"host: {_OLLAMA_HOST}")
+    if provider_preset == "llama_cpp":
+        lines.extend(
+            [
+                "extra_kwargs:",
+                f"  api_key: {_LLAMA_CPP_API_KEY}",
+                f"  base_url: {_LLAMA_CPP_BASE_URL}",
+            ],
+        )
     return textwrap.indent("\n".join(lines), "    ")
+
+
+def _additional_models_template_block(provider_preset: _ProviderPreset) -> str:
+    """Render optional additional named model presets under `models:`."""
+    if provider_preset == "ollama":
+        return (
+            f"\n  {LOCAL_QWEN_PRESET_NAME}:\n"
+            "    provider: ollama\n"
+            f"    id: {OLLAMA_QWEN}\n"
+            f"    context_window: {LOCAL_QWEN_CONTEXT_WINDOW}\n"
+            f"    host: {_OLLAMA_HOST}"
+        )
+    if provider_preset == "llama_cpp":
+        return (
+            f"\n  {LOCAL_QWEN_PRESET_NAME}:\n"
+            "    provider: openai\n"
+            f"    id: {LLAMA_CPP_QWEN}\n"
+            f"    context_window: {LOCAL_QWEN_CONTEXT_WINDOW}\n"
+            "    extra_kwargs:\n"
+            f"      api_key: {_LLAMA_CPP_API_KEY}\n"
+            f"      base_url: {_LLAMA_CPP_BASE_URL}"
+        )
+    return ""
 
 
 def _full_template(
@@ -747,6 +845,7 @@ def _full_template(
     Requester-private agents remain an opt-in advanced config surface.
     """
     model_block = _model_template_block(provider_preset)
+    additional_models_block = _additional_models_template_block(provider_preset)
     mind_memory_knowledge_path = _default_mind_knowledge_base_path(
         config_dir,
         storage_root=storage_root,
@@ -772,7 +871,7 @@ def _full_template(
 
 models:
   default:
-{model_block}
+{model_block}{additional_models_block}
 
 agents:
   assistant:
@@ -851,7 +950,7 @@ memory:
   embedder:
     provider: sentence_transformers
     config:
-      model: sentence-transformers/all-MiniLM-L6-v2
+      model: {SENTENCE_TRANSFORMERS_DEFAULT}
   file:
     max_entrypoint_lines: 200
   auto_flush:
@@ -1008,7 +1107,28 @@ def _provider_env_template(provider_preset: _ProviderPreset) -> str:
         # or set GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
         """).rstrip()
 
-    required_env_key = constants.env_key_for_provider(provider_preset)
+    if provider_preset == "ollama":
+        return textwrap.dedent(f"""\
+        # Ollama local model server
+        OLLAMA_HOST={_OLLAMA_HOST}
+
+        # Pull the starter local models before running MindRoom:
+        # ollama pull {OLLAMA_GEMMA}
+        # ollama pull {OLLAMA_QWEN}
+        """).rstrip()
+
+    if provider_preset == "llama_cpp":
+        return textwrap.dedent(f"""\
+        # llama.cpp OpenAI-compatible local server
+        OPENAI_BASE_URL={_LLAMA_CPP_BASE_URL}
+        OPENAI_API_KEY={_LLAMA_CPP_API_KEY}
+
+        # Start llama.cpp with one of the configured local models before running MindRoom.
+        # {llama_cpp_server_command(LLAMA_CPP_GEMMA)}
+        # {llama_cpp_server_command(LLAMA_CPP_QWEN)}
+        """).rstrip()
+
+    required_env_key = constants.env_key_for_provider(CONFIG_INIT_MODEL_PRESETS[provider_preset].provider)
     key_placeholders = {
         "ANTHROPIC_API_KEY": "your-anthropic-key-here",
         "OPENAI_API_KEY": "your-openai-key-here",
