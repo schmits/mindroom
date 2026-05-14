@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -51,9 +51,70 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
     from mindroom.config.main import Config
+
 logger = get_logger(__name__)
 _WORKER_CLEANUP_INTERVAL_ENV = "MINDROOM_WORKER_CLEANUP_INTERVAL_SECONDS"
+_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS"
+_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV = "MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS"
+_DASHBOARD_CORS_EXPOSE_HEADERS = (config_lifecycle.CONFIG_GENERATION_HEADER,)
+_DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS = (
+    "http://localhost:3003",
+    "http://localhost:5173",
+    "http://127.0.0.1:3003",
+    "http://127.0.0.1:5173",
+)
+
+
+@dataclass(frozen=True)
+class _DashboardCorsSettings:
+    """Dashboard CORS settings derived from the runtime environment."""
+
+    allow_origins: tuple[str, ...]
+    allow_credentials: bool
+
+
+class _RuntimeDashboardCorsMiddleware:
+    """Apply dashboard CORS settings from the app's current runtime context."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        api_app: FastAPI,
+        fallback_runtime_paths: constants.RuntimePaths,
+    ) -> None:
+        self.app = app
+        self.api_app = api_app
+        self.fallback_runtime_paths = fallback_runtime_paths
+        self._middleware_by_settings: dict[_DashboardCorsSettings, CORSMiddleware] = {}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        middleware = self._middleware_for_current_runtime()
+        await middleware(scope, receive, send)
+
+    def _middleware_for_current_runtime(self) -> CORSMiddleware:
+        settings = _dashboard_cors_settings(self._current_runtime_paths())
+        middleware = self._middleware_by_settings.get(settings)
+        if middleware is None:
+            middleware = CORSMiddleware(
+                self.app,
+                allow_origins=list(settings.allow_origins),
+                allow_credentials=settings.allow_credentials,
+                allow_methods=["*"],
+                allow_headers=["*"],
+                expose_headers=list(_DASHBOARD_CORS_EXPOSE_HEADERS),
+            )
+            self._middleware_by_settings[settings] = middleware
+        return middleware
+
+    def _current_runtime_paths(self) -> constants.RuntimePaths:
+        try:
+            return _app_runtime_paths(self.api_app)
+        except TypeError:
+            return self.fallback_runtime_paths
 
 
 class DraftAgentPolicyDefaultsRequest(BaseModel):
@@ -370,24 +431,40 @@ def bind_orchestrator_knowledge_refresh_scheduler(
     config_lifecycle.app_state(api_app).orchestrator_knowledge_refresh_scheduler = scheduler
 
 
-app = FastAPI(title="MindRoom Dashboard API", lifespan=_lifespan)
-initialize_api_app(app, constants.resolve_primary_runtime_paths())
+def _dashboard_cors_settings(runtime_paths: constants.RuntimePaths) -> _DashboardCorsSettings:
+    """Return dashboard CORS settings for one runtime context."""
+    if runtime_paths.env_flag(_DASHBOARD_CORS_ALLOW_ALL_ORIGINS_ENV):
+        return _DashboardCorsSettings(allow_origins=("*",), allow_credentials=False)
 
-# Configure CORS for the standalone frontend dev server.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3003",  # Frontend dev server alternative port
-        "http://localhost:5173",  # Vite dev server default
-        "http://127.0.0.1:3003",  # Alternative localhost
-        "http://127.0.0.1:5173",
-        "*",  # Allow all origins for development (remove in production)
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
+    configured_origins = runtime_paths.env_value(_DASHBOARD_CORS_ALLOWED_ORIGINS_ENV)
+    origins = _parse_dashboard_cors_allowed_origins(configured_origins)
+    return _DashboardCorsSettings(
+        allow_origins=origins,
+        allow_credentials="*" not in origins,
+    )
+
+
+def _parse_dashboard_cors_allowed_origins(configured_origins: str | None) -> tuple[str, ...]:
+    """Parse a comma-separated dashboard CORS origin list."""
+    if configured_origins is None:
+        return _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
+    origins = tuple(origin for origin in (part.strip() for part in configured_origins.split(",")) if origin)
+    return origins or _DEFAULT_DASHBOARD_CORS_ALLOWED_ORIGINS
+
+
+def _add_dashboard_cors_middleware(api_app: FastAPI, runtime_paths: constants.RuntimePaths) -> None:
+    """Add dashboard CORS middleware without wildcard credential defaults."""
+    api_app.add_middleware(
+        _RuntimeDashboardCorsMiddleware,
+        api_app=api_app,
+        fallback_runtime_paths=runtime_paths,
+    )
+
+
+_runtime_paths = constants.resolve_primary_runtime_paths()
+app = FastAPI(title="MindRoom Dashboard API", lifespan=_lifespan)
+initialize_api_app(app, _runtime_paths)
+_add_dashboard_cors_middleware(app, _runtime_paths)
 
 
 def _sanitize_entity_payload(entity_data: dict[str, Any]) -> dict[str, Any]:
