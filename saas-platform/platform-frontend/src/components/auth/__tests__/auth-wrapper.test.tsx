@@ -1,8 +1,11 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import { AuthWrapper } from '../auth-wrapper'
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { useDarkMode } from '@/hooks/useDarkMode'
+import { act } from 'react'
+import { hydrateRoot } from 'react-dom/client'
+import { renderToString } from 'react-dom/server'
 
 // Mock dependencies
 jest.mock('@/lib/supabase/client', () => ({
@@ -33,9 +36,11 @@ describe('AuthWrapper', () => {
   let mockSupabaseClient: any
   let mockRouter: any
   let mockAuthSubscription: any
+  let originalRuntimeConfig: any
 
   beforeEach(() => {
     jest.clearAllMocks()
+    originalRuntimeConfig = window.__MINDROOM_CONFIG__
 
     // Setup mock router
     mockRouter = {
@@ -65,6 +70,10 @@ describe('AuthWrapper', () => {
     ;(createClient as jest.Mock).mockReturnValue(mockSupabaseClient)
   })
 
+  afterEach(() => {
+    window.__MINDROOM_CONFIG__ = originalRuntimeConfig
+  })
+
   describe('Basic Rendering', () => {
     it('should render Auth component with default props', () => {
       render(<AuthWrapper />)
@@ -80,6 +89,65 @@ describe('AuthWrapper', () => {
       render(<AuthWrapper view="sign_up" />)
 
       expect(screen.getByText('View: sign_up')).toBeInTheDocument()
+    })
+
+    it('should render an unavailable state when Supabase is not configured', () => {
+      window.__MINDROOM_CONFIG__ = {
+        apiUrl: 'https://api.mindroom.chat',
+        supabaseUrl: '',
+        supabaseAnonKey: '',
+        platformDomain: 'mindroom.chat',
+      }
+
+      render(<AuthWrapper view="sign_up" />)
+
+      expect(screen.getByText('Account signup is not available yet.')).toBeInTheDocument()
+      expect(screen.queryByTestId('auth-ui')).not.toBeInTheDocument()
+      expect(createClient).not.toHaveBeenCalled()
+    })
+
+    it('should render an unavailable state when runtime config is missing', async () => {
+      window.__MINDROOM_CONFIG__ = undefined
+
+      render(<AuthWrapper />)
+
+      await waitFor(() => {
+        expect(screen.getByText('Sign in is not available yet.')).toBeInTheDocument()
+      })
+      expect(screen.queryByTestId('auth-ui')).not.toBeInTheDocument()
+      expect(createClient).not.toHaveBeenCalled()
+    })
+
+    it('should hydrate without changing the initial auth markup', async () => {
+      const container = document.createElement('div')
+      document.body.appendChild(container)
+      const recoverableErrors: unknown[] = []
+
+      window.__MINDROOM_CONFIG__ = undefined
+      container.innerHTML = renderToString(<AuthWrapper view="sign_up" />)
+      window.__MINDROOM_CONFIG__ = {
+        apiUrl: 'https://api.mindroom.chat',
+        supabaseUrl: '',
+        supabaseAnonKey: '',
+        platformDomain: 'mindroom.chat',
+      }
+
+      let root: ReturnType<typeof hydrateRoot> | undefined
+      await act(async () => {
+        root = hydrateRoot(container, <AuthWrapper view="sign_up" />, {
+          onRecoverableError: (error) => recoverableErrors.push(error),
+        })
+      })
+
+      await waitFor(() => {
+        expect(within(container).getByText('Account signup is not available yet.')).toBeInTheDocument()
+      })
+      expect(recoverableErrors).toHaveLength(0)
+
+      await act(async () => {
+        root?.unmount()
+      })
+      container.remove()
     })
 
     it('should set correct redirect URL with origin', async () => {

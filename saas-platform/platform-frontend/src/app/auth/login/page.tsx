@@ -4,12 +4,14 @@ import { getServerRuntimeConfig } from '@/lib/runtime-config'
 import { headers } from 'next/headers'
 import Link from 'next/link'
 import { X } from 'lucide-react'
+import { sanitizePostAuthRedirect } from '@/lib/auth/redirect'
 
 export default async function LoginPage({ searchParams }: { searchParams: { redirect_to?: string } }) {
-  const nextTarget = searchParams?.redirect_to || '/dashboard'
+  // Use the request host only as a fallback for local or misconfigured deployments.
   const hdrs = await headers()
   const host = hdrs.get('host') || ''
-  const { platformDomain } = getServerRuntimeConfig()
+  const { platformDomain } = getServerRuntimeConfig({ requireSupabase: false })
+  const nextTarget = sanitizePostAuthRedirect(searchParams?.redirect_to, platformDomain)
   const base = platformDomain
     ? `https://app.${platformDomain}`
     : (host ? `https://${host}` : '')
