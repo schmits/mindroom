@@ -8,10 +8,20 @@ import logging
 
 from backend.deps import ensure_supabase
 from backend.entitlements import is_expired_trial, is_subscription_service_active
-from backend.k8s import instance_deployment_ref, run_kubectl
+from backend.k8s import run_kubectl, tenant_stop_deployment_refs
 
 logger = logging.getLogger(__name__)
 RUNNING_INSTANCE_STATUSES = ["running", "provisioning", "restarting"]
+
+
+async def _stop_tenant_deployments(instance_id: str | int) -> str | None:
+    """Scale every deployment for a tenant to zero and return an error message on failure."""
+    for deployment_ref in tenant_stop_deployment_refs(instance_id):
+        code, out, err = await run_kubectl(["scale", deployment_ref, "--replicas=0"], namespace="mindroom-instances")
+        if code != 0:
+            message = (err or out).strip()
+            return message or f"kubectl scale failed for {deployment_ref}"
+    return None
 
 
 def cleanup_soft_deleted_accounts(grace_period_days: int = 7) -> dict:
@@ -124,10 +134,8 @@ async def cleanup_unentitled_instances() -> dict:
 
         for instance in instance_result.data or []:
             instance_id = instance["instance_id"]
-            code, out, err = await run_kubectl(
-                ["scale", instance_deployment_ref(instance_id), "--replicas=0"], namespace="mindroom-instances"
-            )
-            if code == 0:
+            error = await _stop_tenant_deployments(instance_id)
+            if not error:
                 sb.table("instances").update({"status": "stopped", "updated_at": now_iso}).eq(
                     "instance_id", instance_id
                 ).execute()
@@ -139,7 +147,7 @@ async def cleanup_unentitled_instances() -> dict:
                     "Failed to stop instance %s for inactive subscription %s: %s",
                     instance_id,
                     subscription["id"],
-                    err.strip() if err else out.strip(),
+                    error,
                 )
 
         if is_expired_trial(subscription, now=now):

@@ -252,17 +252,10 @@ class TestProvisionerCommandValidation:
                 with patch("backend.routes.provisioner.check_deployment_exists", return_value=True):
                     await stop_instance_provisioner(None, 123, "Bearer test-key")
 
-        args, namespace = captured_kubectl_args[0]
-
-        # Verify correct scale command syntax
-        assert args[0] == "scale"
-        assert args[1].startswith("deployment/")
-        assert "--replicas=0" in args
-        assert namespace == "mindroom-instances"
-
-        # Verify deployment name format
-        deployment = args[1].split("/")[1]
-        assert deployment == "mindroom-123"
+        assert captured_kubectl_args == [
+            (["scale", "deployment/mindroom-123", "--replicas=0"], "mindroom-instances"),
+            (["scale", "deployment/synapse-123", "--replicas=0"], "mindroom-instances"),
+        ]
 
 
 class TestProvisionerStateTransitions:

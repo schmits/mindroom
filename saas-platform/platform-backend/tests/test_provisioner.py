@@ -2,7 +2,7 @@
 
 import base64
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -445,10 +445,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "started successfully" in data["message"]
 
-        # Verify kubectl was called with scale command
-        mock_kubectl.assert_called_with(
-            ["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"
+        # Verify the full tenant stack was started in dependency order.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/synapse-123", "--replicas=1"], namespace="mindroom-instances"),
+                call(["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
         mock_update_status.assert_called_with(123, "running")
 
     def test_start_instance_not_found(
@@ -479,6 +483,32 @@ class TestProvisionerEndpoints:
         assert response.status_code == 500
         assert "Failed to start instance" in response.json()["detail"]
 
+    def test_start_instance_requires_full_stack_scale_success(
+        self,
+        client: TestClient,
+        mock_kubectl: AsyncMock,
+        mock_check_deployment: AsyncMock,
+        mock_update_status: Mock,
+        valid_auth_header: dict,
+    ):
+        """Test start only marks running after Synapse and MindRoom are both scaled."""
+        # Setup
+        mock_kubectl.side_effect = [(0, "synapse scaled", ""), (1, "", "mindroom error")]
+
+        # Make request
+        response = client.post("/system/instances/123/start", headers=valid_auth_header)
+
+        # Verify
+        assert response.status_code == 500
+        assert "Failed to start instance" in response.json()["detail"]
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/synapse-123", "--replicas=1"], namespace="mindroom-instances"),
+                call(["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"),
+            ]
+        )
+        mock_update_status.assert_not_called()
+
     def test_stop_instance_success(
         self,
         client: TestClient,
@@ -497,10 +527,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "stopped successfully" in data["message"]
 
-        # Verify kubectl was called with scale command
-        mock_kubectl.assert_called_with(
-            ["scale", "deployment/mindroom-123", "--replicas=0"], namespace="mindroom-instances"
+        # Verify the app stops before the homeserver to avoid reconnect churn.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["scale", "deployment/mindroom-123", "--replicas=0"], namespace="mindroom-instances"),
+                call(["scale", "deployment/synapse-123", "--replicas=0"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
         mock_update_status.assert_called_with(123, "stopped")
 
     def test_stop_instance_not_found(
@@ -530,10 +564,14 @@ class TestProvisionerEndpoints:
         assert data["success"] is True
         assert "restarted successfully" in data["message"]
 
-        # Verify kubectl was called with rollout restart command
-        mock_kubectl.assert_called_with(
-            ["rollout", "restart", "deployment/mindroom-123"], namespace="mindroom-instances"
+        # Verify both tenant deployments were restarted.
+        mock_kubectl.assert_has_awaits(
+            [
+                call(["rollout", "restart", "deployment/synapse-123"], namespace="mindroom-instances"),
+                call(["rollout", "restart", "deployment/mindroom-123"], namespace="mindroom-instances"),
+            ]
         )
+        assert mock_kubectl.await_count == 2
 
     def test_restart_instance_not_found(
         self, client: TestClient, mock_check_deployment: AsyncMock, valid_auth_header: dict

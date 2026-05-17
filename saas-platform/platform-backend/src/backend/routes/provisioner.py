@@ -49,7 +49,14 @@ from backend.config import (
 )
 from backend.db_utils import update_instance_status
 from backend.deps import _extract_bearer_token, ensure_supabase, limiter
-from backend.k8s import check_deployment_exists, instance_deployment_ref, run_kubectl, wait_for_deployment_ready
+from backend.k8s import (
+    check_deployment_exists,
+    instance_deployment_ref,
+    run_kubectl,
+    tenant_start_deployment_refs,
+    tenant_stop_deployment_refs,
+    wait_for_deployment_ready,
+)
 from backend.models import ActionResult, ProvisionResponse, SyncResult, SyncUpdateOut
 from backend.process import run_helm
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
@@ -71,6 +78,32 @@ async def _background_mark_running_when_ready(instance_id: str, namespace: str =
                 logger.warning("Background update: failed to mark instance %s as running", instance_id)
     except Exception:
         logger.exception("Background readiness wait failed for instance %s", instance_id)
+
+
+async def _run_kubectl_for_deployments(
+    kubectl_args_prefix: list[str], deployment_refs: tuple[str, ...], *, namespace: str
+) -> str:
+    """Run one kubectl command per deployment and fail on the first error."""
+    last_output = ""
+    for deployment_ref in deployment_refs:
+        code, out, err = await run_kubectl([*kubectl_args_prefix, deployment_ref], namespace=namespace)
+        if code != 0:
+            msg = f"kubectl command failed for {deployment_ref}: {err or out}"
+            raise RuntimeError(msg)
+        last_output = out
+    return last_output
+
+
+async def _scale_tenant_deployments(deployment_refs: tuple[str, ...], replicas: int, *, namespace: str) -> str:
+    """Scale each tenant deployment to the requested replica count."""
+    last_output = ""
+    for deployment_ref in deployment_refs:
+        code, out, err = await run_kubectl(["scale", deployment_ref, f"--replicas={replicas}"], namespace=namespace)
+        if code != 0:
+            msg = f"kubectl command failed for {deployment_ref}: {err or out}"
+            raise RuntimeError(msg)
+        last_output = out
+    return last_output
 
 
 def _require_provisioner_auth(authorization: str | None) -> None:
@@ -434,12 +467,9 @@ async def start_instance_provisioner(
         raise HTTPException(status_code=404, detail=error_msg)
 
     try:
-        code, out, err = await run_kubectl(
-            ["scale", instance_deployment_ref(instance_id), "--replicas=1"], namespace="mindroom-instances"
+        out = await _scale_tenant_deployments(
+            tenant_start_deployment_refs(instance_id), replicas=1, namespace="mindroom-instances"
         )
-        if code != 0:
-            msg = f"kubectl command failed: {err}"
-            raise RuntimeError(msg)  # noqa: TRY301
         logger.info("Started instance %s: %s", instance_id, out)
         # Reflect desired state in DB immediately
         if not update_instance_status(instance_id, "running"):
@@ -469,12 +499,9 @@ async def stop_instance_provisioner(
         raise HTTPException(status_code=404, detail=error_msg)
 
     try:
-        code, out, err = await run_kubectl(
-            ["scale", instance_deployment_ref(instance_id), "--replicas=0"], namespace="mindroom-instances"
+        out = await _scale_tenant_deployments(
+            tenant_stop_deployment_refs(instance_id), replicas=0, namespace="mindroom-instances"
         )
-        if code != 0:
-            msg = f"kubectl command failed: {err}"
-            raise RuntimeError(msg)  # noqa: TRY301
         logger.info("Stopped instance %s: %s", instance_id, out)
         # Reflect desired state in DB immediately
         if not update_instance_status(instance_id, "stopped"):
@@ -504,12 +531,9 @@ async def restart_instance_provisioner(
         raise HTTPException(status_code=404, detail=error_msg)
 
     try:
-        code, out, err = await run_kubectl(
-            ["rollout", "restart", instance_deployment_ref(instance_id)], namespace="mindroom-instances"
+        out = await _run_kubectl_for_deployments(
+            ["rollout", "restart"], tenant_start_deployment_refs(instance_id), namespace="mindroom-instances"
         )
-        if code != 0:
-            msg = f"kubectl command failed: {err}"
-            raise RuntimeError(msg)  # noqa: TRY301
         logger.info("Restarted instance %s: %s", instance_id, out)
     except Exception as e:
         logger.exception("Failed to restart instance %s", instance_id)

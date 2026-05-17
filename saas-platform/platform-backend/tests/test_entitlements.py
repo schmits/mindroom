@@ -31,7 +31,9 @@ def test_unexpired_trial_can_run_instances() -> None:
     "subscription",
     [
         _subscription(tier="free", status="active"),
-        _subscription(tier="starter", status="trialing", trial_ends_at=(datetime.now(UTC) - timedelta(days=1)).isoformat()),
+        _subscription(
+            tier="starter", status="trialing", trial_ends_at=(datetime.now(UTC) - timedelta(days=1)).isoformat()
+        ),
         _subscription(tier="starter", status="past_due"),
         _subscription(tier="starter", status="cancelled"),
         _subscription(tier="starter", status="paused"),
