@@ -221,6 +221,7 @@ async def _ensure_room_exists(  # noqa: C901, PLR0912
     response = await client.room_resolve_alias(full_alias)
     if isinstance(response, nio.RoomResolveAliasResponse):
         room_id = str(response.room_id)
+        explicit_room_name = room_name
         logger.debug("managed_room_alias_resolved", room_key=room_key, room_alias=full_alias, room_id=room_id)
 
         # Update our state if needed
@@ -240,9 +241,10 @@ async def _ensure_room_exists(  # noqa: C901, PLR0912
 
         if joined_room:
             # For existing rooms, ensure they have a topic set
-            if room_name is None:
-                room_name = _room_key_to_name(room_key)
-            await ensure_room_has_topic(client, room_id, room_key, room_name, config, runtime_paths)
+            topic_room_name = explicit_room_name or _room_key_to_name(room_key)
+            if explicit_room_name is not None:
+                await ensure_room_name(client, room_id, explicit_room_name)
+            await ensure_room_has_topic(client, room_id, room_key, topic_room_name, config, runtime_paths)
             await ensure_thread_tags_power_level(client, room_id)
 
             if config.matrix_room_access.is_multi_user_mode() and config.matrix_room_access.reconcile_existing_rooms:
@@ -367,12 +369,17 @@ async def ensure_all_rooms_exist(
         power_users = managed_entity_power_user_ids_for_room(room_key, config, runtime_paths)
 
         # Ensure room exists
+        room_config = config.rooms.get(room_key)
+        room_name = None
+        if room_config is not None:
+            room_name = room_config.display_name or _room_key_to_name(room_key)
         try:
             room_id = await _ensure_room_exists(
                 client=client,
                 room_key=room_key,
                 config=config,
                 runtime_paths=runtime_paths,
+                room_name=room_name,
                 power_users=power_users,
             )
         except RuntimeError:
