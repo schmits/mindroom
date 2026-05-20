@@ -1251,6 +1251,66 @@ async def test_restart_resets_monotonic_clock(monkeypatch: pytest.MonkeyPatch) -
     assert bot.sync_calls == 2
 
 
+@pytest.mark.asyncio
+async def test_clean_sync_return_while_running_restarts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A clean sync_forever return is only a shutdown if the bot stopped.
+
+    nio can return from sync_forever without raising even though the bot is
+    still marked running. The supervisor must not treat that as intentional
+    shutdown, otherwise the entity stays present but stops syncing forever.
+    """
+    bot = _FakeBot()
+
+    async def return_once_then_stop() -> None:
+        bot.sync_calls += 1
+        if bot.sync_calls == 1:
+            return
+        bot.running = False
+
+    bot.sync_forever = return_once_then_stop
+
+    retry_attempts: list[int] = []
+
+    def fake_retry_delay(attempt: int, **_kwargs: float) -> float:
+        retry_attempts.append(attempt)
+        return 0.0
+
+    monkeypatch.setattr(runtime_helpers, "retry_delay_seconds", fake_retry_delay)
+
+    await sync_forever_with_restart(bot, max_retries=3)
+
+    assert bot.sync_calls == 2
+    assert bot.prepare_for_sync_shutdown_calls == 2
+    assert retry_attempts == [1]
+
+
+@pytest.mark.asyncio
+async def test_running_bot_logs_when_sync_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Retry exhaustion should be visible if the bot is still logically running."""
+    bot = _FakeBot()
+
+    async def clean_return() -> None:
+        bot.sync_calls += 1
+
+    bot.sync_forever = clean_return
+    logger = MagicMock()
+
+    monkeypatch.setattr(runtime_helpers, "logger", logger)
+    monkeypatch.setattr(runtime_helpers, "retry_delay_seconds", lambda *_args, **_kwargs: 0.0)
+
+    await sync_forever_with_restart(bot, max_retries=2)
+
+    assert bot.running is True
+    assert bot.sync_calls == 2
+    assert bot.prepare_for_sync_shutdown_calls == 2
+    logger.error.assert_called_once_with(
+        "sync_loop_retries_exhausted",
+        agent="test_agent",
+        retry_count=2,
+        max_retries=2,
+    )
+
+
 # ---------------------------------------------------------------------------
 # R4 Fix 1: Immediate sync_forever() failure must retry, not exit cleanly
 # ---------------------------------------------------------------------------
