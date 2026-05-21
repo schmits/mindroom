@@ -409,6 +409,16 @@ def _persist_openrouter_key_metadata(sb: Any, instance_id: str, created_key: Cre
     ).eq("instance_id", instance_id).execute()
 
 
+def _mark_instance_provision_error(sb: Any, instance_id: str, context: str) -> None:
+    """Mark a failed provisioning attempt as error without hiding the original failure."""
+    try:
+        sb.table("instances").update({"status": "error", "updated_at": datetime.now(UTC).isoformat()}).eq(
+            "instance_id", instance_id
+        ).execute()
+    except Exception:
+        logger.warning("Failed to update instance status to error after %s", context)
+
+
 async def _provision_openrouter_key(
     *,
     sb: Any,
@@ -690,13 +700,6 @@ async def provision_instance(  # noqa: C901, PLR0912, PLR0915
         _append_matrix_oidc_helm_args(helm_args)
         code, stdout, stderr = await run_helm(helm_args)
         if code != 0:
-            # Mark as error in DB
-            try:
-                sb.table("instances").update({"status": "error", "updated_at": datetime.now(UTC).isoformat()}).eq(
-                    "instance_id", customer_id
-                ).execute()
-            except Exception:
-                logger.warning("Failed to update instance status to error after helm failure")
             msg = f"Helm install failed: {stderr}"
             raise HTTPException(status_code=500, detail=msg)  # noqa: TRY301
         logger.info("Helm install output: %s", stdout)
@@ -704,16 +707,11 @@ async def provision_instance(  # noqa: C901, PLR0912, PLR0915
         # Helm's resource pruning cannot delete the externally managed Secret.
         await _apply_instance_secret(customer_id, namespace, instance_secret_data)
     except HTTPException:
+        _mark_instance_provision_error(sb, customer_id, "deployment HTTP exception")
         raise
     except Exception as e:
         logger.exception("Failed to deploy instance")
-        # Mark as error in DB
-        try:
-            sb.table("instances").update({"status": "error", "updated_at": datetime.now(UTC).isoformat()}).eq(
-                "instance_id", customer_id
-            ).execute()
-        except Exception:
-            logger.warning("Failed to update instance status to error after deploy exception")
+        _mark_instance_provision_error(sb, customer_id, "deploy exception")
         raise HTTPException(status_code=500, detail=f"Failed to deploy instance: {e!s}") from e
 
     # Optional readiness poll; if ready, mark running. Otherwise remain provisioning.

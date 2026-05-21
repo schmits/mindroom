@@ -369,6 +369,8 @@ class TestProvisionerEndpoints:
         assert response.status_code == 500
         assert "OPENROUTER_PROVISIONING_API_KEY" in response.json()["detail"]
         apply_secret.assert_not_called()
+        update_payloads = [call_.args[0] for call_ in mock_supabase.table().update.call_args_list if call_.args]
+        assert any(payload.get("status") == "error" for payload in update_payloads)
 
     def test_pro_provisioning_uses_larger_resource_profile_and_openrouter_limit(
         self,
