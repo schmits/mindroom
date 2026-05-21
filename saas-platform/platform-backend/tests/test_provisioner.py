@@ -301,6 +301,47 @@ class TestProvisionerEndpoints:
         update_payloads = [call_.args[0] for call_ in mock_supabase.table().update.call_args_list if call_.args]
         assert any(payload.get("openrouter_key_hash") == "hobby_hash" for payload in update_payloads)
 
+    def test_hobby_provisioning_continues_if_openrouter_metadata_persist_fails(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_kubectl: AsyncMock,
+        mock_helm: AsyncMock,
+        mock_wait_for_deployment: AsyncMock,
+        valid_auth_header: dict,
+        mock_config,
+    ):
+        """Generated OpenRouter keys should still be applied if audit metadata persistence fails."""
+        mock_supabase.table().insert().execute.return_value = Mock(data=[{"instance_id": "123"}])
+        mock_supabase.table().update().eq().execute.return_value = Mock()
+        created_key = CreatedOpenRouterKey(
+            key="sk-or-v1-hobby-customer",
+            hash="hobby_hash",
+            label="MindRoom hobby instance 123",
+            limit_usd=15,
+            limit_reset="monthly",
+        )
+
+        with (
+            patch("backend.routes.provisioner.OPENROUTER_PROVISIONING_API_KEY", "sk-or-v1-management", create=True),
+            patch("backend.routes.provisioner.create_openrouter_key", return_value=created_key, create=True),
+            patch(
+                "backend.routes.provisioner._persist_openrouter_key_metadata",
+                side_effect=RuntimeError("supabase unavailable"),
+            ),
+            patch("backend.routes.provisioner._apply_instance_secret", new_callable=AsyncMock) as apply_secret,
+        ):
+            apply_secret.return_value = "hash"
+            response = client.post(
+                "/system/provision",
+                json={"subscription_id": "sub_test_123", "account_id": "acc_test_123", "tier": "hobby"},
+                headers=valid_auth_header,
+            )
+
+        assert response.status_code == 200
+        secret_data = apply_secret.call_args.args[2]
+        assert secret_data["openrouter_key"] == "sk-or-v1-hobby-customer"
+
     def test_hobby_provisioning_missing_openrouter_management_key_returns_operator_error(
         self,
         client: TestClient,

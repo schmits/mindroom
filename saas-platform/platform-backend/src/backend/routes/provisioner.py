@@ -444,14 +444,17 @@ async def _provision_openrouter_key(
     except OpenRouterError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    await anyio.to_thread.run_sync(
-        partial(
-            _persist_openrouter_key_metadata,
-            sb,
-            instance_id,
-            created_key,
+    try:
+        await anyio.to_thread.run_sync(
+            partial(
+                _persist_openrouter_key_metadata,
+                sb,
+                instance_id,
+                created_key,
+            )
         )
-    )
+    except Exception:
+        logger.exception("Failed to persist OpenRouter key metadata for instance %s", instance_id)
     return created_key.key
 
 
