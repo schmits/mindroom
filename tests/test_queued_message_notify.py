@@ -28,7 +28,7 @@ from mindroom.ai_runtime import (
 )
 from mindroom.bot import AgentBot
 from mindroom.bot_runtime_view import BotRuntimeState
-from mindroom.coalescing_batch import PendingEvent, build_coalesced_batch
+from mindroom.coalescing_batch import CoalescingKey, PendingEvent, build_coalesced_batch
 from mindroom.config.agent import AgentConfig
 from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
@@ -42,6 +42,7 @@ from mindroom.dispatch_source import (
     MESSAGE_SOURCE_KIND,
     SCHEDULED_SOURCE_KIND,
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
+    VOICE_SOURCE_KIND,
 )
 from mindroom.final_delivery import FinalDeliveryOutcome
 from mindroom.hooks import MessageEnvelope
@@ -255,6 +256,20 @@ def _queued_notice_metadata(reservation: _ReservationLike) -> tuple[PendingDispa
             payload=reservation,
             close=reservation.cancel,
             requires_solo_batch=True,
+        ),
+    )
+
+
+def _targeted_queued_notice_metadata(
+    reservation: _ReservationLike,
+    target: MessageTarget,
+) -> tuple[PendingDispatchMetadata, ...]:
+    return (
+        PendingDispatchMetadata(
+            kind="queued_notice_reservation",
+            payload=reservation,
+            close=reservation.cancel,
+            target_key=(target.room_id, target.resolved_thread_id),
         ),
     )
 
@@ -1931,7 +1946,7 @@ async def test_reserved_follow_up_cleanup_when_handle_coalesced_batch_fails_befo
         reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
         assert reservation is not None
         batch = build_coalesced_batch(
-            (room.room_id, "$thread", "@user:localhost"),
+            CoalescingKey(room.room_id, "$thread", "@user:localhost"),
             [
                 PendingEvent(
                     event=event,
@@ -1957,6 +1972,148 @@ async def test_reserved_follow_up_cleanup_when_handle_coalesced_batch_fails_befo
 
 
 @pytest.mark.asyncio
+async def test_coalesced_batch_uses_queued_notice_for_batch_thread(tmp_path: Path) -> None:
+    """A mixed batch should keep the reservation for its single coalescing target."""
+    bot = _bot(tmp_path)
+    room = MagicMock(spec=nio.MatrixRoom)
+    room.room_id = "!room:localhost"
+    pre_target = MessageTarget.resolve(room.room_id, "$pre_stt_thread", "$typed")
+    post_target = MessageTarget.resolve(room.room_id, "$post_stt_thread", "$voice")
+    pre_envelope = _envelope(
+        dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+        source_event_id="$typed",
+        target=pre_target,
+    )
+    post_envelope = _envelope(
+        source_kind=VOICE_SOURCE_KIND,
+        dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+        source_event_id="$voice",
+        target=post_target,
+    )
+    coordinator = unwrap_extracted_collaborator(bot._response_runner)
+    lifecycle = coordinator._lifecycle_coordinator
+    pre_signal = lifecycle._get_or_create_queued_signal(pre_target)
+    post_signal = lifecycle._get_or_create_queued_signal(post_target)
+    typed_event = _prepared_text_event(event_id="$typed")
+    voice_event = replace(
+        _prepared_text_event(event_id="$voice"),
+        body="🎤 voice transcript",
+        source_kind_override=VOICE_SOURCE_KIND,
+    )
+    captured_reservations: list[object] = []
+
+    async def capture_dispatch(*_args: object, **kwargs: object) -> None:
+        assert pre_signal.pending_human_messages == 0
+        assert post_signal.pending_human_messages == 1
+        reservation = kwargs["queued_notice_reservation"]
+        captured_reservations.append(reservation)
+        assert reservation is post_reservation
+        reservation.consume()
+
+    pre_signal.begin_response_turn()
+    post_signal.begin_response_turn()
+    try:
+        pre_reservation = lifecycle.reserve_waiting_human_message(target=pre_target, response_envelope=pre_envelope)
+        post_reservation = lifecycle.reserve_waiting_human_message(target=post_target, response_envelope=post_envelope)
+        assert pre_reservation is not None
+        assert post_reservation is not None
+        batch = build_coalesced_batch(
+            CoalescingKey(room.room_id, "$post_stt_thread", "@user:localhost"),
+            [
+                PendingEvent(
+                    event=typed_event,
+                    room=room,
+                    source_kind=MESSAGE_SOURCE_KIND,
+                    dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+                    dispatch_metadata=_targeted_queued_notice_metadata(pre_reservation, pre_target),
+                ),
+                PendingEvent(
+                    event=voice_event,
+                    room=room,
+                    source_kind=VOICE_SOURCE_KIND,
+                    dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+                    dispatch_metadata=_targeted_queued_notice_metadata(post_reservation, post_target),
+                ),
+            ],
+        )
+
+        with patch.object(bot._turn_controller, "_dispatch_text_message", new=AsyncMock(side_effect=capture_dispatch)):
+            await bot._turn_controller.handle_coalesced_batch(batch)
+    finally:
+        pre_signal.finish_response_turn()
+        post_signal.finish_response_turn()
+
+    assert captured_reservations == [post_reservation]
+    assert pre_signal.pending_human_messages == 0
+    assert post_signal.pending_human_messages == 0
+    assert not pre_signal.is_set()
+    assert not post_signal.is_set()
+
+
+@pytest.mark.asyncio
+async def test_room_scoped_root_voice_uses_final_target_for_queued_notice(tmp_path: Path) -> None:
+    """A room-scoped voice root should select the reservation for its final target root."""
+    bot = _bot(tmp_path)
+    room = MagicMock(spec=nio.MatrixRoom)
+    room.room_id = "!room:localhost"
+    voice_event = replace(
+        _prepared_text_event(event_id="$voice-root"),
+        body="🎤 voice follow-up",
+        source_kind_override=VOICE_SOURCE_KIND,
+    )
+    target = bot._turn_controller.deps.resolver.build_message_target(
+        room_id=room.room_id,
+        thread_id=None,
+        reply_to_event_id=voice_event.event_id,
+        event_source=voice_event.source,
+    )
+    assert target.resolved_thread_id == "$voice-root"
+    envelope = _envelope(
+        source_kind=VOICE_SOURCE_KIND,
+        dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+        source_event_id=voice_event.event_id,
+        target=target,
+    )
+    coordinator = unwrap_extracted_collaborator(bot._response_runner)
+    lifecycle = coordinator._lifecycle_coordinator
+    queued_signal = lifecycle._get_or_create_queued_signal(target)
+    captured_reservations: list[object] = []
+
+    async def capture_dispatch(*_args: object, **kwargs: object) -> None:
+        assert queued_signal.pending_human_messages == 1
+        reservation = kwargs["queued_notice_reservation"]
+        captured_reservations.append(reservation)
+        assert reservation is voice_reservation
+        reservation.consume()
+
+    queued_signal.begin_response_turn()
+    try:
+        voice_reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
+        assert voice_reservation is not None
+        batch = build_coalesced_batch(
+            CoalescingKey(room.room_id, None, "@user:localhost"),
+            [
+                PendingEvent(
+                    event=voice_event,
+                    room=room,
+                    source_kind=VOICE_SOURCE_KIND,
+                    dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
+                    dispatch_metadata=_targeted_queued_notice_metadata(voice_reservation, target),
+                ),
+            ],
+        )
+
+        with patch.object(bot._turn_controller, "_dispatch_text_message", new=AsyncMock(side_effect=capture_dispatch)):
+            await bot._turn_controller.handle_coalesced_batch(batch)
+    finally:
+        queued_signal.finish_response_turn()
+
+    assert captured_reservations == [voice_reservation]
+    assert queued_signal.pending_human_messages == 0
+    assert not queued_signal.is_set()
+
+
+@pytest.mark.asyncio
 async def test_active_follow_up_reservation_cancelled_when_enqueue_is_cancelled(tmp_path: Path) -> None:
     """Cancellation during enqueue handoff should not leak the reserved notice."""
     bot = _bot(tmp_path)
@@ -1973,28 +2130,32 @@ async def test_active_follow_up_reservation_cancelled_when_enqueue_is_cancelled(
         reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
         assert reservation is not None
         assert queued_signal.pending_human_messages == 1
-        with (
-            patch.object(
-                bot._turn_controller.deps.response_runner,
-                "reserve_waiting_human_message",
-                return_value=reservation,
-            ),
-            patch.object(
-                bot._turn_controller,
-                "_enqueue_for_dispatch",
-                new=AsyncMock(side_effect=asyncio.CancelledError),
-            ),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await bot._turn_controller._enqueue_active_thread_follow_up(
-                room=room,
-                event=event,
-                target=target,
-                envelope=envelope,
-                coalescing_thread_id="$thread",
-                requester_user_id="@user:localhost",
-                dispatch_timing=None,
-            )
+        reservation_owner = bot._turn_controller._reserve_prompt_ingress_order(room, "@user:localhost")
+        try:
+            with (
+                patch.object(
+                    bot._turn_controller.deps.response_runner,
+                    "reserve_waiting_human_message",
+                    return_value=reservation,
+                ),
+                patch.object(
+                    bot._turn_controller,
+                    "_enqueue_for_dispatch",
+                    new=AsyncMock(side_effect=asyncio.CancelledError),
+                ),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await bot._turn_controller._enqueue_active_thread_follow_up(
+                    room=room,
+                    event=event,
+                    target=target,
+                    envelope=envelope,
+                    coalescing_thread_id="$thread",
+                    requester_user_id="@user:localhost",
+                    reservation_owner=reservation_owner,
+                )
+        finally:
+            await reservation_owner.release()
     finally:
         queued_signal.finish_response_turn()
 
@@ -2109,7 +2270,7 @@ async def test_handed_off_reservation_is_cancelled_when_lock_wait_is_cancelled(t
 
 
 def test_reserved_follow_up_cannot_join_multi_event_batch(tmp_path: Path) -> None:
-    """A reserved active follow-up mixed into a multi-event batch should fail and clear."""
+    """Batch validation should not own cleanup for a reserved active follow-up."""
     bot = _bot(tmp_path)
     room = MagicMock(spec=nio.MatrixRoom)
     room.room_id = "!room:localhost"
@@ -2123,12 +2284,13 @@ def test_reserved_follow_up_cannot_join_multi_event_batch(tmp_path: Path) -> Non
     lifecycle = coordinator._lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
+    reservation = None
     try:
         reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
         assert reservation is not None
         with pytest.raises(ValueError, match="solo batches"):
             build_coalesced_batch(
-                (room.room_id, "$thread", "@user:localhost"),
+                CoalescingKey(room.room_id, "$thread", "@user:localhost"),
                 [
                     PendingEvent(
                         event=_prepared_text_event(event_id="$reserved"),
@@ -2144,7 +2306,10 @@ def test_reserved_follow_up_cannot_join_multi_event_batch(tmp_path: Path) -> Non
                     ),
                 ],
             )
+        assert queued_signal.is_set()
     finally:
+        if reservation is not None:
+            reservation.cancel()
         queued_signal.finish_response_turn()
 
     assert not queued_signal.is_set()

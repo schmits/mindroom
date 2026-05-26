@@ -4135,6 +4135,7 @@ class TestThreadingBehavior:
 
         try:
             await bot._turn_controller.handle_media_event(room, audio_event)
+            await drain_coalescing(bot)
             await _wait_for_room_cache_idle(bot.event_cache_write_coordinator)
 
             assert await real_event_cache.get_thread_id_for_event(room_id, audio_event_id) == thread_root_id
@@ -9362,7 +9363,7 @@ class TestThreadingBehavior:
 
     @pytest.mark.asyncio
     async def test_coalescing_thread_id_labels_thread_membership_reads(self, bot: AgentBot) -> None:
-        """Ingress coalescing should attribute any thread proof refreshes it triggers."""
+        """Ingress coalescing should reject indeterminate thread proof refreshes it triggers."""
         room = _matrix_room()
         event = nio.RoomMessageText.from_dict(
             {
@@ -9396,10 +9397,10 @@ class TestThreadingBehavior:
                     ),
                 ),
             ) as mock_resolve,
+            pytest.raises(RuntimeError, match="Could not resolve canonical coalescing thread"),
         ):
-            thread_id = await resolver.coalescing_thread_id(room, event)
+            await resolver.coalescing_thread_id(room, event)
 
-        assert thread_id == "$thread_root:localhost"
         mock_access.assert_called_once_with(
             mode=ThreadReadMode.DISPATCH_SNAPSHOT,
             caller_label="coalescing_thread_id",
@@ -9412,8 +9413,8 @@ class TestThreadingBehavior:
         )
 
     @pytest.mark.asyncio
-    async def test_coalescing_thread_id_keeps_lookup_failure_candidate(self, bot: AgentBot) -> None:
-        """Lookup-failed plain replies should still coalesce by candidate root."""
+    async def test_coalescing_thread_id_rejects_lookup_failure_candidate(self, bot: AgentBot) -> None:
+        """Lookup-failed plain replies should not be admitted under a guessed coalescing key."""
         room = _matrix_room()
         event = nio.RoomMessageText.from_dict(
             {
@@ -9434,10 +9435,9 @@ class TestThreadingBehavior:
         with (
             patch.object(bot._conversation_cache, "get_thread_id_for_event", AsyncMock(return_value=None)),
             patch.object(bot._conversation_cache, "get_event", AsyncMock(side_effect=RuntimeError("lookup failed"))),
+            pytest.raises(RuntimeError, match="Could not resolve canonical coalescing thread"),
         ):
-            thread_id = await resolver.coalescing_thread_id(room, event)
-
-        assert thread_id == "$maybe_root:localhost"
+            await resolver.coalescing_thread_id(room, event)
 
     @pytest.mark.asyncio
     async def test_full_history_thread_resolution_uses_full_history_to_prove_root(
@@ -9521,7 +9521,7 @@ class TestThreadingBehavior:
 
     @pytest.mark.asyncio
     async def test_command_as_reply_doesnt_cause_thread_error(self, tmp_path: Path) -> None:
-        """Plain-reply commands should stay plain replies without thread promotion."""
+        """Plain-reply commands should answer the command event without following stale reply targets."""
         # Create a router bot to handle commands
         agent_user = AgentMatrixUser(
             user_id="@mindroom_router:localhost",
@@ -9623,7 +9623,8 @@ class TestThreadingBehavior:
             content = call_args.kwargs["content"]
 
             assert "m.relates_to" in content
-            assert "rel_type" not in content["m.relates_to"]
+            assert content["m.relates_to"]["rel_type"] == "m.thread"
+            assert content["m.relates_to"]["event_id"] == "$cmd_reply:localhost"
             assert content["m.relates_to"]["m.in_reply_to"]["event_id"] == "$cmd_reply:localhost"
 
     @pytest.mark.asyncio

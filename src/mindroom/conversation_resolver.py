@@ -29,6 +29,8 @@ from mindroom.matrix.message_content import resolve_event_source_content
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
 from mindroom.matrix.thread_membership import (
     ThreadMembershipAccess,
+    ThreadMembershipLookupError,
+    ThreadResolutionState,
     resolve_event_thread_membership,
     resolve_related_event_thread_id_best_effort,
     thread_messages_thread_membership_access,
@@ -478,16 +480,16 @@ class ConversationResolver:
                 ),
             )
         except Exception as exc:
-            # Coalescing is only a batching optimization; any membership failure must fail open.
-            self.deps.logger.debug(
-                "Failed to resolve coalescing thread id; continuing room-level",
-                room_id=room.room_id,
-                event_id=event.event_id,
-                error=str(exc),
-            )
+            msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
+            raise ThreadMembershipLookupError(msg) from exc
+        if resolution.state is ThreadResolutionState.THREADED:
+            return resolution.thread_id
+        if resolution.state is ThreadResolutionState.ROOM_LEVEL:
             return None
-        else:
-            return resolution.thread_id or resolution.candidate_thread_root_id
+        msg = f"Could not resolve canonical coalescing thread for {event.event_id}"
+        if resolution.error is not None:
+            raise ThreadMembershipLookupError(msg) from resolution.error
+        raise ThreadMembershipLookupError(msg)
 
     async def _explicit_thread_id_for_event(
         self,
@@ -707,29 +709,6 @@ class ConversationResolver:
             requires_model_history_refresh=resolved_thread_id is not None,
         )
         return DispatchContextResult(context=context, thread_context=None)
-
-    async def resolve_dispatch_target(
-        self,
-        room: nio.MatrixRoom,
-        event: DispatchEvent | MatrixMediaEvent,
-        *,
-        caller_label: str,
-    ) -> MessageTarget:
-        """Resolve a bounded stable target for non-response dispatch helpers."""
-        context_result = await self.extract_dispatch_context(
-            room,
-            event,
-            mode=ThreadReadMode.DISPATCH_SNAPSHOT,
-            caller_label=caller_label,
-        )
-        if context_result.thread_context is not None:
-            return context_result.thread_context.stable_target
-        return self.build_message_target(
-            room_id=room.room_id,
-            thread_id=context_result.context.thread_id,
-            reply_to_event_id=event.event_id,
-            event_source=event.source,
-        )
 
     async def extract_message_context(
         self,
