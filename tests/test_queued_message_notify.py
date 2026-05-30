@@ -51,6 +51,7 @@ from mindroom.dispatch_source import (
     VOICE_SOURCE_KIND,
 )
 from mindroom.final_delivery import FinalDeliveryOutcome
+from mindroom.history.types import HistoryScope
 from mindroom.hooks import MessageEnvelope
 from mindroom.inbound_turn_normalizer import DispatchPayload
 from mindroom.interactive import InteractiveMetadata
@@ -872,6 +873,26 @@ async def test_generate_response_skips_signal_for_non_human_prompt_ingress(
             lifecycle_lock.release()
 
     assert not queued_signal.is_set()
+
+
+def test_forced_compaction_placeholder_check_degrades_on_storage_error(tmp_path: Path) -> None:
+    """Storage errors in the placeholder-ordering hint should not abort response generation."""
+    bot = _bot(tmp_path)
+    coordinator = unwrap_extracted_collaborator(bot._response_runner)
+    scope = HistoryScope(kind="agent", scope_id="home")
+
+    with patch.object(
+        coordinator.deps.state_writer,
+        "create_storage",
+        side_effect=RuntimeError("storage unavailable"),
+    ):
+        result = coordinator._has_queued_forced_compaction(
+            session_id="session",
+            scope=scope,
+            execution_identity=None,
+        )
+
+    assert result is False
 
 
 @pytest.mark.asyncio
