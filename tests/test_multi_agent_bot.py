@@ -92,7 +92,7 @@ from mindroom.hooks import (
 )
 from mindroom.inbound_turn_normalizer import DispatchPayload, DispatchPayloadWithAttachmentsRequest
 from mindroom.knowledge.availability import KnowledgeAvailability
-from mindroom.knowledge.manager import KnowledgeManager
+from mindroom.knowledge.manager import IndexingSettings, KnowledgeManager
 from mindroom.knowledge.utils import _KnowledgeResolution, _MultiKnowledgeVectorDb
 from mindroom.matrix.cache import ThreadHistoryResult
 from mindroom.matrix.cache.thread_history_result import thread_history_result
@@ -491,6 +491,29 @@ def _runtime_bound_config(config: Config, runtime_root: Path) -> Config:
     )
     persist_entity_accounts(bound_config, runtime_paths_for(bound_config))
     return bound_config
+
+
+def _fake_indexing_settings(base_id: str) -> IndexingSettings:
+    return IndexingSettings(
+        base_id=base_id,
+        storage_root="storage",
+        knowledge_path=f"knowledge/{base_id}",
+        mode="semantic",
+        embedder_provider="openai",
+        embedder_model="text-embedding-3-small",
+        embedder_host="",
+        embedder_dimensions="",
+        chunk_size="5000",
+        chunk_overlap="0",
+        repo_identity="",
+        git_branch="",
+        git_lfs="",
+        git_skip_hidden="",
+        git_include_patterns="",
+        git_exclude_patterns="",
+        include_extensions="",
+        exclude_extensions="()",
+    )
 
 
 def _configured_team_test_config(runtime_root: Path) -> Config:
@@ -1215,7 +1238,7 @@ class TestAgentBot:
                 base_id="research",
                 storage_root=str(tmp_path),
                 knowledge_path=str(tmp_path / "kb"),
-                indexing_settings=(),
+                indexing_settings=_fake_indexing_settings("research"),
             ),
             index=SimpleNamespace(
                 knowledge=expected_knowledge,
@@ -1297,7 +1320,7 @@ class TestAgentBot:
                     base_id=base_id,
                     storage_root=str(tmp_path),
                     knowledge_path=str(tmp_path / f"kb_{base_id}"),
-                    indexing_settings=(),
+                    indexing_settings=_fake_indexing_settings(base_id),
                 ),
                 index=SimpleNamespace(
                     knowledge={"research": research_knowledge, "legal": legal_knowledge}[base_id],
@@ -15530,7 +15553,11 @@ class TestMultiAgentOrchestrator:
             updated = await orchestrator.update_config()
 
         assert updated is False
-        mock_sync_runtime.assert_awaited_once_with(config, start_watcher=True)
+        mock_sync_runtime.assert_awaited_once_with(
+            config,
+            start_watcher=True,
+            previous_config=config,
+        )
         assert not hasattr(orchestrator, "_schedule_knowledge_refresh")
 
     @pytest.mark.asyncio
