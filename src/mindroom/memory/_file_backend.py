@@ -21,6 +21,7 @@ from ._policy import (
     resolve_file_memory_resolution,
     storage_paths_for_scope_user_id,
 )
+from ._semantic_file_search import search_semantic_file_memories
 from ._shared import (
     FILE_MEMORY_DAILY_DIR,
     FILE_MEMORY_DEFAULT_DIRNAME,
@@ -41,6 +42,13 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 logger = get_logger(__name__)
+
+
+def _tag_keyword_mode(result: MemoryResult) -> None:
+    metadata = result.get("metadata")
+    result["metadata"] = (
+        {**metadata, "search_mode": "keyword"} if isinstance(metadata, dict) else {"search_mode": "keyword"}
+    )
 
 
 def _file_memory_root(
@@ -619,7 +627,7 @@ def _search_team_file_scope_memories(
     )
 
 
-def search_file_agent_memories(
+async def search_file_agent_memories(
     query: str,
     agent_name: str,
     storage_path: Path,
@@ -638,14 +646,32 @@ def search_file_agent_memories(
         agent_name=agent_name,
         execution_identity=execution_identity,
     )
-    results = _search_agent_file_scope_memories(
-        query,
-        agent_name,
-        agent_resolution,
-        config,
-        limit,
-        timing_scope,
-    )
+
+    def keyword_results() -> list[MemoryResult]:
+        results = _search_agent_file_scope_memories(query, agent_name, agent_resolution, config, limit, timing_scope)
+        for result in results:
+            _tag_keyword_mode(result)
+        return results
+
+    search_config = config.get_agent_memory_search(agent_name)
+    if search_config.mode == "semantic":
+        scope_user_id = agent_scope_user_id(agent_name)
+        try:
+            results = await search_semantic_file_memories(
+                query,
+                scope_user_id=scope_user_id,
+                root=_scope_dir(scope_user_id, agent_resolution, config, create=False),
+                config=config,
+                runtime_paths=runtime_paths,
+                search_config=search_config,
+                limit=limit,
+            )
+        except Exception:
+            logger.exception("File-memory semantic search failed; falling back to keyword search", agent=agent_name)
+            results = keyword_results()
+    else:
+        results = keyword_results()
+
     existing_memories = {result.get("memory", "") for result in results}
     for team_id in get_team_ids_for_agent(agent_name, config):
         for target_storage_path in storage_paths_for_scope_user_id(
@@ -662,19 +688,19 @@ def search_file_agent_memories(
                 original_storage_path=storage_path,
                 execution_identity=execution_identity,
             )
-            team_results = _search_team_file_scope_memories(
+            for memory in _search_team_file_scope_memories(
                 team_id,
                 query,
                 team_resolution,
                 config,
                 limit,
                 timing_scope,
-            )
-            for memory in team_results:
+            ):
                 memory_text = memory.get("memory", "")
                 if memory_text in existing_memories:
                     continue
                 existing_memories.add(memory_text)
+                _tag_keyword_mode(memory)
                 results.append(memory)
     results.sort(key=lambda item: cast("float", item.get("score", 0.0)), reverse=True)
     return results[:limit]

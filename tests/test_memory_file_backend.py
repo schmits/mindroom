@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
+from threading import Lock
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
+import mindroom.memory._semantic_file_search as semantic_file_search
 import mindroom.memory.functions as memory_functions
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
@@ -21,6 +27,7 @@ from mindroom.memory import list_all_agent_memories as public_list_all_agent_mem
 from mindroom.memory import search_agent_memories as public_search_agent_memories
 from mindroom.memory import store_conversation_memory as public_store_conversation_memory
 from mindroom.memory import update_agent_memory as public_update_agent_memory
+from mindroom.memory._semantic_file_search import _ensure_index_current, _IndexedFile
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
@@ -447,6 +454,337 @@ async def test_file_backend_worker_scope_workspace_file_memory_uses_workspace_ro
     )
     assert alice_memory_file.exists()
     assert "Alice workspace memory" in alice_memory_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_file_backend_semantic_search_reads_daily_memory_root(storage_path: Path, config: Config) -> None:
+    config.memory.backend = "file"
+    config.memory.search.mode = "semantic"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    (workspace / "memory").mkdir(parents=True)
+    (workspace / "memory" / "2026-06-02.md").write_text("Bas prefers small precise plans.\n", encoding="utf-8")
+    (workspace / "MEMORY.md").write_text("Entrypoint should not be indexed by default.\n", encoding="utf-8")
+
+    with patch("mindroom.memory._file_backend.search_semantic_file_memories") as semantic_search:
+        semantic_search.return_value = [
+            {
+                "id": "semantic:memory/2026-06-02.md:0",
+                "memory": "Bas prefers small precise plans.",
+                "user_id": "agent_general",
+                "score": 1.0,
+                "metadata": {"source_file": "memory/2026-06-02.md", "semantic": True, "search_mode": "semantic"},
+            },
+        ]
+
+        results = await search_agent_memories("precise planning", "general", storage_path, config, limit=5)
+
+    assert results[0]["memory"] == "Bas prefers small precise plans."
+    semantic_search.assert_called_once()
+    assert semantic_search.call_args.kwargs["limit"] == 5
+    assert semantic_search.call_args.kwargs["root"] == workspace
+
+
+@pytest.mark.asyncio
+async def test_file_backend_semantic_search_falls_back_to_keyword_on_index_error(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.memory.search.mode = "semantic"
+    config.agents["general"].memory_backend = "file"
+
+    await add_agent_memory("Keyword fallback memory", "general", storage_path, config)
+
+    with patch(
+        "mindroom.memory._file_backend.search_semantic_file_memories",
+        side_effect=RuntimeError("embedder offline"),
+    ):
+        results = await search_agent_memories("Keyword fallback", "general", storage_path, config, limit=5)
+
+    assert any(result.get("memory") == "Keyword fallback memory" for result in results)
+    assert all((result.get("metadata") or {}).get("search_mode") == "keyword" for result in results)
+
+
+@pytest.mark.asyncio
+async def test_file_backend_private_semantic_search_uses_requester_root(
+    storage_path: Path,
+    config: Config,
+    build_private_template_dir: Callable[..., Path],
+) -> None:
+    template_dir = build_private_template_dir(
+        files={"MEMORY.md": "# Memory\n", "memory/notes.md": "Alice private semantic note.\n"},
+    )
+    config.memory.backend = "file"
+    config.memory.search.mode = "semantic"
+    config.agents["general"].memory_backend = "file"
+    config.agents["general"].private = AgentPrivateConfig(
+        per="user",
+        root="mind_data",
+        template_dir=str(template_dir),
+    )
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session-alice",
+    )
+
+    with (
+        tool_execution_identity(identity),
+        patch(
+            "mindroom.memory._file_backend.search_semantic_file_memories",
+        ) as semantic_search,
+    ):
+        semantic_search.return_value = [
+            {
+                "id": "semantic:memory/notes.md:0",
+                "memory": "Alice private semantic note.",
+                "user_id": "agent_general",
+                "score": 1.0,
+                "metadata": {"source_file": "memory/notes.md", "semantic": True, "search_mode": "semantic"},
+            },
+        ]
+        results = await search_agent_memories("private semantic", "general", storage_path, config, limit=5)
+
+    assert results[0]["memory"] == "Alice private semantic note."
+    root = semantic_search.call_args.kwargs["root"]
+    assert "private_instances" in str(root)
+    assert str(root).endswith("mind_data")
+
+
+def test_semantic_memory_index_updates_changed_files_incrementally(tmp_path: Path) -> None:
+    class FakeVectorDb:
+        collection_name = "memory_collection"
+
+        def __init__(self) -> None:
+            self.deleted = False
+            self.created = False
+
+        def exists(self) -> bool:
+            return True
+
+        def delete(self) -> None:
+            self.deleted = True
+
+        def create(self) -> None:
+            self.created = True
+
+    class FakeKnowledge:
+        def __init__(self) -> None:
+            self.vector_db = FakeVectorDb()
+            self.removed: list[dict[str, str]] = []
+            self.inserted: list[str] = []
+
+        def remove_vectors_by_metadata(self, metadata: dict[str, str]) -> None:
+            self.removed.append(metadata)
+
+        def insert(self, *, path: str, metadata: dict[str, object], upsert: bool, reader: object) -> None:
+            assert upsert is True
+            assert metadata["source_path"] == "memory/2026-06-02.md"
+            assert reader is not None
+            self.inserted.append(path.rsplit("/", 1)[-1])
+
+    memory_root = tmp_path / "memory-root"
+    memory_root.mkdir()
+    changed_file = memory_root / "memory" / "2026-06-02.md"
+    changed_file.parent.mkdir()
+    changed_file.write_text("changed", encoding="utf-8")
+    current_file = _IndexedFile(
+        path=changed_file,
+        relative_path="memory/2026-06-02.md",
+        mtime_ns=2,
+        size=7,
+    )
+    index_path = tmp_path / "index"
+    index_path.mkdir()
+    (index_path / "index_state.json").write_text(
+        json.dumps(
+            {
+                "settings_signature": "same-settings",
+                "collection": "memory_collection",
+                "files": {
+                    "memory/2026-06-02.md": {"mtime_ns": 1, "size": 3},
+                    "memory/deleted.md": {"mtime_ns": 1, "size": 3},
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    knowledge = FakeKnowledge()
+
+    _ensure_index_current(
+        knowledge,
+        [current_file],
+        index_path,
+        "memory_collection",
+        "same-settings",
+    )
+
+    assert knowledge.vector_db.deleted is False
+    assert knowledge.vector_db.created is False
+    assert knowledge.removed == [
+        {"source_path": "memory/deleted.md"},
+        {"source_path": "memory/2026-06-02.md"},
+    ]
+    assert knowledge.inserted == ["2026-06-02.md"]
+
+
+def test_semantic_memory_failed_reset_forces_next_reset(tmp_path: Path) -> None:
+    class FakeVectorDb:
+        collection_name = "memory_collection"
+
+        def __init__(self, *, exists_before: bool) -> None:
+            self.exists_before = exists_before
+            self.deleted = False
+            self.created = False
+
+        def exists(self) -> bool:
+            return self.exists_before
+
+        def delete(self) -> None:
+            self.deleted = True
+
+        def create(self) -> None:
+            self.created = True
+
+    class FakeKnowledge:
+        def __init__(self, *, exists_before: bool, fail_insert: bool) -> None:
+            self.vector_db = FakeVectorDb(exists_before=exists_before)
+            self.fail_insert = fail_insert
+            self.inserted: list[str] = []
+
+        def insert(self, *, path: str, metadata: dict[str, object], upsert: bool, reader: object) -> None:
+            assert upsert is True
+            assert metadata["source_path"] == "memory/2026-06-02.md"
+            assert reader is not None
+            if self.fail_insert:
+                msg = "embedder failed"
+                raise RuntimeError(msg)
+            self.inserted.append(path.rsplit("/", 1)[-1])
+
+    memory_root = tmp_path / "memory-root"
+    memory_root.mkdir()
+    memory_file = memory_root / "memory" / "2026-06-02.md"
+    memory_file.parent.mkdir()
+    memory_file.write_text("current", encoding="utf-8")
+    current_file = _IndexedFile(
+        path=memory_file,
+        relative_path="memory/2026-06-02.md",
+        mtime_ns=1,
+        size=7,
+    )
+    index_path = tmp_path / "index"
+    index_path.mkdir()
+    (index_path / "index_state.json").write_text(
+        json.dumps(
+            {
+                "settings_signature": "same-settings",
+                "collection": "memory_collection",
+                "files": {"memory/2026-06-02.md": {"mtime_ns": 1, "size": 7}},
+            },
+        ),
+        encoding="utf-8",
+    )
+
+    failing_knowledge = FakeKnowledge(exists_before=False, fail_insert=True)
+    with pytest.raises(RuntimeError, match="embedder failed"):
+        _ensure_index_current(
+            failing_knowledge,
+            [current_file],
+            index_path,
+            "memory_collection",
+            "same-settings",
+        )
+
+    incomplete_state = json.loads((index_path / "index_state.json").read_text(encoding="utf-8"))
+    assert "files" not in incomplete_state
+
+    succeeding_knowledge = FakeKnowledge(exists_before=True, fail_insert=False)
+    _ensure_index_current(
+        succeeding_knowledge,
+        [current_file],
+        index_path,
+        "memory_collection",
+        "same-settings",
+    )
+
+    assert succeeding_knowledge.vector_db.deleted is True
+    assert succeeding_knowledge.vector_db.created is True
+    assert succeeding_knowledge.inserted == ["2026-06-02.md"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_memory_index_refresh_and_search_are_serialized(storage_path: Path, config: Config) -> None:
+    root = storage_path / "memory-root"
+    memory_file = root / "memory" / "2026-06-02.md"
+    memory_file.parent.mkdir(parents=True)
+    memory_file.write_text("Serialized semantic memory.\n", encoding="utf-8")
+
+    active_sections = 0
+    max_active_sections = 0
+    section_lock = Lock()
+
+    def run_blocking_index_section() -> None:
+        nonlocal active_sections, max_active_sections
+        with section_lock:
+            active_sections += 1
+            max_active_sections = max(max_active_sections, active_sections)
+        try:
+            time.sleep(0.1)
+        finally:
+            with section_lock:
+                active_sections -= 1
+
+    def fake_ensure_index_current(*_args: object, **_kwargs: object) -> None:
+        run_blocking_index_section()
+
+    class FakeKnowledge:
+        def __init__(self, *, vector_db: object) -> None:
+            self.vector_db = vector_db
+
+        def search(self, *, query: str, max_results: int) -> list[object]:
+            assert query == "semantic memory"
+            assert max_results == 5
+            run_blocking_index_section()
+            return []
+
+    class FakeChromaDb:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    with (
+        patch.object(semantic_file_search, "Knowledge", FakeKnowledge),
+        patch.object(semantic_file_search, "ChromaDb", FakeChromaDb),
+        patch.object(semantic_file_search, "create_configured_embedder", return_value=object()),
+        patch.object(semantic_file_search, "_ensure_index_current", fake_ensure_index_current),
+    ):
+        await asyncio.gather(
+            semantic_file_search.search_semantic_file_memories(
+                "semantic memory",
+                scope_user_id="agent_general",
+                root=root,
+                config=config,
+                runtime_paths=runtime_paths_for(config),
+                search_config=config.memory.search,
+                limit=5,
+            ),
+            semantic_file_search.search_semantic_file_memories(
+                "semantic memory",
+                scope_user_id="agent_general",
+                root=root,
+                config=config,
+                runtime_paths=runtime_paths_for(config),
+                search_config=config.memory.search,
+                limit=5,
+            ),
+        )
+
+    assert max_active_sections == 1
 
 
 @pytest.mark.asyncio

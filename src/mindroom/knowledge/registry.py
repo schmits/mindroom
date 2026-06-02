@@ -35,7 +35,6 @@ if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 logger = get_logger(__name__)
-
 # Identity levels:
 # - KnowledgeSourceRoot: one physical source root. It gates source mutation locks and alias fanout.
 # - KnowledgeRefreshTarget: one refresh target. It coalesces background work for a source and base ID.
@@ -447,7 +446,7 @@ def _build_published_index_vector_db(
             collection=_state_collection_name(state),
             path=str(_published_index_storage_path(key)),
             persistent_client=True,
-            embedder=manager_module._create_embedder(config, runtime_paths),
+            embedder=manager_module.create_configured_embedder(config, runtime_paths),
         ),
     )
 
