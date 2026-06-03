@@ -148,6 +148,7 @@ class _RoomMemberJoinSyncHookPlan:
     arm_after_response: bool = True
     emit_state: bool = False
     emit_timeline: bool = False
+    record_state_seen: bool = False
 
 
 def _create_task_wrapper(
@@ -1117,6 +1118,7 @@ class AgentBot:
             arm_after_response=True,
             emit_state=emit_certified_state,
             emit_timeline=restored_token_first_sync_response,
+            record_state_seen=decision.state is SyncTrustState.CERTIFIED and not emit_certified_state,
         )
 
     async def _run_sync_response_side_effects(
@@ -1127,6 +1129,8 @@ class AgentBot:
         room_member_join_hook_plan: _RoomMemberJoinSyncHookPlan,
     ) -> None:
         """Run sync-response side effects that must poison certification on failure."""
+        if room_member_join_hook_plan.record_state_seen:
+            await self._emit_room_member_joined_sync_state_hooks(response, record_only=True)
         if room_member_join_hook_plan.emit_timeline:
             await self._emit_room_member_joined_sync_timeline_hooks(response)
         if room_member_join_hook_plan.emit_state:
@@ -1600,17 +1604,24 @@ class AgentBot:
             config=self.config,
             runtime_paths=self.runtime_paths,
             storage_root=self.runtime_paths.storage_root,
+            # Live callbacks are armed only after startup sync; prev_content may be absent.
+            require_previous_membership=False,
         )
         if join is None:
             return
 
         await self._emit_room_member_joined_hooks(join)
 
-    async def _emit_room_member_joined_sync_state_hooks(self, response: nio.SyncResponse) -> None:
-        """Expose human joins that matrix-nio delivers through sync room state."""
+    async def _emit_room_member_joined_sync_state_hooks(
+        self,
+        response: nio.SyncResponse,
+        *,
+        record_only: bool = False,
+    ) -> None:
+        """Expose or record human joins that matrix-nio delivers through sync room state."""
         if self.agent_name != ROUTER_AGENT_NAME or not self._first_sync_done or not self._room_member_join_hooks_armed:
             return
-        if not self.hook_registry.has_hooks(EVENT_ROOM_MEMBER_JOINED):
+        if not record_only and not self.hook_registry.has_hooks(EVENT_ROOM_MEMBER_JOINED):
             return
         client = self.client
         if client is None:
@@ -1622,6 +1633,7 @@ class AgentBot:
             config=self.config,
             runtime_paths=self.runtime_paths,
             storage_root=self.runtime_paths.storage_root,
+            record_only=record_only,
         ):
             await self._emit_room_member_joined_hooks(join)
 
