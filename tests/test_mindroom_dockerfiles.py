@@ -20,7 +20,7 @@ _SANDBOX_RUNNER_SCRIPT = _REPO_ROOT / "run-sandbox-runner.sh"
 def _apt_install_packages(dockerfile_text: str) -> set[str]:
     match = re.search(r"apt-get install -y (?P<packages>.*?)\\\s*&&", dockerfile_text, re.DOTALL)
     assert match is not None
-    return set(match.group("packages").split())
+    return {package for package in match.group("packages").split() if not package.startswith("-") and package != "\\"}
 
 
 def _assert_command_starts_with_tini(template_text: str, command: str) -> None:
@@ -29,6 +29,17 @@ def _assert_command_starts_with_tini(template_text: str, command: str) -> None:
     inline_list_pattern = rf"command:\s*\[\s*\"tini\"\s*,\s*\"--\"\s*,\s*\"{escaped_command}\""
 
     assert re.search(block_list_pattern, template_text) or re.search(inline_list_pattern, template_text)
+
+
+def test_apt_install_packages_ignores_flags_and_line_continuations() -> None:
+    """Dockerfile package parsing should tolerate multiline apt install formatting."""
+    text = """RUN apt-get update && apt-get install -y --no-install-recommends \\
+    bash \\
+    git \\
+    && apt-get clean
+"""
+
+    assert _apt_install_packages(text) == {"bash", "git"}
 
 
 def test_mindroom_runtime_images_run_under_tini() -> None:
@@ -57,6 +68,26 @@ def test_mindroom_runtime_images_opt_into_dashboard_asset_build() -> None:
         assert "--reinstall-package mindroom" in builder_after_frontend
         assert "rm -rf frontend/node_modules" in builder_after_frontend
         assert "bun install --frozen-lockfile" not in text
+
+
+def test_full_mindroom_runtime_image_bundles_browser_runtime_packages() -> None:
+    """The full runtime image should support browser and media-capable worker tools."""
+    text = (_REPO_ROOT / "local/instances/deploy/Dockerfile.mindroom").read_text(encoding="utf-8")
+    packages = _apt_install_packages(text)
+
+    assert {"chromium", "ffmpeg", "fonts-liberation", "nodejs"} <= packages
+
+
+def test_mindroom_runtime_images_keep_git_ssh_support_when_disabling_recommends() -> None:
+    """Git-over-SSH needs an explicit SSH client when apt recommendations are disabled."""
+    for dockerfile in _MINDROOM_DOCKERFILES:
+        text = dockerfile.read_text(encoding="utf-8")
+        install_args_match = re.search(r"apt-get install -y (?P<args>.*?)\\\s*&&", text, re.DOTALL)
+        assert install_args_match is not None
+        install_args = install_args_match.group("args").split()
+
+        if "--no-install-recommends" in install_args:
+            assert "openssh-client" in _apt_install_packages(text)
 
 
 def test_kubernetes_command_overrides_run_under_tini() -> None:
