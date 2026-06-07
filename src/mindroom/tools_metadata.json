@@ -227,6 +227,18 @@
         },
         {
           "authored_override": true,
+          "default": false,
+          "description": null,
+          "label": "Save Downloads",
+          "name": "save_downloads",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
           "default": true,
           "description": null,
           "label": "Enable Send Message",
@@ -303,6 +315,18 @@
           "description": null,
           "label": "Enable Search Messages",
           "name": "enable_search_messages",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": false,
+          "description": null,
+          "label": "Enable Search Workspace",
+          "name": "enable_search_workspace",
           "options": null,
           "placeholder": null,
           "required": false,
@@ -412,6 +436,7 @@
         "list_channels",
         "list_users",
         "search_messages",
+        "search_workspace",
         "send_message",
         "send_message_thread",
         "upload_file"
@@ -3048,6 +3073,18 @@
         },
         {
           "authored_override": true,
+          "default": null,
+          "description": "Fnmatch-style path component patterns excluded from content search. Leave unset to use Agno defaults; set an empty list to disable exclusions.",
+          "label": "Search Content Exclude Patterns",
+          "name": "exclude_patterns",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
           "default": false,
           "description": null,
           "label": "All",
@@ -3142,8 +3179,44 @@
           "authored_override": true,
           "default": true,
           "description": null,
+          "label": "Enable DOCX Generation",
+          "name": "enable_docx_generation",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": true,
+          "description": null,
           "label": "Enable TXT Generation",
           "name": "enable_txt_generation",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": true,
+          "description": null,
+          "label": "Enable HTML Generation",
+          "name": "enable_html_generation",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": false,
+          "description": null,
+          "label": "Save Files",
+          "name": "save_files",
           "options": null,
           "placeholder": null,
           "required": false,
@@ -3166,13 +3239,16 @@
       "consumes_workspace_paths": false,
       "default_execution_target": "primary",
       "dependencies": [
+        "python-docx",
         "reportlab"
       ],
-      "description": "Generate JSON, CSV, PDF, and text files from data",
+      "description": "Generate JSON, CSV, PDF, DOCX, HTML, and text files from data",
       "display_name": "File Generation",
       "docs_url": "https://docs.agno.com/tools/toolkits/others/file_generation",
       "function_names": [
         "generate_csv_file",
+        "generate_docx_file",
+        "generate_html_file",
         "generate_json_file",
         "generate_pdf_file",
         "generate_text_file"
@@ -10685,18 +10761,6 @@
           "authored_override": true,
           "default": false,
           "description": null,
-          "label": "Enable Agentic Crawler",
-          "name": "enable_agentic_crawler",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "boolean",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": false,
-          "description": null,
           "label": "Enable Scrape",
           "name": "enable_scrape",
           "options": null,
@@ -10715,6 +10779,42 @@
           "placeholder": null,
           "required": false,
           "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": null,
+          "description": null,
+          "label": "Headers",
+          "name": "headers",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": 3,
+          "description": null,
+          "label": "Crawl Poll Interval",
+          "name": "crawl_poll_interval",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "number",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": 180,
+          "description": null,
+          "label": "Crawl Max Wait",
+          "name": "crawl_max_wait",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "number",
           "validation": null
         },
         {
@@ -10739,7 +10839,6 @@
       "display_name": "ScrapeGraph",
       "docs_url": "https://docs.agno.com/tools/toolkits/web_scrape/scrapegraph",
       "function_names": [
-        "agentic_crawler",
         "crawl",
         "markdownify",
         "scrape",
@@ -11772,6 +11871,18 @@
           "placeholder": null,
           "required": false,
           "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": true,
+          "description": null,
+          "label": "Auto Suggest",
+          "name": "auto_suggest",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
           "validation": null
         },
         {
