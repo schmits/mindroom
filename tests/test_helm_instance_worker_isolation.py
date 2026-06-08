@@ -1283,6 +1283,156 @@ def test_runtime_chart_static_runner_uses_credentials_encryption_key_secret() ->
     assert _env_by_name(runner_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == expected_env
 
 
+def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permissions(tmp_path: Path) -> None:
+    """Hosted runtimes should keep Matrix client state on a dedicated PVC."""
+    values_path = tmp_path / "values.yaml"
+    values_path.write_text(
+        yaml.safe_dump(
+            {
+                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
+                "stateStorage": {
+                    "enabled": True,
+                    "existingClaim": "mindroom-state",
+                    "mountPath": "/app/mindroom_state",
+                    "encryptionKeys": {
+                        "enabled": True,
+                        "mountPath": "/app/agent_data/encryption_keys",
+                        "subPath": "encryption_keys",
+                    },
+                    "syncTokens": {
+                        "enabled": True,
+                        "mountPath": "/app/agent_data/sync_tokens",
+                        "subPath": "sync_tokens",
+                    },
+                    "initPermissions": {
+                        "enabled": True,
+                        "runAsUser": 1000,
+                        "fsGroup": 1000,
+                    },
+                },
+                "initContainers": [
+                    {
+                        "name": "custom-init",
+                        "image": "busybox:1.36",
+                        "command": ["sh", "-c", "true"],
+                    },
+                ],
+                "extraVolumes": [{"name": "custom-config", "configMap": {"name": "custom-config"}}],
+                "extraVolumeMounts": [{"name": "custom-config", "mountPath": "/etc/custom"}],
+            },
+        ),
+        encoding="utf-8",
+    )
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        values_files=(values_path,),
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    pod_spec = deployment["spec"]["template"]["spec"]
+    mindroom_container = _container(deployment, "mindroom")
+    volume_mounts = {mount["mountPath"]: mount for mount in mindroom_container["volumeMounts"]}
+    volumes = {volume["name"]: volume for volume in pod_spec["volumes"]}
+    init_containers = {container["name"]: container for container in pod_spec["initContainers"]}
+
+    assert volumes["state-storage"]["persistentVolumeClaim"]["claimName"] == "mindroom-state"
+    assert volumes["custom-config"]["configMap"]["name"] == "custom-config"
+    assert volume_mounts["/app/mindroom_state"] == {
+        "name": "state-storage",
+        "mountPath": "/app/mindroom_state",
+    }
+    assert volume_mounts["/app/agent_data/encryption_keys"] == {
+        "name": "state-storage",
+        "mountPath": "/app/agent_data/encryption_keys",
+        "subPath": "encryption_keys",
+    }
+    assert volume_mounts["/app/agent_data/sync_tokens"] == {
+        "name": "state-storage",
+        "mountPath": "/app/agent_data/sync_tokens",
+        "subPath": "sync_tokens",
+    }
+    assert volume_mounts["/etc/custom"] == {"name": "custom-config", "mountPath": "/etc/custom"}
+
+    assert "prepare-state-storage" in init_containers
+    assert "custom-init" in init_containers
+    assert init_containers["prepare-state-storage"]["volumeMounts"] == [
+        {"name": "state-storage", "mountPath": "/state"},
+    ]
+    assert init_containers["prepare-state-storage"]["securityContext"] == {
+        "runAsUser": 0,
+        "runAsNonRoot": False,
+        "allowPrivilegeEscalation": False,
+    }
+    assert init_containers["prepare-state-storage"]["command"][:2] == ["sh", "-c"]
+    state_command = init_containers["prepare-state-storage"]["command"][2]
+    assert 'mkdir -p "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
+    assert 'chown -R 1000:1000 "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
+    assert 'chmod 2775 "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
+
+
+def test_runtime_chart_state_storage_can_create_pvc() -> None:
+    """The runtime chart can manage the dedicated state PVC for simple hosted installs."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "eventCache.postgres.auth.password=test-password",
+        "stateStorage.enabled=true",
+        "stateStorage.create=true",
+        "stateStorage.size=20Gi",
+        "stateStorage.storageClassName=fast-rwo",
+        release_name="mindroom-runtime",
+    )
+    pvc = _resource(docs, "PersistentVolumeClaim", "mindroom-runtime-state")
+
+    assert pvc["spec"] == {
+        "accessModes": ["ReadWriteOnce"],
+        "storageClassName": "fast-rwo",
+        "resources": {"requests": {"storage": "20Gi"}},
+    }
+
+
+@pytest.mark.parametrize(
+    ("conflict_args", "expected_error"),
+    [
+        (
+            ("stateStorage.mountPath=/app/agent_data/encryption_keys",),
+            "stateStorage.mountPath must differ from stateStorage.encryptionKeys.mountPath",
+        ),
+        (
+            ("stateStorage.mountPath=/app/agent_data/sync_tokens",),
+            "stateStorage.mountPath must differ from stateStorage.syncTokens.mountPath",
+        ),
+        (
+            ("stateStorage.encryptionKeys.mountPath=/app/agent_data",),
+            "stateStorage.encryptionKeys.mountPath must differ from storage.mountPath",
+        ),
+        (
+            ("stateStorage.syncTokens.mountPath=/app/agent_data",),
+            "stateStorage.syncTokens.mountPath must differ from storage.mountPath",
+        ),
+        (
+            ("stateStorage.syncTokens.mountPath=/app/agent_data/encryption_keys",),
+            "stateStorage.encryptionKeys.mountPath must differ from stateStorage.syncTokens.mountPath",
+        ),
+    ],
+)
+def test_runtime_chart_state_storage_rejects_mount_path_conflicts(
+    conflict_args: tuple[str, ...],
+    expected_error: str,
+) -> None:
+    """Generated runtime volumeMount paths must stay unique."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "eventCache.postgres.auth.password=test-password",
+        "stateStorage.enabled=true",
+        "stateStorage.existingClaim=mindroom-state",
+        *conflict_args,
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert expected_error in completed.stderr
+
+
 def test_runtime_chart_separate_worker_namespace_can_manage_per_worker_auth_secrets() -> None:
     """Explicit worker namespaces may use per-worker Secrets in that namespace."""
     docs = _render_runtime_chart_with_separate_worker_namespace()
