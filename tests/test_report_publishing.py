@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock
+from typing import TYPE_CHECKING, Any, Literal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -74,6 +74,7 @@ def _make_context(
     tmp_path: Path,
     *,
     public_url: str = "https://acme.mindroom.chat",
+    agent_memory_backend: Literal["file"] | None = None,
 ) -> ToolRuntimeContext:
     runtime_paths = test_runtime_paths(tmp_path)
     runtime_paths = runtime_paths.__class__(
@@ -93,6 +94,7 @@ def _make_context(
                 "general": AgentConfig(
                     display_name="General Agent",
                     tools=["dynamic_workflow", "report_publishing"],
+                    memory_backend=agent_memory_backend,
                 ),
             },
             models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-4-6")},
@@ -125,6 +127,7 @@ def test_report_publishing_tool_registered() -> None:
     metadata = TOOL_METADATA["report_publishing"]
 
     assert metadata.display_name == "Report Publishing"
+    assert metadata.consumes_workspace_paths is True
     assert metadata.function_names == (
         "publish_report",
         "revoke_public_report",
@@ -151,7 +154,7 @@ def test_report_publishing_store_creates_revocable_public_link(tmp_path: Path) -
         base_url="https://acme.mindroom.chat",
     )
     loaded = store.get_public_report(report.slug)
-    html_path = store.public_report_html_path(report.slug)
+    html_path = store.report_asset_path(store.get_public_report(report.slug))
     revoked = store.revoke_public_report(report.slug, revoked_by="@alice:localhost")
 
     assert report.slug.startswith("pub_")
@@ -161,7 +164,7 @@ def test_report_publishing_store_creates_revocable_public_link(tmp_path: Path) -
     assert html_path == report_path
     assert revoked.revoked_at is not None
     with pytest.raises(ReportPublishingError, match="revoked"):
-        store.public_report_html_path(report.slug)
+        store.report_asset_path(store.get_public_report(report.slug))
 
 
 def test_report_publishing_store_rejects_artifacts_outside_storage_root(tmp_path: Path) -> None:
@@ -209,7 +212,224 @@ def test_report_publishing_store_rejects_serve_time_symlink_escape(tmp_path: Pat
     report_path.symlink_to(outside_path)
 
     with pytest.raises(ReportPublishingError, match="artifact path is invalid"):
-        store.public_report_html_path(report.slug)
+        store.report_asset_path(store.get_public_report(report.slug))
+
+
+def test_report_publishing_store_creates_static_site_snapshot(tmp_path: Path) -> None:
+    """Static sites should be copied into report publishing storage before serving."""
+    storage_root = tmp_path / "mindroom_data"
+    source_dir = tmp_path / "workspace" / "site"
+    source_dir.mkdir(parents=True)
+    (source_dir / "index.html").write_text(
+        "<!doctype html><script src='app.js'></script><img src='image.png'>",
+        encoding="utf-8",
+    )
+    (source_dir / "app.js").write_text("document.body.dataset.ready = 'true';", encoding="utf-8")
+    (source_dir / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    store = ReportPublishingStore(storage_root)
+
+    report = store.publish_report(
+        source=PublishableReport(
+            source_type="static_site",
+            source={"path": "site"},
+            artifact_path=source_dir,
+            title="Demo Site",
+            requested_by="@alice:localhost",
+            artifact_kind="static_site",
+        ),
+        published_by="@alice:localhost",
+        base_url="https://mindroom.lab.mindroom.chat",
+    )
+    (source_dir / "index.html").write_text("<!doctype html>changed", encoding="utf-8")
+
+    index_path = store.report_asset_path(store.get_public_report(report.slug))
+    script_path = store.report_asset_path(store.get_public_report(report.slug), "app.js")
+
+    assert report.artifact_kind == "static_site"
+    assert report.public_url == f"https://mindroom.lab.mindroom.chat/reports/public/{report.slug}/"
+    assert index_path.read_text(encoding="utf-8").startswith("<!doctype html><script")
+    assert script_path.read_text(encoding="utf-8") == "document.body.dataset.ready = 'true';"
+    assert index_path.parent.is_relative_to(storage_root / "report_publishing" / "artifacts")
+
+
+def test_report_publishing_store_creates_single_page_snapshot(tmp_path: Path) -> None:
+    """A single workspace HTML page should publish as a static site index."""
+    storage_root = tmp_path / "mindroom_data"
+    page_path = tmp_path / "workspace" / "report.html"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("<!doctype html><h1>Single Page</h1>", encoding="utf-8")
+    store = ReportPublishingStore(storage_root)
+
+    report = store.publish_report(
+        source=PublishableReport(
+            source_type="static_site",
+            source={"path": "report.html"},
+            artifact_path=page_path,
+            title="Single Page",
+            requested_by="@alice:localhost",
+            artifact_kind="static_site",
+        ),
+        published_by="@alice:localhost",
+        base_url="https://mindroom.lab.mindroom.chat",
+    )
+
+    index_path = store.report_asset_path(store.get_public_report(report.slug))
+    assert index_path.name == "index.html"
+    assert index_path.read_text(encoding="utf-8") == "<!doctype html><h1>Single Page</h1>"
+
+
+def test_report_publishing_store_removes_single_page_snapshot_on_copy_failure(tmp_path: Path) -> None:
+    """Failed single-page snapshots should return a publishing error and leave no orphaned artifact directory."""
+    storage_root = tmp_path / "mindroom_data"
+    page_path = tmp_path / "workspace" / "report.html"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_text("<!doctype html><h1>Single Page</h1>", encoding="utf-8")
+    store = ReportPublishingStore(storage_root)
+
+    with (
+        patch("mindroom.report_publishing.static_site.shutil.copy2", side_effect=OSError("disk full")),
+        pytest.raises(ReportPublishingError, match="disk full"),
+    ):
+        store.publish_report(
+            source=PublishableReport(
+                source_type="static_site",
+                source={"path": "report.html"},
+                artifact_path=page_path,
+                title="Single Page",
+                requested_by="@alice:localhost",
+                artifact_kind="static_site",
+            ),
+            published_by="@alice:localhost",
+            base_url="https://mindroom.lab.mindroom.chat",
+        )
+
+    artifacts_root = storage_root / "report_publishing" / "artifacts"
+    assert not artifacts_root.exists() or list(artifacts_root.iterdir()) == []
+
+
+def test_report_publishing_tool_reports_static_site_copy_failure(tmp_path: Path) -> None:
+    """Static site copy failures should return the normal tool JSON error payload."""
+    report_tool = ReportPublishingTools()
+    context = _make_context(
+        tmp_path,
+        public_url="https://mindroom.lab.mindroom.chat",
+        agent_memory_backend="file",
+    )
+    workspace_root = context.runtime_paths.storage_root / "agents" / "general" / "workspace"
+    workspace_root.mkdir(parents=True)
+    (workspace_root / "report.html").write_text("<!doctype html><h1>Single Page</h1>", encoding="utf-8")
+
+    with (
+        patch("mindroom.report_publishing.static_site.shutil.copy2", side_effect=OSError("disk full")),
+        tool_runtime_context(context),
+    ):
+        published = _tool_payload(
+            report_tool.publish_report(
+                source_type="static_site",
+                source={"path": "report.html", "title": "Single Page"},
+                confirm_public=True,
+            ),
+        )
+
+    assert published["status"] == "error"
+    assert published["source_type"] == "static_site"
+    assert "disk full" in published["message"]
+
+
+def test_report_publishing_store_rejects_single_page_without_html_suffix(tmp_path: Path) -> None:
+    """Single-file static site sources should stay limited to HTML pages."""
+    storage_root = tmp_path / "mindroom_data"
+    page_path = tmp_path / "workspace" / "report.pdf"
+    page_path.parent.mkdir(parents=True)
+    page_path.write_bytes(b"%PDF-1.7")
+    store = ReportPublishingStore(storage_root)
+
+    with pytest.raises(ReportPublishingError, match="HTML page"):
+        store.publish_report(
+            source=PublishableReport(
+                source_type="static_site",
+                source={"path": "report.pdf"},
+                artifact_path=page_path,
+                title="Not A Page",
+                requested_by="@alice:localhost",
+                artifact_kind="static_site",
+            ),
+            published_by="@alice:localhost",
+            base_url="https://mindroom.lab.mindroom.chat",
+        )
+
+
+def test_report_publishing_store_rejects_static_site_without_index(tmp_path: Path) -> None:
+    """Static site publishing should require index.html."""
+    storage_root = tmp_path / "mindroom_data"
+    source_dir = tmp_path / "workspace" / "site"
+    source_dir.mkdir(parents=True)
+    (source_dir / "app.js").write_text("console.log('missing index')", encoding="utf-8")
+    store = ReportPublishingStore(storage_root)
+
+    with pytest.raises(ReportPublishingError, match=r"index\.html"):
+        store.publish_report(
+            source=PublishableReport(
+                source_type="static_site",
+                source={"path": "site"},
+                artifact_path=source_dir,
+                title="Broken Site",
+                requested_by="@alice:localhost",
+                artifact_kind="static_site",
+            ),
+            published_by="@alice:localhost",
+            base_url="https://mindroom.lab.mindroom.chat",
+        )
+
+
+def test_report_publishing_store_rejects_static_site_symlink(tmp_path: Path) -> None:
+    """Static site snapshots should reject symlinks instead of copying or following them."""
+    storage_root = tmp_path / "mindroom_data"
+    source_dir = tmp_path / "workspace" / "site"
+    outside_file = tmp_path / "secret.txt"
+    source_dir.mkdir(parents=True)
+    (source_dir / "index.html").write_text("<!doctype html>Site", encoding="utf-8")
+    outside_file.write_text("secret", encoding="utf-8")
+    (source_dir / "secret.txt").symlink_to(outside_file)
+    store = ReportPublishingStore(storage_root)
+
+    with pytest.raises(ReportPublishingError, match="symlink"):
+        store.publish_report(
+            source=PublishableReport(
+                source_type="static_site",
+                source={"path": "site"},
+                artifact_path=source_dir,
+                title="Unsafe Site",
+                requested_by="@alice:localhost",
+                artifact_kind="static_site",
+            ),
+            published_by="@alice:localhost",
+            base_url="https://mindroom.lab.mindroom.chat",
+        )
+
+
+def test_report_publishing_store_rejects_static_site_asset_traversal(tmp_path: Path) -> None:
+    """Static site asset lookup should reject traversal paths."""
+    storage_root = tmp_path / "mindroom_data"
+    source_dir = tmp_path / "workspace" / "site"
+    source_dir.mkdir(parents=True)
+    (source_dir / "index.html").write_text("<!doctype html>Site", encoding="utf-8")
+    store = ReportPublishingStore(storage_root)
+    report = store.publish_report(
+        source=PublishableReport(
+            source_type="static_site",
+            source={"path": "site"},
+            artifact_path=source_dir,
+            title="Demo Site",
+            requested_by="@alice:localhost",
+            artifact_kind="static_site",
+        ),
+        published_by="@alice:localhost",
+        base_url="https://mindroom.lab.mindroom.chat",
+    )
+
+    with pytest.raises(ReportPublishingError, match="asset path is invalid"):
+        store.report_asset_path(store.get_public_report(report.slug), "../index.html")
 
 
 def test_report_publishing_tool_publishes_dynamic_workflow_run_report(tmp_path: Path) -> None:
@@ -252,6 +472,100 @@ def test_report_publishing_tool_publishes_dynamic_workflow_run_report(tmp_path: 
     assert published["public_path"] == f"/mindroom/reports/public/{published['slug']}"
     assert revoked["status"] == "ok"
     assert revoked["revoked_at"] is not None
+
+
+def test_report_publishing_tool_publishes_workspace_static_site(tmp_path: Path) -> None:
+    """Report Publishing should let agents publish copied static-site directories."""
+    report_tool = ReportPublishingTools()
+    context = _make_context(
+        tmp_path,
+        public_url="https://mindroom.lab.mindroom.chat",
+        agent_memory_backend="file",
+    )
+    workspace_root = context.runtime_paths.storage_root / "agents" / "general" / "workspace"
+    site_dir = workspace_root / "public-demo"
+    site_dir.mkdir(parents=True)
+    (site_dir / "index.html").write_text("<!doctype html><script src='app.js'></script>", encoding="utf-8")
+    (site_dir / "app.js").write_text("document.body.dataset.ready = 'true';", encoding="utf-8")
+
+    with tool_runtime_context(context):
+        published = _tool_payload(
+            report_tool.publish_report(
+                source_type="static_site",
+                source={"path": "public-demo", "title": "Public Demo"},
+                confirm_public=True,
+            ),
+        )
+
+    assert published["status"] == "ok"
+    assert published["source_type"] == "static_site"
+    assert published["source"] == {"path": "public-demo"}
+    assert published["public_url"] == f"https://mindroom.lab.mindroom.chat/reports/public/{published['slug']}/"
+    assert published["public_path"] == f"/reports/public/{published['slug']}/"
+
+
+def test_report_publishing_tool_publishes_workspace_single_html_page(tmp_path: Path) -> None:
+    """Report Publishing should let agents publish one workspace HTML page directly."""
+    report_tool = ReportPublishingTools()
+    context = _make_context(
+        tmp_path,
+        public_url="https://mindroom.lab.mindroom.chat",
+        agent_memory_backend="file",
+    )
+    workspace_root = context.runtime_paths.storage_root / "agents" / "general" / "workspace"
+    workspace_root.mkdir(parents=True)
+    (workspace_root / "report.html").write_text("<!doctype html><h1>Single Page</h1>", encoding="utf-8")
+
+    with tool_runtime_context(context):
+        published = _tool_payload(
+            report_tool.publish_report(
+                source_type="static_site",
+                source={"path": "report.html", "title": "Single Page"},
+                confirm_public=True,
+            ),
+        )
+
+    assert published["status"] == "ok"
+    assert published["source"] == {"path": "report.html"}
+    assert published["public_url"] == f"https://mindroom.lab.mindroom.chat/reports/public/{published['slug']}/"
+
+
+def test_report_publishing_tool_requires_workspace_for_static_site(tmp_path: Path) -> None:
+    """Static site publishing should require an agent workspace."""
+    report_tool = ReportPublishingTools()
+    context = _make_context(tmp_path)
+
+    with tool_runtime_context(context):
+        published = _tool_payload(
+            report_tool.publish_report(
+                source_type="static_site",
+                source={"path": "public-demo", "title": "Public Demo"},
+                confirm_public=True,
+            ),
+        )
+
+    assert published["status"] == "error"
+    assert "agent workspace" in published["message"]
+
+
+def test_report_publishing_tool_rejects_static_site_path_escape(tmp_path: Path) -> None:
+    """Static site path input should stay workspace-relative."""
+    report_tool = ReportPublishingTools()
+    context = _make_context(tmp_path, agent_memory_backend="file")
+    workspace_root = context.runtime_paths.storage_root / "agents" / "general" / "workspace"
+    workspace_root.mkdir(parents=True)
+
+    with tool_runtime_context(context):
+        escaped = _tool_payload(
+            report_tool.publish_report(
+                source_type="static_site",
+                source={"path": "../outside", "title": "Escape"},
+                confirm_public=True,
+            ),
+        )
+
+    assert escaped["status"] == "error"
+    assert "workspace root" in escaped["message"]
 
 
 def test_report_publishing_tool_rejects_arbitrary_sources(tmp_path: Path) -> None:
