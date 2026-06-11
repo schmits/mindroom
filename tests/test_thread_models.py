@@ -20,6 +20,7 @@ from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.custom_tools.thread_model import ThreadModelTools
 from mindroom.thread_models import (
     _get_thread_model_override,
+    _load_cache,
     _store_path,
     clear_thread_model_override,
     set_thread_model_override,
@@ -75,6 +76,8 @@ def test_store_ignores_corrupt_file(tmp_path: Path) -> None:
     path.write_text("not json", encoding="utf-8")
 
     assert _get_thread_model_override(runtime_paths, THREAD_ID) is None
+    # The corrupt parse result is cached so repeat reads skip re-parsing.
+    assert _load_cache[path] == (path.stat().st_mtime_ns, {})
 
     set_thread_model_override(
         runtime_paths,
