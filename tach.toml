@@ -2545,7 +2545,7 @@ depends_on = [
 
 [[interfaces]]
 expose = [
-    "MemoryBackend",
+    "ResolvedMemoryBackend",
     "resolve_memory_backend",
 ]
 from = ["mindroom.memory._backend"]
