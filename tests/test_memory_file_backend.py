@@ -441,6 +441,84 @@ async def test_file_backend_add_and_list_memories(storage_path: Path, config: Co
 
 
 @pytest.mark.asyncio
+async def test_file_backend_lists_unstructured_daily_memory_lines(storage_path: Path, config: Config) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    daily_file = workspace / "memory" / "2026-06-13.md"
+    daily_file.parent.mkdir(parents=True, exist_ok=True)
+    daily_file.write_text(
+        "# Daily notes\n\nBas prefers repo-grounded answers.\n- [id=m_existing] Structured daily note.\n",
+        encoding="utf-8",
+    )
+
+    results = await list_all_agent_memories("general", storage_path, config)
+
+    assert [result["memory"] for result in results] == [
+        "Structured daily note.",
+        "Bas prefers repo-grounded answers.",
+    ]
+    assert [result["id"] for result in results] == [
+        "m_existing",
+        "file:memory/2026-06-13.md:3",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_backend_deduplicates_unstructured_lines_with_internal_whitespace(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    await add_agent_memory("Bas prefers repo-grounded answers.", "general", storage_path, config)
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    daily_file = workspace / "memory" / "2026-06-13.md"
+    daily_file.parent.mkdir(parents=True, exist_ok=True)
+    daily_file.write_text(
+        "Bas   prefers\trepo-grounded   answers.\nUnique raw note.\n",
+        encoding="utf-8",
+    )
+
+    results = await list_all_agent_memories("general", storage_path, config)
+
+    assert [result["memory"] for result in results] == [
+        "Bas prefers repo-grounded answers.",
+        "Unique raw note.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_backend_list_all_skips_unstructured_entrypoint_lines(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    memory_file = workspace / "MEMORY.md"
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    memory_file.write_text(
+        "# Memory\n\nCurated raw entrypoint line.\n- [id=m_existing] Structured entrypoint note.\n",
+        encoding="utf-8",
+    )
+    daily_file = workspace / "memory" / "2026-06-13.md"
+    daily_file.parent.mkdir(parents=True, exist_ok=True)
+    daily_file.write_text("Daily raw note.\n", encoding="utf-8")
+
+    results = await list_all_agent_memories("general", storage_path, config)
+
+    assert [result["memory"] for result in results] == [
+        "Structured entrypoint note.",
+        "Daily raw note.",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_file_backend_user_scoped_workers_share_agent_memory_across_requesters(
     storage_path: Path,
     config: Config,
@@ -1298,6 +1376,109 @@ async def test_file_backend_memory_crud_and_scope(storage_path: Path, config: Co
     assert await get_agent_memory(private_id, "other_agent", storage_path, config) is None
     with pytest.raises(ValueError, match=f"No memory found with id={private_id}"):
         await update_agent_memory(private_id, "Tampered", "other_agent", storage_path, config)
+
+
+@pytest.mark.asyncio
+async def test_file_backend_can_update_and_delete_unstructured_file_memory_line(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    daily_file = workspace / "memory" / "2026-06-13.md"
+    daily_file.parent.mkdir(parents=True, exist_ok=True)
+    daily_file.write_text("Old raw note.\nKeep this line.\n", encoding="utf-8")
+
+    memory_id = "file:memory/2026-06-13.md:1"
+    await update_agent_memory(memory_id, "Updated raw note.", "general", storage_path, config)
+
+    assert daily_file.read_text(encoding="utf-8") == "Updated raw note.\nKeep this line.\n"
+    updated = await get_agent_memory(memory_id, "general", storage_path, config)
+    assert updated is not None
+    assert updated["memory"] == "Updated raw note."
+
+    await delete_agent_memory(memory_id, "general", storage_path, config)
+    assert daily_file.read_text(encoding="utf-8") == "\nKeep this line.\n"
+    assert await get_agent_memory(memory_id, "general", storage_path, config) is None
+
+
+@pytest.mark.asyncio
+async def test_file_backend_whitespace_only_update_deletes_unstructured_file_memory_line(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    daily_file = workspace / "memory" / "2026-06-13.md"
+    daily_file.parent.mkdir(parents=True, exist_ok=True)
+    daily_file.write_text("  Old raw note.\nKeep this line.\n", encoding="utf-8")
+
+    memory_id = "file:memory/2026-06-13.md:1"
+    await update_agent_memory(memory_id, "   \t", "general", storage_path, config)
+
+    assert daily_file.read_text(encoding="utf-8") == "\nKeep this line.\n"
+    assert await get_agent_memory(memory_id, "general", storage_path, config) is None
+
+
+@pytest.mark.asyncio
+async def test_file_backend_rejects_path_ids_outside_memory_files(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    docs_file = workspace / "docs" / "runbook.md"
+    docs_file.parent.mkdir(parents=True, exist_ok=True)
+    docs_file.write_text("Runbook instruction.\n", encoding="utf-8")
+    soul_file = workspace / "SOUL.md"
+    soul_file.write_text("Protected instruction.\n", encoding="utf-8")
+
+    assert await get_agent_memory("file:docs/runbook.md:1", "general", storage_path, config) is None
+    assert await get_agent_memory("file:SOUL.md:1", "general", storage_path, config) is None
+
+    with pytest.raises(ValueError, match=r"No memory found with id=file:docs/runbook\.md:1"):
+        await update_agent_memory("file:docs/runbook.md:1", "Changed.", "general", storage_path, config)
+    with pytest.raises(ValueError, match=r"No memory found with id=file:SOUL\.md:1"):
+        await delete_agent_memory("file:SOUL.md:1", "general", storage_path, config)
+
+    assert docs_file.read_text(encoding="utf-8") == "Runbook instruction.\n"
+    assert soul_file.read_text(encoding="utf-8") == "Protected instruction.\n"
+
+
+@pytest.mark.asyncio
+async def test_file_backend_rejects_unstructured_entrypoint_path_ids(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    config.memory.backend = "file"
+    config.agents["general"].memory_backend = "file"
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    memory_file = workspace / "MEMORY.md"
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    memory_file.write_text(
+        "# Memory\n\nCurated raw entrypoint line.\n- [id=m_existing] Structured entrypoint note.\n",
+        encoding="utf-8",
+    )
+    original_content = memory_file.read_text(encoding="utf-8")
+
+    structured = await get_agent_memory("m_existing", "general", storage_path, config)
+    assert structured is not None
+    assert structured["memory"] == "Structured entrypoint note."
+    assert await get_agent_memory("file:MEMORY.md:3", "general", storage_path, config) is None
+
+    with pytest.raises(ValueError, match=r"No memory found with id=file:MEMORY\.md:3"):
+        await update_agent_memory("file:MEMORY.md:3", "Changed.", "general", storage_path, config)
+    with pytest.raises(ValueError, match=r"No memory found with id=file:MEMORY\.md:3"):
+        await delete_agent_memory("file:MEMORY.md:3", "general", storage_path, config)
+
+    assert memory_file.read_text(encoding="utf-8") == original_content
 
 
 @pytest.mark.asyncio
