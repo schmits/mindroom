@@ -20,6 +20,8 @@ _POWER_LEVELS_EVENT_TYPE = "m.room.power_levels"
 _ROOM_ADMIN_POWER_LEVEL = 100
 _THREAD_TAGS_POWER_LEVEL = 0
 _DEFAULT_STATE_EVENT_POWER_LEVEL = 50
+_DEFAULT_USER_POWER_LEVEL = 0
+_POWER_USER_POWER_LEVEL = 50
 
 
 async def invite_to_room(
@@ -51,6 +53,7 @@ async def create_room(
         room_config["topic"] = topic
 
     power_level_content: dict[str, Any] = {
+        "users_default": _DEFAULT_USER_POWER_LEVEL,
         "state_default": _DEFAULT_STATE_EVENT_POWER_LEVEL,
         "events": {
             THREAD_TAGS_EVENT_TYPE: _THREAD_TAGS_POWER_LEVEL,
@@ -58,9 +61,9 @@ async def create_room(
     }
     users: dict[str, int] = {}
     if power_users:
-        users.update(dict.fromkeys(power_users, 50))
+        users.update(dict.fromkeys(power_users, _POWER_USER_POWER_LEVEL))
     if client.user_id:
-        users[client.user_id] = 100
+        users[client.user_id] = _ROOM_ADMIN_POWER_LEVEL
     if users:
         power_level_content["users"] = users
     room_config["initial_state"] = [{"type": _POWER_LEVELS_EVENT_TYPE, "content": power_level_content}]

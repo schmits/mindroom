@@ -17,6 +17,7 @@ from mindroom.matrix import client_room_admin as matrix_room_admin
 from mindroom.matrix import rooms as matrix_rooms
 from mindroom.matrix import state as matrix_state
 from mindroom.matrix.presence import is_user_online
+from mindroom.scheduling import _SCHEDULED_TASK_EVENT_TYPE
 from mindroom.thread_tags import THREAD_TAGS_EVENT_TYPE
 from tests.conftest import TEST_ACCESS_TOKEN, bind_runtime_paths, load_config_yaml, runtime_paths_for
 
@@ -316,7 +317,7 @@ async def test_new_room_creation_applies_access_policy_in_multi_user_mode(
 async def test_create_room_seeds_thread_tags_power_level(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Managed room creation should seed the custom state-event override."""
+    """Managed room creation should seed only regular-user-safe state-event overrides."""
     mock_client = AsyncMock()
     mock_client.user_id = "@router:example.com"
     mock_client.room_create.return_value = nio.RoomCreateResponse(room_id="!lobby:example.com")
@@ -337,8 +338,10 @@ async def test_create_room_seeds_thread_tags_power_level(
     assert len(initial_state) == 1
     assert initial_state[0]["type"] == "m.room.power_levels"
     power_levels = initial_state[0]["content"]
+    assert power_levels["users_default"] == 0
     assert power_levels["state_default"] == 50
     assert power_levels["events"][THREAD_TAGS_EVENT_TYPE] == 0
+    assert _SCHEDULED_TASK_EVENT_TYPE not in power_levels["events"]
     assert power_levels["users"]["@agent:example.com"] == 50
     assert power_levels["users"]["@router:example.com"] == 100
     invite_to_room.assert_awaited_once_with(mock_client, "!lobby:example.com", "@agent:example.com")
@@ -374,6 +377,7 @@ async def test_ensure_thread_tags_power_level_preserves_existing_content() -> No
     assert kwargs["content"]["state_default"] == 50
     assert kwargs["content"]["events"]["m.room.name"] == 50
     assert kwargs["content"]["events"][THREAD_TAGS_EVENT_TYPE] == 0
+    assert _SCHEDULED_TASK_EVENT_TYPE not in kwargs["content"]["events"]
 
 
 @pytest.mark.asyncio
@@ -443,7 +447,9 @@ async def test_ensure_thread_tags_power_level_idempotent() -> None:
     mock_client = AsyncMock()
     mock_client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
         content={
-            "events": {THREAD_TAGS_EVENT_TYPE: 0},
+            "events": {
+                THREAD_TAGS_EVENT_TYPE: 0,
+            },
             "state_default": 50,
             "users": {"@router:example.com": 100},
         },
