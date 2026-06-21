@@ -11,6 +11,8 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
 import mcp.types as mcp_types
+from authlib.common.errors import AuthlibBaseError
+from httpx import HTTPError
 from mcp import ClientSession
 
 from mindroom.credentials import get_runtime_credentials_manager, load_scoped_credentials, save_scoped_credentials
@@ -27,8 +29,13 @@ from mindroom.mcp.registry import mcp_server_id_from_tool_name, mcp_tool_name
 from mindroom.mcp.results import tool_result_from_call_result
 from mindroom.mcp.transports import build_transport_handle
 from mindroom.mcp.types import MCPDiscoveredTool, MCPServerCatalog, MCPServerState
-from mindroom.oauth.providers import OAuthConnectionRequired, OAuthProviderError
-from mindroom.oauth.service import build_oauth_connect_instruction, oauth_connect_url, oauth_credentials_usable
+from mindroom.oauth.providers import OAuthConnectionRequired, OAuthProviderError, OAuthRefreshRejectedError
+from mindroom.oauth.service import (
+    build_oauth_connect_instruction,
+    build_oauth_reconnect_instruction,
+    oauth_connect_url,
+    oauth_credentials_usable,
+)
 from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded, get_tool_by_name
 from mindroom.tool_system.dynamic_toolkits import visible_tool_surface
 
@@ -50,6 +57,7 @@ logger = get_logger(__name__)
 # unblocks its dependent agents no slower than the bot-start retry loop did.
 _DISCOVERY_RETRY_INITIAL_DELAY_SECONDS = 5.0
 _DISCOVERY_RETRY_MAX_DELAY_SECONDS = 60.0
+_OAUTH_REFRESH_REJECTED_REASON = "oauth_refresh_rejected"
 
 
 def _discovery_retry_delay_seconds(consecutive_failures: int) -> float:
@@ -282,13 +290,20 @@ class MCPServerManager:
         self,
         state: MCPServerState,
         worker_target: ResolvedWorkerTarget | None,
+        *,
+        reason: str | None = None,
     ) -> OAuthConnectionRequired:
         provider = mcp_oauth_provider(state.server_id, state.config)
         connect_url = oauth_connect_url(provider, self.runtime_paths, worker_target=worker_target)
+        if reason == _OAUTH_REFRESH_REJECTED_REASON:
+            message = build_oauth_reconnect_instruction(provider, connect_url)
+        else:
+            message = build_oauth_connect_instruction(provider, connect_url)
         return OAuthConnectionRequired(
-            build_oauth_connect_instruction(provider, connect_url),
+            message,
             provider_id=provider.id,
             connect_url=connect_url,
+            reason=reason,
         )
 
     def _request_session_key(
@@ -305,6 +320,43 @@ class MCPServerManager:
             worker_scope=worker_scope or "unscoped",
             worker_key=worker_key or "global",
         )
+
+    def _log_oauth_refresh_failure(
+        self,
+        state: MCPServerState,
+        provider_id: str,
+        credentials: Mapping[str, object],
+        exc: OAuthProviderError,
+    ) -> None:
+        refresh_token = credentials.get("refresh_token")
+        raw_expires_at = credentials.get("expires_at")
+        expires_at = (
+            float(raw_expires_at)
+            if not isinstance(raw_expires_at, bool) and isinstance(raw_expires_at, int | float)
+            else None
+        )
+        cause = exc.__cause__
+        safe_cause = isinstance(cause, AuthlibBaseError | HTTPError)
+        logger.warning(
+            "MCP OAuth token refresh failed",
+            provider_id=provider_id,
+            server_id=state.server_id,
+            has_refresh_token=isinstance(refresh_token, str) and bool(refresh_token),
+            expires_at=expires_at,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            oauth_error=exc.oauth_error,
+            error_description=exc.oauth_error_description,
+            cause_type=type(cause).__name__ if safe_cause else None,
+            cause=str(cause) if safe_cause else None,
+        )
+
+    @staticmethod
+    def _oauth_refreshed_expires_at(credentials: Mapping[str, object]) -> float | None:
+        expires_at = credentials.get("expires_at")
+        if isinstance(expires_at, bool) or not isinstance(expires_at, int | float):
+            return None
+        return float(expires_at)
 
     async def _oauth_access_token(
         self,
@@ -325,7 +377,15 @@ class MCPServerManager:
         assert credentials is not None
         try:
             refreshed_credentials = await provider.refresh_token_data(credentials, self.runtime_paths)
+        except OAuthRefreshRejectedError as exc:
+            self._log_oauth_refresh_failure(state, provider.id, credentials, exc)
+            raise self._oauth_connection_required(
+                state,
+                worker_target,
+                reason=_OAUTH_REFRESH_REJECTED_REASON,
+            ) from exc
         except OAuthProviderError as exc:
+            self._log_oauth_refresh_failure(state, provider.id, credentials, exc)
             raise self._oauth_connection_required(state, worker_target) from exc
         if refreshed_credentials is not None:
             save_scoped_credentials(
@@ -333,6 +393,12 @@ class MCPServerManager:
                 refreshed_credentials,
                 credentials_manager=manager,
                 worker_target=worker_target,
+            )
+            logger.info(
+                "MCP OAuth token refreshed",
+                provider_id=provider.id,
+                server_id=state.server_id,
+                expires_at=self._oauth_refreshed_expires_at(refreshed_credentials),
             )
             credentials = refreshed_credentials
         token = credentials.get("token") or credentials.get("access_token")
