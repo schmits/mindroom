@@ -48,6 +48,7 @@ from mindroom.history.summary_call import (
     DEFAULT_SUMMARY_RETRY_POLICY,
     SUMMARY_MAX_OUTPUT_TOKENS,
     SummaryRetryPolicy,
+    _CompactionSummaryOutputLimitError,
     build_summary_request_messages,
     configure_summary_model,
     generate_compaction_summary,
@@ -64,15 +65,16 @@ _HISTORY_SETTINGS = ResolvedHistorySettings(policy=HistoryPolicy(mode="all"), ma
 class _RecordingClaude(Claude):
     """Claude double that records the request instead of calling Anthropic."""
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, *, response: ModelResponse | None = None, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.response = response or ModelResponse(content="recorded summary")
         self.seen_messages: list[Message] = []
 
     async def aresponse(self, *_args: object, **kwargs: object) -> ModelResponse:
         messages = kwargs.get("messages")
         if isinstance(messages, list):
             self.seen_messages = list(messages)
-        return ModelResponse(content="recorded summary")
+        return self.response
 
 
 def _make_config(tmp_path: Path) -> tuple[Config, RuntimePaths]:
@@ -448,6 +450,70 @@ async def test_generate_compaction_summary_applies_tuning_and_request_shape() ->
     ]
 
 
+@pytest.mark.asyncio
+async def test_generate_compaction_summary_rejects_output_cap_truncation() -> None:
+    with pytest.raises(RuntimeError, match="output token limit"):
+        await generate_compaction_summary(
+            model=_RecordingClaude(
+                id="claude-sonnet-4-6",
+                max_tokens=64_000,
+                response=ModelResponse(
+                    content="durable summary ended cleanly.",
+                    output_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+                ),
+            ),
+            summary_input="conversation payload",
+            summary_prompt="Summarize the conversation.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_compaction_summary_uses_configured_output_cap() -> None:
+    with pytest.raises(RuntimeError, match="output token limit"):
+        await generate_compaction_summary(
+            model=_RecordingClaude(
+                id="claude-sonnet-4-6",
+                max_tokens=1_024,
+                response=ModelResponse(content="durable summary ended cleanly.", output_tokens=1_024),
+            ),
+            summary_input="conversation payload",
+            summary_prompt="Summarize the conversation.",
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_compaction_summary_allows_claude_summary_below_output_cap() -> None:
+    summary = await generate_compaction_summary(
+        model=_RecordingClaude(
+            id="claude-sonnet-4-6",
+            max_tokens=64_000,
+            response=ModelResponse(
+                content="durable summary ended cleanly.",
+                output_tokens=SUMMARY_MAX_OUTPUT_TOKENS - 1,
+            ),
+        ),
+        summary_input="conversation payload",
+        summary_prompt="Summarize the conversation.",
+    )
+
+    assert summary.summary == "durable summary ended cleanly."
+
+
+@pytest.mark.asyncio
+async def test_generate_compaction_summary_allows_unknown_provider_without_output_cap() -> None:
+    class _UncappedSummaryModel(FakeModel):
+        async def aresponse(self, *_args: object, **_kwargs: object) -> ModelResponse:
+            return ModelResponse(content="durable summary ended cleanly.", output_tokens=SUMMARY_MAX_OUTPUT_TOKENS + 1)
+
+    summary = await generate_compaction_summary(
+        model=_UncappedSummaryModel(id="summary-model", provider="fake"),
+        summary_input="conversation payload",
+        summary_prompt="Summarize the conversation.",
+    )
+
+    assert summary.summary == "durable summary ended cleanly."
+
+
 def test_build_summary_request_messages_is_the_single_request_seam() -> None:
     messages = build_summary_request_messages(summary_prompt="prompt", summary_input="input")
 
@@ -464,6 +530,14 @@ def test_retry_policy_shrinks_on_timeout_and_context_length_errors() -> None:
     policy = DEFAULT_SUMMARY_RETRY_POLICY
 
     assert policy.retry_budget(attempt=1, budget=16_000, error=TimeoutError()) == 8_000
+    assert (
+        policy.retry_budget(
+            attempt=1,
+            budget=16_000,
+            error=_CompactionSummaryOutputLimitError("renamed owned output-limit signal"),
+        )
+        == 8_000
+    )
     assert policy.retry_budget(attempt=1, budget=16_000, error=RuntimeError("context_length_exceeded")) == 8_000
     assert policy.retry_budget(attempt=1, budget=16_000, error=RuntimeError("request too large")) == 8_000
     assert (
