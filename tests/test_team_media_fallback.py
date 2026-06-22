@@ -35,6 +35,7 @@ from mindroom.execution_preparation import (
     ThreadHistoryRenderLimits,
     _prepare_bound_team_execution_context,
     _PreparedExecutionContext,
+    prepare_bound_team_run_context,
 )
 from mindroom.history.interrupted_replay import _render_interrupted_replay_content
 from mindroom.history.runtime import open_bound_scope_session_context
@@ -54,6 +55,7 @@ from mindroom.teams import (
     TeamMode,
     _materialize_team_members,
     _team_response_stream_raw,
+    build_materialized_team_instance,
     materialize_exact_team_members,
     prepare_materialized_team_execution,
     team_response,
@@ -3629,19 +3631,241 @@ def _build_private_team_orchestrator(*, include_private_member: bool) -> tuple[C
     return config, orchestrator
 
 
-@pytest.mark.asyncio
-async def test_team_response_rejects_private_agents_in_ad_hoc_teams() -> None:
-    """Direct team helpers should reject any team that includes a private agent."""
-    _, orchestrator = _build_private_team_orchestrator(include_private_member=True)
+def test_materialized_private_ad_hoc_team_uses_opened_scope_id() -> None:
+    """Team.id should match the requester-scoped storage scope for private ad hoc teams."""
+    config, _orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    runtime_paths = runtime_paths_for(config)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="calculator",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-123",
+    )
+    agents = [
+        AgnoAgent(id="general", name="GeneralAgent", model=_TEST_MODEL),
+        AgnoAgent(id="calculator", name="CalculatorAgent", model=_TEST_MODEL),
+    ]
 
-    with pytest.raises(ValueError, match="private agents cannot participate in teams yet"):
+    with (
+        open_bound_scope_session_context(
+            agents=agents,
+            session_id="session-123",
+            runtime_paths=runtime_paths,
+            config=config,
+            execution_identity=identity,
+        ) as scope_context,
+        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+    ):
+        assert scope_context is not None
+        team = build_materialized_team_instance(
+            requested_agent_names=["general", "calculator"],
+            agents=agents,
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            scope_context=scope_context,
+            model_name=None,
+            configured_team_name=None,
+            execution_identity=identity,
+        )
+
+    assert scope_context.scope.scope_id.startswith("team_calculator+general_requester_")
+    assert team.id == scope_context.scope.scope_id
+
+
+@pytest.mark.asyncio
+async def test_private_ad_hoc_team_second_turn_replays_first_scoped_run() -> None:
+    """Private ad hoc team replay should read runs written under its requester-scoped Team.id."""
+    config, _orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    runtime_paths = runtime_paths_for(config)
+    session_id = "session-private-team-history"
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="calculator",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id=session_id,
+    )
+    agents = [
+        AgnoAgent(id="general", name="GeneralAgent", model=_TEST_MODEL),
+        AgnoAgent(id="calculator", name="CalculatorAgent", model=_TEST_MODEL),
+    ]
+
+    with (
+        open_bound_scope_session_context(
+            agents=agents,
+            session_id=session_id,
+            runtime_paths=runtime_paths,
+            config=config,
+            execution_identity=identity,
+            create_session_if_missing=True,
+        ) as scope_context,
+        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+    ):
+        assert scope_context is not None
+        assert scope_context.session is not None
+        first_team = build_materialized_team_instance(
+            requested_agent_names=["general", "calculator"],
+            agents=agents,
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            scope_context=scope_context,
+            model_name=None,
+            configured_team_name=None,
+            execution_identity=identity,
+        )
+        first_team.db = scope_context.storage
+        _cleanup_and_store(
+            first_team,
+            TeamRunOutput(
+                run_id="run-1",
+                team_id=first_team.id,
+                team_name=first_team.name,
+                session_id=session_id,
+                messages=[
+                    Message(role="user", content="first question"),
+                    Message(role="assistant", content="first answer"),
+                ],
+                status=RunStatus.completed,
+            ),
+            scope_context.session,
+        )
+
+    with (
+        open_bound_scope_session_context(
+            agents=agents,
+            session_id=session_id,
+            runtime_paths=runtime_paths,
+            config=config,
+            execution_identity=identity,
+        ) as scope_context,
+        patch("mindroom.model_loading.get_model_instance", return_value=_TEST_MODEL),
+    ):
+        assert scope_context is not None
+        second_team = build_materialized_team_instance(
+            requested_agent_names=["general", "calculator"],
+            agents=agents,
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            scope_context=scope_context,
+            model_name=None,
+            configured_team_name=None,
+            execution_identity=identity,
+        )
+        prepared = await prepare_bound_team_run_context(
+            scope_context=scope_context,
+            agents=agents,
+            team=second_team,
+            prompt="second question",
+            thread_history=[],
+            runtime_paths=runtime_paths,
+            config=config,
+            entity_name=None,
+            active_model_name=None,
+            active_context_window=None,
+        )
+
+    assert second_team.id == scope_context.scope.scope_id
+    assert prepared.replays_persisted_history is True
+
+
+@pytest.mark.asyncio
+async def test_team_response_materializes_private_agent_with_execution_identity() -> None:
+    """Direct team helpers should build explicitly requested private members on demand."""
+    _, orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="calculator",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-123",
+    )
+    private_agent = _make_test_agent("GeneralAgent")
+    shared_agent = _make_test_agent("CalculatorAgent")
+    mock_team = _make_test_team()
+    mock_team.arun = AsyncMock(return_value=TeamRunOutput(content="Team response"))
+
+    with (
+        patch("mindroom.teams.create_agent", side_effect=[private_agent, shared_agent]) as mock_create_agent,
+        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+        patch("mindroom.teams._create_team_instance", return_value=mock_team),
+    ):
+        response = await team_response(
+            agent_names=["general", "calculator"],
+            mode=TeamMode.COORDINATE,
+            message="Analyze this.",
+            turn_recorder=_team_turn_recorder("Analyze this."),
+            orchestrator=orchestrator,
+            execution_identity=identity,
+        )
+
+    assert "Team response" in response
+    assert [call.args[0] for call in mock_create_agent.call_args_list] == ["general", "calculator"]
+    assert all(call.kwargs["execution_identity"] is identity for call in mock_create_agent.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_team_response_rejects_private_agent_with_non_matrix_execution_identity() -> None:
+    """Direct private members are only supported for Matrix ad hoc teams."""
+    _, orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    identity = ToolExecutionIdentity(
+        channel="openai_compat",
+        agent_name="calculator",
+        requester_id="@alice:example.org",
+        room_id=None,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session-123",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
+    ):
         await team_response(
             agent_names=["general", "calculator"],
             mode=TeamMode.COORDINATE,
             message="Analyze this.",
             turn_recorder=_team_turn_recorder("Analyze this."),
             orchestrator=orchestrator,
-            execution_identity=None,
+            execution_identity=identity,
+        )
+
+
+@pytest.mark.asyncio
+async def test_team_response_rejects_private_agent_with_empty_requester_identity() -> None:
+    """Direct private members require a requester for scoped history."""
+    _, orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="calculator",
+        requester_id="",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-123",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
+    ):
+        await team_response(
+            agent_names=["general", "calculator"],
+            mode=TeamMode.COORDINATE,
+            message="Analyze this.",
+            turn_recorder=_team_turn_recorder("Analyze this."),
+            orchestrator=orchestrator,
+            execution_identity=identity,
         )
 
 
@@ -3650,7 +3874,10 @@ async def test_team_response_rejects_private_agents_even_when_private_member_is_
     """Direct team helpers should reject requested private members before availability filtering."""
     _, orchestrator = _build_private_team_orchestrator(include_private_member=False)
 
-    with pytest.raises(ValueError, match="private agents cannot participate in teams yet"):
+    with pytest.raises(
+        ValueError,
+        match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
+    ):
         await team_response(
             agent_names=["general", "calculator"],
             mode=TeamMode.COORDINATE,
@@ -3666,7 +3893,10 @@ async def test_team_response_stream_rejects_private_agents_even_when_private_mem
     """Streaming team helpers should reject requested private members before availability filtering."""
     config, orchestrator = _build_private_team_orchestrator(include_private_member=False)
 
-    with pytest.raises(ValueError, match="private agents cannot participate in teams yet"):
+    with pytest.raises(
+        ValueError,
+        match="private agents are only supported in explicit Matrix ad hoc teams with requester identity",
+    ):
         [
             chunk
             async for chunk in team_response_stream(
@@ -3681,6 +3911,54 @@ async def test_team_response_stream_rejects_private_agents_even_when_private_mem
                 execution_identity=None,
             )
         ]
+
+
+@pytest.mark.asyncio
+async def test_team_response_stream_materializes_private_agent_with_execution_identity() -> None:
+    """Streaming team helpers should build explicitly requested private members on demand."""
+    config, orchestrator = _build_private_team_orchestrator(include_private_member=False)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="calculator",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-123",
+    )
+    private_agent = _make_test_agent("GeneralAgent")
+    shared_agent = _make_test_agent("CalculatorAgent")
+    mock_team = _make_test_team()
+
+    async def fake_stream_raw(**_kwargs: object) -> AsyncIterator[object]:
+        yield TeamRunOutput(content="Streamed team response")
+
+    with (
+        patch("mindroom.teams.create_agent", side_effect=[private_agent, shared_agent]) as mock_create_agent,
+        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+        patch("mindroom.teams._create_team_instance", return_value=mock_team),
+        patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+    ):
+        chunks = [
+            chunk
+            async for chunk in team_response_stream(
+                agent_ids=[
+                    entity_ids(config, runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))["calculator"],
+                ],
+                mode=TeamMode.COORDINATE,
+                message="Analyze this.",
+                turn_recorder=_team_turn_recorder("Analyze this."),
+                orchestrator=orchestrator,
+                execution_identity=identity,
+            )
+        ]
+
+    assert len(chunks) == 1
+    assert isinstance(chunks[0], str)
+    assert "Streamed team response" in chunks[0]
+    assert [call.args[0] for call in mock_create_agent.call_args_list] == ["general", "calculator"]
+    assert all(call.kwargs["execution_identity"] is identity for call in mock_create_agent.call_args_list)
 
 
 @pytest.mark.asyncio
@@ -3712,7 +3990,7 @@ async def test_team_response_rejects_members_that_delegate_to_private_agents() -
 
     with pytest.raises(
         ValueError,
-        match="reaches private agent 'mind' via delegation; private agents cannot participate in teams yet",
+        match="reaches private agent 'mind' via delegation; private delegation is not supported for teams",
     ):
         await team_response(
             agent_names=["leader", "helper"],

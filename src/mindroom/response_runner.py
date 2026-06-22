@@ -971,9 +971,6 @@ class ResponseRunner:
         agent_names = [
             registry.current_entity_name_for_user_id(mid.full_id) or mid.username for mid in team_request.team_agents
         ]
-        self.deps.runtime.config.assert_team_agents_supported(
-            [agent_name for agent_name in agent_names if agent_name != ROUTER_AGENT_NAME],
-        )
         include_matrix_prompt_context = any(
             _agent_has_matrix_messaging_tool(self.deps.runtime.config, name, resolved_target.session_id)
             for name in agent_names
@@ -1014,11 +1011,24 @@ class ResponseRunner:
             correlation_id=resolved_correlation_id,
             source_envelope=request.response_envelope,
         )
-        session_scope = self.deps.state_writer.team_history_scope(list(team_request.team_agents))
+        execution_identity = tool_dispatch.execution_identity
+        allow_direct_private_agents = (
+            self.deps.agent_name not in self.deps.runtime.config.teams
+            and execution_identity.channel == "matrix"
+            and bool(execution_identity.requester_id)
+        )
+        self.deps.runtime.config.assert_team_agents_supported(
+            [agent_name for agent_name in agent_names if agent_name != ROUTER_AGENT_NAME],
+            allow_direct_private_agents=allow_direct_private_agents,
+        )
+        session_scope = self.deps.state_writer.team_history_scope(
+            list(team_request.team_agents),
+            requester_user_id=execution_identity.requester_id,
+        )
         session_type = self.deps.state_writer.session_type_for_scope(session_scope)
 
         def team_storage_factory() -> BaseDb:
-            return self.deps.state_writer.create_storage(tool_dispatch.execution_identity, scope=session_scope)
+            return self.deps.state_writer.create_storage(execution_identity, scope=session_scope)
 
         session_started_watch = lifecycle.setup_session_watch(
             tool_context=runtime_context_from_dispatch_context(tool_dispatch),

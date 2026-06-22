@@ -256,6 +256,7 @@ def get_unsupported_team_agents(
     seeds: Mapping[str, AgentPolicySeed],
     *,
     closures: dict[str, frozenset[str]] | None = None,
+    allow_direct_private_agents: bool = False,
 ) -> dict[str, tuple[str, ...] | None]:
     """Return unsupported team members keyed by agent name."""
     closure_cache = closures if closures is not None else {}
@@ -265,6 +266,8 @@ def get_unsupported_team_agents(
             unsupported_agents[agent_name] = None
             continue
         private_targets = get_private_team_targets(agent_name, seeds, closures=closure_cache)
+        if allow_direct_private_agents and agent_name in private_targets:
+            private_targets = tuple(target for target in private_targets if target != agent_name)
         if private_targets:
             unsupported_agents[agent_name] = private_targets
     return unsupported_agents
@@ -281,12 +284,12 @@ def _team_eligibility_reason(
     if not private_targets:
         return None
     if agent_name in private_targets:
-        return "Private agents cannot participate in teams yet."
+        return "Private agents cannot be configured as team members."
     if len(private_targets) == 1:
-        return f"Delegates to private agent '{private_targets[0]}', so it cannot participate in teams yet."
+        return f"Delegates to private agent '{private_targets[0]}', so it cannot participate in teams."
     return (
         "Delegates to private agents "
-        f"{', '.join(repr(target) for target in private_targets)}, so it cannot participate in teams yet."
+        f"{', '.join(repr(target) for target in private_targets)}, so it cannot participate in teams."
     )
 
 
@@ -300,16 +303,19 @@ def unsupported_team_agent_message(
     if private_targets is None:
         return f"{prefix} references unknown agent '{agent_name}'"
     if agent_name in private_targets:
-        return f"{prefix} includes private agent '{agent_name}'; private agents cannot participate in teams yet"
+        return (
+            f"{prefix} includes private agent '{agent_name}'; private agents are only supported "
+            "in explicit Matrix ad hoc teams with requester identity"
+        )
     if len(private_targets) == 1:
         return (
             f"{prefix} includes agent '{agent_name}' which reaches private agent "
-            f"'{private_targets[0]}' via delegation; private agents cannot participate in teams yet"
+            f"'{private_targets[0]}' via delegation; private delegation is not supported for teams"
         )
     return (
         f"{prefix} includes agent '{agent_name}' which reaches private agents "
         f"{', '.join(repr(target) for target in private_targets)} via delegation; "
-        "private agents cannot participate in teams yet"
+        "private delegation is not supported for teams"
     )
 
 

@@ -50,7 +50,7 @@ from mindroom.ai import (
 from mindroom.ai_run_metadata import _serialize_metrics
 from mindroom.bot import AgentBot
 from mindroom.cancellation import USER_STOP_CANCEL_MSG
-from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DebugConfig, ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
@@ -111,6 +111,7 @@ from mindroom.response_runner import (
     prepare_memory_and_model_context,
 )
 from mindroom.streaming import StreamingDeliveryError, strip_visible_tool_markers
+from mindroom.team_scope import ad_hoc_team_scope_id
 from mindroom.tool_system.events import ToolTraceEntry
 from mindroom.tool_system.runtime_context import (
     LiveToolDispatchContext,
@@ -129,7 +130,7 @@ from tests.conftest import make_event_cache_mock, message_origin, request_envelo
 from tests.identity_helpers import fixture_entity_matrix_id, persist_entity_accounts
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Generator, Iterable
     from pathlib import Path
 
     from agno.knowledge.knowledge import Knowledge
@@ -452,14 +453,30 @@ def _build_response_runner(
             scope_id=bot.agent_name,
         ),
     )
-    bot._conversation_state_writer.team_history_scope = MagicMock(
-        side_effect=lambda team_agents: HistoryScope(
+
+    def _team_history_scope_for_test(
+        team_agents: Iterable[MatrixID],
+        *,
+        requester_user_id: str | None = None,
+    ) -> HistoryScope:
+        if bot.agent_name in config.teams:
+            return HistoryScope(kind="team", scope_id=bot.agent_name)
+        member_names = [_entity_alias_for_test(config, runtime_paths, mid) for mid in team_agents]
+        scope_id = (
+            ad_hoc_team_scope_id(
+                member_names,
+                config.agents,
+                requester_user_id=requester_user_id,
+                missing_requester_message="Private ad hoc team history scope requires requester_user_id",
+            )
+            or "team_"
+        )
+        return HistoryScope(
             kind="team",
-            scope_id=bot.agent_name
-            if bot.agent_name in config.teams
-            else f"team_{'+'.join(sorted(_entity_alias_for_test(config, runtime_paths, mid) for mid in team_agents))}",
-        ),
-    )
+            scope_id=scope_id,
+        )
+
+    bot._conversation_state_writer.team_history_scope = MagicMock(side_effect=_team_history_scope_for_test)
     bot._conversation_state_writer.session_type_for_scope = MagicMock(
         side_effect=lambda scope: SessionType.TEAM if scope.kind == "team" else SessionType.AGENT,
     )
@@ -2780,6 +2797,64 @@ async def test_generate_team_response_appends_matrix_tool_prompt_context(tmp_pat
 
     assert model_messages
     assert "[Matrix metadata for tool calls]" in model_messages[0]
+
+
+@pytest.mark.asyncio
+async def test_generate_team_response_allows_explicit_private_ad_hoc_member(tmp_path: Path) -> None:
+    """ResponseRunner preflight should not reject direct private members before team_response."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = bind_runtime_paths(
+        Config(
+            agents={
+                "private_worker": AgentConfig(
+                    display_name="PrivateWorker",
+                    private=AgentPrivateConfig(per="user", root="private_worker_data"),
+                ),
+                "calculator": AgentConfig(display_name="Calculator"),
+            },
+            models={"default": ModelConfig(provider="openai", id="test-model")},
+        ),
+        runtime_paths,
+    )
+    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths, agent_name="calculator")
+    seen_agent_names: list[list[str]] = []
+
+    async def fake_team_response(*_args: object, **kwargs: object) -> str:
+        seen_agent_names.append(cast("list[str]", kwargs["agent_names"]))
+        return "Team answer"
+
+    with (
+        patch("mindroom.response_runner.should_use_streaming", new=AsyncMock(return_value=False)),
+        patch("mindroom.response_runner.team_response", new=AsyncMock(side_effect=fake_team_response)),
+        patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
+    ):
+        coordinator = _build_response_runner(
+            bot,
+            config=config,
+            runtime_paths=runtime_paths,
+            storage_path=tmp_path,
+            requester_id="@alice:localhost",
+            message_target=MessageTarget.resolve("!test:localhost", "$thread-root", "$user_msg"),
+            orchestrator=_team_orchestrator(config, runtime_paths),
+        )
+
+        await coordinator.generate_team_response_helper(
+            _response_request(prompt="Hello", user_id="@alice:localhost", thread_id="$thread-root"),
+            team_agents=[
+                fixture_entity_matrix_id("private_worker", "localhost", runtime_paths),
+                fixture_entity_matrix_id("calculator", "localhost", runtime_paths),
+            ],
+            team_mode="coordinate",
+        )
+
+    assert seen_agent_names == [["private_worker", "calculator"]]
+    bot._conversation_state_writer.team_history_scope.assert_called_once_with(
+        [
+            fixture_entity_matrix_id("private_worker", "localhost", runtime_paths),
+            fixture_entity_matrix_id("calculator", "localhost", runtime_paths),
+        ],
+        requester_user_id="@alice:localhost",
+    )
 
 
 @pytest.mark.asyncio

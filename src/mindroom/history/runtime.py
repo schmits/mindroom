@@ -63,6 +63,7 @@ from mindroom.history.types import (
     ResolvedReplayPlan,
 )
 from mindroom.logging_config import get_logger
+from mindroom.team_scope import ad_hoc_team_has_private_member, ad_hoc_team_scope_id
 from mindroom.timing import timed
 from mindroom.token_budget import estimate_text_tokens
 
@@ -891,11 +892,25 @@ async def prepare_bound_scope_history(
     pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> PreparedScopeHistory:
     """Prepare one team-owned scope by compacting its persisted session before the run."""
-    bound_scope = resolve_bound_team_scope_context(
-        agents=agents,
-        config=config,
-        team_name=team_name,
-    )
+    if scope_context is not None:
+        owner_agent, owner_agent_name = _resolve_bound_history_owner(agents)
+        bound_scope = (
+            _BoundTeamScopeContext(
+                owner_agent=owner_agent,
+                owner_agent_name=owner_agent_name,
+                scope=scope_context.scope,
+            )
+            if owner_agent is not None and owner_agent_name is not None
+            else None
+        )
+    elif team_name is None and ad_hoc_team_has_private_member(_ad_hoc_team_agent_names(agents), config.agents):
+        bound_scope = None
+    else:
+        bound_scope = resolve_bound_team_scope_context(
+            agents=agents,
+            config=config,
+            team_name=team_name,
+        )
     if bound_scope is None:
         resolved_static_prompt_tokens = (
             static_prompt_tokens
@@ -984,13 +999,21 @@ def resolve_bound_team_scope_context(
     agents: list[Agent],
     config: Config,
     team_name: str | None = None,
+    execution_identity: ToolExecutionIdentity | None = None,
 ) -> _BoundTeamScopeContext | None:
     """Resolve the stable owner and scope backing one live team run."""
     owner_agent, owner_agent_name = _resolve_bound_history_owner(agents)
     if owner_agent is None or owner_agent_name is None:
         return None
 
-    team_scope_id = team_name if team_name is not None and team_name in config.teams else _ad_hoc_team_scope_id(agents)
+    if team_name is not None and team_name in config.teams:
+        team_scope_id = team_name
+    else:
+        team_scope_id = ad_hoc_team_scope_id(
+            _ad_hoc_team_agent_names(agents),
+            config.agents,
+            requester_user_id=execution_identity.requester_id if execution_identity is not None else None,
+        )
     if team_scope_id is None:
         return None
     scope = HistoryScope(kind="team", scope_id=team_scope_id)
@@ -1179,6 +1202,7 @@ def open_bound_scope_session_context(
         agents=agents,
         config=config,
         team_name=team_name,
+        execution_identity=execution_identity,
     )
     if bound_scope is None:
         yield None
@@ -1288,11 +1312,8 @@ def _scope_session_agent_id(scope: HistoryScope) -> str:
     return _scope_session_storage_name(scope)
 
 
-def _ad_hoc_team_scope_id(agents: list[Agent]) -> str | None:
-    agent_names = [agent_id for agent in agents if isinstance((agent_id := agent.id), str) and agent_id]
-    if not agent_names:
-        return None
-    return f"team_{'+'.join(sorted(agent_names))}"
+def _ad_hoc_team_agent_names(agents: list[Agent]) -> tuple[str, ...]:
+    return tuple(agent_id for agent in agents if isinstance((agent_id := agent.id), str) and agent_id)
 
 
 def _history_settings_from_agent(agent: Agent) -> ResolvedHistorySettings:

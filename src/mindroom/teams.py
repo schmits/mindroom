@@ -74,6 +74,7 @@ from mindroom.team_exact_members import (
     ResolvedExactTeamMembers,
     materialize_exact_requested_team_members,
     resolve_live_shared_agent_names,
+    resolve_team_materializable_agent_names,
 )
 from mindroom.tool_system.events import (
     StreamingToolTracker,
@@ -617,6 +618,7 @@ def decide_team_formation(
     is_thread: bool = False,
     available_responders_in_room: list[MatrixID] | None = None,
     materializable_agent_names: set[str] | None = None,
+    allow_explicit_private_agents: bool = False,
 ) -> TeamResolution:
     """Determine if a team should form, purely from mention, thread, and room context.
 
@@ -636,6 +638,7 @@ def decide_team_formation(
         is_thread: Whether the current message is in a thread
         available_responders_in_room: Optional pre-filtered room responders for sender-visible availability
         materializable_agent_names: Optional live agent names that can currently produce a response
+        allow_explicit_private_agents: Whether explicitly tagged requester-private agents may join
 
     Returns:
         TeamResolution with explicit intent, member statuses, and final outcome
@@ -655,6 +658,16 @@ def decide_team_formation(
     if team_request.intent is None or not team_request.requested_members:
         return TeamResolution.none()
 
+    allow_direct_private_agents = allow_explicit_private_agents and team_request.intent is TeamIntent.EXPLICIT_MEMBERS
+    materializable_agent_names = (
+        resolve_team_materializable_agent_names(
+            config,
+            materializable_agent_names,
+            allow_direct_private_agents=allow_direct_private_agents,
+        )
+        if config is not None
+        else materializable_agent_names
+    )
     member_statuses = _evaluate_team_members(
         team_request.requested_members,
         config,
@@ -662,6 +675,7 @@ def decide_team_formation(
         room=room,
         sender_visible_responders=available_responders_in_room,
         materializable_agent_names=materializable_agent_names,
+        allow_direct_private_agents=allow_direct_private_agents,
     )
     resolution = _resolve_team_request(
         intent=team_request.intent,
@@ -854,6 +868,7 @@ def _evaluate_team_members(
     room: nio.MatrixRoom | None,
     sender_visible_responders: list[MatrixID] | None,
     materializable_agent_names: set[str] | None,
+    allow_direct_private_agents: bool,
 ) -> list[TeamResolutionMember]:
     """Evaluate one status and response capability for each requested member."""
     room_visible_ids: set[str] | None = None
@@ -877,6 +892,7 @@ def _evaluate_team_members(
     if config is not None:
         unsupported_agents = config.get_unsupported_team_agents(
             [_team_member_name(agent_id, config, runtime_paths) for agent_id in requested_members],
+            allow_direct_private_agents=allow_direct_private_agents,
         )
 
     member_statuses: list[TeamResolutionMember] = []
@@ -1033,16 +1049,18 @@ def _unsupported_team_member_detail(
     if private_targets is None:
         return f"agent '{member.name}' is unknown"
     if member.name in private_targets:
-        return f"agent '{member.name}' is private and cannot participate in teams yet"
+        return (
+            f"agent '{member.name}' is private and can only join explicit Matrix ad hoc teams with requester identity"
+        )
     if len(private_targets) != 1:
         return (
             f"agent '{member.name}' reaches private agents "
             f"{', '.join(repr(target) for target in private_targets)} via delegation "
-            "and cannot participate in teams yet"
+            "and private delegation is not supported for teams"
         )
     return (
         f"agent '{member.name}' reaches private agent '{private_targets[0]}' via delegation "
-        "and cannot participate in teams yet"
+        "and private delegation is not supported for teams"
     )
 
 
@@ -1080,6 +1098,7 @@ def resolve_configured_team(
         room=None,
         sender_visible_responders=None,
         materializable_agent_names=materializable_agent_names,
+        allow_direct_private_agents=False,
     )
     return _resolve_team_request(
         intent=TeamIntent.CONFIGURED_TEAM,
@@ -1249,12 +1268,21 @@ def _materialize_team_members(
     execution_identity: ToolExecutionIdentity | None,
     *,
     session_id: str | None = None,
+    configured_team_name: str | None = None,
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] | None = None,
     reason_prefix: str = "Team request",
 ) -> ResolvedExactTeamMembers:
     """Materialize the exact requested team-member set without silent fallback."""
     requested_agent_names = _requested_team_agent_names(agent_names)
     assert orchestrator.config is not None
+    materializable_agent_names = resolve_team_materializable_agent_names(
+        orchestrator.config,
+        resolve_live_shared_agent_names(orchestrator),
+        allow_direct_private_agents=_allow_direct_private_team_agents(
+            execution_identity,
+            configured_team_name=configured_team_name,
+        ),
+    )
 
     return materialize_exact_team_members(
         requested_agent_names,
@@ -1262,11 +1290,48 @@ def _materialize_team_members(
         runtime_paths=orchestrator.runtime_paths,
         execution_identity=execution_identity,
         session_id=session_id,
-        materializable_agent_names=resolve_live_shared_agent_names(orchestrator),
+        materializable_agent_names=materializable_agent_names,
         unavailable_bases=unavailable_bases,
         refresh_scheduler=orchestrator.knowledge_refresh_scheduler,
         reason_prefix=reason_prefix,
     )
+
+
+def _allow_direct_private_team_agents(
+    execution_identity: ToolExecutionIdentity | None,
+    *,
+    configured_team_name: str | None,
+) -> bool:
+    """Return whether direct private members may join this team request."""
+    return (
+        configured_team_name is None
+        and execution_identity is not None
+        and execution_identity.channel == "matrix"
+        and bool(execution_identity.requester_id)
+    )
+
+
+def _resolve_team_instance_id(
+    *,
+    agents: list[Agent],
+    config: Config,
+    team_display_name: str,
+    configured_team_name: str | None,
+    scope_context: ScopeSessionContext | None,
+    execution_identity: ToolExecutionIdentity | None,
+) -> str:
+    """Return the Team.id for scoped and no-session team runs."""
+    if scope_context is not None:
+        return scope_context.scope.scope_id
+    bound_scope = resolve_bound_team_scope_context(
+        agents=agents,
+        config=config,
+        team_name=configured_team_name,
+        execution_identity=execution_identity,
+    )
+    if bound_scope is not None:
+        return bound_scope.scope.scope_id
+    return team_display_name
 
 
 def _create_team_instance(
@@ -1276,11 +1341,10 @@ def _create_team_instance(
     config: Config,
     runtime_paths: RuntimePaths,
     team_display_name: str,
-    fallback_team_id: str,
+    scope_context: ScopeSessionContext | None,
     execution_identity: ToolExecutionIdentity | None,
     model_name: str | None = None,
     configured_team_name: str | None = None,
-    history_storage: BaseDb | None = None,
 ) -> Team:
     """Create a configured Team instance.
 
@@ -1290,13 +1354,12 @@ def _create_team_instance(
         config: Active runtime configuration
         runtime_paths: Active runtime paths
         team_display_name: Human-readable Team name passed to Agno
-        fallback_team_id: Stable fallback id when no team scope storage is available
+        scope_context: Already-open team history scope, when persisted history
+            is available for this request.
         execution_identity: Request execution identity used for provider-specific
             model behavior such as codex prompt-cache keying
         model_name: Optional model name override
         configured_team_name: Optional configured team id for stable team-scope history
-        history_storage: Optional already-open shared team history storage
-            owned by the caller for this request.
 
     Returns:
         Configured Team instance
@@ -1318,12 +1381,14 @@ def _create_team_instance(
         history_settings = config.get_entity_history_settings(configured_team_name)
     else:
         history_settings = config.get_default_history_settings()
-    scope_context = resolve_bound_team_scope_context(
+    team_id = _resolve_team_instance_id(
         agents=agents,
         config=config,
-        team_name=configured_team_name,
+        team_display_name=team_display_name,
+        configured_team_name=configured_team_name,
+        scope_context=scope_context,
+        execution_identity=execution_identity,
     )
-    team_id = scope_context.scope.scope_id if scope_context is not None else fallback_team_id
 
     for agent in agents:
         # Team-owned replay should come from the shared TeamSession, not from
@@ -1337,7 +1402,7 @@ def _create_team_instance(
         id=team_id,
         name=team_display_name,
         model=model,
-        db=history_storage,
+        db=scope_context.storage if scope_context is not None else None,
         delegate_to_all_members=mode == TeamMode.COLLABORATE,
         add_history_to_context=True,
         add_session_summary_to_context=True,
@@ -1417,11 +1482,10 @@ def build_materialized_team_instance(
         config=config,
         runtime_paths=runtime_paths,
         team_display_name=team_label,
-        fallback_team_id=team_label,
+        scope_context=scope_context,
         execution_identity=execution_identity,
         model_name=resolved_team_model_name,
         configured_team_name=configured_team_name,
-        history_storage=scope_context.storage if scope_context is not None else None,
     )
 
 
@@ -1534,7 +1598,14 @@ async def team_response(  # noqa: C901, PLR0912, PLR0915
     """Create a team and execute response."""
     assert orchestrator.config is not None
     requested_agent_names = _requested_team_agent_names(agent_names)
-    orchestrator.config.assert_team_agents_supported(requested_agent_names)
+    allow_direct_private_agents = _allow_direct_private_team_agents(
+        execution_identity,
+        configured_team_name=configured_team_name,
+    )
+    orchestrator.config.assert_team_agents_supported(
+        requested_agent_names,
+        allow_direct_private_agents=allow_direct_private_agents,
+    )
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] = {}
     room_id = execution_identity.room_id if execution_identity is not None else None
     thread_id = (
@@ -1559,6 +1630,7 @@ async def team_response(  # noqa: C901, PLR0912, PLR0915
             session_id=session_id,
             unavailable_bases=unavailable_bases,
             reason_prefix=reason_prefix,
+            configured_team_name=configured_team_name,
         )
     except ValueError as exc:
         return str(exc)
@@ -1955,7 +2027,14 @@ async def team_response_stream(  # noqa: C901, PLR0912, PLR0915
     requested_agent_names = _requested_team_agent_names(
         [_team_member_name(mid, orchestrator.config, orchestrator.runtime_paths) for mid in agent_ids],
     )
-    orchestrator.config.assert_team_agents_supported(requested_agent_names)
+    allow_direct_private_agents = _allow_direct_private_team_agents(
+        execution_identity,
+        configured_team_name=configured_team_name,
+    )
+    orchestrator.config.assert_team_agents_supported(
+        requested_agent_names,
+        allow_direct_private_agents=allow_direct_private_agents,
+    )
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] = {}
     room_id = execution_identity.room_id if execution_identity is not None else None
     thread_id = (
@@ -1980,6 +2059,7 @@ async def team_response_stream(  # noqa: C901, PLR0912, PLR0915
             session_id=session_id,
             unavailable_bases=unavailable_bases,
             reason_prefix=reason_prefix,
+            configured_team_name=configured_team_name,
         )
     except ValueError as exc:
         yield str(exc)
