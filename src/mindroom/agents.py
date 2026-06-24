@@ -21,7 +21,6 @@ from mindroom import agent_storage, constants, model_loading
 from mindroom.agent_descriptions import describe_agent
 from mindroom.agent_knowledge_descriptions import KnowledgeToolDescribingAgent as Agent
 from mindroom.agent_knowledge_descriptions import knowledge_source_descriptions
-from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.credentials import get_runtime_credentials_manager
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.hooks import HookRegistry
@@ -1518,32 +1517,6 @@ def create_agent(  # noqa: PLR0915, C901, PLR0912
     return agent
 
 
-def get_rooms_for_entity(entity_name: str, config: Config) -> list[str]:
-    """Get the list of room aliases that an entity (agent/team) should be in.
-
-    Args:
-        entity_name: Name of the agent or team
-        config: Configuration object
-
-    Returns:
-        List of room aliases the entity should be in
-
-    """
-    # TeamBot check (teams)
-    if entity_name in config.teams:
-        return config.teams[entity_name].rooms
-
-    # Router agent special case - gets all rooms
-    if entity_name == ROUTER_AGENT_NAME:
-        return list(config.get_all_configured_rooms())
-
-    # Regular agents
-    if entity_name in config.agents:
-        return config.agents[entity_name].rooms
-
-    return []
-
-
 __all__ = [
     "build_agent_toolkit",
     "create_agent",
@@ -1551,7 +1524,6 @@ __all__ = [
     "enable_all_history_replay",
     "ensure_default_agent_workspaces",
     "get_agent_toolkit_names",
-    "get_rooms_for_entity",
     "remove_run_by_event_id",
     "resolve_runtime_worker_tools",
     "show_tool_calls_for_agent",

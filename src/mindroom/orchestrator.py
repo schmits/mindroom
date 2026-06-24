@@ -15,7 +15,7 @@ from uuid import uuid4
 import uvicorn
 
 from mindroom import constants
-from mindroom.agents import ensure_default_agent_workspaces, get_rooms_for_entity
+from mindroom.agents import ensure_default_agent_workspaces
 from mindroom.approval_transport import ApprovalMatrixTransport
 from mindroom.authorization import is_authorized_sender
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -26,6 +26,7 @@ from mindroom.entity_resolution import (
     entity_identity_registry,
     is_configured_room,
 )
+from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.event_loop_stall import EventLoopStallDetector, start_event_loop_stall_detector
 from mindroom.hooks import (
     EVENT_CONFIG_RELOADED,
@@ -86,6 +87,7 @@ from .credentials_sync import sync_env_to_credentials
 from .logging_config import get_logger, setup_logging
 from .orchestration.config_lifecycle import ConfigReloadLifecycle
 from .orchestration.config_updates import configured_entity_names
+from .orchestration.external_trigger_runtime import ExternalTriggerRuntimeCoordinator
 from .orchestration.plugin_watch import PluginWatchState, watch_plugins_task
 from .orchestration.rooms import get_authorized_user_ids_to_invite, get_root_space_user_ids_to_invite
 from .orchestration.runtime import (
@@ -202,6 +204,7 @@ class _MultiAgentOrchestrator:
     """Orchestrates multiple agent bots."""
 
     runtime_paths: RuntimePaths
+    api_enabled: bool = True
     storage_path: Path = field(init=False)
     config_path: Path = field(init=False)
     agent_bots: dict[str, AgentBot | TeamBot] = field(default_factory=dict, init=False)
@@ -222,6 +225,7 @@ class _MultiAgentOrchestrator:
     _knowledge_source_watcher: KnowledgeSourceWatcher = field(init=False)
     hook_registry: HookRegistry = field(default_factory=HookRegistry.empty, init=False)
     _runtime_shutdown_event: asyncio.Event | None = field(default=None, init=False, repr=False)
+    _external_trigger_runtime: ExternalTriggerRuntimeCoordinator = field(init=False, repr=False)
     _approval_transport: ApprovalMatrixTransport = field(init=False, repr=False)
     _startup_maintenance: StartupMaintenanceController = field(init=False, repr=False)
 
@@ -237,6 +241,10 @@ class _MultiAgentOrchestrator:
         self._knowledge_refresh_scheduler = KnowledgeRefreshScheduler()
         self._knowledge_source_watcher = KnowledgeSourceWatcher(self._knowledge_refresh_scheduler)
         self.plugin_watch = PluginWatchState(runtime_paths=self.runtime_paths)
+        self._external_trigger_runtime = ExternalTriggerRuntimeCoordinator(
+            runtime_paths=self.runtime_paths,
+            api_enabled=self.api_enabled,
+        )
         self.config_reload = ConfigReloadLifecycle(
             runtime_paths=self.runtime_paths,
             is_running=lambda: self.running,
@@ -253,12 +261,7 @@ class _MultiAgentOrchestrator:
             event_cache_provider=lambda: self._runtime_support.event_cache,
         )
         self._startup_maintenance = StartupMaintenanceController(
-            setup_rooms_and_memberships=lambda bots: run_with_retry(
-                "Setting up Matrix rooms and memberships",
-                lambda: self._setup_rooms_and_memberships(bots),
-                permanent_error_check=is_permanent_startup_error,
-                update_runtime_state=False,
-            ),
+            setup_rooms_and_memberships=self._setup_startup_rooms_and_memberships,
             cleanup_stale_streams=lambda bots, config, startup_cutoff_ms: self._cleanup_stale_streams_after_restart(
                 bots,
                 config,
@@ -354,6 +357,16 @@ class _MultiAgentOrchestrator:
         for bot in bots:
             self._bind_runtime_support_services(bot)
         self._configure_approval_store_transport()
+
+    async def _setup_startup_rooms_and_memberships(self, bots: list[AgentBot | TeamBot]) -> None:
+        """Run startup room setup, then publish trigger delivery runtime."""
+        await run_with_retry(
+            "Setting up Matrix rooms and memberships",
+            lambda: self._setup_rooms_and_memberships(bots),
+            permanent_error_check=is_permanent_startup_error,
+            update_runtime_state=False,
+        )
+        self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
 
     async def _sync_event_cache_service(self, config: Config) -> None:
         """Ensure the runtime has one initialized shared event-cache service."""
@@ -467,13 +480,15 @@ class _MultiAgentOrchestrator:
     async def _try_start_bot_once(self, entity_name: str, bot: AgentBot | TeamBot) -> bool | None:
         """Run one bot start attempt and classify the result."""
         try:
-            return bool(await bot.try_start())
+            started = bool(await bot.try_start())
         except PermanentStartupError:
             logger.error(  # noqa: TRY400
                 "Bot startup failed permanently; leaving bot disabled until configuration changes",
                 agent_name=entity_name,
             )
             return None
+        else:
+            return started
 
     async def _run_bot_start_retry(self, entity_name: str) -> None:
         """Keep retrying one bot start until it succeeds or the task is cancelled."""
@@ -510,6 +525,7 @@ class _MultiAgentOrchestrator:
                             permanent_error_check=is_permanent_startup_error,
                             update_runtime_state=False,
                         )
+                    self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
                     return
 
                 attempt += 1
@@ -1159,6 +1175,7 @@ class _MultiAgentOrchestrator:
 
     async def _remove_deleted_entities(self, removed_entities: set[str]) -> None:
         """Cancel, clean up, and unregister entities removed from config."""
+        self._external_trigger_runtime.unbind_for_entity_changes(removed_entities)
         for entity_name in removed_entities:
             await self._cancel_bot_start_task(entity_name)
             await cancel_sync_task(entity_name, self._sync_tasks)
@@ -1183,6 +1200,7 @@ class _MultiAgentOrchestrator:
         if not affected_entities:
             return set()
 
+        self._external_trigger_runtime.unbind_for_entity_changes(affected_entities)
         for entity_name in affected_entities:
             await self._cancel_bot_start_task(entity_name)
         await stop_entities(
@@ -1202,6 +1220,7 @@ class _MultiAgentOrchestrator:
         """Restart or create entities affected by the config change."""
         entities_to_stop = plan.entities_to_restart - (already_stopped_entities or set())
         if entities_to_stop:
+            self._external_trigger_runtime.unbind_for_entity_changes(entities_to_stop)
             for entity_name in entities_to_stop:
                 await self._cancel_bot_start_task(entity_name)
             await stop_entities(
@@ -1240,6 +1259,7 @@ class _MultiAgentOrchestrator:
                 server_id=server_id,
                 entities=sorted(changed_entities),
             )
+            self._external_trigger_runtime.unbind_for_entity_changes(changed_entities)
             for entity_name in changed_entities:
                 await self._cancel_bot_start_task(entity_name)
             await stop_entities(
@@ -1253,6 +1273,9 @@ class _MultiAgentOrchestrator:
                 self.config,
                 start_sync_tasks=True,
             )
+            if start_results.started_bots:
+                await self._setup_rooms_and_memberships(start_results.started_bots)
+            self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
             for entity_name in start_results.retryable_entities:
                 await self._schedule_bot_start_retry(entity_name)
             if start_results.permanently_failed_entities:
@@ -1271,10 +1294,11 @@ class _MultiAgentOrchestrator:
         bots_to_setup = self._running_bots_for_entities(changed_entities)
         if bots_to_setup or plan.mindroom_user_changed or plan.matrix_room_access_changed or plan.authorization_changed:
             await self._setup_rooms_and_memberships(bots_to_setup)
-            return
         if plan.matrix_space_changed or plan.room_metadata_changed:
             room_ids = await self._ensure_rooms_exist()
             await self._ensure_root_space(room_ids)
+        if not plan.only_support_service_changes:
+            self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
 
     async def _prepare_accounts_for_config_update(self, new_config: Config, plan: ConfigUpdatePlan) -> None:
         """Prepare or validate managed Matrix accounts before publishing a reloaded config."""
@@ -1326,6 +1350,7 @@ class _MultiAgentOrchestrator:
                 "updating_config_authorization",
                 authorized_user_ids=new_config.authorization.global_users,
             )
+            await self._external_trigger_runtime.sync_api_config_snapshot(new_config)
             if changed_runtime_mcp_servers:
                 plan = replace(
                     plan,
@@ -1343,6 +1368,7 @@ class _MultiAgentOrchestrator:
                     previous_config=current_config,
                 )
                 await self._approval_transport.mark_startup_runtime_support_ready()
+                self._external_trigger_runtime.bind_if_ready(self.config, self.agent_bots)
                 await self._emit_config_reloaded(
                     new_config=new_config,
                     changed_entities=set(),
@@ -1637,6 +1663,7 @@ class _MultiAgentOrchestrator:
         self.running = False
         if self._runtime_shutdown_event is not None:
             self._runtime_shutdown_event.set()
+        self._external_trigger_runtime.unbind()
         await shutdown_approval_runtime()
         await self.config_reload.cancel()
         await self._startup_maintenance.cancel()
@@ -1983,7 +2010,7 @@ async def main(  # noqa: PLR0915
         storage_path.mkdir(parents=True, exist_ok=True)
 
         logger.info("Starting orchestrator...")
-        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths)
+        orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths, api_enabled=api)
         set_runtime_starting()
         auxiliary_specs = [
             (
