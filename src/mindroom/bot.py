@@ -143,7 +143,6 @@ __all__ = ["AgentBot", "TeamBot", "create_bot_for_entity"]
 
 # Constants
 _SYNC_TIMEOUT_MS = 30000
-_STOPPING_RESPONSE_TEXT = "⏹️ Stopping generation..."
 
 
 @dataclass(frozen=True, slots=True)
@@ -1802,12 +1801,7 @@ class AgentBot:
                     self.config,
                     self.runtime_paths,
                 ).current_entity_name_for_user_id(event.sender)
-                tracked_target = self.stop_manager.get_tracked_target(event.reacts_to)
-                if (
-                    not sender_agent_name
-                    and tracked_target is not None
-                    and await self.stop_manager.handle_stop_reaction(event.reacts_to)
-                ):
+                if not sender_agent_name and await self.stop_manager.handle_stop_reaction(event.reacts_to):
                     self.logger.info(
                         "Stop requested for message",
                         message_id=event.reacts_to,
@@ -1817,10 +1811,6 @@ class AgentBot:
                         self.client,
                         event.reacts_to,
                         notify_outbound_redaction=self._conversation_cache.notify_outbound_redaction,
-                    )
-                    await self._send_response(
-                        target=tracked_target,
-                        response_text=_STOPPING_RESPONSE_TEXT,
                     )
                     return
 
