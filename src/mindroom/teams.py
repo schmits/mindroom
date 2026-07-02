@@ -76,6 +76,7 @@ from mindroom.response_turn import (
     BlockingTurnAdapter,
     CancelledAttempt,
     CompletedAttempt,
+    ContinuationCapability,
     DynamicContinuationRunState,
     ErroredAttempt,
     HandledAttempt,
@@ -304,6 +305,15 @@ def _team_response_text(response: TeamRunOutput | RunOutput) -> str:
     """Render one final team response body without the shared team header."""
     parts = format_team_response(response)
     return "\n\n".join(parts) if parts else (_get_response_content(response) or "No team response generated.")
+
+
+def _has_visible_team_output(response: TeamRunOutput | RunOutput) -> bool:
+    """Return whether one terminal team output carries real member or consensus text.
+
+    The "No team response generated." placeholder does not count, so the
+    dynamic-tool continuation limit message can replace it.
+    """
+    return bool(format_team_response(response)) or bool(_get_response_content(response))
 
 
 def _format_terminal_team_response(
@@ -1205,6 +1215,25 @@ def _extract_cancelled_team_tool_trace(
     return completed_trace, interrupted_trace
 
 
+def _collect_team_tool_executions(response: TeamRunOutput | RunOutput) -> list[ToolExecution]:
+    """Collect raw tool executions from a possibly nested team response.
+
+    Any member's completed load/unload call surfaces here and drives a
+    whole-fan continuation, even when the team already produced visible
+    output. That mirrors the agent path deliberately: gating on visible
+    output would disable continuation in coordinate mode, where the leader
+    almost always synthesizes text around a member's truncated tool call.
+    The rerun is bounded by the continuation budget and prior attempts stay
+    in session history for the rerun to reuse.
+    """
+    tools: list[ToolExecution] = list(response.tools or [])
+    if isinstance(response, TeamRunOutput):
+        for member_response in response.member_responses:
+            if isinstance(member_response, TeamRunOutput | RunOutput):
+                tools.extend(_collect_team_tool_executions(member_response))
+    return tools
+
+
 def _is_cancellation_boilerplate(content: str) -> bool:
     """Return whether one string is just Agno cancellation boilerplate."""
     normalized = content.strip().lower()
@@ -1220,11 +1249,51 @@ class _TeamTurnHolder:
     """Live per-turn team state shared between attempt closures and adapter callbacks."""
 
     team: Team | None = None
+    team_members: ResolvedExactTeamMembers | None = None
     last_response: RunOutput | TeamRunOutput | None = None  # blocking turns only
     attempt_started: bool = False
     attempt_run_id: str | None = None
     render_partial: Callable[[], str] = _empty_partial_text  # streaming turns only
     tool_tracker: StreamingToolTracker = field(default_factory=StreamingToolTracker)  # streaming turns only
+
+
+def _build_team_runtime_db_callbacks(
+    holder: _TeamTurnHolder,
+) -> tuple[Callable[[ScopeSessionContext | None], None], Callable[[ScopeSessionContext | None], None]]:
+    """Build the release/close runtime-DB callbacks for one team turn.
+
+    Releasing between continuation attempts closes the spent member agents'
+    runtime DBs and drops them so the next attempt rebuilds members with the
+    updated dynamic-tool schema baked in.
+    """
+
+    def _release_attempt_members(scope_context: ScopeSessionContext | None) -> None:
+        members = holder.team_members
+        if members is None:
+            return
+        close_team_runtime_state_dbs(
+            agents=members.agents,
+            team_db=cast("BaseDb | None", holder.team.db) if holder.team is not None else None,
+            shared_scope_storage=scope_context.storage if scope_context is not None else None,
+        )
+        holder.team_members = None
+        holder.team = None
+        # Cancel snapshots taken between this release and the next attempt must
+        # not see the spent attempt's partials; its completed tools already
+        # carried over via the turn state.
+        holder.last_response = None
+        holder.render_partial = _empty_partial_text
+        holder.tool_tracker = StreamingToolTracker()
+
+    def _close_runtime_dbs(scope_context: ScopeSessionContext | None) -> None:
+        members = holder.team_members
+        close_team_runtime_state_dbs(
+            agents=members.agents if members is not None else [],
+            team_db=cast("BaseDb | None", holder.team.db) if holder.team is not None else None,
+            shared_scope_storage=scope_context.storage if scope_context is not None else None,
+        )
+
+    return _release_attempt_members, _close_runtime_dbs
 
 
 def materialize_exact_team_members(
@@ -1239,8 +1308,15 @@ def materialize_exact_team_members(
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] | None = None,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
     reason_prefix: str = "Team request",
+    dynamic_tool_continuation: bool = False,
 ) -> ResolvedExactTeamMembers:
-    """Materialize the exact team-member set without silent fallback."""
+    """Materialize the exact team-member set without silent fallback.
+
+    ``dynamic_tool_continuation`` must only be enabled by callers that run the
+    members under a continuation-capable response-turn driver; other callers
+    (for example the OpenAI-compatible API) leave it off so a load/unload does
+    not truncate the run.
+    """
     if not requested_agent_names:
         raise ValueError(_NO_AGENTS_RESPONSE)
 
@@ -1268,6 +1344,7 @@ def materialize_exact_team_members(
             include_interactive_questions=False,
             include_openai_compat_guidance=include_openai_compat_guidance,
             refresh_scheduler=refresh_scheduler,
+            dynamic_tool_continuation=dynamic_tool_continuation,
         )
 
     team_members = materialize_exact_requested_team_members(
@@ -1323,6 +1400,7 @@ def _materialize_team_members(
         materializable_agent_names=materializable_agent_names,
         unavailable_bases=unavailable_bases,
         refresh_scheduler=orchestrator.knowledge_refresh_scheduler,
+        dynamic_tool_continuation=True,
         reason_prefix=reason_prefix,
     )
 
@@ -1680,16 +1758,31 @@ async def team_response(  # noqa: C901, PLR0915
     base_media_inputs = media or MediaInputs()
     config = orchestrator.config
     enrichment_items = system_enrichment_items
-    holder = _TeamTurnHolder()
+    holder = _TeamTurnHolder(team_members=team_members)
 
     async def _run_team_attempt(  # noqa: C901, PLR0912, PLR0915
         run: TurnRunState,
         continuation_state: DynamicContinuationRunState,
     ) -> BlockingAttemptResolution:
         """Run one team attempt, including its media-fallback retries."""
+        attempt_members = holder.team_members
+        if attempt_members is None:
+            # A continuation released the spent members; rebuild them so the
+            # loaded dynamic-tool schema is baked into fresh member agents.
+            attempt_members = await asyncio.to_thread(
+                _materialize_team_members,
+                agent_names,
+                orchestrator,
+                execution_identity,
+                session_id=session_id,
+                reason_prefix=reason_prefix,
+                configured_team_name=configured_team_name,
+            )
+            holder.team_members = attempt_members
+        attempt_agents = attempt_members.agents
         team = build_materialized_team_instance(
-            requested_agent_names=team_members.requested_agent_names,
-            agents=agents,
+            requested_agent_names=attempt_members.requested_agent_names,
+            agents=attempt_agents,
             mode=mode,
             config=config,
             runtime_paths=orchestrator.runtime_paths,
@@ -1701,7 +1794,7 @@ async def team_response(  # noqa: C901, PLR0915
         holder.team = team
         prepared_execution = await prepare_materialized_team_execution(
             scope_context=run.scope_context,
-            agents=agents,
+            agents=attempt_agents,
             team=team,
             message=continuation_state.active_prompt,
             thread_history=thread_history,
@@ -1893,6 +1986,7 @@ async def team_response(  # noqa: C901, PLR0915
                     content_preview=response.content[:200] if response.content else None,
                 )
             team_response_text = _team_response_text(response)
+            has_visible_output = _has_visible_team_output(response)
         else:
             logger.warning(
                 "team_response_unexpected_type",
@@ -1900,6 +1994,7 @@ async def team_response(  # noqa: C901, PLR0915
                 response=response,
             )
             team_response_text = str(response)
+            has_visible_output = bool(team_response_text)
 
         logger.info(
             "team_response_preview",
@@ -1920,8 +2015,11 @@ async def team_response(  # noqa: C901, PLR0915
         return CompletedAttempt(
             response_text=response_text,
             replayable_text=response_text,
-            has_visible_content=bool(response_text),
+            has_visible_content=has_visible_output,
             attempt_run_id=attempt_run_id,
+            tool_executions=tuple(
+                _collect_team_tool_executions(response) if isinstance(response, (TeamRunOutput, RunOutput)) else [],
+            ),
             completed_tools=tuple(
                 _extract_completed_team_tool_trace(response)
                 if isinstance(response, (TeamRunOutput, RunOutput))
@@ -1940,6 +2038,7 @@ async def team_response(  # noqa: C901, PLR0915
             entity_name=configured_team_name or team_name,
         )
 
+    _release_team_attempt_members, _close_team_attempt_dbs = _build_team_runtime_db_callbacks(holder)
     adapter = BlockingTurnAdapter(
         open_scope=lambda: open_bound_scope_session_context(
             agents=agents,
@@ -1951,14 +2050,11 @@ async def team_response(  # noqa: C901, PLR0915
         ),
         run_attempt=_run_team_attempt,
         snapshot_partial=lambda: TurnPartialSnapshot(attempt_run_id=holder.attempt_run_id),
-        release_attempt_entity=lambda _scope: None,
-        close_runtime_dbs=lambda scope_context: close_team_runtime_state_dbs(
-            agents=agents,
-            team_db=cast("BaseDb | None", holder.team.db) if holder.team is not None else None,
-            shared_scope_storage=scope_context.storage if scope_context is not None else None,
-        ),
+        release_attempt_entity=_release_team_attempt_members,
+        close_runtime_dbs=_close_team_attempt_dbs,
         finalize_attempt=_finalize_team_attempt,
         unexpected_error_text=lambda e: get_user_friendly_error_message(e, team_name),
+        continuation=ContinuationCapability(),
     )
     return await run_blocking_response_turn(
         ResponseTurnContext(
@@ -2133,16 +2229,31 @@ async def team_response_stream(  # noqa: C901, PLR0915
     base_media_inputs = media or MediaInputs()
     config = orchestrator.config
     enrichment_items = system_enrichment_items
-    holder = _TeamTurnHolder()
+    holder = _TeamTurnHolder(team_members=team_members)
 
     async def _run_team_stream_attempt(  # noqa: C901, PLR0912, PLR0915
         run: TurnRunState,
         continuation_state: DynamicContinuationRunState,
     ) -> AsyncGenerator[_TeamStreamChunk | AttemptResolved, None]:
         """Stream one team attempt, ending with its ``AttemptResolved`` sentinel."""
+        attempt_members = holder.team_members
+        if attempt_members is None:
+            # A continuation released the spent members; rebuild them so the
+            # loaded dynamic-tool schema is baked into fresh member agents.
+            attempt_members = await asyncio.to_thread(
+                _materialize_team_members,
+                requested_agent_names,
+                orchestrator,
+                execution_identity,
+                session_id=session_id,
+                reason_prefix=reason_prefix,
+                configured_team_name=configured_team_name,
+            )
+            holder.team_members = attempt_members
+        attempt_agents = attempt_members.agents
         team = build_materialized_team_instance(
-            requested_agent_names=team_members.requested_agent_names,
-            agents=team_members.agents,
+            requested_agent_names=attempt_members.requested_agent_names,
+            agents=attempt_agents,
             mode=mode,
             config=config,
             runtime_paths=orchestrator.runtime_paths,
@@ -2154,7 +2265,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
         holder.team = team
         prepared_execution = await prepare_materialized_team_execution(
             scope_context=run.scope_context,
-            agents=team_members.agents,
+            agents=attempt_agents,
             team=team,
             message=continuation_state.active_prompt,
             thread_history=thread_history,
@@ -2260,7 +2371,8 @@ async def team_response_stream(  # noqa: C901, PLR0915
         holder.render_partial = _current_canonical_partial_text
 
         def _sync_live_turn_recorder() -> None:
-            turn_recorder.sync_partial_state(
+            run.turn_state.sync_partial(
+                turn_recorder,
                 run_metadata=run_metadata,
                 assistant_text=_current_canonical_partial_text(),
                 completed_tools=completed_tools,
@@ -2383,6 +2495,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
             next_tool_index = 1
             pending_tools = tool_tracker.pending_tools
             holder.tool_tracker = tool_tracker
+            completed_tool_executions: list[ToolExecution] = []
             emitted_output = False
             media_fallback_retry_requested = False
 
@@ -2390,7 +2503,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
 
             raw_stream = await _team_response_stream_raw(
                 team=team,
-                team_members=team_members,
+                team_members=attempt_members,
                 prompt=attempt_prompt,
                 metadata=run_metadata,
                 media=attempt_media_inputs,
@@ -2485,13 +2598,16 @@ async def team_response_stream(  # noqa: C901, PLR0915
                         event,
                         team_display_names=team_members.display_names,
                     )
-                    turn_recorder.record_completed(
-                        run_metadata=run_metadata,
-                        assistant_text=response_text,
-                        completed_tools=_extract_completed_team_tool_trace(event),
-                    )
                     yield response_text
-                    yield AttemptResolved(HandledAttempt())
+                    yield AttemptResolved(
+                        CompletedAttempt(
+                            replayable_text=response_text,
+                            has_visible_content=_has_visible_team_output(event),
+                            attempt_run_id=attempt_run_id,
+                            tool_executions=tuple(_collect_team_tool_executions(event)),
+                            completed_tools=tuple(_extract_completed_team_tool_trace(event)),
+                        ),
+                    )
                     return
 
                 if isinstance(event, TeamRunErrorEvent):
@@ -2568,6 +2684,8 @@ async def team_response_stream(  # noqa: C901, PLR0915
                             agent_name=member_name,
                             tool=event.tool,
                         )
+                        if event.tool is not None:
+                            completed_tool_executions.append(event.tool)
                         _complete_tool_for_member(member_name, event.tool)
                 elif isinstance(event, TeamRunContentEvent):
                     if event.content:
@@ -2595,6 +2713,8 @@ async def team_response_stream(  # noqa: C901, PLR0915
                         agent_name=None,
                         tool=event.tool,
                     )
+                    if event.tool is not None:
+                        completed_tool_executions.append(event.tool)
                     _complete_tool(
                         scope_key="team",
                         get_visible_text=_get_visible_consensus,
@@ -2625,16 +2745,19 @@ async def team_response_stream(  # noqa: C901, PLR0915
                     session_id=session_id,
                     event_ids=[reply_to_event_id, *unseen_event_ids],
                 )
-            if emitted_output:
+            if emitted_output or completed_tool_executions:
                 canonical_text = _current_canonical_partial_text()
-                turn_recorder.record_completed(
-                    run_metadata=run_metadata,
-                    assistant_text=(
-                        _format_team_header(team_members.display_names) + canonical_text if canonical_text else ""
+                yield AttemptResolved(
+                    CompletedAttempt(
+                        replayable_text=(
+                            _format_team_header(team_members.display_names) + canonical_text if canonical_text else ""
+                        ),
+                        has_visible_content=bool(canonical_text),
+                        attempt_run_id=attempt_run_id,
+                        tool_executions=tuple(completed_tool_executions),
+                        completed_tools=tuple(completed_tools),
                     ),
-                    completed_tools=completed_tools,
                 )
-            yield AttemptResolved(HandledAttempt())
             return
 
     def _finalize_team_stream_attempt(scope_context: ScopeSessionContext | None) -> None:
@@ -2656,6 +2779,7 @@ async def team_response_stream(  # noqa: C901, PLR0915
             attempt_run_id=holder.attempt_run_id,
         )
 
+    _release_team_attempt_members, _close_team_attempt_dbs = _build_team_runtime_db_callbacks(holder)
     adapter = StreamingTurnAdapter[_TeamStreamChunk](
         open_scope=lambda: open_bound_scope_session_context(
             agents=team_members.agents,
@@ -2667,14 +2791,12 @@ async def team_response_stream(  # noqa: C901, PLR0915
         ),
         run_attempt=_run_team_stream_attempt,
         snapshot_partial=_snapshot_stream_partial,
-        release_attempt_entity=lambda _scope: None,
-        close_runtime_dbs=lambda scope_context: close_team_runtime_state_dbs(
-            agents=team_members.agents,
-            team_db=cast("BaseDb | None", holder.team.db) if holder.team is not None else None,
-            shared_scope_storage=scope_context.storage if scope_context is not None else None,
-        ),
+        release_attempt_entity=_release_team_attempt_members,
+        close_runtime_dbs=_close_team_attempt_dbs,
         finalize_attempt=_finalize_team_stream_attempt,
+        make_notice_chunk=lambda text: text,
         unexpected_error_text=lambda e: get_user_friendly_error_message(e, team_label),
+        continuation=ContinuationCapability(),
     )
     response_stream = stream_response_turn(
         ResponseTurnContext(
