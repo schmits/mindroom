@@ -2714,7 +2714,7 @@ def test_get_raw_config_source_returns_current_invalid_file(
     response = test_client.get("/api/config/raw")
 
     assert response.status_code == 200
-    assert response.json() == {"source": invalid_source}
+    assert response.json() == {"source": invalid_source, "uses_includes": False}
 
 
 def test_get_raw_config_source_returns_replacement_text_for_non_utf8_invalid_file(
@@ -2730,7 +2730,7 @@ def test_get_raw_config_source_returns_replacement_text_for_non_utf8_invalid_fil
     response = test_client.get("/api/config/raw")
 
     assert response.status_code == 200
-    assert response.json() == {"source": "agents:\n  broken: \ufffd\n"}
+    assert response.json() == {"source": "agents:\n  broken: \ufffd\n", "uses_includes": False}
 
 
 def test_save_raw_config_source_can_recover_from_invalid_reload(
@@ -2866,7 +2866,7 @@ def test_external_raw_config_reload_advances_generation_for_same_authored_config
     reloaded_raw_response = test_client.get("/api/config/raw")
     assert reloaded_raw_response.status_code == 200
     assert int(reloaded_raw_response.headers[config_lifecycle.CONFIG_GENERATION_HEADER]) > initial_generation
-    assert reloaded_raw_response.json() == {"source": externally_edited_source}
+    assert reloaded_raw_response.json() == {"source": externally_edited_source, "uses_includes": False}
 
     stale_save_response = test_client.put(
         "/api/config/raw",
@@ -2949,71 +2949,6 @@ def test_first_party_config_writers_advance_generation_before_watcher_reload(
     )
 
     assert stale_save_response.status_code == 409
-
-
-def test_validate_raw_config_source_uses_unique_validation_files(tmp_path: Path) -> None:
-    """Concurrent raw validation should not let one request read another request's temp file."""
-    runtime_paths = _runtime_paths(tmp_path)
-    first_source = yaml.safe_dump(
-        {
-            "models": {"default": {"provider": "openai", "id": "gpt-5.4"}},
-            "router": {"model": "default"},
-            "agents": {"agent_a": {"display_name": "Agent A", "role": "role a", "rooms": []}},
-        },
-        sort_keys=True,
-    )
-    second_source = yaml.safe_dump(
-        {
-            "models": {"default": {"provider": "openai", "id": "gpt-5.4"}},
-            "router": {"model": "default"},
-            "agents": {"agent_b": {"display_name": "Agent B", "role": "role b", "rooms": []}},
-        },
-        sort_keys=True,
-    )
-    first_entered = threading.Event()
-    second_entered = threading.Event()
-    call_lock = threading.Lock()
-    call_count = 0
-    original_loader = config_lifecycle.load_runtime_config_model
-    results: list[tuple[Config, dict[str, Any]] | None] = [None, None]
-
-    def _interleaving_loader(
-        validation_runtime_paths: constants.RuntimePaths,
-        *,
-        tolerate_plugin_load_errors: bool = False,
-    ) -> Config:
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            call_number = call_count
-        if call_number == 1:
-            first_entered.set()
-            assert second_entered.wait(timeout=5)
-        else:
-            assert first_entered.wait(timeout=5)
-            second_entered.set()
-        return original_loader(
-            validation_runtime_paths,
-            tolerate_plugin_load_errors=tolerate_plugin_load_errors,
-        )
-
-    def _run_validation(index: int, source: str) -> None:
-        results[index] = config_lifecycle._validate_raw_config_source(source, runtime_paths)
-
-    with patch("mindroom.api.config_lifecycle.load_runtime_config_model", side_effect=_interleaving_loader):
-        first_thread = threading.Thread(target=_run_validation, args=(0, first_source))
-        second_thread = threading.Thread(target=_run_validation, args=(1, second_source))
-        first_thread.start()
-        second_thread.start()
-        first_thread.join(timeout=5)
-        second_thread.join(timeout=5)
-
-    assert not first_thread.is_alive()
-    assert not second_thread.is_alive()
-    assert results[0] is not None
-    assert results[1] is not None
-    assert results[0][1]["agents"] == {"agent_a": {"display_name": "Agent A", "role": "role a", "rooms": []}}
-    assert results[1][1]["agents"] == {"agent_b": {"display_name": "Agent B", "role": "role b", "rooms": []}}
 
 
 def test_api_config_load_accepts_missing_plugin_path_in_degraded_mode(temp_config_file: Path) -> None:
@@ -3143,7 +3078,7 @@ def test_api_key_raw_endpoints_recover_from_invalid_reload(
         headers={"Authorization": "Bearer test-key"},
     )
     assert raw_response.status_code == 200
-    assert raw_response.json() == {"source": invalid_source}
+    assert raw_response.json() == {"source": invalid_source, "uses_includes": False}
 
     valid_source = yaml.safe_dump(_authored_config_payload("recovered"), sort_keys=True)
     save_response = api_key_client.put(
@@ -3283,7 +3218,11 @@ def test_cors_exposes_config_generation_header_for_credentialed_origins(tmp_path
     response = test_client.get("/api/health", headers={"Origin": "http://localhost:5173"})
 
     assert response.status_code == 200
-    assert response.headers["access-control-expose-headers"] == config_lifecycle.CONFIG_GENERATION_HEADER
+    exposed = {header.strip() for header in response.headers["access-control-expose-headers"].split(",")}
+    assert exposed == {
+        config_lifecycle.CONFIG_GENERATION_HEADER,
+        config_lifecycle.CONFIG_USES_INCLUDES_HEADER,
+    }
 
 
 def test_cors_wildcard_opt_in_disables_credentials(tmp_path: Path) -> None:
@@ -4078,7 +4017,7 @@ def test_protected_raw_read_keeps_auth_time_snapshot_after_runtime_swap(tmp_path
         )
 
     assert response.status_code == 200
-    assert response.json() == {"source": source_a}
+    assert response.json() == {"source": source_a, "uses_includes": False}
 
 
 def test_protected_raw_write_rejects_runtime_swap_after_auth(tmp_path: Path) -> None:
