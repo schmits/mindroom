@@ -13,6 +13,7 @@ from agno.models.azure import AzureOpenAI
 from agno.models.llama_cpp import LlamaCpp
 from agno.models.message import Message
 from agno.models.openai import OpenAIChat
+from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 from agno.models.vertexai.claude import Claude as VertexAIClaude
 from agno.utils.models.claude import format_messages
@@ -37,12 +38,15 @@ from mindroom.startup_errors import PermanentStartupError
 from mindroom.vertex_claude_compat import MindroomVertexAIClaude, _strip_vertex_claude_tool_strict
 
 
-def _config_with_runtime_paths(config_data: dict[str, object]) -> tuple[Config, RuntimePaths]:
+def _config_with_runtime_paths(
+    config_data: dict[str, object],
+    process_env: dict[str, str] | None = None,
+) -> tuple[Config, RuntimePaths]:
     runtime_root = Path(tempfile.mkdtemp())
     runtime_paths = resolve_runtime_paths(
         config_path=runtime_root / "config.yaml",
         storage_path=runtime_root / "mindroom_data",
-        process_env={},
+        process_env=process_env or {},
     )
     config = Config(**config_data)
     return config, runtime_paths
@@ -1326,6 +1330,89 @@ def test_vertexai_claude_loads_service_account_credentials_directly(
     assert model.client_params is not None
     assert model.client_params["credentials"] is fake_google_credentials
     assert import_order == ["google.oauth2.service_account"]
+
+
+def test_get_model_instance_supports_zai_provider() -> None:
+    """Z.ai should use Agno's OpenAI-compatible provider class with the Z.ai base URL."""
+    config_data = {
+        "models": {
+            "glm": {
+                "provider": "zai",
+                "id": "glm-5.2",
+                "extra_kwargs": {"api_key": "test-zai-key"},
+            },
+            "glm_custom": {
+                "provider": "zai",
+                "id": "glm-5.2",
+                "extra_kwargs": {
+                    "api_key": "test-zai-key",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                },
+            },
+        },
+        "router": {
+            "model": "glm",
+        },
+        "agents": {},
+    }
+
+    config, runtime_paths = _config_with_runtime_paths(config_data)
+
+    model = get_model_instance(config, runtime_paths, "glm")
+    assert isinstance(model, OpenAILike)
+    assert model.id == "glm-5.2"
+    assert model.api_key == "test-zai-key"
+    assert model.base_url == "https://api.z.ai/api/paas/v4"
+    assert model.name == "ZAI"
+    assert model.provider == "ZAI"
+
+    custom_model = get_model_instance(config, runtime_paths, "glm_custom")
+    assert custom_model.base_url == "https://open.bigmodel.cn/api/paas/v4"
+
+
+def test_zai_provider_resolves_api_key_from_runtime_env() -> None:
+    """A zai model without an explicit key should resolve ZAI_API_KEY from the runtime env."""
+    config_data = {
+        "models": {
+            "glm": {
+                "provider": "zai",
+                "id": "glm-5.2",
+            },
+        },
+        "router": {
+            "model": "glm",
+        },
+        "agents": {},
+    }
+
+    config, runtime_paths = _config_with_runtime_paths(config_data, process_env={"ZAI_API_KEY": "env-zai-key"})
+
+    model = get_model_instance(config, runtime_paths, "glm")
+
+    assert model.api_key == "env-zai-key"
+
+
+def test_zai_provider_drops_falsy_api_key() -> None:
+    """A falsy api_key must not reach the client, where agno would fall back to OPENAI_API_KEY."""
+    config_data = {
+        "models": {
+            "glm": {
+                "provider": "zai",
+                "id": "glm-5.2",
+                "extra_kwargs": {"api_key": None},
+            },
+        },
+        "router": {
+            "model": "glm",
+        },
+        "agents": {},
+    }
+
+    config, runtime_paths = _config_with_runtime_paths(config_data)
+
+    model = get_model_instance(config, runtime_paths, "glm")
+
+    assert model.api_key == "not-provided"
 
 
 if __name__ == "__main__":

@@ -149,6 +149,8 @@ _PROVIDER_VALIDATE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1/models",
     "cerebras": "https://api.cerebras.ai/v1/models",
     "groq": "https://api.groq.com/openai/v1/models",
+    # No "zai" entry: Z.ai's paas/v4 OpenAPI spec exposes no GET /models
+    # listing endpoint, so a URL probe would misreport valid keys as broken.
 }
 
 
