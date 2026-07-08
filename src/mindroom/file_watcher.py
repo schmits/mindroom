@@ -54,6 +54,17 @@ def changed_watched_paths(previous: dict[Path, int], current: dict[Path, int]) -
     return sorted(path for path, mtime in current.items() if mtime != 0 and previous.get(path, mtime) != mtime)
 
 
+def any_paths_newly_missing(previous: dict[Path, int], current: dict[Path, int]) -> bool:
+    """Return whether any watched file vanished (mtime dropped to ``0``) since the last scan.
+
+    A vanish is burst activity for quiescence purposes: it defers a pending
+    callback so a delete-and-recreate window is not read mid-rename, but it
+    never fires a callback by itself, and a file that stays missing stops
+    counting after one scan so a permanent deletion cannot defer forever.
+    """
+    return any(mtime == 0 and previous.get(path, 0) != 0 for path, mtime in current.items())
+
+
 async def watch_paths(
     paths_provider: Callable[[], Iterable[Path | str]],
     callback: Callable[[], Awaitable[None]],
@@ -64,8 +75,15 @@ async def watch_paths(
     ``paths_provider`` is re-evaluated every scan so the watched set can grow or
     shrink between calls (e.g. config ``!include`` files after a reload). Change
     detection follows :func:`changed_watched_paths`.
+
+    The callback fires only after a quiet scan: a scan that detects changes marks
+    the watcher dirty, and the callback runs on the next scan with no new changes
+    and no newly vanished files. Multi-file updates (git pull, rsync) thus land
+    completely before a reload reads the tree, at the cost of one extra scan
+    interval of latency.
     """
     last_snapshot = paths_mtime_snapshot(paths_provider())
+    dirty = False
 
     while stop_event is None or not stop_event.is_set():
         await asyncio.sleep(_WATCH_SCAN_INTERVAL_SECONDS)
@@ -73,8 +91,12 @@ async def watch_paths(
         try:
             current_snapshot = paths_mtime_snapshot(paths_provider())
             changed = bool(changed_watched_paths(last_snapshot, current_snapshot))
+            vanished = any_paths_newly_missing(last_snapshot, current_snapshot)
             last_snapshot = current_snapshot
             if changed:
+                dirty = True
+            elif dirty and not vanished:
+                dirty = False
                 await callback()
         except Exception:
             # Don't let callback errors stop the watcher
