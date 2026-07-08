@@ -3256,7 +3256,7 @@ kill_shell_command("shell:abcd1234")
   MindRoom forwards no committed runtime `.env` values by default; matched values pass through except credential seed declarations, Kubernetes worker backend config env names, runner control names including `MINDROOM_CREDENTIALS_ENCRYPTION_KEY`, and names starting with `MINDROOM_SANDBOX_`.
 - Use explicit argv lists for commands that need exact argument boundaries.
 - In authored YAML, `extra_env_passthrough` and `shell_path_prepend` can be written as lists, and MindRoom normalizes them to the tool's comma-or-newline form.
-- Background handles survive multiple requests to the same long-lived runner process, but they do not survive runner restarts.
+- Background handles live in a worker-local shell supervisor process: they survive multiple requests to the same runner, but not runner or worker restarts.
 - `shell_path_prepend` deduplicates PATH entries and only changes subprocess PATH, not the main MindRoom process PATH.
 - For per-workspace env that an agent can edit on the fly (PATH prefixes, `NPM_CONFIG_PREFIX`, `NPM_CONFIG_CACHE`, `PIP_INDEX_URL`, etc.), drop a `.mindroom/worker-env.sh` script in the workspace and `export` the values you want — see "Workspace env hook" in `docs/deployment/sandbox-proxy.md`.
 - MindRoom-owned env names are reasserted after the hook and cannot be redirected from `.mindroom/worker-env.sh`: `HOME`, `MINDROOM_AGENT_WORKSPACE`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `PYTHONPYCACHEPREFIX`, and `VIRTUAL_ENV`.
@@ -16214,7 +16214,7 @@ If you deploy that mode without Helm, see [Kubernetes Deployment](https://docs.m
 | `MINDROOM_STORAGE_PATH` | Writable directory for tool registry init and worker-local caches (e.g., `/app/workspace/.mindroom`) | `mindroom_data` next to config _(will fail if not writable)_ |
 | `MINDROOM_CONFIG_PATH` | Path to config.yaml (for plugin tool registration) | _(optional)_ |
 
-`subprocess` runs every non-shell tool call in a fresh `python -m mindroom.api.sandbox_runner` child that re-imports the runtime on each call.
+`subprocess` runs every tool call in a fresh `python -m mindroom.api.sandbox_runner` child that re-imports the runtime on each call.
 `forkserver` keeps one warm template process per interpreter that imports the runtime once and forks a fresh child per call, preserving per-call process isolation while removing the per-call import cost.
 Dedicated Docker and Kubernetes workers default to `forkserver`.
 If the warm template fails to start, dispatch falls back to spawn-per-call and retries the template after a cooldown.
@@ -16326,8 +16326,9 @@ It also proves garbage and missing proxy session tokens are refused.
 
 Shell commands that exceed their timeout return a background handle.
 Use `check_shell_command(handle)` to poll and `kill_shell_command(handle)` to stop the process.
-These handles are process-local to the sandbox runner: they survive multiple requests to the same runner process, but not runner restarts.
-To make that work, shell background-handle requests stay owned by the long-lived runner process even when `MINDROOM_SANDBOX_RUNNER_EXECUTION_MODE` is `subprocess` or `forkserver`.
+Handles are owned by a small worker-local shell supervisor process that the runner spawns on first shell use: they survive multiple requests to the same runner, but not runner or worker restarts.
+Shell requests run in per-request subprocesses like every other execution tool; the request process computes the shell env and cwd, then relays run/check/kill to the supervisor over a unix socket advertised via `MINDROOM_SANDBOX_SHELL_SUPERVISOR_SOCKET`.
+When the supervisor exits (runner shutdown, worker restart, or orphaning), it kills any still-running supervised process groups, so handles are invalidated without leaking processes.
 
 ## Workspace home contract
 
