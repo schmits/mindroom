@@ -3,7 +3,7 @@
 1. Compacted runs never reappear (``mindroom.history.storage``).
 2. Chunk progress survives interruption (``mindroom.history.storage``).
 3. Summary calls get exactly one model configuration path (``mindroom.history.summary_call``).
-4. Budget shrinks deterministically on provider failure (``mindroom.history.summary_call``).
+4. Retry on provider failure is deterministic (``mindroom.history.summary_call``).
 
 These tests exercise the owning interfaces directly, not the bot runtime.
 """
@@ -49,6 +49,7 @@ from mindroom.history.summary_call import (
     DEFAULT_SUMMARY_RETRY_POLICY,
     CompactionSummaryOutputLimitError,
     SummaryRetryPolicy,
+    _CompactionSummaryEmptyResultError,
     build_summary_request_messages,
     configure_summary_model,
     generate_compaction_summary,
@@ -413,7 +414,7 @@ async def test_chunk_progress_survives_interruption_and_restart(tmp_path: Path) 
 
 def test_configure_summary_model_tunes_claude_in_one_place() -> None:
     model = Claude(
-        id="claude-sonnet-4-6",
+        id="claude-sonnet-5",
         cache_system_prompt=True,
         extended_cache_time=True,
         thinking={"type": "enabled", "budget_tokens": 8192},
@@ -435,7 +436,7 @@ def test_configure_summary_model_tunes_claude_in_one_place() -> None:
 
 def test_configure_summary_model_tunes_vertexai_claude() -> None:
     model = MindroomVertexAIClaude(
-        id="claude-sonnet-4-6",
+        id="claude-sonnet-5",
         project_id="demo-project",
         region="us-central1",
         cache_system_prompt=True,
@@ -455,7 +456,7 @@ def test_configure_summary_model_tunes_vertexai_claude() -> None:
 
 
 def test_configure_summary_model_preserves_authored_output_cap() -> None:
-    model = Claude(id="claude-sonnet-4-6", max_tokens=1024, timeout=30.0)
+    model = Claude(id="claude-sonnet-5", max_tokens=1024, timeout=30.0)
 
     configure_summary_model(model)
 
@@ -475,7 +476,7 @@ def test_configure_summary_model_leaves_unknown_providers_untouched() -> None:
 @pytest.mark.asyncio
 async def test_generate_compaction_summary_applies_tuning_and_request_shape() -> None:
     model = _RecordingClaude(
-        id="claude-sonnet-4-6",
+        id="claude-sonnet-5",
         cache_system_prompt=True,
         extended_cache_time=True,
         thinking={"type": "enabled", "budget_tokens": 8192},
@@ -507,7 +508,7 @@ async def test_generate_compaction_summary_rejects_output_cap_truncation() -> No
     with pytest.raises(RuntimeError, match="output token limit"):
         await generate_compaction_summary(
             model=_RecordingClaude(
-                id="claude-sonnet-4-6",
+                id="claude-sonnet-5",
                 max_tokens=64_000,
                 response=ModelResponse(
                     content="durable summary ended cleanly.",
@@ -524,7 +525,7 @@ async def test_generate_compaction_summary_uses_configured_output_cap() -> None:
     with pytest.raises(RuntimeError, match="output token limit"):
         await generate_compaction_summary(
             model=_RecordingClaude(
-                id="claude-sonnet-4-6",
+                id="claude-sonnet-5",
                 max_tokens=1_024,
                 response=ModelResponse(content="durable summary ended cleanly.", output_tokens=1_024),
             ),
@@ -537,7 +538,7 @@ async def test_generate_compaction_summary_uses_configured_output_cap() -> None:
 async def test_generate_compaction_summary_allows_claude_summary_below_output_cap() -> None:
     summary = await generate_compaction_summary(
         model=_RecordingClaude(
-            id="claude-sonnet-4-6",
+            id="claude-sonnet-5",
             max_tokens=64_000,
             response=ModelResponse(
                 content="durable summary ended cleanly.",
@@ -555,7 +556,7 @@ async def test_generate_compaction_summary_allows_claude_summary_below_output_ca
 async def test_generate_compaction_summary_allows_full_history_summary_above_four_k() -> None:
     summary = await generate_compaction_summary(
         model=_RecordingClaude(
-            id="claude-sonnet-4-6",
+            id="claude-sonnet-5",
             max_tokens=8192,
             response=ModelResponse(
                 content="durable full-history summary ended cleanly.",
@@ -571,7 +572,7 @@ async def test_generate_compaction_summary_allows_full_history_summary_above_fou
 
 @pytest.mark.asyncio
 async def test_generate_compaction_summary_uses_claude_default_output_cap() -> None:
-    model = _RecordingClaude(id="claude-sonnet-4-6")
+    model = _RecordingClaude(id="claude-sonnet-5")
     default_output_cap = model.max_tokens
     assert default_output_cap is not None
     model.response = ModelResponse(
@@ -666,3 +667,82 @@ def test_retry_schedule_halves_deterministically() -> None:
         attempt += 1
 
     assert budgets == [8_000, 4_000, 2_000, 1_000]
+
+
+@pytest.mark.asyncio
+async def test_generate_compaction_summary_empty_result_raises_typed_error_with_diagnostics() -> None:
+    """An empty summary response raises the typed error carrying response diagnostics."""
+    with pytest.raises(
+        _CompactionSummaryEmptyResultError,
+        match=r"returned no result \(output_tokens=0, has_reasoning=False\)",
+    ):
+        await generate_compaction_summary(
+            model=_RecordingClaude(
+                id="claude-sonnet-5",
+                max_tokens=64_000,
+                response=ModelResponse(content="", output_tokens=0),
+            ),
+            summary_input="conversation payload",
+            summary_prompt="Summarize the conversation.",
+        )
+
+
+def test_retry_policy_reissues_same_budget_for_empty_result() -> None:
+    """Empty-result failures retry once at the SAME budget; shrinking would not help."""
+    error = _CompactionSummaryEmptyResultError("summary generation returned no result")
+    assert DEFAULT_SUMMARY_RETRY_POLICY.retry_budget(attempt=1, budget=16_000, error=error) == 16_000
+    assert DEFAULT_SUMMARY_RETRY_POLICY.retry_budget(attempt=2, budget=16_000, error=error) is None
+
+
+@pytest.mark.asyncio
+async def test_compaction_retries_empty_summary_result_once_at_same_budget(tmp_path: Path) -> None:
+    """One transient empty summary response recovers on the plain re-issue."""
+    config, runtime_paths = _make_config(tmp_path)
+    storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
+    session = _session(
+        [
+            _completed_run("run-1", marker="RUN1-MARKER", padding=16_000),
+            _completed_run("run-2", marker="RUN2-MARKER", padding=16_000),
+        ],
+    )
+    write_scope_state(session, _SCOPE, HistoryScopeState(force_compact_before_next_run=True))
+    storage.upsert_session(session)
+
+    attempts: list[str] = []
+
+    async def flaky_summary(*, summary_input: str, **_kwargs: object) -> SessionSummary:
+        attempts.append(summary_input)
+        if len(attempts) == 1:
+            msg = "summary generation returned no result (output_tokens=0, has_reasoning=False)"
+            raise _CompactionSummaryEmptyResultError(msg)
+        return SessionSummary(summary="recovered summary", updated_at=datetime.now(UTC))
+
+    with patch(
+        "mindroom.history.compaction.generate_compaction_summary",
+        new=AsyncMock(side_effect=flaky_summary),
+    ):
+        outcome = await compact_scope_history(
+            storage=storage,
+            session=session,
+            scope=_SCOPE,
+            state=read_scope_state(session, _SCOPE),
+            history_settings=_HISTORY_SETTINGS,
+            available_history_budget=None,
+            summary_input_budget=10_000,
+            summary_model=FakeModel(id="summary-model", provider="fake"),
+            summary_model_name="summary-model",
+            replay_window_tokens=64_000,
+            threshold_tokens=None,
+            summary_prompt=COMPACTION_SUMMARY_PROMPT,
+        )
+
+    assert outcome is not None
+    # Chunk 1 fails empty, is re-issued unchanged, then chunk 2 compacts run-2.
+    assert len(attempts) == 3
+    assert attempts[0] == attempts[1]
+    assert attempts[2] != attempts[1]
+    persisted = get_agent_session(storage, "session-1")
+    assert persisted is not None
+    assert persisted.summary is not None
+    assert persisted.summary.summary == "recovered summary"
+    storage.close()
