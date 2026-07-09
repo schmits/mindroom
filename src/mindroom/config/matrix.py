@@ -14,7 +14,6 @@ from mindroom.runtime_env_policy import is_runtime_database_url_env_name
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
 _RoomAccessMode = Literal["single_user_private", "multi_user"]
@@ -87,25 +86,6 @@ class MatrixSpaceConfig(BaseModel):
         return normalized
 
 
-class MatrixDeliveryConfig(BaseModel):
-    """Configuration for outgoing Matrix event delivery."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    ignore_unverified_devices: bool = Field(
-        default=False,
-        description=(
-            "Whether outgoing encrypted Matrix sends should ignore unverified devices. "
-            "The default keeps nio's device-trust checks enabled."
-        ),
-    )
-
-
-def ignore_unverified_devices_for_config(config: Config) -> bool:
-    """Return the explicit Matrix delivery trust policy for outgoing sends."""
-    return config.matrix_delivery.ignore_unverified_devices
-
-
 class MatrixRoomAccessConfig(BaseModel):
     """Configuration for managed Matrix room access and discoverability."""
 
@@ -133,6 +113,14 @@ class MatrixRoomAccessConfig(BaseModel):
         description=(
             "Whether to reconcile existing managed rooms to match current mode/join rule/directory settings "
             "on startup and config reload"
+        ),
+    )
+    encrypt_managed_rooms: bool = Field(
+        default=False,
+        description=(
+            "Whether managed rooms should have Matrix end-to-end encryption enabled by default. "
+            "Per-room rooms.<key>.encrypted overrides this. "
+            "Enabling encryption on a Matrix room is irreversible; MindRoom never disables it."
         ),
     )
 

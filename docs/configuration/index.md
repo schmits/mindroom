@@ -525,6 +525,7 @@ matrix_room_access:
   publish_to_room_directory: false # Publish managed rooms in server room directory
   invite_only_rooms: []            # Room keys/aliases/IDs that stay invite-only/private
   reconcile_existing_rooms: false  # Explicit migration of existing managed rooms
+  encrypt_managed_rooms: false     # Enable Matrix E2EE on managed rooms (irreversible per room)
 
 # Authorization (optional)
 authorization:
@@ -566,10 +567,6 @@ matrix_space:
   enabled: true                    # Default: true (create a root Matrix Space for managed rooms)
   name: MindRoom                   # Default: "MindRoom" (display name for the root Space)
 
-# Matrix delivery policy (optional)
-matrix_delivery:
-  ignore_unverified_devices: false # Default: false (keep Matrix E2EE device-trust checks enabled)
-
 # Timezone for scheduled tasks (optional)
 timezone: America/Los_Angeles      # Default: UTC
 ```
@@ -580,10 +577,6 @@ Room-specific `authorization.room_permissions` users are invited only through th
 Root Space admin reconciliation is grant-only and preserves existing Matrix admins.
 Removing a user from `authorization.global_users` stops future MindRoom authorization but does not automatically demote that user in the Space.
 Demote stale Space admins manually in a Matrix client when needed.
-
-`matrix_delivery.ignore_unverified_devices` is an explicit opt-in for outgoing encrypted Matrix sends.
-Leave it `false` to preserve Matrix E2EE device-trust checks.
-Setting it to `true` can improve bot delivery when rooms contain unverified devices, but Matrix may encrypt messages for devices the bot has not verified.
 
 ## Credential Seeds
 
@@ -738,6 +731,7 @@ Run `mindroom avatars sync --force` to replace existing Matrix room or root-spac
 - `authorization.aliases` maps bridge bot user IDs to canonical users so bridged messages inherit the same permissions (see [Authorization](../authorization.md))
 - `authorization.room_permissions` accepts room IDs, full room aliases, and managed room keys
 - `matrix_room_access.mode` defaults to `single_user_private`; this preserves current private/invite-only behavior
+- `matrix_room_access.encrypt_managed_rooms` enables Matrix end-to-end encryption on managed rooms; per-room `rooms.<key>.encrypted` overrides it, enabling is irreversible, and MindRoom never disables encryption on a room
 - In `multi_user` mode, MindRoom sets managed room join rules and directory visibility from config
 - In `multi_user` mode, MindRoom also reconciles managed room power levels so `com.mindroom.thread.tags` can be written at PL0
 - Publishing to the room directory requires the managing service account (typically router) to have moderator/admin power in each room

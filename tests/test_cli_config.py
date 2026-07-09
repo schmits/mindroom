@@ -29,7 +29,7 @@ from mindroom.cli.main import _load_active_config_or_exit, _threads_export, app
 from mindroom.constants import OWNER_MATRIX_USER_ID_ENV, OWNER_MATRIX_USER_ID_PLACEHOLDER
 from mindroom.error_handling import AvatarGenerationError, AvatarSyncError
 from mindroom.handled_turns import HandledTurnLedger
-from mindroom.matrix.state import MatrixState
+from mindroom.matrix.state import MatrixAccount, MatrixState
 from mindroom.model_defaults import (
     CONFIG_INIT_MODEL_PRESETS,
     LLAMA_CPP_GEMMA,
@@ -178,7 +178,6 @@ class TestConfigInit:
         assert "authorization:" in content
         assert "matrix_space:" in content
         assert "matrix_space:\n  enabled: true\n  name: MindRoom" in content
-        assert "matrix_delivery:\n  ignore_unverified_devices: false" in content
         assert OWNER_MATRIX_USER_ID_PLACEHOLDER in content
 
     def test_init_defaults_to_openai_for_mindroom_chat(self, tmp_path: Path) -> None:
@@ -2421,12 +2420,44 @@ class TestDoctor:
         assert result.exit_code == 0
         assert "✓" in result.output
         assert "✗" not in result.output
-        assert "6 passed" in result.output
+        assert "7 passed" in result.output
         assert "0 failed" in result.output
         assert "1 warning" in result.output  # memory LLM not configured
         assert "Providers:" in result.output
         assert "anthropic (1 model)" in result.output
         assert "API key valid" in result.output
+
+    def test_warns_when_encryption_store_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Doctor warns when a persisted device has no encryption store on disk."""
+        cfg = tmp_path / "config.yaml"
+        cfg.write_text(_VALID_CONFIG)
+        storage = tmp_path / "storage"
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        _patch_homeserver_ok(monkeypatch)
+
+        runtime_paths = constants_module.resolve_runtime_paths(config_path=cfg, storage_path=storage)
+        MatrixState(
+            accounts={
+                "agent_general": MatrixAccount(
+                    username="mindroom_general",
+                    password="pw",  # noqa: S106
+                    domain="localhost",
+                    device_id="LOSTDEVICE",
+                ),
+            },
+        ).save(runtime_paths=runtime_paths)
+
+        result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
+
+        assert result.exit_code == 0
+        assert "Encryption store missing for agent_general" in result.output
+        assert "1 warning" not in result.output  # memory warning plus this one
+        assert "2 warnings" in result.output
 
     def test_doctor_reports_disabled_memory_backend(
         self,
@@ -2492,9 +2523,10 @@ class TestDoctor:
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
         assert result.exit_code == 0
-        assert len(status_messages) == 6
+        assert len(status_messages) == 7
         assert any("Matrix homeserver" in msg for msg in status_messages)
         assert any("memory config" in msg for msg in status_messages)
+        assert any("encryption stores" in msg for msg in status_messages)
 
     def test_missing_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Doctor reports failure when config file is missing."""
