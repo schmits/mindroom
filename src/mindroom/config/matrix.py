@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
+from mindroom.config.validation import duplicate_items
 from mindroom.constants import resolve_config_relative_path, runtime_mindroom_namespace
 from mindroom.matrix_identifiers import managed_room_key_from_alias_localpart, room_alias_localpart
 from mindroom.runtime_env_policy import is_runtime_database_url_env_name
@@ -123,17 +124,24 @@ class MatrixRoomAccessConfig(BaseModel):
             "Enabling encryption on a Matrix room is irreversible; MindRoom never disables it."
         ),
     )
+    room_admins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Matrix user IDs granted room admin power (100) in every managed room. "
+            "Applied at room creation and reconciled on startup and config reload; "
+            "membership is unchanged, so listed users become admins once they are in the room."
+        ),
+    )
 
-    @field_validator("invite_only_rooms")
+    @field_validator("invite_only_rooms", "room_admins")
     @classmethod
-    def validate_unique_invite_only_rooms(cls, invite_only_rooms: list[str]) -> list[str]:
-        """Ensure each invite-only room identifier appears at most once."""
-        if len(invite_only_rooms) != len(set(invite_only_rooms)):
-            seen: set[str] = set()
-            duplicates = {r for r in invite_only_rooms if r in seen or seen.add(r)}
-            msg = f"Duplicate invite_only_rooms are not allowed: {', '.join(sorted(duplicates))}"
+    def validate_unique_entries(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        """Ensure each configured entry appears at most once."""
+        duplicates = duplicate_items(values)
+        if duplicates:
+            msg = f"Duplicate {info.field_name} are not allowed: {', '.join(duplicates)}"
             raise ValueError(msg)
-        return invite_only_rooms
+        return values
 
     def is_multi_user_mode(self) -> bool:
         """Return whether multi-user room access mode is enabled."""
