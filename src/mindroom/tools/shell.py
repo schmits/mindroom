@@ -161,9 +161,11 @@ def _shell_subprocess_env(
     if base_process_env is not None:
         env.update({key: value for key, value in base_process_env.items() if key in _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS})
     env.update(runtime_env)
-    if base_process_env is not None:
-        env.update(_workspace_home_contract_env_from_process_env(base_process_env))
-    if workspace_dir is not None and not env.get("MINDROOM_AGENT_WORKSPACE"):
+    workspace_home_contract = (
+        _workspace_home_contract_env_from_process_env(base_process_env) if base_process_env is not None else {}
+    )
+    env.update(workspace_home_contract)
+    if workspace_dir is not None and not workspace_home_contract:
         # Local (non-worker) execution keeps the host HOME, but the workspace
         # env var is still promised to agents, so export it from base_dir.
         env["MINDROOM_AGENT_WORKSPACE"] = str(workspace_dir.expanduser().resolve())

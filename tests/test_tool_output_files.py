@@ -545,13 +545,24 @@ def test_invalid_output_paths_rejected_without_calling_tool(tmp_path: Path, bad_
     assert _receipt(result.result)["status"] == "error"
 
 
-@pytest.mark.parametrize("expanded_path", ["~/ride-trace.json", "$HOME/ride-trace.json", "%USERPROFILE%\\out.json"])
-def test_expansion_rejected_with_actionable_workspace_relative_message(expanded_path: str) -> None:
-    error = validate_output_path_syntax(expanded_path)
+@pytest.mark.parametrize(
+    "rejected_path",
+    [
+        "~/ride-trace.json",
+        "$HOME/ride-trace.json",
+        "%USERPROFILE%\\out.json",
+        "reports/100%/out.json",
+        "price$5/output.json",
+        "~literal/output.json",
+    ],
+)
+def test_expansion_characters_rejected_with_actionable_workspace_relative_message(rejected_path: str) -> None:
+    error = validate_output_path_syntax(rejected_path)
 
     assert error is not None
-    assert repr(expanded_path) in error
+    assert repr(rejected_path) in error
     assert "relative to the agent workspace" in error
+    assert "must not start with `~` or contain `$` or `%`" in error
     assert "workspace-relative path" in error
 
 

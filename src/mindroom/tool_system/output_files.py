@@ -298,7 +298,7 @@ def _validate_raw_output_path(raw_path: object) -> tuple[str, Path] | str:
     elif _path_has_environment_expansion(raw_path):
         error = (
             f"mindroom_output_path must be a plain path relative to the agent workspace, but got {raw_path!r}. "
-            "`~`, `$VAR`, and `%VAR%` are not expanded; pass a workspace-relative path like 'output.json', "
+            "Paths must not start with `~` or contain `$` or `%`; pass a workspace-relative path like 'output.json', "
             "then copy the file elsewhere with shell tools if needed."
         )
     else:

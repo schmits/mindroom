@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
 
 
-def _make_runtime_paths(tmp_path: Path) -> RuntimePaths:
+def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = None) -> RuntimePaths:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "models:\n  default:\n    provider: openai\n    id: gpt-5.4\nagents: {}\nrouter:\n  model: default\n",
@@ -42,7 +42,7 @@ def _make_runtime_paths(tmp_path: Path) -> RuntimePaths:
     return resolve_runtime_paths(
         config_path=config_path,
         storage_path=tmp_path / "storage",
-        process_env={},
+        process_env={} if process_env is None else process_env,
     )
 
 
@@ -787,6 +787,25 @@ def test_shell_subprocess_env_exports_workspace_from_base_dir_without_home_contr
     assert env["HOME"] == "/home/host-user"
 
 
+def test_shell_subprocess_env_replaces_incomplete_workspace_contract(tmp_path: Path) -> None:
+    """An unvalidated process workspace must not override the local agent workspace."""
+    workspace = tmp_path / "workspace"
+    stale_workspace = tmp_path / "stale-workspace"
+    base_env = {
+        "HOME": "/home/host-user",
+        "MINDROOM_AGENT_WORKSPACE": str(stale_workspace),
+    }
+
+    env = _shell_subprocess_env(
+        {"MINDROOM_AGENT_WORKSPACE": str(stale_workspace)},
+        base_process_env=base_env,
+        workspace_dir=workspace,
+    )
+
+    assert env["MINDROOM_AGENT_WORKSPACE"] == str(workspace.resolve())
+    assert env["HOME"] == "/home/host-user"
+
+
 def test_shell_subprocess_env_prefers_worker_home_contract_over_base_dir(tmp_path: Path) -> None:
     """The worker workspace HOME contract stays authoritative over the base_dir fallback."""
     contract_workspace = tmp_path / "contract-workspace"
@@ -806,11 +825,17 @@ def test_shell_subprocess_env_prefers_worker_home_contract_over_base_dir(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_local_shell_exports_agent_workspace_env(tmp_path: Path) -> None:
-    """Locally-executed shell commands should see MINDROOM_AGENT_WORKSPACE from base_dir."""
+async def test_local_shell_replaces_stale_agent_workspace_env(tmp_path: Path) -> None:
+    """Local shell execution should replace a stale process workspace with base_dir."""
     workspace = tmp_path / "agent-workspace"
     workspace.mkdir()
-    runtime_paths = _make_runtime_paths(tmp_path)
+    runtime_paths = _make_runtime_paths(
+        tmp_path,
+        process_env={
+            "HOME": str(tmp_path / "host-home"),
+            "MINDROOM_AGENT_WORKSPACE": str(tmp_path / "stale-workspace"),
+        },
+    )
     tool = get_tool_by_name(
         "shell",
         runtime_paths,
@@ -821,7 +846,7 @@ async def test_local_shell_exports_agent_workspace_env(tmp_path: Path) -> None:
     entrypoint = tool.async_functions["run_shell_command"].entrypoint
     assert entrypoint is not None
 
-    result = await entrypoint(["bash", "-lc", 'printf %s "$MINDROOM_AGENT_WORKSPACE"'])
+    result = await entrypoint(["/bin/sh", "-c", 'printf %s "$MINDROOM_AGENT_WORKSPACE"'])
     assert result == str(workspace.resolve())
 
 
