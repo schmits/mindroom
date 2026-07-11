@@ -154,6 +154,7 @@ def _shell_subprocess_env(
     *,
     base_process_env: dict[str, str] | None = None,
     shell_path_prepend: str | None = None,
+    workspace_dir: Path | None = None,
 ) -> dict[str, str]:
     """Build the env passed to shell subprocesses."""
     env = {key: value for key, value in os.environ.items() if key in _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS}
@@ -162,6 +163,10 @@ def _shell_subprocess_env(
     env.update(runtime_env)
     if base_process_env is not None:
         env.update(_workspace_home_contract_env_from_process_env(base_process_env))
+    if workspace_dir is not None and not env.get("MINDROOM_AGENT_WORKSPACE"):
+        # Local (non-worker) execution keeps the host HOME, but the workspace
+        # env var is still promised to agents, so export it from base_dir.
+        env["MINDROOM_AGENT_WORKSPACE"] = str(workspace_dir.expanduser().resolve())
 
     path_value = subprocess_path_with_prepends(
         env.get("PATH"),
@@ -393,6 +398,7 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
                 self._runtime_env,
                 base_process_env=self._base_process_env,
                 shell_path_prepend=self._shell_path_prepend,
+                workspace_dir=self.base_dir,
             )
             argv = _shell_subprocess_args(command_args, subprocess_env)
             cwd = str(self.base_dir) if self.base_dir else None

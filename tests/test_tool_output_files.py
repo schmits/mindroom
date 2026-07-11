@@ -34,6 +34,7 @@ from mindroom.tool_system.output_files import (
     _wrap_function_for_output_files,
     ensure_output_path_schema_optional,
     saved_tool_output_receipt,
+    validate_output_path_syntax,
     wrap_toolkit_for_output_files,
 )
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge, prepend_tool_hook_bridge
@@ -542,6 +543,16 @@ def test_invalid_output_paths_rejected_without_calling_tool(tmp_path: Path, bad_
 
     assert seen == []
     assert _receipt(result.result)["status"] == "error"
+
+
+@pytest.mark.parametrize("expanded_path", ["~/ride-trace.json", "$HOME/ride-trace.json", "%USERPROFILE%\\out.json"])
+def test_expansion_rejected_with_actionable_workspace_relative_message(expanded_path: str) -> None:
+    error = validate_output_path_syntax(expanded_path)
+
+    assert error is not None
+    assert repr(expanded_path) in error
+    assert "relative to the agent workspace" in error
+    assert "workspace-relative path" in error
 
 
 def test_existing_directory_rejected_without_calling_tool(tmp_path: Path) -> None:
