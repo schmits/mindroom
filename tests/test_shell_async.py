@@ -846,7 +846,7 @@ async def test_local_shell_replaces_stale_agent_workspace_env(tmp_path: Path) ->
     entrypoint = tool.async_functions["run_shell_command"].entrypoint
     assert entrypoint is not None
 
-    result = await entrypoint(["/bin/sh", "-c", 'printf %s "$MINDROOM_AGENT_WORKSPACE"'])
+    result = await entrypoint('printf %s "$MINDROOM_AGENT_WORKSPACE"')
     assert result == str(workspace.resolve())
 
 
