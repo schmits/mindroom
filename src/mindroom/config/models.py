@@ -494,13 +494,32 @@ class EmbedderConfig(BaseModel):
     """Configuration for memory embedder."""
 
     model: str = Field(default=OPENAI_EMBEDDING_SMALL, description="Model name for embeddings")
-    api_key: str | None = Field(default=None, description="API key (usually from environment variable)")
+    credentials_service: str | None = Field(
+        default=None,
+        description=(
+            "Optional credential service used only by this embedder. When omitted, legacy resolution checks the "
+            "dedicated 'embedder' service and then the provider credential"
+        ),
+    )
+    api_key: str | None = Field(
+        default=None,
+        description=(
+            "Explicit embedder API key. Highest priority, above credentials_service and the legacy "
+            "dedicated embedder-to-openai fallback"
+        ),
+    )
     host: str | None = Field(default=None, description="Host URL for self-hosted models (Ollama, llama.cpp, etc.)")
     dimensions: int | None = Field(
         default=None,
         ge=1,
         description="Optional embedding dimension override for OpenAI-compatible providers",
     )
+
+    @field_validator("credentials_service")
+    @classmethod
+    def _validate_credentials_service(cls, value: str | None) -> str | None:
+        """Normalize an optional named credential reference."""
+        return None if value is None else validate_service_name(value)
 
 
 class ModelConfig(BaseModel):

@@ -15,9 +15,12 @@ from threading import Event, Lock, get_ident
 from typing import TYPE_CHECKING, ClassVar
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from agno.knowledge.document.base import Document
 from fastapi.testclient import TestClient
+from openai import AuthenticationError
+from structlog.testing import capture_logs
 from watchfiles import Change
 
 import mindroom.knowledge.file_listing as knowledge_file_listing_module
@@ -26,13 +29,15 @@ import mindroom.knowledge.refresh_runner as knowledge_refresh_runner
 import mindroom.knowledge.refresh_scheduler as knowledge_refresh_scheduler
 import mindroom.knowledge.registry as knowledge_registry
 import mindroom.knowledge.utils as knowledge_utils
-from mindroom import file_locks
+from mindroom import embedder_health, file_locks
 from mindroom.api import config_lifecycle, main
 from mindroom.api import knowledge as knowledge_api
+from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, AgentPrivateKnowledgeConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.credentials import get_runtime_shared_credentials_manager
+from mindroom.credentials_sync import get_embedder_api_key
 from mindroom.knowledge import KnowledgeRefreshScheduler, resolve_agent_knowledge_access
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.file_listing import (
@@ -59,6 +64,8 @@ from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_p
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Coroutine, Iterator
+
+    from mindroom.constants import RuntimePaths
 
 
 class _Collection:
@@ -194,7 +201,7 @@ def patch_vector_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr("mindroom.knowledge.manager.create_configured_embedder", lambda *_args, **_kwargs: object())
     monkeypatch.setattr("mindroom.knowledge.indexing_config.ChromaDb", _VectorDb)
     monkeypatch.setattr("mindroom.knowledge.registry.ChromaDb", _VectorDb)
-    monkeypatch.setattr("mindroom.knowledge.registry.Knowledge", _Knowledge)
+    monkeypatch.setattr("mindroom.knowledge.registry.StrictSearchKnowledge", _Knowledge)
     monkeypatch.setattr("mindroom.knowledge.registry.create_configured_embedder", lambda *_args, **_kwargs: object())
     knowledge_registry._published_indexes.clear()
     knowledge_utils._refresh_scheduled_at.clear()
@@ -258,12 +265,14 @@ def _config(
     git_configs: dict[str, KnowledgeGitConfig] | None = None,
     watch: bool = False,
     modes: dict[str, str] | None = None,
+    memory: dict[str, object] | None = None,
 ) -> Config:
     runtime_paths = test_runtime_paths(tmp_path)
     return bind_runtime_paths(
         Config(
             agents={"helper": AgentConfig(display_name="Helper", knowledge_bases=agent_bases)},
             models={},
+            memory=memory or {},
             knowledge_bases={
                 base_id: KnowledgeBaseConfig(
                     path=str(path),
@@ -689,6 +698,59 @@ def test_failed_notice_without_index_says_unavailable() -> None:
     assert "unavailable for semantic search this turn" in notice
     assert "may be stale" not in notice
     assert "Do not claim to have searched it." in notice
+
+
+def test_failed_notice_appends_classified_last_error_cause() -> None:
+    """A refresh-failed notice extracts only the classified cause from the summary."""
+    notice = knowledge_utils.format_knowledge_availability_notice(
+        {
+            "docs": KnowledgeAvailabilityDetail(
+                availability=KnowledgeAvailability.REFRESH_FAILED,
+                search_available=False,
+                last_error="Indexed 0 of 3 managed knowledge files (first error: "
+                "embedder authentication failed (HTTP 401))",
+            ),
+        },
+    )
+
+    assert notice is not None
+    assert notice.endswith("Last error: embedder authentication failed (HTTP 401)")
+    assert "Indexed 0 of 3" not in notice
+
+
+def test_failed_notice_never_renders_unclassified_last_error() -> None:
+    """Operator-grade free text in last_error stays out of model-facing prompts."""
+    notice = knowledge_utils.format_knowledge_availability_notice(
+        {
+            "docs": KnowledgeAvailabilityDetail(
+                availability=KnowledgeAvailability.REFRESH_FAILED,
+                search_available=False,
+                last_error="git sync failed: fatal: could not read from https://token@git.example.com/repo.git",
+            ),
+        },
+    )
+
+    assert notice is not None
+    assert "Last error" not in notice
+    assert "git sync failed" not in notice
+    assert "token" not in notice
+
+
+def test_stale_failed_notice_appends_last_error_cause() -> None:
+    """A last-good-index refresh failure still appends the persisted cause."""
+    notice = knowledge_utils.format_knowledge_availability_notice(
+        {
+            "docs": KnowledgeAvailabilityDetail(
+                availability=KnowledgeAvailability.REFRESH_FAILED,
+                search_available=True,
+                last_error="embedder endpoint unreachable",
+            ),
+        },
+    )
+
+    assert notice is not None
+    assert "may be stale this turn" in notice
+    assert notice.endswith("Last error: embedder endpoint unreachable")
 
 
 def test_config_mismatch_notice_without_index_says_unavailable() -> None:
@@ -3621,6 +3683,31 @@ async def test_cold_failed_refresh_cooldown_is_settings_aware(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_refresh_failed_detail_carries_persisted_last_error(tmp_path: Path) -> None:
+    """The availability detail exposes the persisted refresh failure cause."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(
+        key,
+        error="Indexed 0 of 1 managed knowledge files (first error: embedder authentication failed (HTTP 401))",
+    )
+    scheduler = MagicMock()
+    scheduler.is_refreshing = MagicMock(return_value=False)
+    scheduler.schedule_refresh = MagicMock()
+
+    resolution = resolve_agent_knowledge_access("helper", config, runtime_paths, refresh_scheduler=scheduler)
+
+    detail = resolution.unavailable["docs"]
+    assert detail.availability is KnowledgeAvailability.REFRESH_FAILED
+    assert detail.last_error == (
+        "Indexed 0 of 1 managed knowledge files (first error: embedder authentication failed (HTTP 401))"
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_git_refresh_cooldown_is_credentials_service_aware(tmp_path: Path) -> None:
     """Changing Git auth service config should bypass the failed-refresh retry cooldown."""
     docs_path = tmp_path / "docs"
@@ -4048,6 +4135,181 @@ async def test_first_time_partial_refresh_does_not_publish_ready_index(
     assert not any("_candidate_" in collection for collection in _VectorDb.collections)
 
 
+def _embedder_auth_error() -> AuthenticationError:
+    request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+    response = httpx.Response(401, request=request, json={"error": {"message": "Incorrect API key provided"}})
+    return AuthenticationError("Error code: 401", response=response, body=None)
+
+
+@pytest.mark.asyncio
+async def test_partial_refresh_error_includes_first_classified_file_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The persisted refresh summary carries the first classified per-file indexing error."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    (docs_path / "aaa-broken.md").write_text("cannot embed", encoding="utf-8")
+    (docs_path / "good.md").write_text("indexed text", encoding="utf-8")
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+
+    class _AuthFailingKnowledge(_Knowledge):
+        def insert(
+            self,
+            *,
+            path: str,
+            metadata: dict[str, object],
+            upsert: bool,
+            reader: object | None = None,
+        ) -> None:
+            if Path(path).name == "aaa-broken.md":
+                raise _embedder_auth_error()
+            super().insert(path=path, metadata=metadata, upsert=upsert, reader=reader)
+
+    monkeypatch.setattr("mindroom.knowledge.manager.Knowledge", _AuthFailingKnowledge)
+    manager = KnowledgeManager("docs", config=config, runtime_paths=runtime_paths_for(config))
+
+    assert await manager.reindex_all() == 1
+    assert manager._last_refresh_error == (
+        "Indexed 1 of 2 managed knowledge files (first error: embedder authentication failed (HTTP 401))"
+    )
+
+
+@pytest.mark.asyncio
+async def test_vectorless_file_does_not_inherit_process_global_embedder_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vectorless file is not blamed for a stale failure from another request."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    (docs_path / "broken.md").write_text("cannot embed", encoding="utf-8")
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+
+    class _SwallowingKnowledge(_Knowledge):
+        def insert(
+            self,
+            *,
+            path: str,
+            metadata: dict[str, object],
+            upsert: bool,
+            reader: object | None = None,
+        ) -> None:
+            # Simulate an unrelated request recording health while this insert
+            # returns without vectors.
+            del path, metadata, upsert, reader
+            embedder_health.capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
+
+    monkeypatch.setattr("mindroom.knowledge.manager.Knowledge", _SwallowingKnowledge)
+    embedder_health.capture_embedder_health_recorder().record(None)
+    manager = KnowledgeManager("docs", config=config, runtime_paths=runtime_paths_for(config))
+    try:
+        assert await manager.reindex_all() == 0
+    finally:
+        embedder_health.capture_embedder_health_recorder().record(None)
+
+    assert manager._last_refresh_error == "Indexed 0 of 1 managed knowledge files"
+
+
+def test_refresh_failure_counter_increments_and_resets_preserving_last_good(tmp_path: Path) -> None:
+    """The failure counter climbs across running transitions, keeps last-good fields, resets on success."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+    metadata_path = published_index_metadata_path(key)
+    write_index_metadata_payload(
+        metadata_path,
+        settings=key.indexing_settings.to_metadata(),
+        status="complete",
+        collection="docs_live",
+        indexed_count=1,
+        source_signature="sig",
+    )
+
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom 1")
+    first = load_published_index_state(metadata_path)
+    assert first is not None
+    assert first.consecutive_refresh_failures == 1
+    assert first.status == "complete"
+    assert first.collection == "docs_live"
+
+    knowledge_registry.mark_published_index_refresh_running(key)
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom 2")
+    second = load_published_index_state(metadata_path)
+    assert second is not None
+    assert second.consecutive_refresh_failures == 2
+    assert second.last_error == "boom 2"
+
+    knowledge_registry.mark_published_index_refresh_succeeded(key)
+    recovered = load_published_index_state(metadata_path)
+    assert recovered is not None
+    assert recovered.consecutive_refresh_failures == 0
+    assert recovered.last_error is None
+    assert recovered.status == "complete"
+    assert recovered.collection == "docs_live"
+
+
+def test_refresh_failure_threshold_logs_error_at_three_and_beyond(tmp_path: Path) -> None:
+    """The third consecutive failure and every later one log at ERROR level."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+
+    with capture_logs() as logs:
+        for attempt in range(1, 5):
+            knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error=f"boom {attempt}")
+
+    repeated = [entry for entry in logs if entry["event"] == "knowledge_refresh_failing_repeatedly"]
+    assert [entry["consecutive_refresh_failures"] for entry in repeated] == [3, 4]
+    assert all(entry["log_level"] == "error" for entry in repeated)
+
+
+def test_legacy_metadata_without_failure_counter_parses_as_zero(tmp_path: Path) -> None:
+    """Metadata written before the counter existed loads as zero and increments from there."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+    metadata_path = published_index_metadata_path(key)
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom 1")
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom 2")
+    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del payload["consecutive_refresh_failures"]
+    metadata_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    legacy = load_published_index_state(metadata_path)
+    assert legacy is not None
+    assert legacy.consecutive_refresh_failures == 0
+
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom 3")
+    bumped = load_published_index_state(metadata_path)
+    assert bumped is not None
+    assert bumped.consecutive_refresh_failures == 1
+
+
+def test_published_state_fingerprint_includes_failure_counter(tmp_path: Path) -> None:
+    """States differing only in the failure counter fingerprint differently."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+    knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(key, error="boom")
+    state = load_published_index_state(published_index_metadata_path(key))
+    assert state is not None
+
+    bumped = replace(state, consecutive_refresh_failures=state.consecutive_refresh_failures + 1)
+
+    assert knowledge_refresh_runner._published_state_fingerprint(state) != (
+        knowledge_refresh_runner._published_state_fingerprint(bumped)
+    )
+
+
 @pytest.mark.asyncio
 async def test_cold_refresh_publishes_when_empty_file_produces_no_vectors(
     tmp_path: Path,
@@ -4411,6 +4673,216 @@ async def test_refresh_scheduler_runs_independent_per_binding_tasks(
     assert any(key.base_id == "a" for key in scheduler._tasks)
     release["a"].set()
     await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_refresh_scheduler_probes_embedder_after_persisted_refresh_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh that persisted REFRESH_FAILED triggers one embedder health probe."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    probe_reasons: list[str] = []
+
+    async def _fake_refresh(base_id: str, **_kwargs: object) -> None:
+        key = resolve_published_index_key(base_id, config=config, runtime_paths=runtime_paths, create=True)
+        knowledge_registry.mark_published_index_refresh_failed_preserving_last_good(
+            key,
+            error="Indexed 0 of 3 managed knowledge files (first error: embedder authentication failed (HTTP 401))",
+        )
+
+    async def _fake_check(
+        _config: Config,
+        _runtime_paths: object,
+        *,
+        reason: str,
+        health_recorder: object | None = None,
+    ) -> None:
+        assert health_recorder is not None
+        probe_reasons.append(reason)
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.check_embedder_health", _fake_check)
+
+    scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    for _ in range(200):
+        if probe_reasons:
+            break
+        await asyncio.sleep(0.01)
+    await scheduler.shutdown()
+
+    assert probe_reasons == ["knowledge_refresh_failed"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_scheduler_skips_probe_for_non_embedder_subprocess_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subprocess crash without causal evidence does not bill an embedding probe."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    probe_reasons: list[str] = []
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        msg = "subprocess exited 1"
+        raise RuntimeError(msg)
+
+    async def _fake_check(
+        _config: Config,
+        _runtime_paths: object,
+        *,
+        reason: str,
+        health_recorder: object | None = None,
+    ) -> None:
+        del health_recorder
+        probe_reasons.append(reason)
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.check_embedder_health", _fake_check)
+
+    scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    for _ in range(200):
+        if not scheduler._tasks:
+            break
+        await asyncio.sleep(0.01)
+    await scheduler.shutdown()
+
+    assert probe_reasons == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_scheduler_does_not_probe_after_successful_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh with no persisted failure never triggers a probe."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    refreshed = asyncio.Event()
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        refreshed.set()
+
+    async def _fake_check(
+        _config: Config,
+        _runtime_paths: object,
+        *,
+        reason: str,
+        health_recorder: object | None = None,
+    ) -> None:
+        del health_recorder
+        msg = f"unexpected embedder probe: {reason}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.check_embedder_health", _fake_check)
+
+    scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    await asyncio.wait_for(refreshed.wait(), timeout=5)
+    await wait_for_background_tasks(timeout=5)
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_successful_subprocess_refresh_probes_to_clear_stale_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful child refresh repairs stale main-process health."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    probe_reasons: list[str] = []
+    embedder_health.capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        return None
+
+    async def _fake_check(
+        _config: Config,
+        _runtime_paths: object,
+        *,
+        reason: str,
+        health_recorder: object | None = None,
+    ) -> None:
+        assert health_recorder is not None
+        probe_reasons.append(reason)
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.check_embedder_health", _fake_check)
+
+    try:
+        scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+        for _ in range(200):
+            if probe_reasons:
+                break
+            await asyncio.sleep(0.01)
+        await scheduler.shutdown()
+    finally:
+        embedder_health.capture_embedder_health_recorder().record(None)
+
+    assert probe_reasons == ["knowledge_refresh_recovery"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_scheduled_before_reload_cannot_probe_old_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh carries the generation captured when it was queued."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    scheduler = KnowledgeRefreshScheduler()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    probe_reasons: list[str] = []
+
+    async def _fake_refresh(_base_id: str, **_kwargs: object) -> None:
+        started.set()
+        await release.wait()
+
+    async def _fake_check(
+        _config: Config,
+        _runtime_paths: object,
+        *,
+        reason: str,
+        health_recorder: object | None = None,
+    ) -> None:
+        del health_recorder
+        probe_reasons.append(reason)
+
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.refresh_knowledge_binding_in_subprocess", _fake_refresh)
+    monkeypatch.setattr("mindroom.knowledge.refresh_scheduler.check_embedder_health", _fake_check)
+
+    scheduler.schedule_refresh("docs", config=config, runtime_paths=runtime_paths)
+    await started.wait()
+    embedder_health._reset_embedder_health_generation()
+    embedder_health.capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
+    release.set()
+    for _ in range(200):
+        if not scheduler._tasks:
+            break
+        await asyncio.sleep(0.01)
+    await wait_for_background_tasks(timeout=5)
+    await scheduler.shutdown()
+    embedder_health.capture_embedder_health_recorder().record(None)
+
+    assert probe_reasons == []
 
 
 def test_refresh_scheduler_reads_env_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5547,6 +6019,111 @@ def test_publish_knowledge_index_caches_handle_without_collection_leases(tmp_pat
     )
 
     assert knowledge_registry._published_indexes[key] is index
+
+
+def _write_queryable_index_state(
+    key: knowledge_registry.PublishedIndexKey,
+    *,
+    collection: str,
+) -> None:
+    _VectorDb.collections[collection] = []
+    published_index_metadata_path(key).parent.mkdir(parents=True, exist_ok=True)
+    knowledge_registry.save_published_index_state(
+        published_index_metadata_path(key),
+        knowledge_registry.PublishedIndexState(
+            settings=key.indexing_settings,
+            status="complete",
+            collection=collection,
+            indexed_count=0,
+            source_signature="credential-rotation-test",
+        ),
+    )
+
+
+def test_cached_handle_rebuilds_after_dashboard_embedder_credential_rotation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential save/delete replaces the cached client without rebuilding vectors."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    config = _config(tmp_path, bases={"docs": docs_path}, agent_bases=["docs"])
+    runtime_paths = runtime_paths_for(config)
+    key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
+    _write_queryable_index_state(key, collection="credential_rotation")
+    manager = get_runtime_shared_credentials_manager(runtime_paths)
+    manager.save_credentials("openai", {"api_key": "fallback-key"})
+    manager.save_credentials("embedder", {"api_key": "old-key"})
+    constructed_keys: list[str] = []
+
+    def capture_embedder(_config: Config, _runtime_paths: RuntimePaths) -> object:
+        constructed_keys.append(get_embedder_api_key(_runtime_paths))
+        return object()
+
+    monkeypatch.setattr(knowledge_registry, "create_configured_embedder", capture_embedder)
+
+    first = get_published_index("docs", config=config, runtime_paths=runtime_paths)
+    manager.save_credentials("embedder", {"api_key": "new-key"})
+    second = get_published_index("docs", config=config, runtime_paths=runtime_paths)
+    manager.delete_credentials("embedder")
+    third = get_published_index("docs", config=config, runtime_paths=runtime_paths)
+
+    assert first.index is not None
+    assert second.index is not None
+    assert third.index is not None
+    assert first.index is not second.index
+    assert second.index is not third.index
+    assert constructed_keys == ["old-key", "new-key", "fallback-key"]
+    assert first.index.embedder_client_signature is not None
+    assert second.index.embedder_client_signature is not None
+    assert first.index.embedder_client_signature != second.index.embedder_client_signature
+    assert "old-key" not in first.index.embedder_client_signature
+    assert "new-key" not in second.index.embedder_client_signature
+
+
+def test_cached_handle_rebuilds_after_explicit_embedder_key_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config hot reload replaces a handle that captured the old explicit key."""
+    docs_path = tmp_path / "docs"
+    docs_path.mkdir()
+    old_config = _config(
+        tmp_path,
+        bases={"docs": docs_path},
+        agent_bases=["docs"],
+        memory={"embedder": {"config": {"api_key": "explicit-old"}}},
+    )
+    new_config = _config(
+        tmp_path,
+        bases={"docs": docs_path},
+        agent_bases=["docs"],
+        memory={"embedder": {"config": {"api_key": "explicit-new"}}},
+    )
+    runtime_paths = runtime_paths_for(old_config)
+    key = resolve_published_index_key("docs", config=old_config, runtime_paths=runtime_paths)
+    assert key == resolve_published_index_key("docs", config=new_config, runtime_paths=runtime_paths)
+    _write_queryable_index_state(key, collection="explicit_key_rotation")
+    constructed_keys: list[str] = []
+
+    def capture_embedder(config: Config, _runtime_paths: RuntimePaths) -> object:
+        constructed_keys.append(
+            get_embedder_api_key(
+                _runtime_paths,
+                explicit_api_key=config.memory.embedder.config.api_key,
+            ),
+        )
+        return object()
+
+    monkeypatch.setattr(knowledge_registry, "create_configured_embedder", capture_embedder)
+
+    first = get_published_index("docs", config=old_config, runtime_paths=runtime_paths)
+    second = get_published_index("docs", config=new_config, runtime_paths=runtime_paths)
+
+    assert first.index is not None
+    assert second.index is not None
+    assert first.index is not second.index
+    assert constructed_keys == ["explicit-old", "explicit-new"]
 
 
 @pytest.mark.asyncio

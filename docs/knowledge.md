@@ -373,15 +373,19 @@ memory:
     provider: openai        # or "ollama", "huggingface", or "sentence_transformers"
     config:
       model: text-embedding-3-small
+      credentials_service: embedder # Optional strict credential binding
       host: null             # For self-hosted (Ollama)
       dimensions: null       # Optional: embedding dimension override (e.g., 256)
 ```
 
 | Provider | Model Example | Notes |
 |----------|---------------|-------|
-| `openai` | `text-embedding-3-small` | Requires `OPENAI_API_KEY` |
+| `openai` | `text-embedding-3-small` | Key resolution below; keyless local endpoints allowed |
 | `ollama` | `nomic-embed-text` | Self-hosted, set `host` or `OLLAMA_HOST` |
 | `sentence_transformers` | `sentence-transformers/all-MiniLM-L6-v2` | Fully local Python runtime; auto-installs the optional extra on first use |
+
+The `openai` provider resolves its key in this order: explicit `memory.embedder.config.api_key`; then the service named by `memory.embedder.config.credentials_service`; or, when no service is named, the dedicated `embedder` credential followed by the shared `OPENAI_API_KEY`. A named service is a strict binding and never falls through to another provider key.
+See [Memory](memory.md) for the full embedder credential contract and failure surfacing.
 
 ## Storage
 

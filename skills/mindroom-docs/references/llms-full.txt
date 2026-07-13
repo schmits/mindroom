@@ -636,6 +636,7 @@ Configure global memory defaults:
 - **Backend** - Global default backend (`mem0`, `file`, or `none`)
 - **Provider** - Ollama (local), OpenAI, or Sentence Transformers
 - **Model** - Provider-specific embedding models
+- **Credential service** - Strictly bind an OpenAI-compatible embedder to a dedicated stored key
 - **Host URL** - For Ollama provider
 - **File backend settings** - Path and file memory tuning options
 - **Auto-flush settings** - Background extraction and flush controls for file-backed memory
@@ -840,6 +841,7 @@ MindRoom tracks runtime phases internally:
 | `ready` | Orchestrator booted, serving requests |
 | `failed` | Startup or runtime failure (detail message available) |
 
+When the semantic-search embedder is failing, the health payload additionally carries `"embedder": {"status": "failing", "detail": ...}` with the classified cause; this block is diagnostic only and never flips liveness.
 Use `/api/health` for liveness probes and `/api/ready` for readiness probes in container orchestrators. Note: `/api/health` returns `503` when Matrix sync is stale (>180s without successful sync, after the 120s watchdog timeout has attempted recovery). Configure liveness probe `failureThreshold` to allow sufficient time for watchdog self-healing.
 
 ### Tools & Matrix
@@ -1028,6 +1030,7 @@ Set the API key for each provider you use in `config.yaml`:
 | `CEREBRAS_API_KEY` | Cerebras |
 | `GROQ_API_KEY` | Groq |
 | `OLLAMA_HOST` | Ollama (host URL, not a key) |
+| `EMBEDDER_API_KEY` | Dedicated semantic-search embedder key (optional; falls back to the shared `OPENAI_API_KEY`) |
 | `OPENAI_BASE_URL` | Base URL for OpenAI-compatible APIs (e.g., local inference servers) |
 
 All API key variables also support a `_FILE` suffix for file-based secrets (e.g., `ANTHROPIC_API_KEY_FILE=/run/secrets/anthropic-api-key`).
@@ -1288,7 +1291,8 @@ memory:
     provider: openai               # Default: openai (openai, ollama, huggingface, sentence_transformers)
     config:
       model: text-embedding-3-small  # Default embedding model
-      api_key: null                # Optional: From env var
+      credentials_service: null     # Optional: strict named credential binding (e.g. embedder)
+      api_key: null                # Optional: explicit embedder key (highest priority; see docs/memory.md)
       host: null                   # Optional: For self-hosted
       dimensions: null             # Optional: Embedding dimension override (e.g., 256)
   llm:                             # Optional: LLM for memory operations
@@ -12315,15 +12319,19 @@ memory:
     provider: openai        # or "ollama", "huggingface", or "sentence_transformers"
     config:
       model: text-embedding-3-small
+      credentials_service: embedder # Optional strict credential binding
       host: null             # For self-hosted (Ollama)
       dimensions: null       # Optional: embedding dimension override (e.g., 256)
 ```
 
 | Provider | Model Example | Notes |
 |----------|---------------|-------|
-| `openai` | `text-embedding-3-small` | Requires `OPENAI_API_KEY` |
+| `openai` | `text-embedding-3-small` | Key resolution below; keyless local endpoints allowed |
 | `ollama` | `nomic-embed-text` | Self-hosted, set `host` or `OLLAMA_HOST` |
 | `sentence_transformers` | `sentence-transformers/all-MiniLM-L6-v2` | Fully local Python runtime; auto-installs the optional extra on first use |
+
+The `openai` provider resolves its key in this order: explicit `memory.embedder.config.api_key`; then the service named by `memory.embedder.config.credentials_service`; or, when no service is named, the dedicated `embedder` credential followed by the shared `OPENAI_API_KEY`. A named service is a strict binding and never falls through to another provider key.
+See [Memory](https://docs.mindroom.chat/memory/) for the full embedder credential contract and failure surfacing.
 
 ## Storage
 
@@ -12406,8 +12414,14 @@ memory:
     provider: openai
     config:
       model: text-embedding-3-small
+      credentials_service: embedder # Optional strict credential binding
       dimensions: null             # Optional: embedding dimension override (e.g., 256)
 ```
+
+The `openai` embedder resolves its API key in this order: explicit `memory.embedder.config.api_key`; then the service named by `memory.embedder.config.credentials_service`; or, when no service is named, the legacy dedicated `embedder` credential (seeded from `EMBEDDER_API_KEY` or `EMBEDDER_API_KEY_FILE`) followed by the shared `openai` provider key.
+An explicit `credentials_service` is a strict binding: if that service has no key, MindRoom does not silently borrow another OpenAI key. Use it when your embedding endpoint needs a different key than chat, voice, or another OpenAI-compatible model.
+When none of these are set, MindRoom sends a non-secret placeholder key so keyless local OpenAI-compatible endpoints keep working, while a keyed endpoint rejects the placeholder with a loud classified auth failure.
+When the embedder rejects its credential, semantic search degrades loudly instead of returning fake-empty results: memory tool output and the per-turn prompt carry the classified cause, and `/api/health` reports an `embedder` block until a request succeeds again.
 
 Fully local embedder example:
 

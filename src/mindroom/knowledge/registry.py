@@ -13,12 +13,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, ParamSpec, Protocol, TypeVar, cast
 
-from agno.knowledge.knowledge import Knowledge
 from agno.vectordb.chroma import ChromaDb
 
-from mindroom.embedding_factory import create_configured_embedder
+from mindroom.embedding_factory import create_configured_embedder, embedder_client_signature
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.index_metadata import (
+    coerce_nonnegative_metadata_int,
     load_index_metadata_payload,
     optional_metadata_str,
     parse_index_metadata_fields,
@@ -32,9 +32,12 @@ from mindroom.knowledge.indexing_config import (
 )
 from mindroom.logging_config import get_logger
 from mindroom.runtime_resolution import resolve_knowledge_binding
+from mindroom.strict_knowledge import StrictSearchKnowledge
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from agno.knowledge.knowledge import Knowledge
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -91,6 +94,7 @@ class PublishedIndexState:
     last_error: str | None = None
     updated_at: str | None = None
     last_refresh_at: str | None = None
+    consecutive_refresh_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,7 @@ class _PublishedIndexHandle:
     knowledge: Knowledge
     state: PublishedIndexState
     metadata_path: Path
+    embedder_client_signature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,7 @@ class _PublishedIndexVectorDb(Protocol):
 
 
 _published_indexes: dict[PublishedIndexKey, _PublishedIndexHandle] = {}
+_CONSECUTIVE_REFRESH_FAILURE_ALERT_THRESHOLD = 3
 _PRIVATE_KNOWLEDGE_BASE_ID_PREFIX = "__agent_private__:"
 _MAX_PRIVATE_PUBLISHED_INDEXES = 128
 _PUBLISHED_INDEX_STATUSES = {"resetting", "indexing", "complete", "failed"}
@@ -297,6 +303,7 @@ def load_published_index_state(metadata_path: Path) -> PublishedIndexState | Non
         last_error=optional_metadata_str(payload.get("last_error")),
         updated_at=optional_metadata_str(payload.get("updated_at")),
         last_refresh_at=optional_metadata_str(payload.get("last_refresh_at")),
+        consecutive_refresh_failures=coerce_nonnegative_metadata_int(payload.get("consecutive_refresh_failures")) or 0,
     )
 
 
@@ -316,6 +323,7 @@ def save_published_index_state(metadata_path: Path, state: PublishedIndexState) 
         last_error=state.last_error,
         updated_at=state.updated_at,
         last_refresh_at=state.last_refresh_at,
+        consecutive_refresh_failures=state.consecutive_refresh_failures,
     )
 
 
@@ -408,9 +416,18 @@ def mark_published_index_refresh_failed_preserving_last_good(key: PublishedIndex
         reason="refresh_failed",
         last_error=error,
     )
+    consecutive_refresh_failures = (current.consecutive_refresh_failures if current is not None else 0) + 1
+    state = replace(state, consecutive_refresh_failures=consecutive_refresh_failures)
     if current is not None and current.status == "complete":
         state = replace(state, status="complete")
     save_published_index_state(published_index_metadata_path(key), state)
+    if consecutive_refresh_failures >= _CONSECUTIVE_REFRESH_FAILURE_ALERT_THRESHOLD:
+        logger.error(
+            "knowledge_refresh_failing_repeatedly",
+            base_id=key.base_id,
+            consecutive_refresh_failures=consecutive_refresh_failures,
+            last_error=error,
+        )
 
 
 def mark_published_index_refresh_succeeded(key: PublishedIndexKey) -> None:
@@ -427,6 +444,7 @@ def mark_published_index_refresh_succeeded(key: PublishedIndexKey) -> None:
             last_error=None,
             updated_at=_utc_now(),
             last_refresh_at=_utc_now(),
+            consecutive_refresh_failures=0,
         ),
     )
 
@@ -463,7 +481,7 @@ def _build_published_index_knowledge(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> Knowledge:
-    return Knowledge(
+    return StrictSearchKnowledge(
         vector_db=_build_published_index_vector_db(key, state, config=config, runtime_paths=runtime_paths),
     )
 
@@ -627,11 +645,13 @@ def get_published_index(
     metadata_path = published_index_metadata_path(key)
     state = load_published_index_state(metadata_path)
     availability = _published_index_availability(key=key, state=state, metadata_exists=metadata_path.exists())
+    current_embedder_client_signature = embedder_client_signature(config, runtime_paths)
 
     index = _published_indexes.get(key)
     if index is not None:
         if (
-            state is not None
+            index.embedder_client_signature == current_embedder_client_signature
+            and state is not None
             and _cached_index_matches_persisted_state(index, state)
             and _cached_index_still_queryable(index)
         ):
@@ -687,6 +707,7 @@ def get_published_index(
         knowledge=knowledge,
         state=state,
         metadata_path=published_index_metadata_path(key),
+        embedder_client_signature=current_embedder_client_signature,
     )
     _cache_published_index(index)
     return PublishedIndexResolution(
@@ -704,6 +725,7 @@ def _publish_knowledge_index(
     knowledge: Knowledge,
     state: PublishedIndexState,
     metadata_path: Path | None = None,
+    embedder_client_signature: str | None = None,
 ) -> _PublishedIndexHandle:
     """Publish a read handle in this process."""
     _evict_published_indexes_for_refresh_target(refresh_target_for_published_index_key(key))
@@ -712,6 +734,7 @@ def _publish_knowledge_index(
         knowledge=knowledge,
         state=state,
         metadata_path=metadata_path or published_index_metadata_path(key),
+        embedder_client_signature=embedder_client_signature,
     )
     _cache_published_index(index)
     return index
@@ -729,7 +752,13 @@ def publish_knowledge_index_from_state(
     knowledge = _load_queryable_index_from_state(key, state, config=config, runtime_paths=runtime_paths)
     if knowledge is None:
         return None
-    return _publish_knowledge_index(key, knowledge=knowledge, state=state, metadata_path=metadata_path)
+    return _publish_knowledge_index(
+        key,
+        knowledge=knowledge,
+        state=state,
+        metadata_path=metadata_path,
+        embedder_client_signature=embedder_client_signature(config, runtime_paths),
+    )
 
 
 def _same_physical_binding(key: PublishedIndexKey, refresh_target: KnowledgeRefreshTarget) -> bool:

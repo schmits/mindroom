@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from mindroom.credentials import get_runtime_shared_credentials_manager
+from mindroom.embedding_errors import extract_classified_embedder_detail
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.redaction import embedded_http_userinfo
 from mindroom.knowledge.registry import (
@@ -48,6 +49,7 @@ class KnowledgeAvailabilityDetail:
 
     availability: KnowledgeAvailability
     search_available: bool
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,7 @@ class KnowledgeBaseAccessResolution:
 
     knowledge: Knowledge | None
     availability: KnowledgeAvailability
+    last_error: str | None = None
 
 
 class _KnowledgeVectorDb(Protocol):
@@ -378,8 +381,8 @@ def _resolve_base_knowledge(
     runtime_paths: RuntimePaths,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     execution_identity: ToolExecutionIdentity | None,
-) -> tuple[Knowledge | None, KnowledgeAvailability]:
-    """Resolve one knowledge base handle with its effective availability."""
+) -> tuple[Knowledge | None, KnowledgeAvailability, str | None]:
+    """Resolve one knowledge base handle with its effective availability and last error."""
     lookup = _lookup_knowledge_for_base(
         base_id,
         config=config,
@@ -402,7 +405,8 @@ def _resolve_base_knowledge(
             lookup=lookup,
             availability=availability,
         )
-    return knowledge, availability
+    last_error = lookup.state.last_error if lookup is not None and lookup.state is not None else None
+    return knowledge, availability, last_error
 
 
 def resolve_agent_knowledge_access(
@@ -421,7 +425,7 @@ def resolve_agent_knowledge_access(
     unavailable_bases: dict[str, KnowledgeAvailabilityDetail] = {}
     knowledges: list[Knowledge] = []
     for base_id in base_ids:
-        knowledge, availability = _resolve_base_knowledge(
+        knowledge, availability, last_error = _resolve_base_knowledge(
             base_id,
             config=config,
             runtime_paths=runtime_paths,
@@ -432,6 +436,7 @@ def resolve_agent_knowledge_access(
             unavailable_bases[base_id] = KnowledgeAvailabilityDetail(
                 availability=availability,
                 search_available=knowledge is not None,
+                last_error=last_error,
             )
         if knowledge is None:
             missing_base_ids.append(base_id)
@@ -470,7 +475,8 @@ def resolve_knowledge_base_access(
     knowledge = lookup.index.knowledge if lookup is not None and lookup.index is not None else None
     if knowledge is not None:
         _apply_knowledge_metadata(base_id, knowledge, config)
-    return KnowledgeBaseAccessResolution(knowledge=knowledge, availability=availability)
+    last_error = lookup.state.last_error if lookup is not None and lookup.state is not None else None
+    return KnowledgeBaseAccessResolution(knowledge=knowledge, availability=availability, last_error=last_error)
 
 
 def _stale_availability_notice(base_id: str, *, search_available: bool) -> str:
@@ -516,15 +522,19 @@ def format_knowledge_availability_notice(
         elif availability is KnowledgeAvailability.STALE:
             lines.append(_stale_availability_notice(base_id, search_available=search_available))
         elif availability is KnowledgeAvailability.REFRESH_FAILED:
+            # Persisted last_error is operator-grade free text; only the fixed
+            # classified embedder vocabulary may enter model-facing prompts.
+            classified_cause = extract_classified_embedder_detail(detail.last_error)
+            cause = f" Last error: {classified_cause}" if classified_cause else ""
             if search_available:
                 lines.append(
                     f"Knowledge base `{base_id}` had a recent refresh failure and may be stale this turn. "
-                    "Do not claim to have searched the latest contents.",
+                    f"Do not claim to have searched the latest contents.{cause}",
                 )
             else:
                 lines.append(
                     f"Knowledge base `{base_id}` is unavailable for semantic search this turn after a refresh "
-                    "failure. Do not claim to have searched it.",
+                    f"failure. Do not claim to have searched it.{cause}",
                 )
     return "\n".join(lines) if lines else None
 
@@ -597,12 +607,20 @@ class _MultiKnowledgeVectorDb:
         limit: int,
         filters: dict[str, Any] | list[Any] | None = None,
     ) -> list[Document]:
-        """Search each assigned vector database and interleave merged results."""
+        """Search each assigned vector database and interleave merged results.
+
+        Partial failures warn and merge the surviving sources; when every
+        source failed the first captured exception re-raises so the caller
+        sees the real cause instead of silently empty results (ISSUE-237).
+        """
         results_by_db: list[list[Document]] = []
+        first_error: Exception | None = None
         for vector_db in self._resolved_vector_dbs():
             try:
                 results = vector_db.search(query=query, limit=limit, filters=filters)
-            except Exception:
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
                 logger.warning(
                     "Knowledge vector database search failed",
                     vector_db_type=type(vector_db).__name__,
@@ -610,6 +628,8 @@ class _MultiKnowledgeVectorDb:
                 )
                 continue
             results_by_db.append(results)
+        if first_error is not None and not results_by_db:
+            raise first_error
         return _interleave_documents(results_by_db, limit)
 
     async def async_search(
@@ -621,7 +641,9 @@ class _MultiKnowledgeVectorDb:
     ) -> list[Document]:
         """Async variant of ``search`` that searches DBs concurrently."""
 
-        async def _search_one(vdb: _KnowledgeVectorDb) -> list[Document]:
+        async def _search_one(
+            vdb: _KnowledgeVectorDb,
+        ) -> tuple[list[Document] | None, Exception | None]:
             results: list[Document]
             try:
                 if isinstance(vdb, _AsyncKnowledgeVectorDb):
@@ -631,17 +653,22 @@ class _MultiKnowledgeVectorDb:
                         results = vdb.search(query=query, limit=limit, filters=filters)
                 else:
                     results = vdb.search(query=query, limit=limit, filters=filters)
-            except Exception:
+            except Exception as exc:
                 logger.warning(
                     "Knowledge vector database async search failed",
                     vector_db_type=type(vdb).__name__,
                     exc_info=True,
                 )
-                return []
-            return results
+                return None, exc
+            return results, None
 
-        results_by_db = await asyncio.gather(*[_search_one(vdb) for vdb in self._resolved_vector_dbs()])
-        return _interleave_documents(list(results_by_db), limit)
+        outcomes = await asyncio.gather(*[_search_one(vdb) for vdb in self._resolved_vector_dbs()])
+        results_by_db = [results for results, _error in outcomes if results is not None]
+        if not results_by_db:
+            for _results, error in outcomes:
+                if error is not None:
+                    raise error
+        return _interleave_documents(results_by_db, limit)
 
 
 def _interleave_documents(results_by_db: list[list[Document]], limit: int) -> list[Document]:

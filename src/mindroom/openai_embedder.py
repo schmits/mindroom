@@ -4,6 +4,14 @@ Lives apart from the light helpers in ``mindroom.embeddings`` because
 subclassing agno's ``OpenAIEmbedder`` imports the openai SDK; the embedding
 factory imports this module only when the openai provider is configured
 (#1436).
+
+Unlike agno's base embedder, every sync/async/batch method here raises on
+provider failure or a malformed success response instead of returning empty
+vectors: a silent ``[]`` turns an auth failure into fake-empty search results
+and unpublished indexes (ISSUE-237). Failures raise ``EmbedderRequestError``
+carrying only the classified detail (never the raw provider exception, whose
+text can echo the rejected key), and each path records process-wide embedder
+health so recovery is visible the moment a real request succeeds again.
 """
 
 from __future__ import annotations
@@ -12,12 +20,48 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from agno.knowledge.embedder.openai import OpenAIEmbedder
-from agno.utils.log import log_info, log_warning
+from agno.utils.log import log_info
 
+from mindroom.embedder_health import EmbedderHealthRecorder, capture_embedder_health_recorder
+from mindroom.embedding_errors import (
+    EMBEDDER_EMPTY_VECTOR_DETAIL,
+    EmbedderRequestError,
+    describe_embedder_error,
+)
 from mindroom.model_defaults import OPENAI_EMBEDDING_DIMENSIONS
 
 if TYPE_CHECKING:
     from openai.types.create_embedding_response import CreateEmbeddingResponse
+
+
+def _classified_request_error(exc: Exception, health_recorder: EmbedderHealthRecorder) -> EmbedderRequestError:
+    """Record and return the classified failure for one provider exception."""
+    detail = describe_embedder_error(exc)
+    health_recorder.record(detail)
+    return EmbedderRequestError(detail)
+
+
+def _validated_embeddings(
+    response: CreateEmbeddingResponse,
+    expected_count: int,
+    health_recorder: EmbedderHealthRecorder,
+) -> list[list[float]]:
+    """Validate one non-empty vector per requested input and record health.
+
+    OpenAI-compatible servers can return HTTP 200 with empty ``data``, empty
+    vectors, or fewer items than inputs; accepting those silently recreates
+    the fake-empty results this module exists to kill.
+    """
+    embeddings = [data.embedding for data in response.data]
+    if len(embeddings) != expected_count:
+        detail = f"embedder returned {len(embeddings)} embeddings for {expected_count} inputs"
+        health_recorder.record(detail)
+        raise EmbedderRequestError(detail)
+    if any(not embedding for embedding in embeddings):
+        health_recorder.record(EMBEDDER_EMPTY_VECTOR_DETAIL)
+        raise EmbedderRequestError(EMBEDDER_EMPTY_VECTOR_DETAIL)
+    health_recorder.record(None)
+    return embeddings
 
 
 @dataclass
@@ -25,6 +69,7 @@ class MindRoomOpenAIEmbedder(OpenAIEmbedder):
     """Avoid forcing OpenAI defaults onto arbitrary OpenAI-compatible hosts."""
 
     _dimensions_explicit: bool = field(init=False, default=False, repr=False)
+    health_recorder: EmbedderHealthRecorder = field(default_factory=capture_embedder_health_recorder, repr=False)
 
     def __post_init__(self) -> None:
         """Track whether dimensions came from explicit config."""
@@ -49,38 +94,68 @@ class MindRoomOpenAIEmbedder(OpenAIEmbedder):
             request.update(self.request_params)
         return request
 
-    # NOTE: These overrides intentionally mirror agno's async/embedder methods
-    # because upstream inlines request construction instead of calling a shared helper.
-    # Keep them aligned with agno when upgrading that dependency.
+    # NOTE: These overrides intentionally mirror agno's sync/async embedder
+    # methods because upstream inlines request construction instead of calling
+    # a shared helper. Keep them aligned with agno when upgrading that
+    # dependency, but never reintroduce its swallow-and-return-[] behavior.
     def response(self, text: str) -> CreateEmbeddingResponse:
         """Request a single embedding synchronously."""
         return self.client.embeddings.create(**self._request_params(text))
 
+    def get_embedding(self, text: str) -> list[float]:
+        """Request one embedding; raise a classified error on failure."""
+        try:
+            response = self.response(text)
+        except Exception as exc:
+            raise _classified_request_error(exc, self.health_recorder) from None
+        return _validated_embeddings(response, 1, self.health_recorder)[0]
+
+    def get_embedding_and_usage(self, text: str) -> tuple[list[float], dict[str, Any] | None]:
+        """Request one embedding and its usage payload; raise a classified error on failure."""
+        try:
+            response = self.response(text)
+        except Exception as exc:
+            raise _classified_request_error(exc, self.health_recorder) from None
+        embedding = _validated_embeddings(response, 1, self.health_recorder)[0]
+        usage = response.usage
+        return embedding, usage.model_dump() if usage else None
+
+    def get_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
+        """Request a synchronous batch for adapters that support batch embedding."""
+        try:
+            response = self.client.embeddings.create(**self._request_params(texts))
+        except Exception as exc:
+            raise _classified_request_error(exc, self.health_recorder) from None
+        return _validated_embeddings(response, len(texts), self.health_recorder)
+
     async def async_get_embedding(self, text: str) -> list[float]:
-        """Request a single embedding asynchronously."""
+        """Request a single embedding asynchronously; raise a classified error on failure."""
         try:
             response: CreateEmbeddingResponse = await self.aclient.embeddings.create(**self._request_params(text))
-            return response.data[0].embedding
-        except Exception as e:
-            log_warning(e)
-            return []
+        except Exception as exc:
+            raise _classified_request_error(exc, self.health_recorder) from None
+        return _validated_embeddings(response, 1, self.health_recorder)[0]
 
     async def async_get_embedding_and_usage(self, text: str) -> tuple[list[float], dict[str, Any] | None]:
-        """Request one embedding and its usage payload asynchronously."""
+        """Request one embedding and its usage payload asynchronously; raise a classified error on failure."""
         try:
             response = await self.aclient.embeddings.create(**self._request_params(text))
-            embedding = response.data[0].embedding
-            usage = response.usage
-            return embedding, usage.model_dump() if usage else None
-        except Exception as e:
-            log_warning(f"Error getting embedding: {e}")
-            return [], None
+        except Exception as exc:
+            raise _classified_request_error(exc, self.health_recorder) from None
+        embedding = _validated_embeddings(response, 1, self.health_recorder)[0]
+        usage = response.usage
+        return embedding, usage.model_dump() if usage else None
 
     async def async_get_embeddings_batch_and_usage(
         self,
         texts: list[str],
     ) -> tuple[list[list[float]], list[dict[str, Any] | None]]:
-        """Request embeddings for a batch of texts and return per-item usage."""
+        """Request embeddings for a batch of texts; raise a classified error on failure.
+
+        A failing batch fails the whole call instead of retrying per item:
+        after a batch-wide auth failure every retry repeats the same rejected
+        credential and obscures the root cause.
+        """
         all_embeddings: list[list[float]] = []
         all_usage: list[dict[str, Any] | None] = []
         log_info(f"Getting embeddings and usage for {len(texts)} texts in batches of {self.batch_size} (async)")
@@ -91,20 +166,11 @@ class MindRoomOpenAIEmbedder(OpenAIEmbedder):
                 response: CreateEmbeddingResponse = await self.aclient.embeddings.create(
                     **self._request_params(batch_texts),
                 )
-                batch_embeddings = [data.embedding for data in response.data]
-                all_embeddings.extend(batch_embeddings)
-                usage_dict = response.usage.model_dump() if response.usage else None
-                all_usage.extend([usage_dict] * len(batch_embeddings))
-            except Exception as e:
-                log_warning(f"Error in async batch embedding: {e}")
-                for text in batch_texts:
-                    try:
-                        embedding, usage = await self.async_get_embedding_and_usage(text)
-                        all_embeddings.append(embedding)
-                        all_usage.append(usage)
-                    except Exception as inner:
-                        log_warning(f"Error in individual async embedding fallback: {inner}")
-                        all_embeddings.append([])
-                        all_usage.append(None)
+            except Exception as exc:
+                raise _classified_request_error(exc, self.health_recorder) from None
+            batch_embeddings = _validated_embeddings(response, len(batch_texts), self.health_recorder)
+            all_embeddings.extend(batch_embeddings)
+            usage_dict = response.usage.model_dump() if response.usage else None
+            all_usage.extend([usage_dict] * len(batch_embeddings))
 
         return all_embeddings, all_usage

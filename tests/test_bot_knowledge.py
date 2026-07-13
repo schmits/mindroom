@@ -15,6 +15,7 @@ from mindroom.bot import AgentBot
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.utils import _MultiKnowledgeVectorDb
+from mindroom.knowledge_source_descriptions import KnowledgeWithSourceDescriptions
 from tests.bot_helpers import (
     AgentBotTestBase,
     _AsyncStubVectorDb,
@@ -89,6 +90,7 @@ class TestAgentBot(AgentBotTestBase):
                 ),
             ),
             availability=KnowledgeAvailability.READY,
+            state=None,
         )
 
         with patch("mindroom.knowledge.utils.get_published_index", return_value=lookup):
@@ -142,6 +144,7 @@ class TestAgentBot(AgentBotTestBase):
                     ),
                 ),
                 availability=KnowledgeAvailability.READY,
+                state=None,
             )
 
         with patch("mindroom.knowledge.utils.get_published_index", side_effect=_lookup):
@@ -247,3 +250,58 @@ class TestAgentBot(AgentBotTestBase):
 
         docs = await vector_db.async_search(query="knowledge query", limit=3)
         assert [doc.content for doc in docs] == ["research 1", "research 2"]
+
+    def test_multi_knowledge_vector_db_sync_raises_when_all_sources_fail(self) -> None:
+        """When every knowledge source fails, the first error surfaces instead of empty results."""
+        vector_db = _MultiKnowledgeVectorDb(
+            vector_dbs=[
+                _FailingStubVectorDb(error_message="first boom"),
+                _FailingStubVectorDb(error_message="second boom"),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="first boom"):
+            vector_db.search(query="knowledge query", limit=3)
+
+    @pytest.mark.asyncio
+    async def test_multi_knowledge_vector_db_async_raises_when_all_sources_fail(self) -> None:
+        """Async search re-raises the first captured failure when every source fails."""
+        vector_db = _MultiKnowledgeVectorDb(
+            vector_dbs=[
+                _FailingStubVectorDb(error_message="first boom"),
+                _FailingStubVectorDb(error_message="second boom"),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="first boom"):
+            await vector_db.async_search(query="knowledge query", limit=3)
+
+    def test_strict_knowledge_handle_propagates_search_failure(self) -> None:
+        """The Knowledge handle agents query raises instead of agno's swallow-to-[].
+
+        agno's ``Knowledge.search`` catches every vector-db exception and
+        returns an empty list, so the agent-facing ``search_knowledge_base``
+        tool would report "No documents found" during an embedder outage.
+        MindRoom read handles must keep the failure loud through the same
+        ``retrieve -> search`` chain the generated tool uses.
+        """
+        knowledge = KnowledgeWithSourceDescriptions(
+            name="merged",
+            vector_db=_MultiKnowledgeVectorDb(vector_dbs=[_FailingStubVectorDb(error_message="first boom")]),
+        )
+
+        with pytest.raises(RuntimeError, match="first boom"):
+            knowledge.search(query="knowledge query")
+        with pytest.raises(RuntimeError, match="first boom"):
+            knowledge.retrieve(query="knowledge query")
+
+    @pytest.mark.asyncio
+    async def test_strict_knowledge_handle_propagates_async_search_failure(self) -> None:
+        """The async search path agents use raises instead of returning []."""
+        knowledge = KnowledgeWithSourceDescriptions(
+            name="merged",
+            vector_db=_MultiKnowledgeVectorDb(vector_dbs=[_FailingStubVectorDb(error_message="first boom")]),
+        )
+
+        with pytest.raises(RuntimeError, match="first boom"):
+            await knowledge.asearch(query="knowledge query")

@@ -12,6 +12,7 @@ from mindroom.timing import timed
 from ._backend import resolve_memory_backend
 from ._file_backend import append_agent_daily_file_memory
 from ._prompting import format_memories_as_context
+from ._shared import MemorySearchOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -88,10 +89,10 @@ async def search_agent_memories(
     runtime_paths: RuntimePaths,
     limit: int = 3,
     execution_identity: ToolExecutionIdentity | None = None,
-) -> list[MemoryResult]:
+) -> MemorySearchOutcome:
     """Search agent memories including team memories."""
     if (backend := resolve_memory_backend(agent_name, config, runtime_paths)) is None:
-        return []
+        return MemorySearchOutcome(results=[])
     return await backend.search(
         query,
         agent_name,
@@ -201,7 +202,7 @@ async def build_memory_prompt_parts(
     if (backend := resolve_memory_backend(agent_name, config, runtime_paths)) is None:
         return MemoryPromptParts()
 
-    agent_memories = await search_agent_memories(
+    search_outcome = await search_agent_memories(
         prompt,
         agent_name,
         storage_path,
@@ -209,6 +210,7 @@ async def build_memory_prompt_parts(
         runtime_paths,
         execution_identity=execution_identity,
     )
+    agent_memories = search_outcome.results
     if agent_memories:
         logger.debug("Agent memories added", count=len(agent_memories))
 
@@ -225,7 +227,17 @@ async def build_memory_prompt_parts(
     if agent_entrypoint:
         session_preamble = f"{config.get_prompt('FILE_MEMORY_ENTRYPOINT_HEADER')}\n{agent_entrypoint}"
 
-    turn_context = (
+    # The automatic per-turn path must not silently drop the degradation
+    # signal: a broken embedder would otherwise look like an agent with no
+    # relevant memories, the original ISSUE-237 failure shape.
+    degradation_notice = ""
+    if search_outcome.degraded_reason is not None:
+        degradation_notice = (
+            f"Semantic memory search is unavailable this turn ({search_outcome.degraded_reason}); "
+            "stored memories may be missing or keyword-only. Do not claim to have checked stored memories."
+        )
+
+    memory_context = (
         format_memories_as_context(
             agent_memories,
             backend.context_label,
@@ -234,6 +246,7 @@ async def build_memory_prompt_parts(
         if agent_memories
         else ""
     )
+    turn_context = "\n\n".join(part for part in (degradation_notice, memory_context) if part)
     return MemoryPromptParts(
         session_preamble=session_preamble,
         turn_context=turn_context,

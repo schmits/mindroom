@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast, runtime_checkable
 from urllib.parse import quote, urlparse, urlunparse
 
-from agno.knowledge.knowledge import Knowledge
 from agno.knowledge.reader import ReaderFactory
 from agno.knowledge.reader.markdown_reader import MarkdownReader
 from agno.knowledge.reader.text_reader import TextReader
@@ -24,6 +23,7 @@ from agno.vectordb.chroma import ChromaDb
 from mindroom.chunking import SafeFixedSizeChunking
 from mindroom.constants import RuntimePaths, resolve_config_relative_path
 from mindroom.credentials import get_runtime_shared_credentials_manager
+from mindroom.embedding_errors import classified_embedder_error
 from mindroom.embedding_factory import create_configured_embedder
 from mindroom.knowledge.file_listing import (
     git_checkout_present,
@@ -50,6 +50,7 @@ from mindroom.knowledge.redaction import (
     redact_url_credentials,
 )
 from mindroom.logging_config import get_logger
+from mindroom.strict_knowledge import StrictInsertKnowledge as Knowledge
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -338,6 +339,7 @@ class KnowledgeManager:
     _git_sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _git_last_successful_commit: str | None = field(default=None, init=False)
     _last_refresh_error: str | None = field(default=None, init=False)
+    _last_file_index_error: str | None = field(default=None, init=False)
     _git_lfs_checked: bool = field(default=False, init=False)
     _git_lfs_repository_ready: bool = field(default=False, init=False)
     _git_tracked_relative_paths: set[str] | None = field(default=None, init=False, repr=False)
@@ -1039,7 +1041,11 @@ class KnowledgeManager:
                 upsert=upsert,
                 reader=reader,
             )
-        except Exception:
+        except Exception as exc:
+            if self._last_file_index_error is None:
+                self._last_file_index_error = classified_embedder_error(exc) or (
+                    f"knowledge indexing failed ({type(exc).__name__})"
+                )
             logger.exception("Failed to index knowledge file", base_id=self.base_id, path=str(resolved_path))
             return False
 
@@ -1048,26 +1054,12 @@ class KnowledgeManager:
             knowledge=target_knowledge,
         )
         if not has_vectors:
-            if source_size == 0:
-                if indexed_files is not None and indexed_signatures is not None:
-                    indexed_files.add(relative_path)
-                    indexed_signatures[relative_path] = (source_mtime_ns, source_size, source_digest)
-                else:
-                    async with self._state_lock:
-                        self._indexed_files.add(relative_path)
-                        self._indexed_signatures[relative_path] = (source_mtime_ns, source_size, source_digest)
-                logger.info("Scanned empty knowledge file with no vectors", base_id=self.base_id, path=relative_path)
-                return True
-
-            logger.warning("Indexing produced no vectors for file", base_id=self.base_id, path=relative_path)
-            if indexed_files is not None and indexed_signatures is not None:
-                indexed_files.discard(relative_path)
-                indexed_signatures.pop(relative_path, None)
-            else:
-                async with self._state_lock:
-                    self._indexed_files.discard(relative_path)
-                    self._indexed_signatures.pop(relative_path, None)
-            return False
+            return await self._handle_vectorless_file(
+                relative_path,
+                (source_mtime_ns, source_size, source_digest),
+                indexed_files=indexed_files,
+                indexed_signatures=indexed_signatures,
+            )
 
         if indexed_files is not None and indexed_signatures is not None:
             indexed_files.add(relative_path)
@@ -1078,6 +1070,37 @@ class KnowledgeManager:
                 self._indexed_signatures[relative_path] = (source_mtime_ns, source_size, source_digest)
         logger.info("Indexed knowledge file", base_id=self.base_id, path=relative_path)
         return True
+
+    async def _handle_vectorless_file(
+        self,
+        relative_path: str,
+        signature: _FileSignature,
+        *,
+        indexed_files: set[str] | None,
+        indexed_signatures: dict[str, _FileSignature | None] | None,
+    ) -> bool:
+        """Record one insert that produced no vectors; success only for empty sources."""
+        source_size = signature[1]
+        if source_size == 0:
+            if indexed_files is not None and indexed_signatures is not None:
+                indexed_files.add(relative_path)
+                indexed_signatures[relative_path] = signature
+            else:
+                async with self._state_lock:
+                    self._indexed_files.add(relative_path)
+                    self._indexed_signatures[relative_path] = signature
+            logger.info("Scanned empty knowledge file with no vectors", base_id=self.base_id, path=relative_path)
+            return True
+
+        logger.warning("Indexing produced no vectors for file", base_id=self.base_id, path=relative_path)
+        if indexed_files is not None and indexed_signatures is not None:
+            indexed_files.discard(relative_path)
+            indexed_signatures.pop(relative_path, None)
+        else:
+            async with self._state_lock:
+                self._indexed_files.discard(relative_path)
+                self._indexed_signatures.pop(relative_path, None)
+        return False
 
     async def _reindex_files_locked(
         self,
@@ -1129,6 +1152,7 @@ class KnowledgeManager:
 
         async with self._lock:
             self._last_refresh_error = None
+            self._last_file_index_error = None
             files = await asyncio.to_thread(self.list_files)
             candidate_knowledge = self._build_knowledge(self._candidate_collection_name())
             candidate_vector_db = candidate_knowledge.vector_db
@@ -1149,7 +1173,10 @@ class KnowledgeManager:
                     indexed_signatures=candidate_indexed_signatures,
                 )
                 if indexed_count != len(files):
-                    self._last_refresh_error = f"Indexed {indexed_count} of {len(files)} managed knowledge files"
+                    summary = f"Indexed {indexed_count} of {len(files)} managed knowledge files"
+                    if self._last_file_index_error is not None:
+                        summary = f"{summary} (first error: {self._last_file_index_error})"
+                    self._last_refresh_error = summary
                     return indexed_count
 
                 expected_paths = {self._relative_path(file_path) for file_path in files}

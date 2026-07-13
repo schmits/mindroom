@@ -1,21 +1,81 @@
 """Memory configuration and setup."""
 
+from __future__ import annotations
+
 import hashlib
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from mem0 import AsyncMemory
 
-from mindroom.config.main import Config
-from mindroom.constants import RuntimePaths
 from mindroom.credentials_sync import get_api_key_for_provider, get_ollama_host
+from mindroom.embedding_factory import resolve_embedder_settings
 from mindroom.embeddings import effective_mem0_embedder_signature, ensure_sentence_transformers_dependencies
 from mindroom.logging_config import get_logger
 from mindroom.model_defaults import MEMORY_OLLAMA_LLM, OLLAMA_HOST_DEFAULT
 from mindroom.timing import timed
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+
 logger = get_logger(__name__)
 _MEMORY_COLLECTION_PREFIX = "mindroom_memories"
+
+
+class _StrictOpenAIEmbedder(Protocol):
+    def get_embedding(self, text: str) -> list[float]: ...
+
+    def get_embeddings_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+
+@dataclass
+class _Mem0StrictOpenAIEmbedder:
+    """Adapt MindRoom's strict OpenAI embedder to Mem0's embedding interface."""
+
+    embedder: _StrictOpenAIEmbedder
+    _operation_failure: Exception | None = field(default=None, init=False, repr=False)
+
+    def _remember_operation_failure(self, exc: Exception) -> None:
+        if self._operation_failure is None:
+            self._operation_failure = exc
+
+    def begin_operation(self) -> None:
+        """Start tracking failures that Mem0 may swallow during one operation."""
+        self._operation_failure = None
+
+    def raise_for_operation_failure(self) -> None:
+        """Raise a safe error when Mem0 swallowed an embedding failure."""
+        failure = self._operation_failure
+        self._operation_failure = None
+        if failure is not None:
+            raise failure
+
+    def embed(
+        self,
+        text: str,
+        memory_action: Literal["add", "search", "update"] | None = None,
+    ) -> list[float]:
+        del memory_action
+        try:
+            return self.embedder.get_embedding(text.replace("\n", " "))
+        except Exception as exc:
+            self._remember_operation_failure(exc)
+            raise
+
+    def embed_batch(
+        self,
+        texts: list[str],
+        memory_action: Literal["add", "search", "update"] = "add",
+    ) -> list[list[float]]:
+        del memory_action
+        try:
+            return self.embedder.get_embeddings_batch([text.replace("\n", " ") for text in texts])
+        except Exception as exc:
+            self._remember_operation_failure(exc)
+            raise
 
 
 def _chroma_similarity_from_distance(distance: float | None, space: str) -> float | None:
@@ -79,7 +139,7 @@ def _memory_collection_name(config: Config) -> str:
     return f"{_MEMORY_COLLECTION_PREFIX}_{digest}"
 
 
-def _get_memory_config(storage_path: Path, config: Config, runtime_paths: RuntimePaths) -> dict:  # noqa: C901, PLR0912
+def _get_memory_config(storage_path: Path, config: Config, runtime_paths: RuntimePaths) -> dict:  # noqa: C901
     """Get Mem0 configuration with ChromaDB backend.
 
     Args:
@@ -98,11 +158,12 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
     # Ensure storage directories exist
     chroma_path = resolved_storage_path / "chroma"
     chroma_path.mkdir(parents=True, exist_ok=True)
-    embedder_provider = app_config.memory.embedder.provider
+    resolved_embedder = resolve_embedder_settings(app_config, runtime_paths)
+    embedder_provider = resolved_embedder.provider
 
     # Build embedder config from config.yaml
     embedder_provider_config: dict[str, Any] = {
-        "model": app_config.memory.embedder.config.model,
+        "model": resolved_embedder.model,
     }
     embedder_config: dict[str, Any] = {
         "provider": "huggingface" if embedder_provider == "sentence_transformers" else embedder_provider,
@@ -111,23 +172,16 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
 
     # Add provider-specific configuration
     if embedder_provider == "openai":
-        api_key = get_api_key_for_provider("openai", runtime_paths=runtime_paths)
-        if api_key:
-            embedder_provider_config["api_key"] = api_key
+        embedder_provider_config["api_key"] = resolved_embedder.api_key
         # Support custom OpenAI-compatible base URL (e.g., llama.cpp)
-        if app_config.memory.embedder.config.host:
-            embedder_provider_config["openai_base_url"] = app_config.memory.embedder.config.host
-        if app_config.memory.embedder.config.dimensions is not None:
-            embedder_provider_config["embedding_dims"] = app_config.memory.embedder.config.dimensions
+        if resolved_embedder.host:
+            embedder_provider_config["openai_base_url"] = resolved_embedder.host
+        if resolved_embedder.dimensions is not None:
+            embedder_provider_config["embedding_dims"] = resolved_embedder.dimensions
     elif embedder_provider == "ollama":
-        host = (
-            get_ollama_host(runtime_paths=runtime_paths)
-            or app_config.memory.embedder.config.host
-            or OLLAMA_HOST_DEFAULT
-        )
-        embedder_provider_config["ollama_base_url"] = host
-    elif embedder_provider == "sentence_transformers" and app_config.memory.embedder.config.dimensions is not None:
-        embedder_provider_config["embedding_dims"] = app_config.memory.embedder.config.dimensions
+        embedder_provider_config["ollama_base_url"] = resolved_embedder.host
+    elif embedder_provider == "sentence_transformers" and resolved_embedder.dimensions is not None:
+        embedder_provider_config["embedding_dims"] = resolved_embedder.dimensions
 
     # Build LLM config from memory configuration
     if app_config.memory.llm:
@@ -206,6 +260,13 @@ async def create_memory_instance(
     # Create AsyncMemory instance with dictionary config directly
     # Mem0 expects a dict for configuration, not config objects
     memory = AsyncMemory.from_config(config_dict)
+    if config.memory.embedder.provider == "openai":
+        # Mem0's own OpenAI embedder indexes response.data[0] without validation
+        # and can expose raw provider errors. Reuse MindRoom's strict boundary.
+        from mindroom.embedding_factory import create_configured_embedder  # noqa: PLC0415
+
+        strict_embedder = cast("_StrictOpenAIEmbedder", create_configured_embedder(config, runtime_paths))
+        cast("Any", memory).embedding_model = _Mem0StrictOpenAIEmbedder(strict_embedder)
     _install_chroma_similarity_scores(memory.vector_store)
 
     logger.info("created_memory_instance", path=config_dict["vector_store"]["config"]["path"])
