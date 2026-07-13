@@ -136,6 +136,13 @@ class BotRoomLifecycle:
             return
         save_invited_rooms(self.invited_rooms_file_path(), self.invited_rooms)
 
+    def forget_invited_room(self, room_id: str) -> None:
+        """Stop preserving an ad-hoc room after this bot leaves it."""
+        if room_id not in self.invited_rooms:
+            return
+        self.invited_rooms.remove(room_id)
+        self.save_invited_rooms()
+
     async def join_configured_rooms(self) -> None:
         """Join all rooms this bot should preserve across restarts."""
         client = self._client()

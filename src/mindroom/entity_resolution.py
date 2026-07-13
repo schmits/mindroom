@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Literal
 from mindroom.constants import ROUTER_AGENT_NAME, runtime_matrix_homeserver
 from mindroom.matrix import state as matrix_state
 from mindroom.matrix.identity import MatrixID, managed_account_key, managed_account_user_id
+from mindroom.matrix.invited_rooms_store import should_persist_invited_rooms
 from mindroom.matrix_identifiers import (
     extract_server_name_from_homeserver,
     room_alias_identifier_candidates,
@@ -15,6 +16,7 @@ from mindroom.matrix_identifiers import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
+    from collections.abc import Set as AbstractSet
 
     from mindroom.config.agent import AgentConfig, TeamConfig
     from mindroom.config.main import Config
@@ -62,6 +64,7 @@ def configured_call_agent_name_for_room(
     runtime_paths: RuntimePaths,
     *,
     room_aliases: Iterable[str] = (),
+    invited_rooms_by_agent: Mapping[str, AbstractSet[str]],
 ) -> str | None:
     """Return the sole calls-enabled agent for a live room, failing on ambiguity."""
     routable_names = configured_routable_entity_names_for_room(
@@ -70,7 +73,13 @@ def configured_call_agent_name_for_room(
         runtime_paths,
         room_aliases=room_aliases,
     )
-    call_agents = sorted(set(routable_names).intersection(config.calls.agents))
+    call_agents = set(routable_names).intersection(config.calls.agents)
+    for agent_name in config.calls.agents:
+        if not should_persist_invited_rooms(config, agent_name):
+            continue
+        if room_id in invited_rooms_by_agent.get(agent_name, ()):
+            call_agents.add(agent_name)
+    call_agents = sorted(call_agents)
     if len(call_agents) > 1:
         msg = f"calls.agents resolves multiple agents for live room {room_id}: {', '.join(call_agents)}"
         raise ValueError(msg)

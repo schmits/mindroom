@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 import aiohttp
 import httpx
@@ -51,7 +52,8 @@ from mindroom.model_defaults import LOCAL_OPENAI_API_KEY_DEFAULT
 from mindroom.session_ids import create_session_id
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
+    from collections.abc import Set as AbstractSet
 
     from mindroom.config.main import Config
     from mindroom.config.voice import SpeechServiceConfig
@@ -122,6 +124,7 @@ def maybe_build_call_manager(
     runtime_paths: RuntimePaths,
     ssl_verify: bool,
     tool_support: ToolRuntimeSupport,
+    get_invited_rooms_by_agent: Callable[[], Mapping[str, AbstractSet[str]]],
 ) -> CallManager | None:
     """Build a call manager when this agent is configured for voice calls."""
     if not config.calls.enabled or agent_name not in config.calls.agents:
@@ -142,6 +145,7 @@ def maybe_build_call_manager(
         runtime_paths=runtime_paths,
         ssl_verify=ssl_verify,
         tool_support=tool_support,
+        get_invited_rooms_by_agent=get_invited_rooms_by_agent,
     )
 
 
@@ -158,6 +162,7 @@ class CallManager:
         ssl_verify: bool,
         bridge_factory: Callable[[str, bool], VoiceBridgeLike] | None = None,
         tool_support: ToolRuntimeSupport,
+        get_invited_rooms_by_agent: Callable[[], Mapping[str, AbstractSet[str]]],
         clock_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
         self._agent_name = agent_name
@@ -169,12 +174,14 @@ class CallManager:
             _default_cascaded_bridge_factory if config.calls.backend == "cascaded" else _default_bridge_factory
         )
         self._tool_support = tool_support
+        self._get_invited_rooms_by_agent = get_invited_rooms_by_agent
         self._clock_ms = clock_ms
         self._key_transport = ToDeviceFrameKeyTransport(client)
         self._sessions: dict[str, CallSession] = {}
         self._pending_keys: dict[str, dict[tuple[str, str, int], ReceivedFrameKey]] = {}
         self._observed_rooms: dict[str, nio.MatrixRoom] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._departed_rooms: set[str] = set()
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._retry_attempts: dict[str, int] = {}
         self._logical_calls: dict[str, _LogicalCallState] = {}
@@ -189,12 +196,53 @@ class CallManager:
         self._observed_rooms[room.room_id] = room
         await self._reconcile(room)
 
-    async def on_room_membership_event(self, room: nio.MatrixRoom, _event: nio.RoomMemberEvent) -> None:
+    async def on_room_membership_event(self, room: nio.MatrixRoom, event: nio.RoomMemberEvent) -> None:
         """Reconcile calls when a user's underlying room membership changes."""
-        if self._shutting_down or not self._is_configured_call_room(room):
+        if self._shutting_down:
+            return
+        if event.state_key == self._client.user_id and event.membership in {"leave", "ban"}:
+            if self._is_configured_call_room(room):
+                self._departed_rooms.add(room.room_id)
+            if self._has_tracked_call_state(room.room_id):
+                await self._handle_own_room_leave(room.room_id)
+            return
+        if event.state_key == self._client.user_id and event.membership == "join":
+            self._departed_rooms.discard(room.room_id)
+        if not self._is_configured_call_room(room):
             return
         self._observed_rooms[room.room_id] = room
         await self._reconcile(room)
+
+    async def on_sync_room_membership(
+        self,
+        *,
+        joined_room_ids: AbstractSet[str],
+        left_room_ids: AbstractSet[str],
+    ) -> None:
+        """Apply the bot's authoritative joined/left room sections from sync."""
+        if self._shutting_down:
+            return
+        self._departed_rooms.difference_update(joined_room_ids)
+        for room_id in left_room_ids:
+            room = self._observed_rooms.get(room_id) or self._client.rooms.get(room_id)
+            if room is not None and self._is_configured_call_room(room):
+                self._departed_rooms.add(room_id)
+            if self._has_tracked_call_state(room_id):
+                await self._handle_own_room_leave(room_id)
+
+    async def _handle_own_room_leave(self, room_id: str) -> None:
+        """Tear down call state immediately when the bot no longer belongs to the room."""
+        lock = self._locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            self._observed_rooms.pop(room_id, None)
+            self._pending_keys.pop(room_id, None)
+            self._clear_logical_call(room_id)
+            expiry = self._expiry_handles.pop(room_id, None)
+            if expiry is not None:
+                expiry.cancel()
+            session = self._sessions.pop(room_id, None)
+            if session is not None:
+                await self._stop_session(session)
 
     async def on_to_device_event(self, event: nio.ToDeviceEvent) -> None:
         """Sync callback for decrypted call frame-key to-device events."""
@@ -209,9 +257,13 @@ class CallManager:
         if parsed is None:
             return
         room_id, received = parsed
-        if not self._is_configured_call_room_id(room_id) or not self._is_authorized_call_member(
-            received.user_id,
-            room_id,
+        if (
+            room_id in self._departed_rooms
+            or not self._is_configured_call_room_id(room_id)
+            or not self._is_authorized_call_member(
+                received.user_id,
+                room_id,
+            )
         ):
             return
         session = self._sessions.get(room_id)
@@ -239,6 +291,9 @@ class CallManager:
         self._background_tasks.clear()
         self._retry_attempts.clear()
         self._logical_calls.clear()
+        self._observed_rooms.clear()
+        self._departed_rooms.clear()
+        self._locks.clear()
         for handle in self._expiry_handles.values():
             handle.cancel()
         self._expiry_handles.clear()
@@ -252,13 +307,13 @@ class CallManager:
             await self._stop_session(session, event="call_session_shutdown_failed")
 
     async def _reconcile(self, room: nio.MatrixRoom, *, retrying: bool = False) -> None:
-        if not self._is_configured_call_room(room):
+        if room.room_id in self._departed_rooms or not self._is_configured_call_room(room):
             return
         self._observed_rooms[room.room_id] = room
         room_id = room.room_id
         lock = self._locks.setdefault(room_id, asyncio.Lock())
         async with lock:
-            if self._shutting_down:
+            if self._shutting_down or room_id in self._departed_rooms:
                 return
             members = await self._fetch_remote_members(room_id)
             if members is None:
@@ -358,6 +413,7 @@ class CallManager:
                 room.room_id,
                 self._runtime_paths,
                 room_aliases=room_aliases,
+                invited_rooms_by_agent=self._get_invited_rooms_by_agent(),
             )
         except ValueError as error:
             logger.warning("call_room_ownership_ambiguous", room_id=room.room_id, error=str(error))
@@ -368,6 +424,21 @@ class CallManager:
         """Return whether this agent is configured to join calls in ``room_id``."""
         room = self._observed_rooms.get(room_id) or self._client.rooms.get(room_id)
         return room is not None and self._is_configured_call_room(room)
+
+    def _has_tracked_call_state(self, room_id: str) -> bool:
+        """Return whether this manager has call state to tear down for ``room_id``."""
+        return any(
+            room_id in state
+            for state in (
+                self._observed_rooms,
+                self._sessions,
+                self._pending_keys,
+                self._retry_tasks,
+                self._retry_attempts,
+                self._logical_calls,
+                self._expiry_handles,
+            )
+        )
 
     def _queue_pending_key(self, room_id: str, received: ReceivedFrameKey) -> None:
         """Retain a bounded, deduplicated key set while a session is starting."""
@@ -716,12 +787,23 @@ class CallManager:
         self._logical_calls.pop(room_id, None)
         self._clear_reconcile_retry(room_id)
 
-    def _resolve_voice_backend(self, room_id: str) -> _ResolvedVoiceBackend | None:
+    @property
+    def voice_backend_available(self) -> bool:
+        """Return whether the configured voice backend has its runtime credentials."""
+        return self._resolve_voice_backend(room_id=None, warn_if_unavailable=False) is not None
+
+    def _resolve_voice_backend(
+        self,
+        room_id: str | None,
+        *,
+        warn_if_unavailable: bool = True,
+    ) -> _ResolvedVoiceBackend | None:
         """Resolve backend-specific credentials without affecting call lifecycle."""
         if self._config.calls.backend == "realtime":
             api_key = get_api_key_for_provider("openai", self._runtime_paths)
             if not api_key:
-                logger.warning("call_join_skipped_no_openai_key", room_id=room_id, agent=self._agent_name)
+                if warn_if_unavailable:
+                    logger.warning("call_join_skipped_no_openai_key", room_id=room_id, agent=self._agent_name)
                 return None
             return _ResolvedVoiceBackend(realtime_api_key=api_key)
 
@@ -730,8 +812,18 @@ class CallManager:
         if stt_config is None or tts_config is None:
             msg = "Cascaded call configuration requires STT and TTS"
             raise ValueError(msg)
-        stt = self._resolve_speech_service(stt_config, component="stt", room_id=room_id)
-        tts = self._resolve_speech_service(tts_config, component="tts", room_id=room_id)
+        stt = self._resolve_speech_service(
+            stt_config,
+            component="stt",
+            room_id=room_id,
+            warn_if_unavailable=warn_if_unavailable,
+        )
+        tts = self._resolve_speech_service(
+            tts_config,
+            component="tts",
+            room_id=room_id,
+            warn_if_unavailable=warn_if_unavailable,
+        )
         if stt is None or tts is None:
             return None
         return _ResolvedVoiceBackend(stt=stt, tts=tts)
@@ -784,7 +876,8 @@ class CallManager:
         service: SpeechServiceConfig,
         *,
         component: str,
-        room_id: str,
+        room_id: str | None,
+        warn_if_unavailable: bool = True,
     ) -> SpeechServiceOptions | None:
         """Resolve one independently credentialed cloud or local speech service."""
         base_url = normalize_speech_base_url(service.host)
@@ -795,7 +888,7 @@ class CallManager:
             api_key = LOCAL_OPENAI_API_KEY_DEFAULT
         if api_key is None:
             api_key = get_api_key_for_provider(service.provider, self._runtime_paths)
-        if not api_key:
+        if not api_key and warn_if_unavailable:
             logger.warning(
                 "call_join_skipped_no_speech_key",
                 room_id=room_id,
@@ -803,6 +896,7 @@ class CallManager:
                 component=component,
                 provider=service.provider,
             )
+        if not api_key:
             return None
         return SpeechServiceOptions(
             provider=service.provider,

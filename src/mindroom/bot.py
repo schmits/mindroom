@@ -986,7 +986,11 @@ class AgentBot:
         if self.client is None:
             return
 
-        status_msg = build_agent_status_message(self.agent_name, self.config)
+        status_msg = build_agent_status_message(
+            self.agent_name,
+            self.config,
+            voice_calls_available=(self._call_manager is not None and self._call_manager.voice_backend_available),
+        )
         await set_presence_status(self.client, status_msg)
 
     def mark_sync_loop_started(self) -> None:
@@ -1228,6 +1232,7 @@ class AgentBot:
             )
 
         if isinstance(_response, nio.SyncResponse):
+            await self._apply_own_room_membership_from_sync(_response)
             restored_token_first_sync_response = (
                 first_sync_response and self._sync_trust_state is SyncTrustState.PENDING
             )
@@ -1331,6 +1336,15 @@ class AgentBot:
             runtime_paths=self.runtime_paths,
             ssl_verify=constants.runtime_matrix_ssl_verify(self.runtime_paths),
             tool_support=self._tool_runtime_support,
+            get_invited_rooms_by_agent=self._invited_call_rooms_by_agent,
+        )
+        client.add_event_callback(
+            _create_task_wrapper(
+                self._on_room_membership_event,
+                owner=self._runtime_view,
+                on_error=self._mark_callback_failed,
+            ),
+            nio.RoomMemberEvent,
         )
         if self._call_manager is None:
             return
@@ -1342,14 +1356,6 @@ class AgentBot:
             ),
             nio.UnknownEvent,
         )
-        client.add_event_callback(
-            _create_task_wrapper(
-                self._call_manager.on_room_membership_event,
-                owner=self._runtime_view,
-                on_error=self._mark_callback_failed,
-            ),
-            nio.RoomMemberEvent,
-        )
         client.add_to_device_callback(
             _create_task_wrapper(  # ty: ignore[invalid-argument-type]  # matrix-nio callback types are too strict here
                 self._call_manager.on_to_device_event,
@@ -1358,6 +1364,46 @@ class AgentBot:
             ),
             AuthenticatedToDeviceEvent,
         )
+
+    async def _apply_own_room_membership_from_sync(self, response: nio.SyncResponse) -> None:
+        """Apply this bot's authoritative joined/left room sections before other sync work."""
+        joined_room_ids = set(response.rooms.join)
+        left_room_ids = set(response.rooms.leave)
+        for room_id in left_room_ids:
+            self._room_lifecycle.forget_invited_room(room_id)
+        call_manager = self._call_manager
+        if call_manager is not None:
+            await call_manager.on_sync_room_membership(
+                joined_room_ids=joined_room_ids,
+                left_room_ids=left_room_ids,
+            )
+
+    def _invited_call_rooms_by_agent(self) -> dict[str, frozenset[str]]:
+        """Return live accepted-invite state for the configured call agents."""
+        orchestrator = self.orchestrator
+        agent_bots_value = orchestrator.agent_bots if orchestrator is not None else None
+        if not isinstance(agent_bots_value, dict):
+            return {self.agent_name: frozenset(self._room_lifecycle.invited_rooms)}
+        agent_bots = cast("dict[str, object]", agent_bots_value)
+
+        invited_rooms: dict[str, frozenset[str]] = {}
+        for agent_name in self.config.calls.agents:
+            bot = agent_bots.get(agent_name)
+            if isinstance(bot, AgentBot):
+                invited_rooms[agent_name] = frozenset(bot._room_lifecycle.invited_rooms)
+        return invited_rooms
+
+    async def _on_room_membership_event(
+        self,
+        room: nio.MatrixRoom,
+        event: nio.RoomMemberEvent,
+    ) -> None:
+        """Apply invited-room cleanup before optional call reconciliation."""
+        if event.state_key == self.agent_user.user_id and event.membership in {"leave", "ban"}:
+            self._room_lifecycle.forget_invited_room(room.room_id)
+        call_manager = self._call_manager
+        if call_manager is not None:
+            await call_manager.on_room_membership_event(room, event)
 
     async def start(self) -> None:
         """Start the agent bot with user account setup (but don't join rooms yet)."""
@@ -1377,7 +1423,6 @@ class AgentBot:
             self._runtime_view.mark_runtime_started()
             self._restore_saved_sync_token()
             await self._set_avatar_if_available()
-            await self._set_presence_with_model_info()
             # Both load tracking state under advisory file locks; keep that
             # off the event loop so per-bot startup never stalls dispatch.
             await asyncio.to_thread(self._turn_store.warm)
@@ -1429,6 +1474,7 @@ class AgentBot:
                 nio.MegolmEvent,
             )
             self._register_call_manager_callbacks(client)
+            await self._set_presence_with_model_info()
             client.add_response_callback(self._on_sync_response, nio.SyncResponse)  # ty: ignore[invalid-argument-type]  # matrix-nio callback types are too strict here
             client.add_response_callback(self._on_sync_error, nio.SyncError)  # ty: ignore[invalid-argument-type]
 
