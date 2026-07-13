@@ -283,7 +283,13 @@ Export Matrix threads to local files.
 
 Export Matrix threads to YAML files for grep/ripgrep search.
 The command reads persisted Matrix accounts and rooms from `matrix_state.yaml`, so run MindRoom once before exporting.
+Rooms joined through authorized invites (user-created rooms) are exported too, each with the invited entity's own account, unless `--no-invited-rooms` is passed.
 By default it writes to `<storage>/thread_exports`.
+A thread file is only rewritten when its content changed, so `exported_at` reflects the last content-changing export.
+Each thread document includes the latest MindRoom thread summary as `thread.summary` when one exists.
+Each room directory also gets an `index.json` mapping every thread file to its message count, participants, latest summary, and last activity, sorted by most recent activity.
+Complete passes remove exported room and thread files that are no longer present or authorized; a `--room` pass only reconciles the selected room.
+With `--prefer-cache` thread bodies are served from the durable event cache and only fetched from the homeserver on miss or invalidation; use it alongside a running MindRoom that keeps the cache fresh.
 
 <!-- CODE:START -->
 <!-- from mindroom.cli.main import app -->
@@ -303,17 +309,32 @@ By default it writes to `<storage>/thread_exports`.
  Export Matrix threads to YAML files for grep/ripgrep search.
 
 ╭─ Options ──────────────────────────────────────────────────────────────────────────────╮
-│ --config            -c      PATH     Use this config file path.                        │
-│ --storage-path      -s      PATH     Base directory for persistent MindRoom data.      │
-│ --output            -o      PATH     Output directory. Defaults to                     │
-│                                      <storage>/thread_exports.                         │
-│ --room              -r      TEXT     Filter exported rooms by a substring of the room  │
-│                                      key, alias, name, or Matrix room ID.              │
-│ --watch                              Repeat the export forever on a fixed interval.    │
-│ --interval                  INTEGER  Watch interval in seconds. [default: 300]         │
-│ --max-thread-roots          INTEGER  Maximum thread roots to enumerate per room.       │
-│                                      [default: 2000]                                   │
-│ --help              -h               Show this message and exit.                       │
+│ --config            -c                        PATH     Use this config file path.      │
+│ --storage-path      -s                        PATH     Base directory for persistent   │
+│                                                        MindRoom data.                  │
+│ --output            -o                        PATH     Output directory. Defaults to   │
+│                                                        <storage>/thread_exports.       │
+│ --room              -r                        TEXT     Filter exported rooms by a      │
+│                                                        substring of the room key,      │
+│                                                        alias, name, or Matrix room ID. │
+│ --watch                                                Repeat the export forever on a  │
+│                                                        fixed interval.                 │
+│ --interval                                    INTEGER  Watch interval in seconds.      │
+│                                                        [default: 300]                  │
+│ --max-thread-roots                            INTEGER  Maximum thread roots to         │
+│                                                        enumerate per room.             │
+│                                                        [default: 2000]                 │
+│ --prefer-cache                                         Serve thread bodies from the    │
+│                                                        durable event cache and only    │
+│                                                        fetch from the homeserver on    │
+│                                                        miss or invalidation. Use       │
+│                                                        alongside a running MindRoom    │
+│                                                        that keeps the cache fresh.     │
+│ --invited-rooms         --no-invited-rooms             Include rooms joined through    │
+│                                                        authorized invites              │
+│                                                        (user-created rooms).           │
+│                                                        [default: invited-rooms]        │
+│ --help              -h                                 Show this message and exit.     │
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
 
@@ -325,6 +346,7 @@ By default it writes to `<storage>/thread_exports`.
 mindroom threads export --storage-path mindroom_data --output /tmp/mindroom-thread-exports
 mindroom threads export --storage-path mindroom_data --room lobby
 mindroom threads export --storage-path mindroom_data --watch --interval 300
+mindroom threads export --storage-path mindroom_data --prefer-cache
 ```
 
 ## service
