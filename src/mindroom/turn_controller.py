@@ -1791,6 +1791,7 @@ class TurnController:
                 response_event_id = await self._finalize_dispatch_failure(
                     target=dispatch.target,
                     error=failure,
+                    existing_event_id=error.placeholder_event_id,
                 )
                 if response_event_id is not None:
                     self._mark_source_events_responded(replace(handled_turn, response_event_id=response_event_id))

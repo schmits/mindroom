@@ -150,6 +150,7 @@ def _bot(tmp_path: Path) -> AgentBot:
     )
     bot = AgentBot(agent_user, tmp_path, config, runtime_paths_for(config), rooms=["!room:localhost"])
     bot.client = AsyncMock(spec=nio.AsyncClient)
+    bot.client.rooms = {}
     install_runtime_cache_support(bot)
     wrap_extracted_collaborators(bot)
     return bot
@@ -1070,8 +1071,9 @@ async def test_generate_response_detects_active_turn_before_lock_is_held(tmp_pat
         request: ResponseRequest,
         *,
         resolved_target: MessageTarget,
+        early_placeholder_state: object,
     ) -> str:
-        del resolved_target
+        del resolved_target, early_placeholder_state
         return str(request.user_id)
 
     with (
@@ -1413,7 +1415,9 @@ async def test_generate_team_response_uses_post_lock_reproof_target(tmp_path: Pa
     """Team delivery/session setup must enter the runner with the finalized stable room target."""
     bot = _bot(tmp_path)
     bot.client = MagicMock()
-    bot.client.rooms = {}
+    cached_room = MagicMock(encrypted=False)
+    bot.client.rooms = {"!room:localhost": cached_room}
+    bot.client.room_send = AsyncMock()
     bot.client.room_typing = AsyncMock()
     bot.orchestrator = MagicMock()
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
@@ -1479,7 +1483,9 @@ async def test_generate_team_response_keeps_locked_target_when_payload_preparati
     """Team response setup and delivery should keep the target selected before lock acquisition."""
     bot = _bot(tmp_path)
     bot.client = MagicMock()
-    bot.client.rooms = {}
+    cached_room = MagicMock(encrypted=False)
+    bot.client.rooms = {"!room:localhost": cached_room}
+    bot.client.room_send = AsyncMock()
     bot.client.room_typing = AsyncMock()
     bot.orchestrator = MagicMock()
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
