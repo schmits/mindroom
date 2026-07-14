@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from html import escape
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -39,7 +40,7 @@ from mindroom.history.types import (
 from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, emit
 from mindroom.logging_config import get_logger
 from mindroom.timing import timed
-from mindroom.token_budget import estimate_text_tokens, stable_serialize
+from mindroom.token_budget import estimate_compaction_input_tokens, estimate_text_tokens, stable_serialize
 from mindroom.tool_system.runtime_context import get_tool_runtime_context, resolve_tool_runtime_hook_bindings
 
 if TYPE_CHECKING:
@@ -343,6 +344,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
     before_persist_callback: Callable[[Sequence[RunOutput | TeamRunOutput]], Awaitable[None]] | None = None,
 ) -> _CompactionRewriteResult | None:
     final_summary_text = _current_summary_text(working_session) or ""
+    token_estimator = partial(estimate_compaction_input_tokens, model_id=summary_model.id)
     total_compacted_run_count = 0
     all_compacted_run_ids: list[str] = []
     all_compacted_run_id_set: set[str] = set()
@@ -364,6 +366,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
             compacted_runs=compactable_runs,
             history_settings=history_settings,
             max_input_tokens=summary_input_budget,
+            token_estimator=token_estimator,
         )
         if not included_runs:
             logger.warning(
@@ -388,6 +391,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
             scope=scope,
             history_settings=history_settings,
             summary_prompt=summary_prompt,
+            token_estimator=token_estimator,
         )
         included_runs = new_summary.included_runs
         generated_summary = new_summary.summary
@@ -502,6 +506,7 @@ async def _generate_compaction_summary_with_retry(
     scope: HistoryScope,
     history_settings: ResolvedHistorySettings,
     summary_prompt: str,
+    token_estimator: Callable[[str], int],
 ) -> _GeneratedSummaryChunk:
     """Generate one summary chunk, shrinking the input per the retry policy when safe."""
     summary_input = initial_summary_input
@@ -510,7 +515,7 @@ async def _generate_compaction_summary_with_retry(
     retry_policy = DEFAULT_SUMMARY_RETRY_POLICY
     attempt = 1
     while True:
-        estimated_input_tokens = estimate_text_tokens(summary_input)
+        estimated_input_tokens = token_estimator(summary_input)
         started = asyncio.get_running_loop().time()
         logger.info(
             "Compaction summary chunk request",
@@ -551,12 +556,11 @@ async def _generate_compaction_summary_with_retry(
                     compacted_runs=compactable_runs,
                     history_settings=history_settings,
                     max_input_tokens=retry_budget,
+                    token_estimator=token_estimator,
                 )
                 # The policy decides whether a retry is allowed; rebuilt_runs is the
-                # feasibility gate. Only a shrunken budget can rebuild empty (an
-                # unchanged budget reproduces the input that already fit), and it
-                # means no run fits — fall through to raise instead of resending
-                # the too-large input.
+                # feasibility gate. If no run fits the smaller budget, fall through
+                # to raise instead of resending the original input.
                 if rebuilt_runs:
                     summary_input = rebuilt_input
                     included_runs = rebuilt_runs
@@ -587,20 +591,31 @@ def _build_summary_input(
     compacted_runs: Sequence[RunOutput | TeamRunOutput],
     max_input_tokens: int,
     history_settings: ResolvedHistorySettings,
+    token_estimator: Callable[[str], int] = estimate_compaction_input_tokens,
 ) -> tuple[str, list[RunOutput | TeamRunOutput]]:
     summary_block = ""
     if previous_summary is not None and previous_summary.strip():
         escaped_summary = _escape_xml_content(previous_summary)
         summary_block = f"<previous_summary>\n{escaped_summary}\n</previous_summary>"
 
-    remaining = max_input_tokens - estimate_text_tokens(summary_block) - _WRAPPER_OVERHEAD_TOKENS
+    empty_input = _compose_summary_input(summary_block, "")
+    remaining = max_input_tokens - token_estimator(empty_input) - _WRAPPER_OVERHEAD_TOKENS
 
     if remaining <= 0:
-        return summary_block, []
+        return _build_oversized_summary_input(
+            summary_block=summary_block,
+            compacted_runs=compacted_runs[:1],
+            history_settings=history_settings,
+            max_input_tokens=max_input_tokens,
+            token_estimator=token_estimator,
+        )
 
     included_runs: list[RunOutput | TeamRunOutput] = []
-    for run in compacted_runs:
-        run_tokens = _estimate_serialized_run_tokens(run, history_settings)
+    serialized_runs: list[str] = []
+    for index, run in enumerate(compacted_runs):
+        serialized_run = _serialize_run(run, index, history_settings)
+        separator = "\n\n" if serialized_runs else ""
+        run_tokens = token_estimator(f"{separator}{serialized_run}")
         if run_tokens > remaining:
             if not included_runs:
                 return _build_oversized_summary_input(
@@ -608,18 +623,17 @@ def _build_summary_input(
                     compacted_runs=[run],
                     history_settings=history_settings,
                     max_input_tokens=max_input_tokens,
+                    token_estimator=token_estimator,
                 )
             break
         included_runs.append(run)
+        serialized_runs.append(serialized_run)
         remaining -= run_tokens
 
     if not included_runs:
         return summary_block, []
 
-    serialized_runs = "\n\n".join(
-        _serialize_run(run, index, history_settings) for index, run in enumerate(included_runs)
-    )
-    return _compose_summary_input(summary_block, serialized_runs), included_runs
+    return _compose_summary_input(summary_block, "\n\n".join(serialized_runs)), included_runs
 
 
 def _build_oversized_summary_input(
@@ -628,6 +642,7 @@ def _build_oversized_summary_input(
     compacted_runs: Sequence[RunOutput | TeamRunOutput],
     history_settings: ResolvedHistorySettings,
     max_input_tokens: int,
+    token_estimator: Callable[[str], int],
 ) -> tuple[str, list[RunOutput | TeamRunOutput]]:
     if not compacted_runs:
         return summary_block, []
@@ -636,7 +651,8 @@ def _build_oversized_summary_input(
         first_run,
         index=0,
         history_settings=history_settings,
-        max_tokens=_remaining_excerpt_budget(max_input_tokens, summary_block),
+        max_tokens=_remaining_excerpt_budget(max_input_tokens, summary_block, token_estimator),
+        token_estimator=token_estimator,
     )
     if oversized_excerpt is None:
         return summary_block, []
@@ -649,24 +665,25 @@ def _serialize_oversized_run_excerpt(
     index: int,
     history_settings: ResolvedHistorySettings,
     max_tokens: int,
+    token_estimator: Callable[[str], int],
 ) -> str | None:
     if max_tokens <= 0:
         return None
 
     full_run = _serialize_run(run, index, history_settings)
-    if estimate_text_tokens(full_run) <= max_tokens:
+    if token_estimator(full_run) <= max_tokens:
         return full_run
 
     blocks = _excerpt_blocks(run, history_settings)
     budget_chars = max_tokens * 4
     while budget_chars > 0:
         excerpt = _serialize_run_excerpt(run, index=index, blocks=blocks, content_budget_chars=budget_chars)
-        if estimate_text_tokens(excerpt) <= max_tokens:
+        if token_estimator(excerpt) <= max_tokens:
             return excerpt
         budget_chars //= 2
 
     minimal_excerpt = _serialize_run_excerpt(run, index=index, blocks=blocks, content_budget_chars=0)
-    if estimate_text_tokens(minimal_excerpt) <= max_tokens:
+    if token_estimator(minimal_excerpt) <= max_tokens:
         return minimal_excerpt
     return None
 
@@ -737,14 +754,12 @@ def _truncate_excerpt(text: str, max_chars: int) -> str:
     return f"{text[: max_chars - 1].rstrip()}…"
 
 
-def _remaining_excerpt_budget(max_input_tokens: int, summary_block: str) -> int:
-    return (
-        max_input_tokens
-        - estimate_text_tokens(summary_block)
-        - estimate_text_tokens(
-            "<new_conversation>\n\n</new_conversation>",
-        )
-    )
+def _remaining_excerpt_budget(
+    max_input_tokens: int,
+    summary_block: str,
+    token_estimator: Callable[[str], int],
+) -> int:
+    return max_input_tokens - token_estimator(_compose_summary_input(summary_block, ""))
 
 
 def _compose_summary_input(summary_block: str, serialized_runs: str) -> str:
@@ -753,10 +768,6 @@ def _compose_summary_input(summary_block: str, serialized_runs: str) -> str:
         parts.append(summary_block)
     parts.append(f"<new_conversation>\n{serialized_runs}\n</new_conversation>")
     return "\n\n".join(parts)
-
-
-def _estimate_serialized_run_tokens(run: RunOutput | TeamRunOutput, history_settings: ResolvedHistorySettings) -> int:
-    return estimate_text_tokens(_serialize_run(run, 0, history_settings))
 
 
 def _messages_for_runs(

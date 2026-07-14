@@ -7,6 +7,9 @@ Agno replay helpers and compaction serialization stay in their own modules.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
+
+import tiktoken
 
 
 def estimate_text_tokens(value: str | list[str] | None) -> int:
@@ -18,6 +21,22 @@ def estimate_text_tokens(value: str | list[str] | None) -> int:
     if isinstance(value, list):
         return sum(len(stable_serialize(part)) for part in value) // 4
     return len(stable_serialize(value)) // 4
+
+
+@lru_cache(maxsize=16)
+def _compaction_encoding(model_id: str | None) -> tiktoken.Encoding:
+    if model_id:
+        try:
+            return tiktoken.encoding_for_model(model_id)
+        except KeyError:
+            pass
+    return tiktoken.get_encoding("o200k_base")
+
+
+def estimate_compaction_input_tokens(value: str, *, model_id: str | None = None) -> int:
+    """Estimate serialized compaction history with the closest tiktoken encoding."""
+    encoding = _compaction_encoding(model_id)
+    return len(encoding.encode(value, disallowed_special=()))
 
 
 def compute_compaction_input_budget(
