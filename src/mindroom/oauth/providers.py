@@ -12,6 +12,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlparse
 
 from authlib.common.errors import AuthlibBaseError
 from authlib.deprecate import AuthlibDeprecationWarning
@@ -41,6 +42,17 @@ _SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {_PUBLIC_TOKEN_ENDPOINT_AUTH_METHOD, "client_secret_post", "client_secret_basic"},
 )
 _SUPPORTED_PKCE_CODE_CHALLENGE_METHODS = frozenset({None, "S256"})
+_OAUTH_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def is_oauth_loopback_hostname(hostname: str | None) -> bool:
+    """Return whether a hostname is supported by the bundled loopback flow."""
+    return hostname is not None and hostname.casefold() in _OAUTH_LOOPBACK_HOSTNAMES
+
+
+def oauth_connect_url_requires_host_browser(connect_url: str | None) -> bool:
+    """Return whether an OAuth link must open beside the MindRoom process."""
+    return connect_url is not None and is_oauth_loopback_hostname(urlparse(connect_url).hostname)
 
 
 class OAuthProviderError(RuntimeError):
@@ -97,6 +109,8 @@ def oauth_connection_required_payload(exc: OAuthConnectionRequired) -> dict[str,
     }
     if exc.reason is not None:
         payload["reason"] = exc.reason
+    if oauth_connect_url_requires_host_browser(exc.connect_url):
+        payload["requires_host_browser"] = True
     return payload
 
 
@@ -107,6 +121,7 @@ class OAuthClientConfig:
     client_id: str
     client_secret: str | None
     redirect_uri: str
+    token_endpoint_auth_method: _TokenEndpointAuthMethod | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,11 +134,12 @@ class OAuthRuntimeEndpoints:
 
 
 @dataclass(frozen=True, slots=True)
-class _OAuthClientConfigResolution:
+class OAuthClientConfigResolution:
     """Resolved OAuth client settings plus the credential service that supplied them."""
 
     config: OAuthClientConfig
     service: str
+    stored: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +397,8 @@ class OAuthProvider:
     extra_token_params: Mapping[str, str] = field(default_factory=dict)
     token_endpoint_auth_method: _TokenEndpointAuthMethod = _DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD
     pkce_code_challenge_method: _PKCECodeChallengeMethod | None = None
+    loopback_client_id: str | None = None
+    loopback_client_secret: str | None = None
     allow_empty_scopes: bool = False
     allowed_email_domains: tuple[str, ...] = ()
     allowed_hosted_domains: tuple[str, ...] = ()
@@ -436,6 +454,19 @@ class OAuthProvider:
         if self.pkce_code_challenge_method not in _SUPPORTED_PKCE_CODE_CHALLENGE_METHODS:
             msg = f"OAuth provider '{self.id}' supports only S256 PKCE"
             raise ValueError(msg)
+        if self.loopback_client_id is not None and not self.loopback_client_id.strip():
+            msg = f"OAuth provider '{self.id}' loopback_client_id must not be blank"
+            raise ValueError(msg)
+        if (
+            self.loopback_client_id is not None
+            and self.loopback_client_secret is None
+            and self.pkce_code_challenge_method is None
+        ):
+            msg = f"OAuth provider '{self.id}' public loopback client requires S256 PKCE"
+            raise ValueError(msg)
+        if self.loopback_client_secret is not None and self.loopback_client_id is None:
+            msg = f"OAuth provider '{self.id}' loopback_client_secret requires loopback_client_id"
+            raise ValueError(msg)
 
     def _validate_redirect_path(self) -> None:
         """Validate provider callback path shape."""
@@ -459,23 +490,44 @@ class OAuthProvider:
         resolution = self.client_config_resolution(runtime_paths)
         return resolution.config if resolution is not None else None
 
-    def client_config_resolution(self, runtime_paths: RuntimePaths) -> _OAuthClientConfigResolution | None:
-        """Return stored OAuth app client settings and the supplying credential service."""
+    def client_config_resolution(self, runtime_paths: RuntimePaths) -> OAuthClientConfigResolution | None:
+        """Return stored or bundled OAuth app client settings and their source."""
         manager = get_runtime_credentials_manager(runtime_paths)
         for service in self.client_config_services:
             config = self._stored_client_config_from_service(runtime_paths, manager.load_credentials(service), True)
             if config is not None:
-                return _OAuthClientConfigResolution(config=config, service=service)
+                return OAuthClientConfigResolution(config=config, service=service)
         for service in self.shared_client_config_services:
             config = self._stored_client_config_from_service(runtime_paths, manager.load_credentials(service), False)
             if config is not None:
-                return _OAuthClientConfigResolution(config=config, service=service)
-        return None
+                return OAuthClientConfigResolution(config=config, service=service)
+        if self.loopback_client_id is None:
+            return None
+        redirect_uri = self.default_redirect_uri(runtime_paths)
+        if not is_oauth_loopback_hostname(urlparse(redirect_uri).hostname):
+            return None
+        service = (
+            self.client_config_services[0] if self.client_config_services else self.shared_client_config_services[0]
+        )
+        return OAuthClientConfigResolution(
+            config=OAuthClientConfig(
+                client_id=self.loopback_client_id,
+                client_secret=self.loopback_client_secret,
+                redirect_uri=redirect_uri,
+                token_endpoint_auth_method=(
+                    _DEFAULT_TOKEN_ENDPOINT_AUTH_METHOD
+                    if self.loopback_client_secret is not None
+                    else _PUBLIC_TOKEN_ENDPOINT_AUTH_METHOD
+                ),
+            ),
+            service=service,
+            stored=False,
+        )
 
     async def client_config_resolution_async(
         self,
         runtime_paths: RuntimePaths,
-    ) -> _OAuthClientConfigResolution | None:
+    ) -> OAuthClientConfigResolution | None:
         """Return stored client settings, after any lazy runtime bootstrap."""
         resolution = self.client_config_resolution(runtime_paths)
         if resolution is not None:
@@ -544,9 +596,17 @@ class OAuthProvider:
             raise OAuthProviderError(msg)
         return endpoints
 
-    def _runtime_token_endpoint_auth_method(self, endpoints: OAuthRuntimeEndpoints) -> _TokenEndpointAuthMethod:
-        """Return the token endpoint auth method after endpoint resolution."""
-        return endpoints.token_endpoint_auth_method or self.token_endpoint_auth_method
+    def _runtime_token_endpoint_auth_method(
+        self,
+        endpoints: OAuthRuntimeEndpoints,
+        client_config: OAuthClientConfig,
+    ) -> _TokenEndpointAuthMethod:
+        """Return the token endpoint auth method after client and endpoint resolution."""
+        return (
+            client_config.token_endpoint_auth_method
+            or endpoints.token_endpoint_auth_method
+            or self.token_endpoint_auth_method
+        )
 
     def default_redirect_uri(self, runtime_paths: RuntimePaths) -> str:
         """Return the local default redirect URI for this provider."""
@@ -578,7 +638,7 @@ class OAuthProvider:
             client_secret=client_config.client_secret,
             scope=self.scopes,
             redirect_uri=client_config.redirect_uri,
-            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints),
+            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints, client_config),
         )
         auth_params = dict(self.extra_auth_params)
         if self.pkce_code_challenge_method is not None:
@@ -625,7 +685,7 @@ class OAuthProvider:
             client_secret=client_config.client_secret,
             scope=self.scopes,
             redirect_uri=client_config.redirect_uri,
-            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints),
+            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints, client_config),
             timeout=_DEFAULT_AUTHORIZE_TIMEOUT_SECONDS,
         ) as client:
             try:
@@ -671,7 +731,7 @@ class OAuthProvider:
             client_id=client_config.client_id,
             client_secret=client_config.client_secret,
             scope=self.scopes,
-            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints),
+            token_endpoint_auth_method=self._runtime_token_endpoint_auth_method(endpoints, client_config),
             timeout=_DEFAULT_AUTHORIZE_TIMEOUT_SECONDS,
         ) as client:
             try:
