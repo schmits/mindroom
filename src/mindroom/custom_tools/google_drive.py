@@ -30,6 +30,7 @@ _MODEL_FUNCTION_NAME_ALIASES = {
     "list_files": "google_drive_list_files",
     "search_files": "google_drive_search_files",
     "read_file": "google_drive_read_file",
+    "download_file": "google_drive_download_file",
 }
 
 
@@ -83,6 +84,7 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
         runtime_paths: RuntimePaths,
         credentials_manager: CredentialsManager | None = None,
         worker_target: ResolvedWorkerTarget | None = None,
+        tool_output_workspace_root: Path | None = None,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
         provided_creds = kwargs.pop("creds", None)
@@ -95,6 +97,12 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
                 kwargs.pop("max_read_size")
             else:
                 kwargs["max_read_size"] = max_read_size
+        if kwargs.get("download_file"):
+            if tool_output_workspace_root is None:
+                logger.warning("Google Drive downloads are disabled because this agent has no workspace")
+                kwargs["download_file"] = False
+            else:
+                kwargs["download_dir"] = tool_output_workspace_root / "google-drive-downloads"
         self._runtime_paths = runtime_paths
         self._creds_manager = credentials_manager
         defer_to_original_auth = self._apply_runtime_original_auth_kwargs(kwargs)
@@ -123,6 +131,11 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
 
     def _should_fallback_to_original_auth(self) -> bool:
         return google_service_account_configured(self.service_account_path, self._runtime_paths)
+
+    def _download_guidance(self) -> str:
+        if "google_drive_download_file" in self.functions:
+            return " Use google_drive_download_file instead."
+        return ""
 
     def _get_file_metadata(self, file_id: str, fields: str) -> dict[str, Any]:
         service = cast("Any", self.service)
@@ -182,7 +195,10 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
                 export_mime = self.TEXT_EXPORT_TYPES[mime_type]
             elif mime_type.startswith(WorkspaceType.WORKSPACE_PREFIX):
                 return json.dumps(
-                    {"error": f"Cannot read {mime_type} as text. Use download_file instead.", "file": metadata},
+                    {
+                        "error": f"Cannot read {mime_type} as text.{self._download_guidance()}",
+                        "file": metadata,
+                    },
                 )
             else:
                 export_mime = None
@@ -195,7 +211,8 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
                 if file_size > self.max_read_size:
                     return json.dumps(
                         {
-                            "error": f"File is {file_size} bytes, exceeds max_read_size ({self.max_read_size}). Use download_file instead.",
+                            "error": f"File is {file_size} bytes, exceeds max_read_size ({self.max_read_size})."
+                            f"{self._download_guidance()}",
                             "file": metadata,
                         },
                     )

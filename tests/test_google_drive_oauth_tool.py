@@ -134,7 +134,7 @@ def _google_drive_download_tool(
         credentials_manager=CredentialsManager(tmp_path / "credentials"),
         creds=_ValidCredentials(),
         download_file=True,
-        download_dir=download_dir or tmp_path,
+        tool_output_workspace_root=download_dir or tmp_path,
     )
     service = _FakeDriveService()
     tool.service = service
@@ -228,6 +228,56 @@ def test_google_drive_model_functions_do_not_collide_with_local_file_tools(tmp_p
         "google_drive_search_files",
         "google_drive_read_file",
     } <= function_names
+
+
+def test_google_drive_download_uses_namespaced_model_function(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
+    tool = get_tool_by_name(
+        "google_drive",
+        runtime_paths,
+        credentials_manager=CredentialsManager(tmp_path / "credentials"),
+        tool_config_overrides={"download_file": True},
+        disable_sandbox_proxy=True,
+        tool_output_workspace_root=tmp_path,
+        worker_target=None,
+    )
+
+    assert "google_drive_download_file" in tool.functions
+    assert "download_file" not in tool.functions
+    assert "google_drive_download_file" in tool.async_functions
+    assert "download_file" not in tool.async_functions
+    assert tool.download_dir == tmp_path / "google-drive-downloads"
+
+
+def test_google_drive_download_disabled_without_workspace(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
+    tool = get_tool_by_name(
+        "google_drive",
+        runtime_paths,
+        credentials_manager=CredentialsManager(tmp_path / "credentials"),
+        tool_config_overrides={"download_file": True},
+        disable_sandbox_proxy=True,
+        tool_output_workspace_root=None,
+        worker_target=None,
+    )
+
+    assert "google_drive_download_file" not in tool.functions
+    assert "google_drive_download_file" not in tool.async_functions
+    assert "google_drive_list_files" in tool.functions
+
+
+def test_google_drive_download_confines_truthy_non_bool_flag(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
+    tool = GoogleDriveTools(
+        runtime_paths=runtime_paths,
+        credentials_manager=CredentialsManager(tmp_path / "credentials"),
+        creds=_ValidCredentials(),
+        download_file="true",
+        tool_output_workspace_root=tmp_path,
+    )
+
+    assert "google_drive_download_file" in tool.functions
+    assert tool.download_dir == tmp_path / "google-drive-downloads"
 
 
 def test_google_drive_connect_instruction_uses_redirect_uri_public_origin(tmp_path: Path) -> None:
@@ -575,7 +625,7 @@ def test_google_drive_read_metadata_supports_shared_drive_files(tmp_path: Path) 
 
     result = json.loads(tool.read_file("shared-drive-folder-id"))
 
-    assert result["error"] == "Cannot read application/vnd.google-apps.folder as text. Use download_file instead."
+    assert result["error"] == "Cannot read application/vnd.google-apps.folder as text."
     assert service.files_resource.get_kwargs == {
         "fileId": "shared-drive-folder-id",
         "fields": tool.READ_METADATA_FIELDS,
@@ -610,6 +660,44 @@ def test_google_drive_read_media_supports_shared_drive_files(tmp_path: Path) -> 
     assert service.files_resource.export_media_kwargs is None
 
 
+def test_google_drive_large_file_error_names_exposed_download_function(tmp_path: Path) -> None:
+    runtime_paths = _runtime_paths_with_google_drive_client(tmp_path)
+    tool = GoogleDriveTools(
+        runtime_paths=runtime_paths,
+        credentials_manager=CredentialsManager(tmp_path / "credentials"),
+        creds=_ValidCredentials(),
+        max_read_size=4,
+    )
+    service = _FakeDriveService()
+    service.files_resource.file_metadata = {
+        "name": "notes.txt",
+        "mimeType": "text/plain",
+        "size": "5",
+        "webViewLink": "https://drive.google.com/file/d/example",
+    }
+    tool.service = service
+
+    result = json.loads(tool.read_file("shared-drive-file-id"))
+
+    assert result["error"] == "File is 5 bytes, exceeds max_read_size (4)."
+    assert service.files_resource.get_media_kwargs is None
+
+
+def test_google_drive_read_error_names_enabled_download_function(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch)
+
+    result = json.loads(tool.read_file("shared-drive-folder-id"))
+
+    assert (
+        result["error"]
+        == "Cannot read application/vnd.google-apps.folder as text. Use google_drive_download_file instead."
+    )
+    assert service.files_resource.get_media_kwargs is None
+
+
 def test_google_drive_download_media_supports_shared_drive_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -624,8 +712,8 @@ def test_google_drive_download_media_supports_shared_drive_files(
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
     assert result["status"] == "downloaded"
-    assert Path(result["path"]) == tmp_path / "notes.txt"
-    assert (tmp_path / "notes.txt").read_text() == "hello"
+    assert Path(result["path"]) == tmp_path / "google-drive-downloads" / "notes.txt"
+    assert (tmp_path / "google-drive-downloads" / "notes.txt").read_text() == "hello"
     assert service.files_resource.get_media_kwargs == {
         "fileId": "shared-drive-file-id",
         "supportsAllDrives": True,
@@ -712,10 +800,11 @@ def test_google_drive_download_rejects_symlink_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     download_dir = tmp_path / "downloads"
-    download_dir.mkdir()
+    target_dir = download_dir / "google-drive-downloads"
+    target_dir.mkdir(parents=True)
     outside_path = tmp_path / "outside.txt"
     outside_path.write_text("outside")
-    (download_dir / "notes.txt").symlink_to(outside_path)
+    (target_dir / "notes.txt").symlink_to(outside_path)
     tool, service = _google_drive_download_tool(tmp_path, monkeypatch, download_dir=download_dir)
     service.files_resource.file_metadata = {
         "name": "notes.txt",
@@ -746,11 +835,35 @@ def test_google_drive_download_adds_export_extension_inside_download_dir(
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
     assert result["status"] == "exported"
-    assert Path(result["path"]) == tmp_path / "proposal.docx"
-    assert (tmp_path / "proposal.docx").read_bytes() == b"docx"
+    assert Path(result["path"]) == tmp_path / "google-drive-downloads" / "proposal.docx"
+    assert (tmp_path / "google-drive-downloads" / "proposal.docx").read_bytes() == b"docx"
     assert service.files_resource.export_media_kwargs == {
         "fileId": "shared-drive-file-id",
         "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    }
+    assert service.files_resource.get_media_kwargs is None
+
+
+def test_google_drive_download_exports_complete_spreadsheet_as_xlsx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch)
+    service.files_resource.file_metadata = {
+        "name": "hardware-baseline",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "webViewLink": "https://drive.google.com/spreadsheets/d/example",
+    }
+    tool._download_bytes = lambda _request: b"xlsx workbook"
+
+    result = json.loads(tool.download_file("shared-drive-file-id"))
+
+    assert result["status"] == "exported"
+    assert Path(result["path"]) == tmp_path / "google-drive-downloads" / "hardware-baseline.xlsx"
+    assert (tmp_path / "google-drive-downloads" / "hardware-baseline.xlsx").read_bytes() == b"xlsx workbook"
+    assert service.files_resource.export_media_kwargs == {
+        "fileId": "shared-drive-file-id",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     }
     assert service.files_resource.get_media_kwargs is None
 
@@ -770,9 +883,9 @@ def test_google_drive_download_preserves_existing_export_extension(
     result = json.loads(tool.download_file("shared-drive-file-id"))
 
     assert result["status"] == "exported"
-    assert Path(result["path"]) == tmp_path / "proposal.docx"
-    assert (tmp_path / "proposal.docx").read_bytes() == b"docx"
-    assert not (tmp_path / "proposal.docx.docx").exists()
+    assert Path(result["path"]) == tmp_path / "google-drive-downloads" / "proposal.docx"
+    assert (tmp_path / "google-drive-downloads" / "proposal.docx").read_bytes() == b"docx"
+    assert not (tmp_path / "google-drive-downloads" / "proposal.docx.docx").exists()
     assert service.files_resource.export_media_kwargs == {
         "fileId": "shared-drive-file-id",
         "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
