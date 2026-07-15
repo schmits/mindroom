@@ -33,7 +33,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
 from mindroom.model_loading import get_model_instance
-from mindroom.openai_responses_model import MindRoomOpenAIResponses
+from mindroom.openai_models import MindRoomOpenAIResponses
 from mindroom.openai_tool_search import (
     _DEFERRED_TOOL_NAMES_ATTR,
     install_openai_deferred_tool_search,
