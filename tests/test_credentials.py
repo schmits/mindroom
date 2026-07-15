@@ -123,6 +123,66 @@ class TestCredentialsManager:
         loaded_creds = credentials_manager.load_credentials("test_service")
         assert loaded_creds == test_creds
 
+    def test_plaintext_credentials_storage_is_private(self, tmp_path: Path) -> None:
+        """Plaintext credential storage should only be accessible to the owning OS user."""
+        credentials_dir = tmp_path / "credentials"
+        credentials_dir.mkdir(mode=0o755)
+        existing_path = credentials_dir / "existing_credentials.json"
+        existing_path.write_text('{"token":"existing"}', encoding="utf-8")
+        existing_path.chmod(0o644)
+
+        manager = CredentialsManager(credentials_dir)
+        manager.save_credentials("new", {"token": "new"})
+
+        assert stat.S_IMODE(credentials_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(existing_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(manager.get_credentials_path("new").stat().st_mode) == 0o600
+
+    def test_credentials_hardening_permission_error_is_actionable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Permission failures should identify the path, mode, and ownership fix."""
+        credentials_dir = tmp_path / "credentials"
+        credentials_dir.mkdir()
+        original_chmod = Path.chmod
+
+        def deny_credentials_chmod(path: Path, mode: int) -> None:
+            if path == credentials_dir:
+                raise PermissionError
+            original_chmod(path, mode)
+
+        monkeypatch.setattr(Path, "chmod", deny_credentials_chmod)
+
+        with pytest.raises(
+            PermissionError,
+            match=rf"{credentials_dir}.*0o700.*MindRoom OS user owns",
+        ):
+            CredentialsManager(credentials_dir)
+
+    def test_primary_manager_hardens_existing_worker_credentials(self, tmp_path: Path) -> None:
+        """Root initialization should secure dormant worker credential stores."""
+        storage_root = tmp_path / "mindroom_data"
+        worker_root = storage_root / "workers" / "worker-existing"
+        worker_credentials = worker_root / "credentials"
+        worker_shared_credentials = worker_root / ".shared_credentials"
+        worker_credentials.mkdir(parents=True, mode=0o755)
+        worker_shared_credentials.mkdir(mode=0o755)
+        credentials_path = worker_credentials / "google_credentials.json"
+        shared_credentials_path = worker_shared_credentials / "openai_credentials.json"
+        credentials_path.write_text('{"token":"worker"}', encoding="utf-8")
+        shared_credentials_path.write_text('{"api_key":"shared"}', encoding="utf-8")
+        credentials_path.chmod(0o644)
+        shared_credentials_path.chmod(0o644)
+
+        CredentialsManager(storage_root / "credentials")
+
+        assert stat.S_IMODE(worker_credentials.stat().st_mode) == 0o700
+        assert stat.S_IMODE(worker_shared_credentials.stat().st_mode) == 0o700
+        assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(shared_credentials_path.stat().st_mode) == 0o600
+
     def test_encrypted_save_and_load_credentials_round_trip(
         self,
         tmp_path: Path,

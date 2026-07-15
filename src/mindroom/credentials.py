@@ -150,16 +150,52 @@ def _ensure_private_directory(path: Path, *, harden_existing: bool = False) -> N
             if directory_path not in directories_to_chmod:
                 directories_to_chmod.append(directory_path)
     for directory_path in directories_to_chmod:
-        directory_path.chmod(0o700)
+        _set_private_permissions(directory_path, 0o700)
+
+
+def _set_private_permissions(path: Path, mode: int) -> None:
+    """Set a private mode or fail with actionable ownership guidance."""
+    try:
+        path.chmod(mode)
+    except PermissionError as exc:
+        msg = (
+            f"Cannot secure credential path '{path}' with mode {mode:#05o}. "
+            "Ensure the MindRoom OS user owns this path and can change its permissions."
+        )
+        raise PermissionError(msg) from exc
 
 
 def _credential_owned_directory_chain(path: Path) -> list[Path]:
-    """Return credential-owned directories that should be private when encryption is enabled."""
+    """Return credential-owned directories that should be private."""
     chain = [path, *path.parents]
     for index, directory_path in enumerate(chain):
         if directory_path.name == _PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME:
             return list(reversed(chain[: index + 1]))
     return [path]
+
+
+def _harden_existing_credential_files(path: Path) -> None:
+    """Make existing credential payloads owner-readable only."""
+    for credentials_path in path.glob("*_credentials.json"):
+        if not credentials_path.is_symlink() and credentials_path.is_file():
+            _set_private_permissions(credentials_path, 0o600)
+
+
+def _existing_worker_credential_paths(storage_root: Path) -> tuple[Path, ...]:
+    """Return real credential directories belonging to existing workers."""
+    workers_root = storage_root / "workers"
+    if workers_root.is_symlink() or not workers_root.is_dir():
+        return ()
+
+    paths: list[Path] = []
+    for worker_root in workers_root.iterdir():
+        if worker_root.is_symlink() or not worker_root.is_dir():
+            continue
+        for directory_name in ("credentials", _WORKER_SHARED_CREDENTIALS_DIRNAME):
+            credential_path = worker_root / directory_name
+            if not credential_path.is_symlink() and credential_path.is_dir():
+                paths.append(credential_path)
+    return tuple(paths)
 
 
 def _atomic_write_private_file(path: Path, payload: bytes) -> None:
@@ -221,16 +257,12 @@ class CredentialsManager:
             else None
         )
 
-        encrypted_storage_enabled = self._encryption_key is not None
-        if encrypted_storage_enabled:
-            _ensure_private_directory(self.base_path, harden_existing=True)
-        else:
-            self.base_path.mkdir(parents=True, exist_ok=True)
-        if self.shared_base_path != self.base_path:
-            if encrypted_storage_enabled:
-                _ensure_private_directory(self.shared_base_path, harden_existing=True)
-            else:
-                self.shared_base_path.mkdir(parents=True, exist_ok=True)
+        credential_paths = {self.base_path, self.shared_base_path}
+        if self.current_worker_key is None and self.base_path.name == "credentials":
+            credential_paths.update(_existing_worker_credential_paths(self.storage_root))
+        for credential_path in credential_paths:
+            _ensure_private_directory(credential_path, harden_existing=True)
+            _harden_existing_credential_files(credential_path)
 
     @property
     def storage_root(self) -> Path:
@@ -379,8 +411,7 @@ class CredentialsManager:
         if credentials_path.exists() and _has_encrypted_credentials_magic(credentials_path):
             msg = f"Stored credentials for {normalized_service} are encrypted; refusing to overwrite without a key"
             raise ValueError(msg)
-        with credentials_path.open("w", encoding="utf-8") as f:
-            json.dump(credentials, f, indent=2)
+        _atomic_write_private_file(credentials_path, json.dumps(credentials, indent=2).encode("utf-8"))
 
     def delete_credentials(self, service: str) -> None:
         """Delete credentials for a service.
