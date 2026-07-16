@@ -491,6 +491,17 @@ See the [Hooks](https://docs.mindroom.chat/hooks/) page for full documentation i
 - Error handling without cooldowns or circuit breakers
 - Testing patterns
 
+## Compatibility checks
+
+Validate a plugin against the installed MindRoom version before deployment:
+
+```bash
+mindroom plugins check ./my-plugin
+```
+
+The command strictly loads and validates the manifest, tools, hooks, OAuth providers, and skills using isolated temporary runtime paths.
+It reports discovered tools, hooks, and skills, then exits nonzero without leaving plugin registrations active when validation fails.
+
 ## Live development (hot reload)
 
 Plugins hot-reload automatically.
