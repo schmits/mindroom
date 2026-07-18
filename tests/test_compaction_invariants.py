@@ -718,6 +718,82 @@ def test_compaction_input_estimate_uses_tiktoken() -> None:
     assert estimate_compaction_input_tokens("☃☃") == 4
 
 
+def test_compaction_input_estimate_uses_conservative_claude_fallback() -> None:
+    assert estimate_compaction_input_tokens(
+        "structured: true",
+        model_id="claude-sonnet-5",
+        conservative_fallback=True,
+    ) == len(b"structured: true")
+    assert estimate_compaction_input_tokens("☃☃", model_id="claude-sonnet-5", conservative_fallback=True) == 6
+
+
+def test_compaction_input_estimate_keeps_known_model_encoding() -> None:
+    assert estimate_compaction_input_tokens("structured: true", model_id="gpt-4o", conservative_fallback=True) == 3
+
+
+@pytest.mark.asyncio
+async def test_claude_compaction_splits_dense_tool_schema_before_the_input_limit(tmp_path: Path) -> None:
+    """Regression for the production request that tiktoken underestimated by 1.63x."""
+    config, runtime_paths = _make_config(tmp_path)
+    storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
+    runs = []
+    for run_index in range(20):
+        run = _completed_run(f"run-{run_index}")
+        run.metadata = {
+            "tools_schema": [
+                {
+                    "name": f"tool_{run_index}_{tool_index}",
+                    "description": "".join(
+                        f"{run_index * 100_000 + tool_index * 1_000 + value:08x}" for value in range(50)
+                    ),
+                }
+                for tool_index in range(20)
+            ],
+        }
+        runs.append(run)
+    session = _session(runs)
+    write_scope_state(session, _SCOPE, HistoryScopeState(force_compact_before_next_run=True))
+    storage.upsert_session(session)
+    summary_inputs: list[str] = []
+
+    async def record_summary(*, summary_input: str, **_kwargs: object) -> SessionSummary:
+        summary_inputs.append(summary_input)
+        return SessionSummary(summary=f"summary chunk {len(summary_inputs)}", updated_at=datetime.now(UTC))
+
+    summary_input_limit = 167_232
+    with patch(
+        "mindroom.history.compaction.generate_compaction_summary",
+        new=AsyncMock(side_effect=record_summary),
+    ):
+        outcome = await compact_scope_history(
+            storage=storage,
+            session=session,
+            scope=_SCOPE,
+            state=read_scope_state(session, _SCOPE),
+            history_settings=_HISTORY_SETTINGS,
+            available_history_budget=None,
+            summary_input_budget=summary_input_limit,
+            summary_model=_RecordingClaude(id="claude-sonnet-5"),
+            summary_model_name="summary-model",
+            replay_window_tokens=200_000,
+            threshold_tokens=None,
+            summary_prompt=COMPACTION_SUMMARY_PROMPT,
+        )
+
+    assert outcome is not None
+    assert outcome.compacted_run_count == 20
+    assert len(summary_inputs) == 2
+    assert all(len(summary_input.encode("utf-8")) <= summary_input_limit for summary_input in summary_inputs)
+    assert (
+        estimate_compaction_input_tokens(
+            summary_inputs[0],
+            model_id="claude-sonnet-5",
+        )
+        < summary_input_limit
+    )
+    storage.close()
+
+
 @pytest.mark.asyncio
 async def test_compaction_retries_empty_summary_result_with_smaller_input(tmp_path: Path) -> None:
     """An empty summary response retries with a smaller input."""
