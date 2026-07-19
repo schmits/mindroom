@@ -18,7 +18,7 @@ import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import nio
 from nio.responses import RoomGetEventError
@@ -41,6 +41,10 @@ from mindroom.matrix.client_thread_history import (
     get_room_threads_page,
 )
 from mindroom.matrix.event_info import EventInfo
+from mindroom.matrix.media import (
+    is_encrypted_media_event_source,
+    parse_matrix_media_event_source,
+)
 from mindroom.matrix.message_content import extract_edit_body
 from mindroom.matrix.thread_bookkeeping import ThreadMutationResolver
 from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
@@ -301,6 +305,14 @@ async def _cached_room_get_event_response(
         event_cache=event_cache,
         trusted_sender_ids=trusted_sender_ids,
     )
+    if is_encrypted_media_event_source(visible_event_source):
+        parsed_media_event = parse_matrix_media_event_source(visible_event_source)
+        if parsed_media_event is None:
+            return None
+        cached_response = nio.RoomGetEventResponse()
+        # nio's response parser also assigns BadEvent to this Event-typed field.
+        cached_response.event = cast("nio.Event", parsed_media_event)
+        return cached_response
     cached_response = nio.RoomGetEventResponse.from_dict(visible_event_source)
     return cached_response if isinstance(cached_response, nio.RoomGetEventResponse) else None
 
