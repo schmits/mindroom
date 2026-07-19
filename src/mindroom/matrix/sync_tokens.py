@@ -12,30 +12,24 @@ from mindroom.matrix.sync_token_values import normalize_sync_token
 if TYPE_CHECKING:
     from pathlib import Path
 
-_SYNC_TOKEN_RECORD_VERSION = "mindroom-sync-token-v1"  # noqa: S105
+_SYNC_TOKEN_RECORD_VERSION = "mindroom-sync-token-v2"  # noqa: S105
 
 
 @dataclass(frozen=True)
 class _SyncTokenRecord:
-    """Loaded sync token plus optional durable cache checkpoint."""
+    """One sync checkpoint bound to the cache generation that certified it."""
 
-    token: str
-    checkpoint: SyncCheckpoint | None = None
+    checkpoint: SyncCheckpoint
+    cache_generation: str
 
-    @property
-    def certified(self) -> bool:
-        """Return whether this token carries cache-trust certification."""
-        return self.checkpoint is not None
+    def is_bound_to(self, cache_generation: str | None) -> bool:
+        """Return whether this record was certified against the active cache."""
+        return cache_generation is not None and self.cache_generation == cache_generation
 
 
 def _sync_token_path(storage_path: Path, agent_name: str) -> Path:
     """Return the on-disk path for one agent's sync token."""
     return storage_path / "sync_tokens" / f"{agent_name}.token"
-
-
-def _sync_token_certification_path(storage_path: Path, agent_name: str) -> Path:
-    """Return the legacy marker path removed during cleanup."""
-    return storage_path / "sync_tokens" / f"{agent_name}.token.certified"
 
 
 def _record_from_json(text: str) -> _SyncTokenRecord | None:
@@ -49,13 +43,19 @@ def _record_from_json(text: str) -> _SyncTokenRecord | None:
     token = normalize_sync_token(payload.get("token"))
     if token is None:
         return None
-    checkpoint = SyncCheckpoint(token=token)
-    return _SyncTokenRecord(token=token, checkpoint=checkpoint)
+    cache_generation = payload.get("cache_generation")
+    if not isinstance(cache_generation, str) or not cache_generation:
+        return None
+    return _SyncTokenRecord(
+        checkpoint=SyncCheckpoint(token=token),
+        cache_generation=cache_generation,
+    )
 
 
-def _record_json(checkpoint: SyncCheckpoint) -> str:
+def _record_json(checkpoint: SyncCheckpoint, *, cache_generation: str) -> str:
     """Return the durable JSON token record for one certified checkpoint."""
     payload = {
+        "cache_generation": cache_generation,
         "token": checkpoint.token,
         "version": _SYNC_TOKEN_RECORD_VERSION,
     }
@@ -66,6 +66,8 @@ def save_sync_token(
     storage_path: Path,
     agent_name: str,
     token: str,
+    *,
+    cache_generation: str,
 ) -> None:
     """Persist one cache-certified sync token checkpoint."""
     token_path = _sync_token_path(storage_path, agent_name)
@@ -73,18 +75,21 @@ def save_sync_token(
     if token_value is None:
         msg = "Certified sync tokens require a non-empty token"
         raise ValueError(msg)
+    if not cache_generation:
+        msg = "Certified sync tokens require a cache generation"
+        raise ValueError(msg)
     checkpoint = SyncCheckpoint(token=token_value)
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(_record_json(checkpoint), encoding="utf-8")
-    _sync_token_certification_path(storage_path, agent_name).unlink(missing_ok=True)
+    token_path.write_text(
+        _record_json(checkpoint, cache_generation=cache_generation),
+        encoding="utf-8",
+    )
 
 
 def clear_sync_token(storage_path: Path, agent_name: str) -> None:
     """Remove one persisted sync token when present."""
     token_path = _sync_token_path(storage_path, agent_name)
-    certification_path = _sync_token_certification_path(storage_path, agent_name)
     token_path.unlink(missing_ok=True)
-    certification_path.unlink(missing_ok=True)
 
 
 def load_sync_token_record(storage_path: Path, agent_name: str) -> _SyncTokenRecord | None:
@@ -99,10 +104,4 @@ def load_sync_token_record(storage_path: Path, agent_name: str) -> _SyncTokenRec
     if not token_text:
         return None
 
-    if token_text.lstrip().startswith("{"):
-        return _record_from_json(token_text)
-
-    token = normalize_sync_token(token_text)
-    if token is None:
-        return None
-    return _SyncTokenRecord(token=token)
+    return _record_from_json(token_text)

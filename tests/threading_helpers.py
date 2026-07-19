@@ -70,7 +70,7 @@ def _load_sync_token_value(storage_path: Path, agent_name: str) -> str | None:
     token_record = load_sync_token_record(storage_path, agent_name)
     if token_record is None:
         return None
-    return token_record.token
+    return token_record.checkpoint.token
 
 
 def _runtime_bound_config(config: Config, runtime_root: Path) -> Config:
@@ -532,6 +532,7 @@ def _save_certified_sync_token(
         bot.storage_path,
         bot.agent_name,
         token,
+        cache_generation=bot.event_cache.certification_generation or "test-cache-generation",
     )
 
 

@@ -1021,7 +1021,7 @@ class AgentBot:
         """Reset the monotonic watchdog clock for a fresh sync iteration."""
         self._last_sync_monotonic = None
 
-    def _loaded_sync_token_for_certification(self) -> SyncCheckpoint | str | None:
+    def _loaded_sync_token_for_certification(self) -> SyncCheckpoint | None:
         """Load a saved token record without deciding trust in bot code."""
         try:
             token_record = load_sync_token_record(self.storage_path, self.agent_name)
@@ -1030,11 +1030,16 @@ class AgentBot:
             return None
         if token_record is None:
             return None
-        self.logger.info(
-            "matrix_sync_token_restored",
-            certified=token_record.certified,
-        )
-        return token_record.checkpoint if token_record.checkpoint is not None else token_record.token
+        cache_generation = self.event_cache.certification_generation
+        if not token_record.is_bound_to(cache_generation):
+            self.logger.warning(
+                "matrix_sync_token_cache_generation_mismatch",
+                cache_generation_present=cache_generation is not None,
+            )
+            self._clear_saved_sync_token()
+            return None
+        self.logger.info("matrix_sync_token_restored")
+        return token_record.checkpoint
 
     def _restore_saved_sync_token(self) -> None:
         """Restore Matrix sync continuity and initialize cache certification state."""
@@ -1048,18 +1053,21 @@ class AgentBot:
             # Without sync continuity the initial sync replays recent history an
             # earlier device may already have handled; don't re-notify on it.
             raise_notice_floor(self.client.user_id)
-        if startup.legacy_token:
-            self.logger.warning("matrix_sync_token_uncertified_legacy")
 
     def _save_sync_checkpoint(self, checkpoint: SyncCheckpoint | None) -> None:
         """Persist one certified sync checkpoint if present."""
         if checkpoint is None:
+            return
+        cache_generation = self.event_cache.certification_generation
+        if cache_generation is None:
+            self.logger.warning("matrix_sync_token_save_failed", error="cache generation unavailable")
             return
         try:
             save_sync_token(
                 self.storage_path,
                 self.agent_name,
                 checkpoint.token,
+                cache_generation=cache_generation,
             )
         except (OSError, ValueError) as exc:
             self.logger.warning("matrix_sync_token_save_failed", error=str(exc))
@@ -1816,7 +1824,12 @@ class AgentBot:
             except OSError as exc:
                 self.logger.warning("matrix_sync_token_load_failed", error=str(exc))
             else:
-                retry_token = token_record.token if token_record is not None else None
+                cache_generation = self.event_cache.certification_generation
+                retry_token = (
+                    token_record.checkpoint.token
+                    if token_record is not None and token_record.is_bound_to(cache_generation)
+                    else None
+                )
         cast("Any", client).next_batch = retry_token
         self.logger.warning(
             "matrix_redaction_callback_failed_replaying_sync",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ from .event_batching import group_lookup_events_by_room
 from .event_cache import EventCacheBackendUnavailableError
 from .event_normalization import normalize_event_source_for_cache
 from .postgres_agent_message_snapshot import load_postgres_agent_message_snapshot
+from .postgres_cache_maintenance import migrate_postgres_schema, run_startup_maintenance
 from .postgres_redaction import redact_postgres_connection_info
 from .thread_cache_state import replacement_validated_at
 
@@ -28,10 +30,11 @@ if TYPE_CHECKING:
     from psycopg import AsyncConnection
 
     from .agent_message_snapshot import AgentMessageSnapshot
+    from .cache_maintenance import CacheMaintenanceReport
     from .event_cache import ThreadCacheState
 
 
-_POSTGRES_EVENT_CACHE_SCHEMA_VERSION = 1
+_POSTGRES_EVENT_CACHE_SCHEMA_VERSION = 2
 _LOCK_WAIT_LOG_THRESHOLD_SECONDS = 0.1
 _MAX_CACHED_ROOM_LOCKS = 256
 _MAX_TRANSIENT_OPERATION_ATTEMPTS = 2
@@ -61,6 +64,25 @@ _TRANSIENT_ERROR_TEXT: tuple[str, ...] = (
     "temporary failure in name resolution",
     "terminating connection",
 )
+
+
+class _CertificationGenerationChangedError(RuntimeError):
+    """Raised when a reconnect no longer sees the initialized cache generation."""
+
+
+def _require_runtime_certification_generation(generation: str | None) -> str:
+    """Return the initialized generation required for a safe reconnect."""
+    if generation is None:
+        msg = "PostgreSQL event cache reconnect lacks an initialized certification generation"
+        raise RuntimeError(msg)
+    return generation
+
+
+def _require_matching_certification_generation(actual: str | None, expected: str) -> None:
+    """Reject reconnecting to missing or replaced namespace state."""
+    if actual != expected:
+        msg = "PostgreSQL event cache certification generation changed during reconnect"
+        raise _CertificationGenerationChangedError(msg)
 
 
 def _postgres_error_sqlstate(exc: BaseException) -> str | None:
@@ -139,16 +161,65 @@ async def _initialize_postgres_event_cache_db(
     database_url: str,
     *,
     namespace: str,
-) -> psycopg.AsyncConnection:
+) -> tuple[psycopg.AsyncConnection, CacheMaintenanceReport, str]:
     """Open the PostgreSQL database and ensure the event-cache schema exists."""
     db = await psycopg.AsyncConnection.connect(database_url)
     try:
+        await db.execute("SELECT pg_advisory_xact_lock(hashtext('mindroom_event_cache_schema'))")
         await _create_postgres_event_cache_schema(db)
-        await _validate_postgres_event_cache_schema(db)
+        current_schema_version = await _postgres_schema_version(db)
+        migration_result = await migrate_postgres_schema(
+            db,
+            namespace=namespace,
+            current_schema_version=current_schema_version,
+            target_schema_version=_POSTGRES_EVENT_CACHE_SCHEMA_VERSION,
+        )
+        certification_generation = await _initialize_namespace_certification_generation(
+            db,
+            namespace=namespace,
+        )
+        report = await run_startup_maintenance(
+            db,
+            namespace=namespace,
+            schema_version=_POSTGRES_EVENT_CACHE_SCHEMA_VERSION,
+            migrated_from_schema_version=migration_result.migrated_from_schema_version,
+            normalized_legacy_thread_payload_rows=migration_result.normalized_legacy_thread_payload_rows,
+        )
         await db.commit()
     except BaseException:
         await _rollback_postgres_connection_best_effort(db, namespace=namespace, operation="initialize")
         await _close_postgres_connection_best_effort(db, namespace=namespace, operation="initialize")
+        raise
+    logger.info(
+        "Matrix event cache startup maintenance complete",
+        backend="postgres",
+        namespace=namespace,
+        **report.as_runtime_diagnostics(),
+    )
+    return db, report, certification_generation
+
+
+async def _reconnect_postgres_event_cache_db(
+    database_url: str,
+    *,
+    namespace: str,
+    expected_certification_generation: str,
+) -> psycopg.AsyncConnection:
+    """Open a replacement connection without rerunning startup-wide maintenance."""
+    db = await psycopg.AsyncConnection.connect(database_url)
+    try:
+        certification_generation = await _load_namespace_certification_generation(
+            db,
+            namespace=namespace,
+        )
+        _require_matching_certification_generation(
+            certification_generation,
+            expected_certification_generation,
+        )
+        await db.commit()
+    except BaseException:
+        await _rollback_postgres_connection_best_effort(db, namespace=namespace, operation="reconnect")
+        await _close_postgres_connection_best_effort(db, namespace=namespace, operation="reconnect")
         raise
     return db
 
@@ -164,7 +235,7 @@ async def _create_postgres_event_cache_schema(db: AsyncConnection) -> None:
             thread_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             origin_server_ts BIGINT NOT NULL,
-            event_json TEXT NOT NULL,
+            event_json TEXT,
             write_seq BIGINT NOT NULL DEFAULT nextval('mindroom_event_cache_write_seq'),
             PRIMARY KEY (namespace, room_id, event_id)
         )
@@ -290,6 +361,61 @@ async def _create_postgres_event_cache_schema(db: AsyncConnection) -> None:
         )
         """,
     )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mindroom_event_cache_namespace_metadata (
+            namespace TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (namespace, key)
+        )
+        """,
+    )
+
+
+async def _initialize_namespace_certification_generation(
+    db: AsyncConnection,
+    *,
+    namespace: str,
+) -> str:
+    """Return a durable cache generation for one PostgreSQL namespace."""
+    await db.execute(
+        """
+        INSERT INTO mindroom_event_cache_namespace_metadata(namespace, key, value)
+        VALUES (%s, 'certification_generation', %s)
+        ON CONFLICT(namespace, key) DO NOTHING
+        """,
+        (namespace, uuid.uuid4().hex),
+    )
+    certification_generation = await _load_namespace_certification_generation(db, namespace=namespace)
+    if certification_generation is None:
+        msg = "PostgreSQL event cache certification generation was not initialized"
+        raise RuntimeError(msg)
+    return certification_generation
+
+
+async def _load_namespace_certification_generation(
+    db: AsyncConnection,
+    *,
+    namespace: str,
+) -> str | None:
+    """Load the existing certification generation without creating one."""
+    cursor = await db.execute(
+        """
+        SELECT value
+        FROM mindroom_event_cache_namespace_metadata
+        WHERE namespace = %s AND key = 'certification_generation'
+        """,
+        (namespace,),
+    )
+    try:
+        row = await cursor.fetchone()
+    finally:
+        await cursor.close()
+    if row is None:
+        return None
+    generation = str(row[0])
+    return generation or None
 
 
 async def _postgres_schema_version(db: AsyncConnection) -> int | None:
@@ -306,32 +432,6 @@ async def _postgres_schema_version(db: AsyncConnection) -> int | None:
     finally:
         await cursor.close()
     return None if row is None else int(row[0])
-
-
-async def _validate_postgres_event_cache_schema(db: AsyncConnection) -> None:
-    """Store or validate the PostgreSQL cache schema version."""
-    current_schema_version = await _postgres_schema_version(db)
-    if current_schema_version is None:
-        await db.execute(
-            """
-            INSERT INTO mindroom_event_cache_metadata(key, value)
-            VALUES ('schema_version', %s)
-            ON CONFLICT(key) DO NOTHING
-            """,
-            (str(_POSTGRES_EVENT_CACHE_SCHEMA_VERSION),),
-        )
-        current_schema_version = await _postgres_schema_version(db)
-        if current_schema_version is None:
-            msg = "PostgreSQL Matrix event cache schema version was not initialized"
-            raise RuntimeError(msg)
-    if current_schema_version == _POSTGRES_EVENT_CACHE_SCHEMA_VERSION:
-        return
-    msg = (
-        "PostgreSQL Matrix event cache schema version "
-        f"{current_schema_version} is not compatible with expected version "
-        f"{_POSTGRES_EVENT_CACHE_SCHEMA_VERSION}"
-    )
-    raise RuntimeError(msg)
 
 
 @dataclass
@@ -357,6 +457,8 @@ class _PostgresEventCacheRuntime:
         self._database_url = database_url
         self._namespace = namespace
         self._db: psycopg.AsyncConnection | None = None
+        self._maintenance_report: CacheMaintenanceReport | None = None
+        self._certification_generation: str | None = None
         self._disabled_reason: str | None = None
         self._unavailable_reason: str | None = None
         self._transient_failure_count = 0
@@ -403,6 +505,11 @@ class _PostgresEventCacheRuntime:
         """Return whether callers should still attempt durable cache writes."""
         return not self.is_disabled and not self._explicitly_closed
 
+    @property
+    def certification_generation(self) -> str | None:
+        """Return the durable generation bound to certified sync checkpoints."""
+        return self._certification_generation
+
     def disable(self, reason: str) -> None:
         """Disable the advisory cache for the rest of the runtime."""
         if self._disabled_reason is not None:
@@ -426,11 +533,14 @@ class _PostgresEventCacheRuntime:
             "cache_postgres_pending_thread_invalidations": len(self._pending_thread_invalidations),
             "cache_postgres_pending_room_invalidations": len(self._pending_room_invalidations),
             "cache_postgres_explicitly_closed": self._explicitly_closed,
+            "cache_certification_generation_present": self._certification_generation is not None,
         }
         if self._disabled_reason is not None:
             diagnostics["cache_postgres_disabled_reason"] = self._disabled_reason
         if self._unavailable_reason is not None:
             diagnostics["cache_postgres_unavailable_reason"] = self._unavailable_reason
+        if self._maintenance_report is not None:
+            diagnostics.update(self._maintenance_report.as_runtime_diagnostics())
         return diagnostics
 
     async def initialize(self) -> None:
@@ -444,7 +554,24 @@ class _PostgresEventCacheRuntime:
             had_previous_connection = self._db is not None
             await self._close_db_locked(operation="initialize")
             try:
-                self._db = await _initialize_postgres_event_cache_db(self._database_url, namespace=self._namespace)
+                if self._maintenance_report is None:
+                    self._db, report, self._certification_generation = await _initialize_postgres_event_cache_db(
+                        self._database_url,
+                        namespace=self._namespace,
+                    )
+                    self._maintenance_report = report
+                else:
+                    expected_certification_generation = _require_runtime_certification_generation(
+                        self._certification_generation,
+                    )
+                    self._db = await _reconnect_postgres_event_cache_db(
+                        self._database_url,
+                        namespace=self._namespace,
+                        expected_certification_generation=expected_certification_generation,
+                    )
+            except _CertificationGenerationChangedError:
+                self.disable("certification_generation_changed")
+                raise
             except Exception as exc:
                 if _is_transient_postgres_failure(exc):
                     self._transient_failure_count += 1
@@ -679,6 +806,11 @@ class PostgresEventCache:
         """Return whether cache writes can durably persist data."""
         return self._runtime.durable_writes_available
 
+    @property
+    def certification_generation(self) -> str | None:
+        """Return the durable generation bound to certified sync checkpoints."""
+        return self._runtime.certification_generation
+
     async def initialize(self) -> None:
         """Open the PostgreSQL database and create the cache schema."""
         await self._runtime.initialize()
@@ -720,12 +852,15 @@ class PostgresEventCache:
         disabled_result: _T,
         reader: Callable[[psycopg.AsyncConnection], Awaitable[_T]],
     ) -> _T:
-        return await self._operation(
-            room_id,
-            operation=operation,
-            disabled_result=disabled_result,
-            callback=reader,
-        )
+        try:
+            return await self._operation(
+                room_id,
+                operation=operation,
+                disabled_result=disabled_result,
+                callback=reader,
+            )
+        except _CertificationGenerationChangedError:
+            return disabled_result
 
     async def _write_operation(
         self,
@@ -735,12 +870,15 @@ class PostgresEventCache:
         disabled_result: _T,
         writer: Callable[[psycopg.AsyncConnection], Awaitable[_T]],
     ) -> _T:
-        return await self._operation(
-            room_id,
-            operation=operation,
-            disabled_result=disabled_result,
-            callback=writer,
-        )
+        try:
+            return await self._operation(
+                room_id,
+                operation=operation,
+                disabled_result=disabled_result,
+                callback=writer,
+            )
+        except _CertificationGenerationChangedError:
+            return disabled_result
 
     async def _operation(
         self,
