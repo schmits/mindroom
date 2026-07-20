@@ -278,6 +278,7 @@ Otherwise MindRoom leaves the session unchanged and relies on replay fitting for
 Replay planning uses a chars/4 approximation and reserves headroom for the current prompt and output.
 Summary-input chunk sizing uses the model's tiktoken encoding when recognized.
 Direct Anthropic, Vertex AI Claude, and Bedrock Claude summary models without a recognized encoding use one token per UTF-8 byte as a conservative upper bound.
+Compaction chunk logs report `summary_input_estimate`, `summary_input_estimate_kind`, and `summary_input_budget_tokens` so tiktoken counts, o200k estimates, and UTF-8 byte upper bounds are never presented as the same measurement.
 MindRoom does not mutate configured `num_history_runs` to fit the window.
 Instead, it computes the replay plan that actually fits the current call and uses compaction to keep future replay healthy.
 If needed, that replay plan can reduce raw replay, fall back to summary-only replay, or disable persisted replay entirely for the run.

@@ -48,7 +48,13 @@ from mindroom.history.types import (
 from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, emit
 from mindroom.logging_config import get_logger
 from mindroom.timing import timed
-from mindroom.token_budget import estimate_compaction_input_tokens, estimate_text_tokens, stable_serialize
+from mindroom.token_budget import (
+    CompactionEstimateKind,
+    compaction_estimate_kind,
+    estimate_compaction_input_tokens,
+    estimate_text_tokens,
+    stable_serialize,
+)
 from mindroom.tool_system.runtime_context import get_tool_runtime_context, resolve_tool_runtime_hook_bindings
 
 if TYPE_CHECKING:
@@ -370,7 +376,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
     before_persist_callback: Callable[[Sequence[RunOutput | TeamRunOutput]], Awaitable[None]] | None = None,
 ) -> _CompactionRewriteResult | None:
     final_summary_text = _current_summary_text(working_session) or ""
-    token_estimator = _compaction_token_estimator(summary_model)
+    token_estimator, estimate_kind = _compaction_sizing(summary_model)
     total_compacted_run_count = 0
     all_compacted_run_ids: list[str] = []
     all_compacted_run_id_set: set[str] = set()
@@ -400,7 +406,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
                 session_id=session_id,
                 scope=scope.key,
                 candidate_runs=len(compactable_runs),
-                summary_input_budget=summary_input_budget,
+                summary_input_budget_tokens=summary_input_budget,
             )
             if total_compacted_run_count == 0:
                 return None
@@ -419,6 +425,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
             history_settings=history_settings,
             summary_prompt=summary_prompt,
             token_estimator=token_estimator,
+            estimate_kind=estimate_kind,
             fallback_model=fallback_summary_model,
             fallback_model_name=fallback_summary_model_name,
         )
@@ -427,7 +434,7 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
             # summary model for every later chunk, including token estimation.
             summary_model = new_summary.model
             summary_model_name = new_summary.model_name
-            token_estimator = _compaction_token_estimator(summary_model)
+            token_estimator, estimate_kind = _compaction_sizing(summary_model)
             fallback_summary_model = None
             fallback_summary_model_name = None
         included_runs = new_summary.included_runs
@@ -489,13 +496,16 @@ async def _rewrite_working_session_for_compaction(  # noqa: C901
     )
 
 
-def _compaction_token_estimator(summary_model: Model) -> Callable[[str], int]:
-    """Return the summary-input token estimator tuned for one loaded summary model."""
-    return partial(
+def _compaction_sizing(summary_model: Model) -> tuple[Callable[[str], int], CompactionEstimateKind]:
+    """Resolve one estimator together with the kind describing its arithmetic."""
+    conservative_fallback = as_anthropic_claude(summary_model) is not None
+    estimator = partial(
         estimate_compaction_input_tokens,
         model_id=summary_model.id,
-        conservative_fallback=as_anthropic_claude(summary_model) is not None,
+        conservative_fallback=conservative_fallback,
     )
+    kind = compaction_estimate_kind(summary_model.id, conservative_fallback=conservative_fallback)
+    return estimator, kind
 
 
 async def _emit_lifecycle_progress_after_persist(
@@ -542,6 +552,15 @@ async def _emit_lifecycle_progress_after_persist(
     )
 
 
+def _sizing_log_fields(*, kind: CompactionEstimateKind, estimate: int, budget_tokens: int) -> dict[str, object]:
+    """Return unit-explicit fields shared by compaction chunk log events."""
+    return {
+        "summary_input_estimate": estimate,
+        "summary_input_estimate_kind": kind,
+        "summary_input_budget_tokens": budget_tokens,
+    }
+
+
 async def _generate_compaction_summary_with_retry(
     *,
     model: Model,
@@ -556,6 +575,7 @@ async def _generate_compaction_summary_with_retry(
     history_settings: ResolvedHistorySettings,
     summary_prompt: str,
     token_estimator: Callable[[str], int],
+    estimate_kind: CompactionEstimateKind,
     fallback_model: Model | None = None,
     fallback_model_name: str | None = None,
 ) -> _GeneratedSummaryChunk:
@@ -581,7 +601,7 @@ async def _generate_compaction_summary_with_retry(
     )
     attempt = 1
     while True:
-        estimated_input_tokens = token_estimator(summary_input)
+        summary_input_estimate = token_estimator(summary_input)
         started = asyncio.get_running_loop().time()
         logger.info(
             "Compaction summary chunk request",
@@ -591,8 +611,7 @@ async def _generate_compaction_summary_with_retry(
             attempt=attempt,
             candidate_runs=len(compactable_runs),
             included_runs=len(included_runs),
-            estimated_input_tokens=estimated_input_tokens,
-            summary_input_budget=budget,
+            **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
             timeout_seconds=MINDROOM_COMPACTION_CHUNK_TIMEOUT_SECONDS,
         )
         try:
@@ -611,8 +630,7 @@ async def _generate_compaction_summary_with_retry(
                 attempt=attempt,
                 candidate_runs=len(compactable_runs),
                 included_runs=len(included_runs),
-                estimated_input_tokens=estimated_input_tokens,
-                summary_input_budget=budget,
+                **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
                 timeout_seconds=MINDROOM_COMPACTION_CHUNK_TIMEOUT_SECONDS,
                 duration_ms=duration_ms,
                 error=str(exc) or type(exc).__name__,
@@ -641,7 +659,7 @@ async def _generate_compaction_summary_with_retry(
             retry_decision: SummaryRetryDecision | None = retry_policy.retry_budget(
                 attempt=attempt,
                 budget=budget,
-                input_tokens=estimated_input_tokens,
+                input_tokens=summary_input_estimate,
                 minimum_progress_input_tokens=minimum_progress_input_tokens,
                 error=exc,
             )
@@ -659,7 +677,7 @@ async def _generate_compaction_summary_with_retry(
                 )
                 if rebuilt_runs:
                     rebuilt_input_tokens = token_estimator(rebuilt_input)
-                    if retry_decision.kind == "shrink" and rebuilt_input_tokens >= estimated_input_tokens:
+                    if retry_decision.kind == "shrink" and rebuilt_input_tokens >= summary_input_estimate:
                         raise
                     summary_input = rebuilt_input
                     included_runs = rebuilt_runs
@@ -676,8 +694,7 @@ async def _generate_compaction_summary_with_retry(
             attempt=attempt,
             candidate_runs=len(compactable_runs),
             included_runs=len(included_runs),
-            estimated_input_tokens=estimated_input_tokens,
-            summary_input_budget=budget,
+            **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
             timeout_seconds=MINDROOM_COMPACTION_CHUNK_TIMEOUT_SECONDS,
             duration_ms=duration_ms,
         )

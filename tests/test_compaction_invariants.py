@@ -1158,6 +1158,7 @@ async def test_retry_helper_propagates_original_error_when_rebuilt_input_is_not_
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=lambda _value: 2_000,
+            estimate_kind="o200k_base_tokens",
         )
 
     assert raised.value is original_error
@@ -1197,6 +1198,7 @@ async def test_retry_helper_honors_transient_fallthrough_for_shrink_message_at_f
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=lambda _value: COMPACTION_SUMMARY_RETRY_FLOOR_TOKENS,
+            estimate_kind="o200k_base_tokens",
         )
 
     assert generated.summary is recovered_summary
@@ -1251,6 +1253,7 @@ async def test_retry_helper_shrinks_around_a_large_durable_summary() -> None:
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=_chars_per_token_estimator,
+            estimate_kind="o200k_base_tokens",
         )
 
     assert generated.summary is recovered_summary
@@ -1296,6 +1299,7 @@ async def test_retry_helper_propagates_error_when_no_smaller_progress_input_exis
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=_chars_per_token_estimator,
+            estimate_kind="o200k_base_tokens",
         )
 
     assert raised.value is original_error
@@ -1512,6 +1516,7 @@ async def test_retry_helper_switches_to_fallback_once_with_unchanged_prompt_and_
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=lambda _value: 2_000,
+            estimate_kind="o200k_base_tokens",
             fallback_model=fallback,
             fallback_model_name="fallback-model",
         )
@@ -1583,6 +1588,7 @@ async def test_retry_helper_propagates_fallback_refusal_or_failure(fallback_erro
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=lambda _value: 2_000,
+            estimate_kind="o200k_base_tokens",
             fallback_model=fallback,
             fallback_model_name="fallback-model",
         )
@@ -1625,6 +1631,7 @@ async def test_retry_helper_refusal_after_transient_retry_propagates_within_atte
             history_settings=_HISTORY_SETTINGS,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
             token_estimator=lambda _value: 2_000,
+            estimate_kind="o200k_base_tokens",
             fallback_model=fallback,
             fallback_model_name="fallback-model",
         )
