@@ -17,6 +17,7 @@ from psycopg.conninfo import make_conninfo
 from mindroom.matrix.cache import (
     ThreadCacheState,
     postgres_event_cache,
+    sqlite_cache_maintenance,
     sqlite_event_cache,
 )
 from mindroom.matrix.cache.postgres_cache_maintenance import migrate_postgres_schema
@@ -284,6 +285,50 @@ async def test_sqlite_unsupported_schema_reset_reports_destructive_reset(tmp_pat
         assert diagnostics["cache_event_rows"] == 0
     finally:
         await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_startup_report_uses_nonblocking_read_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup diagnostics must stay coherent without blocking active cache writes."""
+    db_path = tmp_path / "event_cache.db"
+    primary = SqliteEventCache(db_path)
+    await primary.initialize()
+    await primary._runtime.require_db().execute("PRAGMA busy_timeout=0")
+    report_started = asyncio.Event()
+    release_report = asyncio.Event()
+    scalar_count = sqlite_cache_maintenance._scalar_count
+
+    async def held_first_count(
+        db: aiosqlite.Connection,
+        query: str,
+        parameters: tuple[object, ...] = (),
+    ) -> int:
+        result = await scalar_count(db, query, parameters)
+        if query == "SELECT COUNT(*) FROM events":
+            report_started.set()
+            await release_report.wait()
+        return result
+
+    monkeypatch.setattr(sqlite_cache_maintenance, "_scalar_count", held_first_count)
+    secondary = SqliteEventCache(db_path)
+    initialize_secondary = asyncio.create_task(secondary.initialize())
+    try:
+        await asyncio.wait_for(report_started.wait(), timeout=1)
+        await primary.mark_thread_stale(_ROOM_ID, _THREAD_ID, reason="concurrent_startup_report")
+    finally:
+        release_report.set()
+        await initialize_secondary
+        diagnostics = secondary.runtime_diagnostics()
+        await secondary.close()
+        await primary.close()
+
+    assert diagnostics["cache_event_rows"] == 0
+    assert diagnostics["cache_thread_state_rows"] == 0
+    assert diagnostics["cache_room_state_rows"] == 0
+    assert diagnostics["cache_stale_thread_markers"] == 0
 
 
 @pytest.mark.asyncio
