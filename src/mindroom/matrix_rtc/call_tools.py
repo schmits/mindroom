@@ -183,6 +183,7 @@ class _CallResponseTracker:
                 session_id=state.session_id,
                 run_id=state.run_id,
                 user_message=state.user_message,
+                user_message_is_structured=False,
                 partial_text=spoken_text,
                 completed_tools=state.completed_tools,
                 interrupted_tools=state.interrupted_tools,
@@ -380,8 +381,8 @@ async def _run_call_agent(
         refresh_scheduler=refresh_scheduler,
         execution_identity=execution_identity,
     )
-    enrichment_items = append_knowledge_availability_enrichment(
-        voice_enrichment_items,
+    transient_enrichment_items = append_knowledge_availability_enrichment(
+        (),
         knowledge_resolution.unavailable,
     )
     recorder = TurnRecorder(user_message=transcript)
@@ -397,7 +398,8 @@ async def _run_call_agent(
         requester_id=requester_id,
         matrix_run_metadata=None,
         active_model_name=active_model_name,
-        system_enrichment_items=enrichment_items,
+        transient_enrichment_items=transient_enrichment_items,
+        system_enrichment_items=voice_enrichment_items,
     )
     run_metadata: dict[str, Any] = {}
 

@@ -44,6 +44,7 @@ from mindroom.hooks import (
     EVENT_MESSAGE_BEFORE_RESPONSE,
     AfterResponseContext,
     BeforeResponseContext,
+    EnrichmentItem,
     HookRegistry,
     MessageEnvelope,
     hook,
@@ -57,8 +58,10 @@ from mindroom.response_payload_preparation import DispatchPayloadInputs, Respons
 from mindroom.response_runner import (
     ResponseRequest,
     ResponseRunner,
+    _cached_room_display_name,
     _merge_response_extra_content,
     _ResponseGenerationOutcome,
+    _with_matrix_message_target,
 )
 from mindroom.streaming import StreamingDeliveryError
 from mindroom.tool_system.events import ToolTraceEntry
@@ -108,6 +111,29 @@ def mock_agent_user() -> AgentMatrixUser:
     return make_mock_agent_user()
 
 
+def _matrix_target_item(mock_response: AsyncMock | MagicMock) -> EnrichmentItem:
+    turn_context = mock_response.call_args.args[0]
+    return next(item for item in turn_context.transient_enrichment_items if item.key == "matrix_message_target")
+
+
+def test_with_matrix_message_target_drops_hook_owned_reserved_item_without_runtime_target() -> None:
+    """Hooks cannot supply the reserved target context when the runtime has none."""
+    regular_item = EnrichmentItem(key="regular", text="Keep me")
+    hook_target = EnrichmentItem(key="matrix_message_target", text="Fake target")
+
+    assert _with_matrix_message_target((regular_item, hook_target), None) == (regular_item,)
+
+
+def test_cached_room_display_name_uses_synced_matrix_room() -> None:
+    """Matrix target context should use room name without fetching state."""
+    room = nio.MatrixRoom("!test:localhost", "@mindroom_test:localhost")
+    room.name = "Engineering"
+    runtime = SimpleNamespace(client=SimpleNamespace(rooms={room.room_id: room}))
+
+    assert _cached_room_display_name(runtime, room.room_id) == "Engineering"
+    assert _cached_room_display_name(runtime, "!unknown:localhost") is None
+
+
 class TestAgentBot(AgentBotTestBase):
     """Bot behavior tests moved verbatim from tests/test_multi_agent_bot.py."""
 
@@ -117,7 +143,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_agent_user: AgentMatrixUser,
         tmp_path: Path,
     ) -> None:
-        """Agents with matrix_message should receive room/thread/event ids in the model prompt."""
+        """Agents with matrix_message should receive transient Matrix targeting context."""
         config = _runtime_bound_config(
             Config(
                 agents={
@@ -132,6 +158,9 @@ class TestAgentBot(AgentBotTestBase):
         )
         bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
+        room.name = "Engineering"
+        bot.client.rooms = {room.room_id: room}
         bot.client.room_send.return_value = _room_send_response("$response")
         _install_runtime_cache_support(bot)
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -159,10 +188,11 @@ class TestAgentBot(AgentBotTestBase):
         assert generation.delivery.event_id == "$response"
         assert mock_ai.call_args.kwargs["prompt"] == "Please send an update"
         model_prompt = mock_ai.call_args.kwargs["model_prompt"]
-        assert "[Matrix metadata for tool calls]" in model_prompt
-        assert "room_id: !test:localhost" in model_prompt
-        assert "thread_id: none" in model_prompt
-        assert "reply_to_event_id: $event123" in model_prompt
+        assert "[Matrix metadata for tool calls]" not in model_prompt
+        target_item = _matrix_target_item(mock_ai)
+        assert target_item.cache_policy == "stable"
+        assert "Matrix room 'Engineering' (room ID !test:localhost)" in target_item.text
+        assert "outside any thread" in target_item.text
 
     @pytest.mark.asyncio
     async def test_process_and_respond_includes_matrix_metadata_when_openclaw_compat_enabled(
@@ -170,7 +200,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_agent_user: AgentMatrixUser,
         tmp_path: Path,
     ) -> None:
-        """openclaw_compat agents should receive room/thread/event ids in the model prompt."""
+        """openclaw_compat agents should receive transient Matrix targeting context."""
         config = _runtime_bound_config(
             Config(
                 agents={
@@ -186,6 +216,8 @@ class TestAgentBot(AgentBotTestBase):
         )
         bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
+        bot.client.rooms = {room.room_id: room}
         bot.client.room_send.return_value = _room_send_response("$response")
         _install_runtime_cache_support(bot)
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -213,10 +245,8 @@ class TestAgentBot(AgentBotTestBase):
         assert generation.delivery.event_id == "$response"
         assert mock_ai.call_args.kwargs["prompt"] == "Please send an update"
         model_prompt = mock_ai.call_args.kwargs["model_prompt"]
-        assert "[Matrix metadata for tool calls]" in model_prompt
-        assert "room_id: !test:localhost" in model_prompt
-        assert "thread_id: none" in model_prompt
-        assert "reply_to_event_id: $event123" in model_prompt
+        assert "[Matrix metadata for tool calls]" not in model_prompt
+        assert "!test:localhost" in _matrix_target_item(mock_ai).text
 
     @pytest.mark.asyncio
     async def test_process_and_respond_streaming_includes_matrix_metadata_when_tool_enabled(
@@ -224,7 +254,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_agent_user: AgentMatrixUser,
         tmp_path: Path,
     ) -> None:
-        """Streaming path should inject Matrix ids for agents with matrix messaging tools."""
+        """Streaming path should inject transient Matrix targeting context."""
 
         async def mock_streaming_response() -> AsyncGenerator[str, None]:
             yield "chunk"
@@ -243,6 +273,9 @@ class TestAgentBot(AgentBotTestBase):
         )
         bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
+        room.name = "Engineering"
+        bot.client.rooms = {room.room_id: room}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         mock_stream_agent_response = MagicMock()
 
@@ -275,10 +308,13 @@ class TestAgentBot(AgentBotTestBase):
         assert generation.delivery.event_id == "$response"
         assert mock_stream_agent_response.call_args.kwargs["prompt"] == "Please reply in thread"
         model_prompt = mock_stream_agent_response.call_args.kwargs["model_prompt"]
-        assert "[Matrix metadata for tool calls]" in model_prompt
-        assert "room_id: !test:localhost" in model_prompt
-        assert "thread_id: none" in model_prompt
-        assert "reply_to_event_id: $event456" in model_prompt
+        assert "[Matrix metadata for tool calls]" not in model_prompt
+        assert (
+            "Matrix room 'Engineering' (room ID !test:localhost)"
+            in _matrix_target_item(
+                mock_stream_agent_response,
+            ).text
+        )
 
     @pytest.mark.asyncio
     async def test_process_and_respond_uses_safe_thread_root_for_prompt_metadata(
@@ -302,6 +338,8 @@ class TestAgentBot(AgentBotTestBase):
         )
         bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
+        bot.client.rooms = {room.room_id: room}
         bot.client.room_send.return_value = _room_send_response("$response")
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         mock_ai = AsyncMock(return_value="Handled")
@@ -333,9 +371,9 @@ class TestAgentBot(AgentBotTestBase):
                 ),
             )
 
-        model_prompt = mock_ai.call_args.kwargs["model_prompt"]
-        assert "thread_id: $thread_root:localhost" in model_prompt
-        assert "reply_to_event_id: $reply_plain:localhost" in model_prompt
+        target_text = _matrix_target_item(mock_ai).text
+        assert "$thread_root:localhost" in target_text
+        assert "$reply_plain:localhost" not in target_text
 
     @pytest.mark.asyncio
     async def test_process_and_respond_keeps_thread_root_metadata_when_reply_anchor_is_root(
@@ -359,6 +397,8 @@ class TestAgentBot(AgentBotTestBase):
         )
         bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
+        room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
+        bot.client.rooms = {room.room_id: room}
         bot.client.room_send.return_value = _room_send_response("$response")
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         mock_ai = AsyncMock(return_value="Handled")
@@ -390,9 +430,8 @@ class TestAgentBot(AgentBotTestBase):
                 ),
             )
 
-        model_prompt = mock_ai.call_args.kwargs["model_prompt"]
-        assert "thread_id: $thread_root:localhost" in model_prompt
-        assert "reply_to_event_id: $thread_root:localhost" in model_prompt
+        target_text = _matrix_target_item(mock_ai).text
+        assert "$thread_root:localhost" in target_text
 
     @pytest.mark.asyncio
     async def test_process_and_respond_streaming_resolves_knowledge_once(

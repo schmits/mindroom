@@ -57,10 +57,7 @@ from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE
 from mindroom.execution_preparation import _PreparedExecutionContext
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import PreparedHistoryState
-from mindroom.hooks import (
-    EnrichmentItem,
-    render_system_enrichment_block,
-)
+from mindroom.hooks import EnrichmentItem, render_enrichment_block, render_transient_context
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.utils import KnowledgeAvailabilityDetail
 from mindroom.llm_request_logging import install_llm_request_logging, stream_with_llm_request_log_context
@@ -223,8 +220,8 @@ def test_ai_run_metadata_context_regression_cached_prefix_sample() -> None:
 
 
 def test_append_knowledge_availability_notice_rendering() -> None:
-    """Knowledge availability notices should render as transient system enrichment."""
-    rendered_context = render_system_enrichment_block(
+    """Knowledge availability notices should render as transient message enrichment."""
+    rendered_context = render_enrichment_block(
         append_knowledge_availability_enrichment(
             (),
             {
@@ -755,7 +752,7 @@ class TestUserIdPassthrough:
         transient_messages = mock_prepare_execution.await_args.kwargs["transient_context_messages"]
         assert len(transient_messages) == 1
         assert transient_messages[0].role == "user"
-        assert transient_messages[0].content == "turn context"
+        assert transient_messages[0].content == render_transient_context(("turn context",))
         assert transient_messages[0].add_to_agent_memory is False
         assert mock_agent.additional_context == "existing context\n\nsession preamble\n\nsystem enrichment"
 
@@ -3769,6 +3766,7 @@ class TestUserIdPassthrough:
             async for _chunk in stream_agent_response(
                 make_turn_context("general", session_id="session1", correlation_id="e1", reply_to_event_id="e1"),
                 prompt="test",
+                model_prompt="test\n\n<mindroom_message_context>persist me</mindroom_message_context>",
                 runtime_paths=_runtime_paths(tmp_path),
                 config=_config(),
                 show_tool_calls=False,
@@ -3797,7 +3795,7 @@ class TestUserIdPassthrough:
         assert persisted_run.status is RunStatus.completed
         assert persisted_run.messages is not None
         assert [(message.role, message.content) for message in persisted_run.messages] == [
-            ("user", "test"),
+            ("user", "test\n\n<mindroom_message_context>persist me</mindroom_message_context>"),
             ("assistant", "Half done\n\n(turn stopped before completion)"),
         ]
 

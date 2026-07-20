@@ -19,6 +19,7 @@ from mindroom.ai_run_metadata import ai_run_extra_content_from_metadata
 from mindroom.background_tasks import create_background_task
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
+    MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY,
     ORIGINAL_SENDER_KEY,
     ROUTER_AGENT_NAME,
     STREAM_STATUS_KEY,
@@ -29,6 +30,7 @@ from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
 from mindroom.history.storage import has_pending_force_compaction_scope, read_scope_state
 from mindroom.history.turn_recorder import TurnRecorder
+from mindroom.hooks import EnrichmentItem
 from mindroom.matrix.client_visible_messages import replace_visible_message
 from mindroom.matrix.presence import should_use_streaming
 from mindroom.matrix.typing import typing_indicator
@@ -104,7 +106,7 @@ if TYPE_CHECKING:
     from mindroom.conversation_state_writer import ConversationStateWriter
     from mindroom.dispatch_source import ScheduledHistoryBudget
     from mindroom.history.types import HistoryScope
-    from mindroom.hooks import EnrichmentItem, MessageEnvelope
+    from mindroom.hooks import MessageEnvelope
     from mindroom.knowledge import KnowledgeAccessSupport
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.matrix.identity import MatrixID
@@ -188,28 +190,57 @@ def _agent_has_matrix_messaging_tool(config: Config, agent_name: str, session_id
     return "matrix_message" in {entry.name for entry in surface.runtime_tool_configs}
 
 
-def _append_matrix_prompt_context(
-    prompt: str,
-    *,
-    target: MessageTarget,
-    include_context: bool,
-) -> str:
-    """Append room/thread/event ids to the prompt when messaging tools are available."""
-    if not include_context:
-        return prompt
-    if "[Matrix metadata for tool calls]" in prompt:
-        return prompt
+def _cached_room_display_name(runtime: BotRuntimeView, room_id: str) -> str | None:
+    """Return the room name already present in the synced Matrix cache."""
+    client = runtime.client
+    if client is None:
+        return None
+    room = client.rooms.get(room_id)
+    if room is None or not room.display_name:
+        return None
+    return room.display_name
 
-    metadata_block = "\n".join(
-        (
-            "[Matrix metadata for tool calls]",
-            f"room_id: {target.room_id}",
-            f"thread_id: {target.resolved_thread_id or 'none'}",
-            f"reply_to_event_id: {target.reply_to_event_id or 'none'}",
-            "Use these IDs when calling matrix_message.",
-        ),
+
+def _matrix_message_target_item(
+    target: MessageTarget,
+    *,
+    matrix_message_available: bool,
+    runtime: BotRuntimeView,
+) -> EnrichmentItem | None:
+    """Build transient Matrix targeting context when the tool is available."""
+    if not matrix_message_available:
+        return None
+    room_display_name = _cached_room_display_name(runtime, target.room_id)
+    room_label = f"{room_display_name!r} (room ID {target.room_id})" if room_display_name else target.room_id
+    thread_id = target.resolved_thread_id
+    if thread_id is None:
+        text = (
+            f"You are responding in Matrix room {room_label}, outside any thread. "
+            "When calling matrix_message here, use this room_id and do not pass thread_id."
+        )
+    else:
+        text = (
+            f"You are responding in Matrix room {room_label}, in thread {thread_id}. "
+            "When calling matrix_message here, use this room_id and thread_id."
+        )
+    text += " Use a current or selected <msg event_id> as target for reactions and edits."
+    return EnrichmentItem(
+        key=MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY,
+        text=text,
+        cache_policy="stable",
+        persist=False,
     )
-    return f"{prompt.rstrip()}\n\n{metadata_block}"
+
+
+def _with_matrix_message_target(
+    items: Sequence[EnrichmentItem],
+    target_item: EnrichmentItem | None,
+) -> tuple[EnrichmentItem, ...]:
+    """Replace any hook-provided Matrix target with runtime-owned context."""
+    filtered_items = tuple(item for item in items if item.key != MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY)
+    if target_item is None:
+        return filtered_items
+    return (*filtered_items, target_item)
 
 
 def _timestamp_thread_history_user_turns(
@@ -285,6 +316,7 @@ class ResponseRequest:
     attachment_ids: tuple[str, ...] | None = None
     correlation_id: str | None = None
     matrix_run_metadata: Mapping[str, Any] | None = None
+    transient_enrichment_items: tuple[EnrichmentItem, ...] = ()
     system_enrichment_items: tuple[EnrichmentItem, ...] = ()
     requires_model_history_refresh: bool = False
     scheduled_history_budget: ScheduledHistoryBudget | None = None
@@ -546,15 +578,21 @@ class ResponseRunner:
         self,
         *,
         user_message: str,
+        user_message_is_structured: bool,
         reply_to_event_id: str | None,
+        requester_id: str | None,
         matrix_run_metadata: dict[str, Any] | None,
     ) -> TurnRecorder:
         """Create one lifecycle-owned recorder seeded with canonical Matrix metadata."""
-        recorder = TurnRecorder(user_message=user_message)
+        recorder = TurnRecorder(
+            user_message=user_message,
+            user_message_is_structured=user_message_is_structured,
+        )
         recorder.set_run_metadata(
             build_matrix_run_metadata(
                 reply_to_event_id,
                 [],
+                requester_id=requester_id,
                 extra_metadata=matrix_run_metadata,
             ),
         )
@@ -586,6 +624,7 @@ class ResponseRunner:
                 run_id=recorder.run_id or run_id or str(uuid4()),
                 snapshot=recorder.interrupted_snapshot(),
                 is_team=is_team,
+                response_sender_id=self.deps.matrix_full_id,
             )
         finally:
             storage.close()
@@ -845,6 +884,7 @@ class ResponseRunner:
                     session_type=session_type,
                     run_id=run_id,
                     response_event_id=response_event_id,
+                    response_sender_id=self.deps.matrix_full_id,
                 )
             finally:
                 storage.close()
@@ -1010,9 +1050,19 @@ class ResponseRunner:
         runtime: _PreparedResponseRuntime,
         run_id: str | None,
         active_event_ids: set[str],
+        transient_enrichment_items: Sequence[EnrichmentItem],
         system_enrichment_items: Sequence[EnrichmentItem],
     ) -> ResponseTurnContext:
         """Build the per-turn identity context for one agent response."""
+        matrix_target_item = _matrix_message_target_item(
+            runtime.resolved_target,
+            matrix_message_available=_agent_has_matrix_messaging_tool(
+                self.deps.runtime.config,
+                self.deps.agent_name,
+                runtime.session_id,
+            ),
+            runtime=self.deps.runtime,
+        )
         return ResponseTurnContext(
             entity_label=self.deps.agent_name,
             session_id=runtime.session_id,
@@ -1024,6 +1074,10 @@ class ResponseRunner:
             requester_id=request.user_id,
             matrix_run_metadata=_materialize_matrix_run_metadata(request.matrix_run_metadata),
             active_event_ids=frozenset(active_event_ids),
+            transient_enrichment_items=_with_matrix_message_target(
+                transient_enrichment_items,
+                matrix_target_item,
+            ),
             system_enrichment_items=tuple(system_enrichment_items),
             scheduled_history_budget=request.scheduled_history_budget,
         )
@@ -1548,14 +1602,13 @@ class ResponseRunner:
         agent_names = [
             registry.current_entity_name_for_user_id(mid.full_id) or mid.username for mid in team_request.team_agents
         ]
-        include_matrix_prompt_context = any(
-            _agent_has_matrix_messaging_tool(self.deps.runtime.config, name, resolved_target.session_id)
-            for name in agent_names
-        )
-        model_message = _append_matrix_prompt_context(
-            prepared_prompt,
-            target=resolved_target,
-            include_context=include_matrix_prompt_context,
+        matrix_target_item = _matrix_message_target_item(
+            resolved_target,
+            matrix_message_available=any(
+                _agent_has_matrix_messaging_tool(self.deps.runtime.config, name, resolved_target.session_id)
+                for name in agent_names
+            ),
+            runtime=self.deps.runtime,
         )
         resolved_request = self._request_with_locked_target(
             replace(
@@ -1631,12 +1684,18 @@ class ResponseRunner:
             requester_id=requester_user_id or execution_identity.requester_id,
             matrix_run_metadata=matrix_run_metadata,
             active_event_ids=frozenset(active_event_ids),
-            system_enrichment_items=tuple(request.system_enrichment_items),
+            transient_enrichment_items=_with_matrix_message_target(
+                request.transient_enrichment_items,
+                matrix_target_item,
+            ),
+            system_enrichment_items=request.system_enrichment_items,
             scheduled_history_budget=request.scheduled_history_budget,
         )
         team_turn_recorder = self._build_turn_recorder(
-            user_message=request.prompt,
+            user_message=prepared_prompt,
+            user_message_is_structured=request.current_prompt_is_structured,
             reply_to_event_id=request.reply_to_event_id,
+            requester_id=requester_user_id or execution_identity.requester_id,
             matrix_run_metadata=matrix_run_metadata,
         )
 
@@ -1688,7 +1747,7 @@ class ResponseRunner:
                     def build_response_stream() -> AsyncIterator[StreamInputChunk]:
                         return team_response_stream(
                             agent_ids=list(team_request.team_agents),
-                            message=model_message,
+                            message=prepared_prompt,
                             orchestrator=orchestrator,
                             execution_identity=tool_dispatch.execution_identity,
                             ctx=team_turn_ctx,
@@ -1790,7 +1849,7 @@ class ResponseRunner:
                                 return await team_response(
                                     agent_names=agent_names,
                                     mode=mode,
-                                    message=model_message,
+                                    message=prepared_prompt,
                                     orchestrator=orchestrator,
                                     execution_identity=tool_dispatch.execution_identity,
                                     ctx=team_turn_ctx,
@@ -2051,15 +2110,7 @@ class ResponseRunner:
         resolved_target = resolved_target.with_thread_root(response_thread_id)
         media_inputs = request.media or MediaInputs()
         session_id = resolved_target.session_id
-        resolved_model_prompt = _append_matrix_prompt_context(
-            request.model_prompt or request.prompt,
-            target=resolved_target,
-            include_context=_agent_has_matrix_messaging_tool(
-                self.deps.runtime.config,
-                self.deps.agent_name,
-                session_id,
-            ),
-        )
+        resolved_model_prompt = request.model_prompt or request.prompt
         runtime_model = self.deps.runtime.config.resolve_runtime_model(
             entity_name=self.deps.agent_name,
             room_id=resolved_target.room_id,
@@ -2115,8 +2166,8 @@ class ResponseRunner:
                 self.deps.agent_name,
                 execution_identity=runtime.tool_dispatch.execution_identity,
             )
-            system_enrichment_items = append_knowledge_availability_enrichment(
-                request.system_enrichment_items,
+            transient_enrichment_items = append_knowledge_availability_enrichment(
+                request.transient_enrichment_items,
                 knowledge_resolution.unavailable,
             )
             return await ai_response(
@@ -2125,7 +2176,8 @@ class ResponseRunner:
                     runtime=runtime,
                     run_id=run_id,
                     active_event_ids=active_event_ids,
-                    system_enrichment_items=system_enrichment_items,
+                    transient_enrichment_items=transient_enrichment_items,
+                    system_enrichment_items=request.system_enrichment_items,
                 ),
                 prompt=request.prompt,
                 runtime_paths=self.deps.runtime_paths,
@@ -2207,8 +2259,8 @@ class ResponseRunner:
             self.deps.agent_name,
             execution_identity=runtime.tool_dispatch.execution_identity,
         )
-        system_enrichment_items = append_knowledge_availability_enrichment(
-            request.system_enrichment_items,
+        transient_enrichment_items = append_knowledge_availability_enrichment(
+            request.transient_enrichment_items,
             knowledge_resolution.unavailable,
         )
         response_stream = stream_agent_response(
@@ -2217,7 +2269,8 @@ class ResponseRunner:
                 runtime=runtime,
                 run_id=run_id,
                 active_event_ids=active_event_ids,
-                system_enrichment_items=system_enrichment_items,
+                transient_enrichment_items=transient_enrichment_items,
+                system_enrichment_items=request.system_enrichment_items,
             ),
             prompt=request.prompt,
             runtime_paths=self.deps.runtime_paths,
@@ -2333,8 +2386,10 @@ class ResponseRunner:
         attempt_run_ids = attempt_run_id_collector if attempt_run_id_collector is not None else []
         active_event_ids = self._active_response_event_ids(request.room_id)
         turn_recorder = self._build_turn_recorder(
-            user_message=request.prompt,
+            user_message=runtime.model_prompt,
+            user_message_is_structured=request.current_prompt_is_structured,
             reply_to_event_id=request.reply_to_event_id,
+            requester_id=request.user_id,
             matrix_run_metadata=_materialize_matrix_run_metadata(request.matrix_run_metadata),
         )
 
@@ -2482,8 +2537,10 @@ class ResponseRunner:
         tool_trace: list[Any] = []
         transport_outcome: StreamTransportOutcome | None = None
         turn_recorder = self._build_turn_recorder(
-            user_message=request.prompt,
+            user_message=runtime.model_prompt,
+            user_message_is_structured=request.current_prompt_is_structured,
             reply_to_event_id=request.reply_to_event_id,
+            requester_id=request.user_id,
             matrix_run_metadata=_materialize_matrix_run_metadata(request.matrix_run_metadata),
         )
 

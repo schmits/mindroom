@@ -16,8 +16,9 @@ from agno.session.agent import AgentSession
 from agno.session.team import TeamSession
 
 from mindroom.agent_storage import get_agent_session, get_team_session
-from mindroom.constants import MATRIX_RESPONSE_EVENT_ID_METADATA_KEY
+from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, MATRIX_RESPONSE_EVENT_ID_METADATA_KEY
 from mindroom.history.storage import new_scope_session
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.redaction import redact_sensitive_text
 from mindroom.tool_system.events import (
     ToolTraceEntry,
@@ -51,6 +52,7 @@ class InterruptedReplaySnapshot:
     completed_tools: tuple[ToolTraceEntry, ...]
     interrupted_tools: tuple[ToolTraceEntry, ...]
     run_metadata: dict[str, Any] = field(default_factory=dict)
+    user_message_is_structured: bool = False
     original_status: RunStatus = RunStatus.cancelled
 
 
@@ -206,13 +208,33 @@ def _build_interrupted_replay_run(
     scope_id: str,
     session_id: str,
     is_team: bool,
+    response_sender_id: str | None = None,
 ) -> RunOutput | TeamRunOutput:
     """Build one canonical replayable run for an interrupted top-level turn."""
     content = _render_interrupted_replay_content(snapshot)
     messages = []
     if snapshot.user_message:
-        messages.append(Message(role="user", content=snapshot.user_message))
-    messages.append(Message(role="assistant", content=content))
+        requester_id = snapshot.run_metadata.get("requester_id")
+        source_event_id = snapshot.run_metadata.get(MATRIX_EVENT_ID_METADATA_KEY)
+        user_content = snapshot.user_message
+        if (
+            not snapshot.user_message_is_structured
+            and isinstance(requester_id, str)
+            and requester_id
+            and isinstance(source_event_id, str)
+            and source_event_id
+        ):
+            user_content = render_msg_tag(sender=requester_id, body=user_content, event_id=source_event_id)
+        messages.append(Message(role="user", content=user_content))
+    response_event_id = snapshot.run_metadata.get(MATRIX_RESPONSE_EVENT_ID_METADATA_KEY)
+    assistant_content = content
+    if response_sender_id and isinstance(response_event_id, str) and response_event_id:
+        assistant_content = render_msg_tag(
+            sender=response_sender_id,
+            body=content,
+            event_id=response_event_id,
+        )
+    messages.append(Message(role="assistant", content=assistant_content))
     metadata = _interrupted_replay_metadata(snapshot)
     if is_team:
         return TeamRunOutput(
@@ -238,6 +260,7 @@ def _build_interrupted_replay_run(
 def build_interrupted_replay_snapshot(
     *,
     user_message: str | None,
+    user_message_is_structured: bool,
     partial_text: str | None,
     completed_tools: Sequence[ToolTraceEntry],
     interrupted_tools: Sequence[ToolTraceEntry],
@@ -258,6 +281,7 @@ def build_interrupted_replay_snapshot(
         completed_tools=tuple(completed_tools),
         interrupted_tools=tuple(interrupted_tools),
         run_metadata=metadata,
+        user_message_is_structured=user_message_is_structured,
         original_status=original_status,
     )
 
@@ -271,6 +295,7 @@ def persist_interrupted_replay_snapshot(
     run_id: str,
     snapshot: InterruptedReplaySnapshot,
     is_team: bool,
+    response_sender_id: str | None = None,
 ) -> None:
     """Persist one canonical interrupted replay snapshot into session history."""
     persisted_session = _load_persisted_session(
@@ -292,6 +317,7 @@ def persist_interrupted_replay_snapshot(
         scope_id=scope_id,
         session_id=session_id,
         is_team=is_team,
+        response_sender_id=response_sender_id,
     )
     if is_team:
         assert isinstance(persisted_session, TeamSession)
@@ -310,6 +336,7 @@ def persist_interrupted_replay(
     session_id: str,
     run_id: str,
     user_message: str | None,
+    user_message_is_structured: bool,
     partial_text: str | None,
     completed_tools: Sequence[ToolTraceEntry],
     interrupted_tools: Sequence[ToolTraceEntry],
@@ -328,6 +355,7 @@ def persist_interrupted_replay(
         run_id=run_id,
         snapshot=build_interrupted_replay_snapshot(
             user_message=user_message,
+            user_message_is_structured=user_message_is_structured,
             partial_text=partial_text,
             completed_tools=completed_tools,
             interrupted_tools=interrupted_tools,

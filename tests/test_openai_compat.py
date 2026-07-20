@@ -57,6 +57,7 @@ from mindroom.knowledge.utils import KnowledgeAvailabilityDetail, _KnowledgeReso
 from mindroom.llm_request_logging import current_llm_request_log_context
 from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.memory import MemoryPromptParts
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode
@@ -4344,7 +4345,13 @@ class TestTeamCompletion:
 
         assert response.status_code == 200
         prompt = mock_team.arun.call_args.args[0]
-        assert prompt == "user: Start\n\nassistant: Ack\n\nFollow-up"
+        assert prompt == "\n\n".join(
+            (
+                render_msg_tag(sender="user", body="Start", event_id="$openai-1"),
+                render_msg_tag(sender="assistant", body="Ack", event_id="$openai-2"),
+                "Follow-up",
+            ),
+        )
 
     def test_team_non_streaming_preserves_full_request_history_for_ad_hoc_team_runs(
         self,
@@ -4382,8 +4389,8 @@ class TestTeamCompletion:
 
         assert response.status_code == 200
         run_input = mock_team.arun.call_args.args[0]
-        assert "user: msg 0" in run_input
-        assert f"assistant: {long_body}" in run_input
+        assert render_msg_tag(sender="user", body="msg 0", event_id="$openai-1") in run_input
+        assert render_msg_tag(sender="assistant", body=long_body, event_id="$openai-2") in run_input
         assert run_input.endswith("Final prompt")
 
     def test_team_non_streaming_prefers_persisted_history_over_thread_history(

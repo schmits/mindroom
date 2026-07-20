@@ -7,18 +7,49 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
 from agno.agent import Agent
+from agno.models.message import Message
+from agno.run.agent import RunOutput
 
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.conversation_state_writer import ConversationStateWriter, ConversationStateWriterDeps
+from mindroom.conversation_state_writer import (
+    ConversationStateWriter,
+    ConversationStateWriterDeps,
+    _wrap_final_assistant_message,
+)
 from mindroom.history.runtime import create_scope_session_storage, open_bound_scope_session_context
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.identity_helpers import entity_ids, persist_entity_accounts
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def test_wrap_final_assistant_message_adds_visible_matrix_identity() -> None:
+    """Persisted assistant history should expose the event used by Matrix tools."""
+    run = RunOutput(
+        content="Final answer",
+        messages=[
+            Message(role="user", content="Question"),
+            Message(role="assistant", content="Final answer"),
+        ],
+    )
+
+    _wrap_final_assistant_message(
+        run,
+        response_sender_id="@agent:localhost",
+        response_event_id="$answer",
+    )
+
+    assert run.messages is not None
+    assert run.messages[-1].content == render_msg_tag(
+        sender="@agent:localhost",
+        body="Final answer",
+        event_id="$answer",
+    )
 
 
 def test_private_ad_hoc_team_history_scope_is_requester_partitioned(tmp_path: Path) -> None:

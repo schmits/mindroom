@@ -27,7 +27,7 @@ from mindroom.hooks import hook
 async def enrich_with_location(ctx):
     location = await fetch_location(ctx.settings["dawarich_url"])
     if location:
-        ctx.add_metadata("location", f"User is at {location}")
+        ctx.add_metadata("location", f"User is at {location}", persist=False)
 ```
 
 ```yaml
@@ -38,8 +38,8 @@ plugins:
       dawarich_url: http://dawarich.local
 ```
 
-When any agent receives a message, this hook runs concurrently with other enrichment hooks and injects the user's location into the AI prompt.
-The enrichment is stripped from session history after the response completes.
+When any agent receives a message, this hook runs concurrently with other enrichment hooks and injects the user's location into non-persisted current-turn context.
+The `persist=False` option keeps it out of session history.
 
 ## Hook types
 
@@ -291,22 +291,22 @@ If a hook name appears in `hooks:` but the plugin has no hook with that name, Mi
 
 ## Enrichment pipeline
 
-The `message:enrich` event powers a full enrichment pipeline that injects live context into the current AI prompt and preserves that exact model-facing turn in persisted history.
+The `message:enrich` event injects structured context into the current turn and lets each item choose whether it belongs in persisted history.
 
 ### How it works
 
 1. **Collect**: After routing decides the target agent, MindRoom runs `emit_collect("message:enrich")` which executes all matching enrichment hooks concurrently.
-2. **Render**: Collected `EnrichmentItem` entries are rendered into an XML block appended to the user turn:
+2. **Render**: Persisted `EnrichmentItem` entries are rendered into an XML block appended to the user turn:
 
     ```xml
     <mindroom_message_context>
-    <item key="location" cache_policy="stable">User is at Home (San Francisco)</item>
-    <item key="weather" cache_policy="volatile">Current weather: 18C, partly cloudy</item>
+    <item key="user_profile" cache_policy="stable">Prefers concise answers, timezone Europe/Amsterdam</item>
     </mindroom_message_context>
     ```
 
-3. **AI sees it**: The model receives the enrichment block as part of the current user message, so it has live context for its response.
-4. **Replay sees it too**: MindRoom keeps that same enriched user turn in persisted session history, so later replays and prompt-cache shaping can reuse the exact prompt the model saw.
+3. **AI sees it**: The model receives persisted items in the current user message and all `persist=False` items in one separate non-persisted current-turn context message.
+For Claude requests, MindRoom places that transient block after the cacheable user content so the growing conversation prefix remains reusable.
+4. **Replay sees persisted items**: MindRoom keeps only persisted enrichment in session history.
 
 ### Enrichment policy
 
@@ -315,8 +315,12 @@ Each enrichment item has a `cache_policy`:
 - `"volatile"` (default): The item may change on every message (e.g., weather, time).
 - `"stable"`: The item changes rarely (e.g., user profile, timezone).
 
-MindRoom preserves the merged enrichment block exactly as rendered for the live request.
+MindRoom preserves persisted enrichment exactly as rendered for the live request.
 Use stable keys and deterministic hook output when you want later replays and cache keys to line up cleanly.
+
+Message enrichment is persisted by default.
+Set `persist=False` for live context that should be visible only during the current turn, such as location, weather, or other frequently changing external state.
+Transient items stay out of the system prompt and replayable history so provider prompt caches can reuse their stable prefixes.
 
 ### Adding enrichment items
 
@@ -341,8 +345,10 @@ from mindroom.hooks import EnrichmentItem, hook
 
 @hook("message:enrich")
 async def enrich_with_time(ctx):
-    return EnrichmentItem(key="time", text=f"Current time: {now()}")
+    return EnrichmentItem(key="time", text=f"Current time: {now()}", persist=False)
 ```
+
+The `persist` option only affects `message:enrich` items because `system:enrich` items are already current-turn context.
 
 ### Performance
 
@@ -400,6 +406,12 @@ Each item still carries a `cache_policy`, but system enrichment uses it to contr
 
 - `"stable"`: Sorted first by key so long-lived instructions stay grouped at the front of the block.
 - `"volatile"` (default): Sorted last by key so frequently changing instructions stay grouped at the end of the block.
+
+System enrichment changes the system prompt, so use it only when context needs system-level priority.
+Use `message:enrich` with `persist=False` for live data so the stable system and history prefixes remain reusable.
+
+The `matrix_message_target` key is runtime-owned and travels with non-persisted current-turn context for agents that can use `matrix_message`.
+Hook-provided items with that key are replaced by the runtime value.
 
 ### Key differences from `message:enrich`
 

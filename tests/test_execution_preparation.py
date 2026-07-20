@@ -41,6 +41,7 @@ from mindroom.history.types import (
     ResolvedHistorySettings,
     ResolvedReplayPlan,
 )
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.tool_schema_cache import clear_tool_schema_cache
 from mindroom.tool_system.events import ToolTraceEntry, build_tool_trace_content
 from tests.conftest import FakeModel, bind_runtime_paths, make_turn_context, make_visible_message
@@ -210,7 +211,11 @@ async def test_prepare_execution_context_skips_fallback_replay_when_persisted_hi
     )
 
     assert prepared.prepared_history.replays_persisted_history is True
-    assert prepared.context_messages[0].content == "@alice:localhost: older context"
+    assert prepared.context_messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="older context",
+        event_id="$older",
+    )
 
 
 def test_scheduled_limit_zero_disables_replay_plan() -> None:
@@ -363,9 +368,9 @@ async def test_scheduled_history_limit_does_not_count_current_event_as_history()
         fallback_static_token_budget=100,
     )
 
-    assert [str(message.content) for message in prepared.context_messages] == [
-        "@alice:localhost: recent context",
-        "@alice:localhost: newest context",
+    assert [message.content for message in prepared.context_messages] == [
+        render_msg_tag(sender="@alice:localhost", body="recent context", event_id="$recent"),
+        render_msg_tag(sender="@alice:localhost", body="newest context", event_id="$newest"),
     ]
     replay_plan = prepared.prepared_history.replay_plan
     assert replay_plan is not None
@@ -459,7 +464,8 @@ async def test_routed_scheduled_history_budget_exempts_the_prompt_source(
         fallback_static_token_budget=100,
     )
 
-    assert [str(message.content).split(": ", 1)[-1] for message in prepared.context_messages] == expected_context
+    assert len(prepared.context_messages) == len(expected_context)
+    assert all(body in str(message.content) for body, message in zip(expected_context, prepared.context_messages))
     assert "Poll the deployment queue" in str(prepared.messages[-1].content)
     assert all("Automated Task" not in str(message.content) for message in prepared.context_messages)
 
@@ -653,7 +659,11 @@ def test_fallback_thread_history_caps_long_messages_without_dropping_them() -> N
 
     assert len(messages) == 2
     assert messages[0].role == "user"
-    assert messages[0].content == f"@alice:localhost: {'x' * 199}…"
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body=f"{'x' * 199}…",
+        event_id="$long",
+    )
     assert long_body not in str(messages[0].content)
     assert messages[1].content == "Current request"
 
@@ -667,12 +677,14 @@ def test_current_matrix_message_renders_timestamp_as_msg_attribute() -> None:
         "Hello <world>",
         current_sender_id="@alice:localhost",
         current_timestamp_ms=1_774_019_700_000,
+        current_event_id="$current",
         config=config,
     )
 
     assert len(messages) == 1
     assert messages[0].content == (
-        'Current message:\n<msg from="@alice:localhost" ts="2026-03-20 08:15 PDT"><![CDATA[Hello <world>]]></msg>'
+        'Current message:\n<msg event_id="$current" from="@alice:localhost" '
+        'ts="2026-03-20 08:15 PDT"><![CDATA[Hello <world>]]></msg>'
     )
 
 
@@ -787,9 +799,17 @@ def test_fallback_thread_history_pins_attachments_to_their_messages(tmp_path: Pa
     assert len(messages) == 3
     history_with_media = messages[0]
     assert history_with_media.role == "user"
-    assert history_with_media.content == ('@alice:localhost: look at this\n[attachments: att_car (image, "car.jpg")]')
+    assert history_with_media.content == render_msg_tag(
+        sender="@alice:localhost",
+        body='look at this\n[attachments: att_car (image, "car.jpg")]',
+        event_id="$img",
+    )
     assert [image.id for image in (history_with_media.images or [])] == ["att_car"]
-    assert messages[1].content == "@alice:localhost: no attachments here"
+    assert messages[1].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="no attachments here",
+        event_id="$text",
+    )
     assert not messages[1].images
     assert not messages[2].images
 
@@ -825,7 +845,11 @@ def test_fallback_thread_history_maps_raw_media_events_to_attachments(tmp_path: 
         attachment_context=_ThreadAttachmentContext(storage_path=tmp_path, room_id="!room:localhost"),
     )
 
-    assert messages[0].content == (f'@alice:localhost: photo.png\n[attachments: {attachment_id} (image, "photo.png")]')
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body=f'photo.png\n[attachments: {attachment_id} (image, "photo.png")]',
+        event_id="$raw-img",
+    )
     assert [image.id for image in (messages[0].images or [])] == [attachment_id]
 
 
@@ -859,7 +883,11 @@ def test_fallback_thread_history_agent_attachments_annotate_without_media(tmp_pa
     )
 
     assert messages[0].role == "assistant"
-    assert messages[0].content == 'here is the report\n[attachments: att_report (file, "report.pdf")]'
+    assert messages[0].content == render_msg_tag(
+        sender="@mindroom_team:localhost",
+        body='here is the report\n[attachments: att_report (file, "report.pdf")]',
+        event_id="$agent-file",
+    )
     assert not messages[0].files
 
 
@@ -892,7 +920,11 @@ def test_fallback_thread_history_drops_cross_room_attachments(tmp_path: Path) ->
         attachment_context=_ThreadAttachmentContext(storage_path=tmp_path, room_id="!room:localhost"),
     )
 
-    assert messages[0].content == "@alice:localhost: see file"
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="see file",
+        event_id="$cross",
+    )
     assert not messages[0].files
 
 
@@ -937,7 +969,11 @@ def test_fallback_thread_history_drops_cross_thread_attachments(tmp_path: Path) 
         attachment_context=_ThreadAttachmentContext(storage_path=tmp_path, room_id="!room:localhost"),
     )
 
-    assert messages[0].content == ('@alice:localhost: see files\n[attachments: att_in_thread (file, "in-thread.txt")]')
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body='see files\n[attachments: att_in_thread (file, "in-thread.txt")]',
+        event_id="$in-thread",
+    )
     assert [file.id for file in (messages[0].files or [])] == ["att_in_thread"]
 
 
@@ -971,7 +1007,11 @@ def test_fallback_thread_history_matches_thread_root_attachments(tmp_path: Path)
         attachment_context=_ThreadAttachmentContext(storage_path=tmp_path, room_id="!room:localhost"),
     )
 
-    assert messages[0].content == '@alice:localhost: root image\n[attachments: att_root (image, "root.png")]'
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body='root image\n[attachments: att_root (image, "root.png")]',
+        event_id="$root",
+    )
     assert [image.id for image in (messages[0].images or [])] == ["att_root"]
 
 
@@ -998,7 +1038,11 @@ def test_fallback_thread_history_strips_visible_tool_markers_from_assistant_cont
     )
 
     assert messages[0].role == "assistant"
-    assert messages[0].content == "Checking status.\n\n\nStill checking.\n\n\nDone."
+    assert messages[0].content == render_msg_tag(
+        sender="@mindroom_code:localhost",
+        body="Checking status.\n\n\nStill checking.\n\n\nDone.",
+        event_id="$assistant",
+    )
     assert "🔧" not in str(messages[0].content)
 
 
@@ -1037,7 +1081,11 @@ def test_fallback_thread_history_preserves_user_authored_tool_marker_text() -> N
     )
 
     assert messages[0].role == "user"
-    assert messages[0].content == "@alice:localhost: Please see:\n\n🔧 `run_shell_command` [1]\n\nActual content"
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="Please see:\n\n🔧 `run_shell_command` [1]\n\nActual content",
+        event_id="$user",
+    )
 
 
 def test_fallback_thread_history_strips_structured_tool_markers_from_labeled_context() -> None:
@@ -1060,7 +1108,11 @@ def test_fallback_thread_history_strips_structured_tool_markers_from_labeled_con
     )
 
     assert messages[0].role == "user"
-    assert messages[0].content == "@mindroom_research:localhost: Please see:\n\n\nActual content"
+    assert messages[0].content == render_msg_tag(
+        sender="@mindroom_research:localhost",
+        body="Please see:\n\n\nActual content",
+        event_id="$agent",
+    )
 
 
 def test_unseen_context_keeps_self_sent_relayed_user_message() -> None:
@@ -1095,7 +1147,11 @@ def test_unseen_context_keeps_self_sent_relayed_user_message() -> None:
 
     assert unseen_event_ids == ["$spawn-root"]
     assert messages[0].role == "user"
-    assert messages[0].content == "@alice:localhost: @mindroom_missing_agent Please investigate this"
+    assert messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="@mindroom_missing_agent Please investigate this",
+        event_id="$spawn-root",
+    )
 
 
 def test_unseen_context_keeps_unpersisted_self_sent_message() -> None:
@@ -1126,7 +1182,11 @@ def test_unseen_context_keeps_unpersisted_self_sent_message() -> None:
 
     assert unseen_event_ids == ["$spawn-root"]
     assert messages[0].role == "assistant"
-    assert messages[0].content == "@mindroom_missing_agent Please investigate this"
+    assert messages[0].content == render_msg_tag(
+        sender="@mindroom_code:localhost",
+        body="@mindroom_missing_agent Please investigate this",
+        event_id="$spawn-root",
+    )
 
 
 def test_unseen_context_skips_persisted_self_sent_response_event() -> None:

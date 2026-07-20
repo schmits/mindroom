@@ -64,6 +64,7 @@ _PARTIAL_REPLY_SENDER_LABELS = {
     "interrupted": "You (interrupted reply draft)",
     "in_progress": "You (reply still streaming)",
 }
+_PARTIAL_REPLY_GUIDANCE_LABELS = frozenset({*_PARTIAL_REPLY_SENDER_LABELS.values(), "You (partial reply)"})
 
 
 class _PartialReplyKind(str, Enum):
@@ -125,10 +126,16 @@ def _build_matrix_prompt_with_history(
     prompt_intro: str,
     current_sender: str | None,
     current_ts: str | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
 ) -> str:
     if current_sender is not None and not current_prompt_is_structured:
-        current_block = render_msg_tag(sender=current_sender, body=prompt, ts=current_ts)
+        current_block = render_msg_tag(
+            sender=current_sender,
+            body=prompt,
+            event_id=current_event_id,
+            ts=current_ts,
+        )
     else:
         current_block = prompt
     standalone_prompt = f"{prompt_intro}{current_block}" if current_sender is not None else prompt
@@ -249,6 +256,7 @@ def _context_message_from_visible_message(
     annotation = format_attachment_annotation(list(attachment_records))
     if annotation:
         body = f"{body}\n{annotation}" if body else annotation
+    event_id = message.event_id or None
     if (
         response_sender_id is not None
         and message.sender == response_sender_id
@@ -256,11 +264,21 @@ def _context_message_from_visible_message(
     ):
         # Provider APIs reject media on assistant turns, so agent-sent
         # attachments surface through the annotation text only.
-        return Message(role="assistant", content=body)
+        return Message(
+            role="assistant",
+            content=render_msg_tag(sender=message.sender, body=body, event_id=event_id),
+        )
     speaker_label = _message_speaker_label(message)
     if not speaker_label:
         speaker_label = missing_sender_label
-    content = f"{speaker_label}: {body}" if speaker_label else body
+    if speaker_label in _PARTIAL_REPLY_GUIDANCE_LABELS and response_sender_id is not None:
+        content = render_msg_tag(
+            sender=response_sender_id,
+            body=f"{speaker_label}: {body}",
+            event_id=event_id,
+        )
+    else:
+        content = render_msg_tag(sender=speaker_label or "", body=body, event_id=event_id)
     if not attachment_records:
         return Message(role="user", content=content)
     audio, images, files, videos = attachment_records_to_media(list(attachment_records))
@@ -319,6 +337,7 @@ def _messages_with_capped_context(
     transient_context_messages: Sequence[Message] = (),
     current_sender_id: str | None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
     static_token_budget: int,
@@ -332,6 +351,7 @@ def _messages_with_capped_context(
         transient_context_messages=transient_context_messages,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
     )
@@ -347,6 +367,7 @@ def _messages_with_capped_context(
             transient_context_messages=transient_context_messages,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
         )
@@ -359,6 +380,7 @@ def _messages_with_capped_context(
         transient_context_messages=transient_context_messages,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
     )
@@ -371,6 +393,7 @@ def _messages_with_current_prompt(
     transient_context_messages: Sequence[Message] = (),
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
 ) -> tuple[Message, ...]:
@@ -385,6 +408,7 @@ def _messages_with_current_prompt(
             prompt_intro=config.get_prompt("CURRENT_MESSAGE_PROMPT_INTRO"),
             current_sender=current_sender_id,
             current_ts=current_ts,
+            current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
         )
         if current_sender_id is not None
@@ -422,6 +446,7 @@ def _build_unseen_context_messages(
     response_sender_id: str | None,
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    prompt_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
     attachment_context: _ThreadAttachmentContext | None = None,
@@ -451,6 +476,7 @@ def _build_unseen_context_messages(
             transient_context_messages=transient_context_messages,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            current_event_id=prompt_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
         ),
@@ -469,6 +495,7 @@ def _build_thread_history_messages(
     response_sender_id: str | None,
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
     max_messages: int | None = None,
@@ -486,6 +513,7 @@ def _build_thread_history_messages(
             transient_context_messages=transient_context_messages,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
         )
@@ -508,6 +536,7 @@ def _build_thread_history_messages(
             transient_context_messages=transient_context_messages,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
             static_token_budget=static_token_budget,
@@ -520,6 +549,7 @@ def _build_thread_history_messages(
         transient_context_messages=transient_context_messages,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
     )
@@ -711,6 +741,7 @@ async def _prepare_execution_context_common(
     response_sender_id: str | None,
     current_sender_id: str | None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
     prepare_scope_history_fn: Callable[[str], Awaitable[PreparedScopeHistory]],
@@ -739,6 +770,7 @@ async def _prepare_execution_context_common(
         transient_context_messages=transient_context_messages,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
     )
@@ -753,6 +785,7 @@ async def _prepare_execution_context_common(
             response_sender_id=response_sender_id,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            prompt_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
             attachment_context=attachment_context,
@@ -765,6 +798,7 @@ async def _prepare_execution_context_common(
         transient_context_messages=transient_context_messages,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
     )
@@ -779,6 +813,7 @@ async def _prepare_execution_context_common(
             response_sender_id=response_sender_id,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            prompt_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
             attachment_context=attachment_context,
@@ -816,6 +851,7 @@ async def _prepare_execution_context_common(
             response_sender_id=response_sender_id,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
+            current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
             max_messages=thread_history_render_limits.max_messages if thread_history_render_limits else None,
@@ -860,6 +896,7 @@ async def prepare_agent_execution_context(
     compaction_lifecycle: CompactionLifecycle | None = None,
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     include_openai_compat_guidance: bool = False,
     pipeline_timing: DispatchPipelineTiming | None = None,
@@ -915,6 +952,7 @@ async def prepare_agent_execution_context(
         response_sender_id=response_sender,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
         prepare_scope_history_fn=_prepare_agent_scope_history,
@@ -940,6 +978,7 @@ async def _prepare_bound_team_execution_context(
     agents: list[Agent],
     team: Team,
     prompt: str,
+    transient_context_messages: Sequence[Message] = (),
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     runtime_paths: RuntimePaths,
     config: Config,
@@ -949,6 +988,7 @@ async def _prepare_bound_team_execution_context(
     response_sender_id: str | None = None,
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     compaction_lifecycle: CompactionLifecycle | None = None,
     thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
@@ -984,11 +1024,12 @@ async def _prepare_bound_team_execution_context(
         ctx,
         scope_context=scope_context,
         prompt=prompt,
-        transient_context_messages=(),
+        transient_context_messages=transient_context_messages,
         thread_history=thread_history,
         response_sender_id=response_sender_id,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
         prepare_scope_history_fn=_prepare_team_scope_history,
@@ -1029,6 +1070,7 @@ async def prepare_bound_team_run_context(
     agents: list[Agent],
     team: Team,
     prompt: str,
+    transient_context_messages: Sequence[Message] = (),
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     runtime_paths: RuntimePaths,
     config: Config,
@@ -1038,6 +1080,7 @@ async def prepare_bound_team_run_context(
     response_sender_id: str | None = None,
     current_sender_id: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     compaction_lifecycle: CompactionLifecycle | None = None,
     thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
@@ -1055,6 +1098,7 @@ async def prepare_bound_team_run_context(
         agents=agents,
         team=team,
         prompt=prompt,
+        transient_context_messages=transient_context_messages,
         thread_history=thread_history,
         runtime_paths=runtime_paths,
         config=config,
@@ -1064,6 +1108,7 @@ async def prepare_bound_team_run_context(
         response_sender_id=response_sender_id,
         current_sender_id=current_sender_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         compaction_lifecycle=compaction_lifecycle,
         thread_history_render_limits=thread_history_render_limits,

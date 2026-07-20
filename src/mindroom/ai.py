@@ -48,7 +48,12 @@ from mindroom.history.runtime import (
     open_resolved_scope_session_context,
 )
 from mindroom.history.types import HistoryScope, PreparedHistoryState
-from mindroom.hooks import EnrichmentItem, render_system_enrichment_block
+from mindroom.hooks import (
+    EnrichmentItem,
+    render_enrichment_block,
+    render_system_enrichment_block,
+    render_transient_context,
+)
 from mindroom.llm_request_logging import (
     bind_llm_request_log_context,
     build_llm_request_log_context,
@@ -164,6 +169,7 @@ def _initial_agent_continuation(
     model_prompt: str | None,
     current_timestamp_ms: float | None,
     current_prompt_is_structured: bool,
+    current_event_id: str | None,
     run_id: str | None,
 ) -> DynamicContinuationRunState:
     """Build the initial continuation state for one agent response turn."""
@@ -172,6 +178,7 @@ def _initial_agent_continuation(
         model_prompt=model_prompt,
         current_timestamp_ms=current_timestamp_ms,
         current_prompt_is_structured=current_prompt_is_structured,
+        current_event_id=current_event_id,
         run_id=run_id,
         continuation_model_prompt_tail=_model_prompt_tail_after_raw_prompt(
             raw_prompt=prompt,
@@ -357,6 +364,7 @@ def _build_agent_turn_callbacks(
     *,
     agent_name: str,
     prompt: str,
+    current_prompt_is_structured: bool,
     session_id: str,
     runtime_paths: RuntimePaths,
     config: Config,
@@ -414,6 +422,7 @@ def _build_agent_turn_callbacks(
             session_id=snapshot.session_id or session_id,
             run_id=snapshot.run_id,
             user_message=prompt,
+            user_message_is_structured=current_prompt_is_structured,
             partial_text=snapshot.partial_text,
             completed_tools=snapshot.completed_tools,
             interrupted_tools=snapshot.interrupted_tools,
@@ -1083,6 +1092,7 @@ async def _prepare_agent_and_prompt(
     include_openai_compat_guidance: bool = False,
     model_prompt: str | None = None,
     current_timestamp_ms: float | None = None,
+    current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     pipeline_timing: DispatchPipelineTiming | None = None,
     eager_deferred_tools: bool = False,
@@ -1182,6 +1192,12 @@ async def _prepare_agent_and_prompt(
             agent,
             _render_system_enrichment_context(ctx.system_enrichment_items),
         )
+    transient_turn_context = render_transient_context(
+        (
+            prompt_parts.transient_turn_context,
+            render_enrichment_block(list(ctx.transient_enrichment_items)),
+        ),
+    )
 
     prepared_execution = await prepare_agent_execution_context(
         ctx,
@@ -1192,11 +1208,11 @@ async def _prepare_agent_and_prompt(
             (
                 Message(
                     role="user",
-                    content=prompt_parts.transient_turn_context,
+                    content=transient_turn_context,
                     add_to_agent_memory=False,
                 ),
             )
-            if prompt_parts.transient_turn_context
+            if transient_turn_context
             else ()
         ),
         thread_history=thread_history,
@@ -1206,6 +1222,7 @@ async def _prepare_agent_and_prompt(
         compaction_lifecycle=compaction_lifecycle,
         current_sender_id=None if include_openai_compat_guidance else ctx.requester_id,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         include_openai_compat_guidance=include_openai_compat_guidance,
         pipeline_timing=pipeline_timing,
@@ -1249,6 +1266,7 @@ async def _prepare_agent_run_context(
     refresh_scheduler: KnowledgeRefreshScheduler | None,
     model_prompt: str | None,
     current_timestamp_ms: float | None,
+    current_event_id: str | None,
     current_prompt_is_structured: bool,
     turn_recorder: TurnRecorder | None,
     pipeline_timing: DispatchPipelineTiming | None,
@@ -1274,6 +1292,7 @@ async def _prepare_agent_run_context(
         include_openai_compat_guidance=include_openai_compat_guidance,
         model_prompt=model_prompt,
         current_timestamp_ms=current_timestamp_ms,
+        current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         pipeline_timing=pipeline_timing,
         eager_deferred_tools=eager_deferred_tools,
@@ -1442,7 +1461,8 @@ async def ai_response(  # noqa: C901
     callbacks = _build_agent_turn_callbacks(
         holder,
         agent_name=agent_name,
-        prompt=prompt,
+        prompt=_compose_current_turn_prompt(raw_prompt=prompt, model_prompt=model_prompt),
+        current_prompt_is_structured=current_prompt_is_structured,
         session_id=session_id,
         runtime_paths=runtime_paths,
         config=config,
@@ -1473,6 +1493,7 @@ async def ai_response(  # noqa: C901
                 refresh_scheduler=refresh_scheduler,
                 model_prompt=continuation_state.active_model_prompt,
                 current_timestamp_ms=continuation_state.active_current_timestamp_ms,
+                current_event_id=continuation_state.active_current_event_id,
                 current_prompt_is_structured=continuation_state.active_current_prompt_is_structured,
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
@@ -1586,6 +1607,7 @@ async def ai_response(  # noqa: C901
             model_prompt=model_prompt,
             current_timestamp_ms=current_timestamp_ms,
             current_prompt_is_structured=current_prompt_is_structured,
+            current_event_id=ctx.reply_to_event_id,
             run_id=ctx.run_id,
         ),
     )
@@ -1884,7 +1906,8 @@ async def stream_agent_response(  # noqa: C901, PLR0915
     callbacks = _build_agent_turn_callbacks(
         holder,
         agent_name=agent_name,
-        prompt=prompt,
+        prompt=_compose_current_turn_prompt(raw_prompt=prompt, model_prompt=model_prompt),
+        current_prompt_is_structured=current_prompt_is_structured,
         session_id=session_id,
         runtime_paths=runtime_paths,
         config=config,
@@ -1927,6 +1950,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
                 refresh_scheduler=refresh_scheduler,
                 model_prompt=continuation_state.active_model_prompt,
                 current_timestamp_ms=continuation_state.active_current_timestamp_ms,
+                current_event_id=continuation_state.active_current_event_id,
                 current_prompt_is_structured=continuation_state.active_current_prompt_is_structured,
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
@@ -2151,6 +2175,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
             model_prompt=model_prompt,
             current_timestamp_ms=current_timestamp_ms,
             current_prompt_is_structured=current_prompt_is_structured,
+            current_event_id=ctx.reply_to_event_id,
             run_id=ctx.run_id,
         ),
     )

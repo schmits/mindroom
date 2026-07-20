@@ -36,7 +36,9 @@ from mindroom.history.storage import (
     update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope, PreparedHistoryState
+from mindroom.hooks import render_transient_context
 from mindroom.memory import MemoryPromptParts
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.token_budget import estimate_text_tokens, stable_serialize
 from tests.conftest import (
     FakeModel,
@@ -383,8 +385,8 @@ async def test_prepare_agent_and_prompt_uses_thread_history_and_transient_memory
     config, runtime_paths = _make_config(tmp_path)
     live_agent = _agent()
     thread_history = [
-        make_visible_message(sender="alice", body="Earlier context"),
-        make_visible_message(sender="bob", body="More context"),
+        make_visible_message(event_id="$earlier", sender="alice", body="Earlier context"),
+        make_visible_message(event_id="$more", sender="bob", body="More context"),
     ]
 
     with (
@@ -420,14 +422,19 @@ async def test_prepare_agent_and_prompt_uses_thread_history_and_transient_memory
     assert prepared_agent is live_agent
     assert prepared.replays_persisted_history is False
     assert [message.content for message in prepared_run.messages] == [
-        "alice: Earlier context",
-        "bob: More context",
-        "Retrieved memory for this turn",
+        render_msg_tag(sender="alice", body="Earlier context", event_id="$earlier"),
+        render_msg_tag(sender="bob", body="More context", event_id="$more"),
+        render_transient_context(("Retrieved memory for this turn",)),
         "Current prompt",
     ]
     assert [message.add_to_agent_memory for message in prepared_run.messages] == [True, True, False, True]
-    assert full_prompt == (
-        "alice: Earlier context\n\nbob: More context\n\nRetrieved memory for this turn\n\nCurrent prompt"
+    assert full_prompt == "\n\n".join(
+        (
+            render_msg_tag(sender="alice", body="Earlier context", event_id="$earlier"),
+            render_msg_tag(sender="bob", body="More context", event_id="$more"),
+            render_transient_context(("Retrieved memory for this turn",)),
+            "Current prompt",
+        ),
     )
 
 
@@ -436,12 +443,12 @@ async def test_prepare_agent_and_prompt_caps_thread_fallback_to_active_window(tm
     config, runtime_paths = _make_config(
         tmp_path,
         defaults_compaction=CompactionConfig(reserve_tokens=0),
-        context_window=16,
+        context_window=24,
     )
     live_agent = _agent()
     thread_history = [
-        make_visible_message(sender="alice", body="Old context " + ("o" * 120)),
-        make_visible_message(sender="bob", body="Recent context"),
+        make_visible_message(event_id="$old", sender="alice", body="Old context " + ("o" * 120)),
+        make_visible_message(event_id="$recent", sender="bob", body="Recent context"),
     ]
 
     class FakeAgentStaticTokenEstimator:
@@ -472,8 +479,14 @@ async def test_prepare_agent_and_prompt_caps_thread_fallback_to_active_window(tm
             thread_history=thread_history,
         )
 
-    assert prepared_run.prompt_text == "bob: Recent context\n\nCurrent prompt"
-    assert estimate_text_tokens(prepared_run.prompt_text) <= 16
+    assert prepared_run.prompt_text == "\n\n".join(
+        (
+            render_msg_tag(sender="bob", body="Recent context", event_id="$recent"),
+            "Current prompt",
+        ),
+    )
+    assert "Old context" not in prepared_run.prompt_text
+    assert estimate_text_tokens(prepared_run.prompt_text) <= 24
 
 
 @pytest.mark.asyncio
@@ -512,13 +525,17 @@ async def test_prepare_agent_and_prompt_uses_full_thread_fallback_for_threaded_m
             runtime_paths=runtime_paths,
             config=config,
             thread_history=thread_history,
+            current_event_id="$current",
         )
 
     assert prepared_run.prepared_history.replays_persisted_history is False
-    assert prepared_run.prompt_text == (
-        "@alice:localhost: Original question\n\n"
-        "Prior diagnosis\n\n"
-        'Current message:\n<msg from="@alice:localhost"><![CDATA[What was that?]]></msg>'
+    assert prepared_run.prompt_text == "\n\n".join(
+        (
+            render_msg_tag(sender="@alice:localhost", body="Original question", event_id="$root"),
+            render_msg_tag(sender="@bot:localhost", body="Prior diagnosis", event_id="$agent-reply"),
+            "Current message:\n"
+            + render_msg_tag(sender="@alice:localhost", body="What was that?", event_id="$current"),
+        ),
     )
     assert "Later reaction" not in prepared_run.prompt_text
 
@@ -789,7 +806,11 @@ async def test_prepare_agent_and_prompt_uses_native_history_with_unseen_thread_c
 
     unseen_user_message = recording_model.seen_messages[-2]
     assert unseen_user_message.role == "user"
-    assert unseen_user_message.content == "alice: Fresh follow-up"
+    assert unseen_user_message.content == render_msg_tag(
+        sender="alice",
+        body="Fresh follow-up",
+        event_id="event-2",
+    )
 
     final_user_message = recording_model.seen_messages[-1]
     assert final_user_message.role == "user"
@@ -870,14 +891,14 @@ async def test_prepare_agent_and_prompt_keeps_transient_memory_out_of_replay_and
     session_preamble = "[File memory entrypoint (agent)]\nStable MEMORY.md"
     assert [message["content"] for message in recorded_requests[0]] == [
         session_preamble,
-        "turn context one",
+        render_transient_context(("turn context one",)),
         "First prompt",
     ]
     assert [message["content"] for message in second_request] == [
         session_preamble,
         "First prompt",
         "ok",
-        "turn context two",
+        render_transient_context(("turn context two",)),
         "Second prompt",
     ]
     assert [message["content"] for message in third_request] == [
@@ -886,7 +907,7 @@ async def test_prepare_agent_and_prompt_keeps_transient_memory_out_of_replay_and
         "ok",
         "Second prompt",
         "ok",
-        "turn context three",
+        render_transient_context(("turn context three",)),
         "Third prompt",
     ]
     assert third_request[-2]["add_to_agent_memory"] is False
@@ -999,7 +1020,7 @@ async def test_prepare_agent_and_prompt_timestamps_current_turn_without_duplicat
     assert stable_serialize(second_request[:-2]) == stable_serialize(third_request[: len(second_request) - 2])
     assert third_request[-2] == {
         "role": "user",
-        "content": "turn context three",
+        "content": render_transient_context(("turn context three",)),
         "add_to_agent_memory": False,
     }
     assert third_request[-1]["content"] == (

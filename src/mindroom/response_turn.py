@@ -11,9 +11,9 @@ bodies as injected callables.
 
 ``ResponseTurnContext`` is the per-turn identity carrier built once by the
 caller that owns the turn: the drivers consume its Matrix-identity fields,
-while ``active_event_ids`` and ``system_enrichment_items`` ride along for the
-entity prepare chains. Mutable per-turn state (collectors, recorders,
-callbacks) stays out of it and crosses via ``TurnSinks`` or the adapters.
+while ``active_event_ids`` and enrichment items ride along for the entity
+prepare chains. Mutable per-turn state (collectors, recorders, callbacks) stays
+out of it and crosses via ``TurnSinks`` or the adapters.
 """
 
 from __future__ import annotations
@@ -148,6 +148,7 @@ class DynamicContinuationRunState:
     active_model_prompt: str | None
     active_current_timestamp_ms: float | None
     active_current_prompt_is_structured: bool
+    active_current_event_id: str | None
     active_run_id: str | None
     continuation_model_prompt_tail: str
 
@@ -159,6 +160,7 @@ class DynamicContinuationRunState:
         model_prompt: str | None,
         current_timestamp_ms: float | None,
         current_prompt_is_structured: bool,
+        current_event_id: str | None,
         run_id: str | None,
         continuation_model_prompt_tail: str,
     ) -> DynamicContinuationRunState:
@@ -169,6 +171,7 @@ class DynamicContinuationRunState:
             active_model_prompt=model_prompt,
             active_current_timestamp_ms=current_timestamp_ms,
             active_current_prompt_is_structured=current_prompt_is_structured,
+            active_current_event_id=current_event_id,
             active_run_id=run_id,
             continuation_model_prompt_tail=continuation_model_prompt_tail,
         )
@@ -186,6 +189,7 @@ class DynamicContinuationRunState:
             active_model_prompt=self.continuation_model_prompt_tail or None,
             active_current_timestamp_ms=None,
             active_current_prompt_is_structured=False,
+            active_current_event_id=None,
             active_run_id=ai_runtime.next_retry_run_id(previous_run_id),
         )
 
@@ -211,6 +215,7 @@ class ResponseTurnContext:
     matrix_run_metadata: dict[str, Any] | None
     active_model_name: str | None = None
     active_event_ids: frozenset[str] = frozenset()
+    transient_enrichment_items: tuple[EnrichmentItem, ...] = ()
     system_enrichment_items: tuple[EnrichmentItem, ...] = ()
     # Set only for scheduled fires that carry a history limit; identifies the
     # prompt-owning event while capping this turn without changing authored config.

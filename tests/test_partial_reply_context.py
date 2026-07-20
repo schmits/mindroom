@@ -38,6 +38,7 @@ from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.matrix.client_thread_history import fetch_thread_history
 from mindroom.matrix.client_visible_messages import _stream_status_from_content
 from mindroom.message_target import MessageTarget
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.streaming import (
     _CANCELLED_RESPONSE_NOTE,
     _INTERRUPTED_RESPONSE_NOTE,
@@ -400,7 +401,11 @@ class TestUnseenMessagesPartialReplies:
         assert [message.role for message in context_messages] == ["user", "user", "user"]
         assert "Your previous response is still being delivered." in str(context_messages[0].content)
         assert "Do NOT repeat or redo that work." in str(context_messages[0].content)
-        assert context_messages[1].content == "You (reply still streaming): Partial reply"
+        assert context_messages[1].content == render_msg_tag(
+            sender=agent_id,
+            body="You (reply still streaming): Partial reply",
+            event_id="e2",
+        )
         assert context_messages[2].content == "Answer the new question."
 
     def test_replay_fallback_sanitizer_matches_unseen_context_rules(self) -> None:

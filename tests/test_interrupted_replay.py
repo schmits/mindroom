@@ -20,6 +20,7 @@ from mindroom.history.interrupted_replay import (
     split_interrupted_tool_trace,
 )
 from mindroom.history.turn_recorder import TurnRecorder
+from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.tool_system.events import ToolTraceEntry
 
 if TYPE_CHECKING:
@@ -171,6 +172,42 @@ def test_build_interrupted_replay_run_creates_completed_agent_run_with_summary_a
     ]
 
 
+def test_build_interrupted_replay_run_tags_matrix_messages() -> None:
+    """Interrupted history should retain source and response event identity."""
+    snapshot = InterruptedReplaySnapshot(
+        user_message="Please continue",
+        partial_text="Partial answer",
+        completed_tools=(),
+        interrupted_tools=(),
+        run_metadata={
+            "requester_id": "@alice:localhost",
+            "matrix_event_id": "$question",
+            "matrix_response_event_id": "$answer",
+        },
+    )
+
+    run = _build_interrupted_replay_run(
+        snapshot=snapshot,
+        run_id="run-123",
+        scope_id="test_agent",
+        session_id="session-1",
+        is_team=False,
+        response_sender_id="@agent:localhost",
+    )
+
+    assert run.messages is not None
+    assert run.messages[0].content == render_msg_tag(
+        sender="@alice:localhost",
+        body="Please continue",
+        event_id="$question",
+    )
+    assert run.messages[1].content == render_msg_tag(
+        sender="@agent:localhost",
+        body="Partial answer\n\n(turn stopped before completion)",
+        event_id="$answer",
+    )
+
+
 def test_interrupted_replay_content_retains_safe_matrix_tool_previews_without_raw_trace() -> None:
     """Replay should retain redacted Matrix previews without restoring provider-like tool logs."""
     snapshot = InterruptedReplaySnapshot(
@@ -317,6 +354,7 @@ def test_build_interrupted_replay_run_preserves_coalesced_source_metadata() -> N
     """Interrupted replay runs should round-trip the same coalesced metadata as completed runs."""
     snapshot = build_interrupted_replay_snapshot(
         user_message="Please continue",
+        user_message_is_structured=False,
         partial_text="Text emitted before interruption",
         completed_tools=(),
         interrupted_tools=(),
@@ -381,6 +419,7 @@ def test_persist_interrupted_replay_snapshot_preserves_newer_persisted_runs(tmp_
 
         snapshot = build_interrupted_replay_snapshot(
             user_message="Please continue",
+            user_message_is_structured=False,
             partial_text="Text emitted before interruption",
             completed_tools=(),
             interrupted_tools=(),
@@ -482,6 +521,26 @@ def test_turn_recorder_record_helpers_capture_completed_and_interrupted_turns() 
     assert [tool.tool_name for tool in snapshot.interrupted_tools] == ["save_file"]
 
 
+def test_turn_recorder_keeps_seed_metadata_when_runtime_metadata_is_missing() -> None:
+    """Early interruptions should retain Matrix identity seeded by the runner."""
+    recorder = TurnRecorder(
+        user_message="Please continue",
+        run_metadata={"matrix_event_id": "$question", "requester_id": "@alice:localhost"},
+    )
+
+    recorder.record_interrupted(
+        run_metadata=None,
+        assistant_text="Partial answer",
+        completed_tools=[],
+        interrupted_tools=[],
+    )
+
+    assert recorder.interrupted_snapshot().run_metadata == {
+        "matrix_event_id": "$question",
+        "requester_id": "@alice:localhost",
+    }
+
+
 def test_persist_interrupted_replay_snapshot_keeps_minimal_interrupted_turn(tmp_path: Path) -> None:
     """Even hard-cancelled turns with no observed assistant state should persist one interrupted record."""
     storage = create_state_storage(
@@ -493,6 +552,7 @@ def test_persist_interrupted_replay_snapshot_keeps_minimal_interrupted_turn(tmp_
     try:
         snapshot = build_interrupted_replay_snapshot(
             user_message="Please continue",
+            user_message_is_structured=False,
             partial_text="",
             completed_tools=(),
             interrupted_tools=(),

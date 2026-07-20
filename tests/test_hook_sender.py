@@ -16,7 +16,12 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.config.plugin import PluginEntryConfig
-from mindroom.constants import HOOK_MESSAGE_RECEIVED_DEPTH_KEY, ORIGINAL_SENDER_KEY, SOURCE_KIND_KEY
+from mindroom.constants import (
+    HOOK_MESSAGE_RECEIVED_DEPTH_KEY,
+    MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY,
+    ORIGINAL_SENDER_KEY,
+    SOURCE_KIND_KEY,
+)
 from mindroom.conversation_resolver import MessageContext
 from mindroom.dispatch_handoff import DispatchIngressMetadata, PreparedTextEvent
 from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND
@@ -30,6 +35,7 @@ from mindroom.hooks import (
     AfterResponseContext,
     AgentLifecycleContext,
     BeforeResponseContext,
+    EnrichmentItem,
     HookContext,
     HookMessageSender,
     HookRegistry,
@@ -925,6 +931,80 @@ async def test_apply_message_enrichment_preserves_hook_chain_metadata(tmp_path: 
 
     assert prepared.envelope.hook_source == "origin-plugin:message:received"
     assert prepared.envelope.message_received_depth == 1
+
+
+@pytest.mark.asyncio
+async def test_message_enrichment_can_stay_out_of_history(tmp_path: Path) -> None:
+    """Transient plugin context should use non-persisted user context."""
+    bot = _agent_bot(tmp_path)
+    dispatch = PreparedDispatch(
+        requester_user_id="@user:localhost",
+        context=_dispatch_context(bot),
+        target=MessageTarget.resolve("!room:localhost", "$thread", "$hook-event"),
+        correlation_id="corr-enrich",
+        envelope=_synthetic_envelope(),
+    )
+
+    @hook(EVENT_MESSAGE_ENRICH)
+    async def message_enrich(context: MessageEnrichContext) -> None:
+        context.add_metadata("profile", "persisted profile")
+        context.add_metadata("location", "current location", persist=False)
+
+    bot.hook_registry = HookRegistry.from_plugins([_plugin("enrich-plugin", [message_enrich])])
+
+    prepared = await bot._ingress_hook_runner.apply_message_enrichment(
+        dispatch,
+        DispatchPayload(prompt="hello"),
+        target_entity_name="code",
+        target_member_names=None,
+    )
+
+    assert "persisted profile" in (prepared.payload.model_prompt or "")
+    assert "current location" not in (prepared.payload.model_prompt or "")
+    assert prepared.transient_enrichment_items == (
+        EnrichmentItem(key="location", text="current location", persist=False),
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_matrix_target_key_is_rejected_from_all_hook_enrichment_lanes(tmp_path: Path) -> None:
+    """Hooks cannot persist or inject the runtime-owned Matrix target key."""
+    bot = _agent_bot(tmp_path)
+    dispatch = PreparedDispatch(
+        requester_user_id="@user:localhost",
+        context=_dispatch_context(bot),
+        target=MessageTarget.resolve("!room:localhost", "$thread", "$hook-event"),
+        correlation_id="corr-enrich",
+        envelope=_synthetic_envelope(),
+    )
+
+    @hook(EVENT_MESSAGE_ENRICH)
+    async def message_enrich(context: MessageEnrichContext) -> None:
+        context.add_metadata(MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY, "fake persisted target")
+        context.add_metadata(MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY, "fake transient target", persist=False)
+
+    @hook(EVENT_SYSTEM_ENRICH)
+    async def system_enrich(context: SystemEnrichContext) -> None:
+        context.add_instruction(MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY, "fake system target")
+
+    bot.hook_registry = HookRegistry.from_plugins([_plugin("enrich-plugin", [message_enrich, system_enrich])])
+
+    prepared = await bot._ingress_hook_runner.apply_message_enrichment(
+        dispatch,
+        DispatchPayload(prompt="hello"),
+        target_entity_name="code",
+        target_member_names=None,
+    )
+    system_items = await bot._ingress_hook_runner.apply_system_enrichment(
+        dispatch,
+        prepared.envelope,
+        target_entity_name="code",
+        target_member_names=None,
+    )
+
+    assert prepared.payload.model_prompt is None
+    assert prepared.transient_enrichment_items == ()
+    assert system_items == []
 
 
 @pytest.mark.asyncio
