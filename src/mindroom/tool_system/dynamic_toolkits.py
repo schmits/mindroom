@@ -13,6 +13,8 @@ from mindroom.tool_system.catalog import TOOL_METADATA, validate_authored_tool_e
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from agno.tools import Toolkit
+
     from mindroom.config.main import Config
 
 
@@ -149,6 +151,19 @@ def _normalize_effective_tool_config_overrides(
 def has_deferred_tools(config: Config, agent_name: str) -> bool:
     """Return whether one agent has at least one authored deferred tool."""
     return bool(config.resolve_entity(agent_name).authored_deferred_tool_configs)
+
+
+def suppress_fully_deferred_toolkit_instructions(
+    toolkit: Toolkit,
+) -> None:
+    """Omit all instructions for one provider-deferred toolkit.
+
+    Native tool search cannot extend the already-sent system prompt when it discovers a tool.
+    """
+    toolkit.add_instructions = False
+    functions = (*toolkit.get_functions().values(), *toolkit.get_async_functions().values())
+    for function in functions:
+        function.add_instructions = False
 
 
 def _special_tool_names(
