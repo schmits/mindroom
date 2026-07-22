@@ -32,6 +32,7 @@ from mindroom.desktop.protocol import (
     desktop_pairing_verification,
 )
 from mindroom.matrix.device_identity import PinnedMatrixDevice
+from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.to_device import AuthenticatedToDeviceEvent
 from tests.conftest import test_runtime_paths
 
@@ -379,6 +380,14 @@ def test_setup_command_uses_public_homeserver_and_access_flag(
     )
     assert "--homeserver https://matrix.example.org" in public_setup_command
     assert public_setup_command.endswith("--cloudflare-access")
+    message_content = format_message_with_mentions(
+        config,
+        public_runtime_paths,
+        public_setup_response,
+    )
+    assert message_content["body"] == public_setup_response
+    assert "https://matrix.to/#/" not in message_content["formatted_body"]
+    assert "m.mentions" not in message_content
 
 
 def test_confirmation_keeps_claim_retryable_when_controller_lookup_fails(
