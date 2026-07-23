@@ -6022,7 +6022,7 @@
         {
           "authored_override": true,
           "default": false,
-          "description": "Per-agent network policy flag. The MVP records this but does not perform network operations.",
+          "description": "Per-agent network requests are rejected in the MVP; no clone/fetch/network operations are performed.",
           "label": "Allow Network",
           "name": "allow_network",
           "options": null,
@@ -6117,7 +6117,7 @@
         {
           "authored_override": true,
           "default": false,
-          "description": "Network policy flag recorded in provenance. The MVP does not perform clone/fetch/network operations.",
+          "description": "Network requests are rejected in the MVP; no clone/fetch/network operations are performed.",
           "label": "Allow Network",
           "name": "allow_network",
           "options": null,

@@ -72,7 +72,7 @@ if TYPE_CHECKING:
             type="boolean",
             required=False,
             default=False,
-            description="Network policy flag recorded in provenance. The MVP does not perform clone/fetch/network operations.",
+            description="Network requests are rejected in the MVP; no clone/fetch/network operations are performed.",
         ),
         ConfigField(
             name="default_repo",
