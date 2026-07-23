@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -117,6 +118,8 @@ class RepoWorkspaceTools(Toolkit):
             return f"Error: {exc}"
 
         effective_network = self.allow_network if allow_network is None else bool(allow_network)
+        if effective_network:
+            return "Error: network materialization is not implemented by repo_workspace MVP. Use an approved GitHub/materialization tool instead."
         workspace_dir = self._workspace_dir(workspace_id)
         if workspace_dir.exists():
             return f"Error: workspace already exists: {workspace_id}"
@@ -147,7 +150,7 @@ class RepoWorkspaceTools(Toolkit):
             "expires_at": (created_at + timedelta(minutes=ttl)).isoformat(),
             "ttl_minutes": ttl,
             "network_policy": {
-                "allow_network": effective_network,
+                "requested_allow_network": effective_network,
                 "network_performed": False,
                 "note": "Network/clone/fetch is not implemented by repo_workspace MVP.",
             },
@@ -311,7 +314,7 @@ class RepoWorkspaceTools(Toolkit):
             return repo_dir
         if (repo_dir / ".git").is_dir():
             status_result = _run_git(["status", "--short", "--branch"], cwd=repo_dir)
-            diff_result = _run_git(["diff", "--stat", "--"], cwd=repo_dir)
+            diff_result = _run_git(["diff", "--no-ext-diff", "--no-textconv", "--stat", "--"], cwd=repo_dir)
             parts = ["# git status", status_result.stdout or status_result.stderr]
             if diff_result.stdout:
                 parts.extend(["\n# git diff --stat", diff_result.stdout])
@@ -326,7 +329,7 @@ class RepoWorkspaceTools(Toolkit):
             return repo_dir
         if not (repo_dir / ".git").is_dir():
             return "Error: diff requires a git checkout with a .git directory."
-        args = ["diff", "--"]
+        args = ["diff", "--no-ext-diff", "--no-textconv", "--"]
         if path:
             resolved = self._resolve_workspace_file(workspace_id, path, must_exist=False)
             if isinstance(resolved, str):
@@ -350,7 +353,7 @@ class RepoWorkspaceTools(Toolkit):
             return "Error: export_patch requires a git checkout with a .git directory."
         if "/" in artifact_name or "\\" in artifact_name or artifact_name in {"", ".", ".."}:
             return "Error: artifact_name must be a simple filename."
-        result = _run_git(["diff", "--binary", "--"], cwd=repo_dir)
+        result = _run_git(["diff", "--no-ext-diff", "--no-textconv", "--binary", "--"], cwd=repo_dir)
         if result.returncode != 0:
             return _format_completed_process("git diff failed", result)
         artifact_path = resolve_base_dir_path(workspace_dir / "artifacts", artifact_name)
@@ -388,10 +391,11 @@ class RepoWorkspaceTools(Toolkit):
             "repo_dir": metadata.get("repo_dir"),
             "command": command,
             "execution_policy": {
+                "authorization_status": "not_authorized_by_repo_workspace",
                 "allow_arbitrary_execution": False,
                 "requires_external_execution_substrate": "coding_sandbox",
-                "allow_network": allow_network,
-                "allow_dependency_install": allow_dependency_install,
+                "requested_allow_network": allow_network,
+                "requested_allow_dependency_install": allow_dependency_install,
                 "timeout_seconds": timeout_seconds,
                 "capture_stdout": True,
                 "capture_stderr": True,
@@ -421,6 +425,8 @@ class RepoWorkspaceTools(Toolkit):
             raise ValueError("repo must be in owner/name form with safe GitHub characters.")
         if any(fnmatch.fnmatch(repo_name, pattern) for pattern in self.denied_repos):
             raise ValueError(f"repo is explicitly denied: {repo_name}")
+        for pattern in self.allowed_repos:
+            _validate_repo_pattern(pattern, field_name="allowed_repos")
         if not any(fnmatch.fnmatch(repo_name, pattern) for pattern in self.allowed_repos):
             raise ValueError(f"repo is not allowlisted: {repo_name}")
         return repo_name
@@ -514,9 +520,24 @@ def _normalize_string_list(value: list[str] | str | None) -> list[str]:
 def _normalize_repo_patterns(value: list[str] | str | None, *, fallback: tuple[str, ...], field_name: str) -> list[str]:
     patterns = _normalize_string_list(value) or list(fallback)
     for pattern in patterns:
-        if ".." in pattern or pattern.startswith("/") or "\\" in pattern:
-            raise ValueError(f"{field_name} contains an unsafe repository pattern: {pattern!r}")
+        _validate_repo_pattern(pattern, field_name=field_name)
     return patterns
+
+
+def _validate_repo_pattern(pattern: str, *, field_name: str) -> None:
+    if ".." in pattern or pattern.startswith("/") or "\\" in pattern:
+        raise ValueError(f"{field_name} contains an unsafe repository pattern: {pattern!r}")
+    if pattern in {"*", "*/*"}:
+        raise ValueError(f"{field_name} contains an overly broad repository pattern: {pattern!r}")
+    if "/" not in pattern:
+        raise ValueError(f"{field_name} must use owner/name or owner/* patterns: {pattern!r}")
+    owner, name = pattern.split("/", 1)
+    if not owner or not name or owner == "*":
+        raise ValueError(f"{field_name} contains an overly broad repository pattern: {pattern!r}")
+    if "*" in owner:
+        raise ValueError(f"{field_name} may wildcard repository names only, not owners: {pattern!r}")
+    if "*" in name and name != "*":
+        raise ValueError(f"{field_name} wildcard repository patterns must be owner/*: {pattern!r}")
 
 
 def _safe_subprocess_env() -> dict[str, str]:
@@ -531,7 +552,7 @@ def _safe_subprocess_env() -> dict[str, str]:
 
 def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "diff.external=", "-c", "core.fsmonitor=false", *args],
         cwd=cwd,
         env=_safe_subprocess_env(),
         text=True,
@@ -542,14 +563,25 @@ def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _copy_source_tree(source: Path, destination: Path) -> None:
+    _validate_source_tree_safe(source)
     for child in source.iterdir():
         target = destination / child.name
-        if child.is_symlink():
-            raise ValueError("source_path contains symlinks; refusing to materialize ambiguous paths.")
         if child.is_dir():
             shutil.copytree(child, target, symlinks=False, ignore_dangling_symlinks=False)
         elif child.is_file():
             shutil.copy2(child, target)
+
+
+def _validate_source_tree_safe(source: Path) -> None:
+    for path in [source, *source.rglob("*")]:
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise ValueError(f"source_path contains an unreadable path: {path}") from exc
+        if stat.S_ISLNK(mode):
+            raise ValueError("source_path contains symlinks; refusing to materialize ambiguous paths.")
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise ValueError("source_path contains special files; refusing to materialize ambiguous paths.")
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
