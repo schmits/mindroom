@@ -5951,6 +5951,224 @@
       "status": "available"
     },
     {
+      "agent_override_fields": [
+        {
+          "authored_override": true,
+          "default": null,
+          "description": "Per-agent workspace root. Defaults to ./repo_workspace in the worker workspace.",
+          "label": "Workspace Root",
+          "name": "workspace_root",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/repo-sandbox-fixture"
+          ],
+          "description": "Per-agent owner/name repositories or owner/* patterns this workspace tool may materialize.",
+          "label": "Allowed GitHub Repositories",
+          "name": "allowed_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/prod",
+            "schmits/production",
+            "schmits/secrets",
+            "schmits/security"
+          ],
+          "description": "Per-agent owner/name repositories or owner/* patterns denied before allow rules are evaluated.",
+          "label": "Denied GitHub Repositories",
+          "name": "denied_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [],
+          "description": "Per-agent local directories from which create_workspace may copy repository sources.",
+          "label": "Allowed Local Source Roots",
+          "name": "allowed_source_roots",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": 120,
+          "description": "Per-agent maximum workspace lifetime requested by create_workspace.",
+          "label": "Maximum Workspace TTL Minutes",
+          "name": "max_ttl_minutes",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "number",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": false,
+          "description": "Per-agent network requests are rejected in the MVP; no clone/fetch/network operations are performed.",
+          "label": "Allow Network",
+          "name": "allow_network",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": "schmits/repo-sandbox-fixture",
+          "description": "Per-agent default owner/name repository when create_workspace omits repo.",
+          "label": "Default Repository",
+          "name": "default_repo",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        }
+      ],
+      "auth_provider": null,
+      "category": "development",
+      "config_fields": [
+        {
+          "authored_override": true,
+          "default": null,
+          "description": "Directory for ephemeral repo_workspace state. Defaults to ./repo_workspace in the worker workspace.",
+          "label": "Workspace Root",
+          "name": "workspace_root",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/repo-sandbox-fixture"
+          ],
+          "description": "Owner/name repositories or owner/* patterns this workspace tool may materialize.",
+          "label": "Allowed GitHub Repositories",
+          "name": "allowed_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/prod",
+            "schmits/production",
+            "schmits/secrets",
+            "schmits/security"
+          ],
+          "description": "Owner/name repositories or owner/* patterns denied before allow rules are evaluated.",
+          "label": "Denied GitHub Repositories",
+          "name": "denied_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [],
+          "description": "Local directories from which create_workspace may copy already-materialized repository sources.",
+          "label": "Allowed Local Source Roots",
+          "name": "allowed_source_roots",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": 120,
+          "description": "Maximum allowed workspace lifetime requested by create_workspace.",
+          "label": "Maximum Workspace TTL Minutes",
+          "name": "max_ttl_minutes",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "number",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": false,
+          "description": "Network requests are rejected in the MVP; no clone/fetch/network operations are performed.",
+          "label": "Allow Network",
+          "name": "allow_network",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "boolean",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": "schmits/repo-sandbox-fixture",
+          "description": "Default owner/name repository when create_workspace omits repo.",
+          "label": "Default Repository",
+          "name": "default_repo",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        }
+      ],
+      "consumes_workspace_paths": true,
+      "default_execution_target": "worker",
+      "dependencies": [],
+      "description": "Ephemeral, repo-scoped workspace for safe file materialization, editing, status, diff, patch artifacts, and controlled coding_sandbox handoff. No arbitrary execution, GitHub writes, or ambient secrets.",
+      "display_name": "Repository Workspace",
+      "docs_url": null,
+      "function_names": [
+        "apply_patch",
+        "create_workspace",
+        "delete_file",
+        "destroy_workspace",
+        "export_patch",
+        "get_diff",
+        "get_status",
+        "get_workspace_info",
+        "handoff_to_coding_sandbox",
+        "list_files",
+        "list_workspaces",
+        "read_file",
+        "write_file"
+      ],
+      "helper_text": null,
+      "icon": "FolderGit2",
+      "icon_color": "text-emerald-600",
+      "name": "repo_workspace",
+      "requires_room_context": false,
+      "setup_type": "none",
+      "status": "available"
+    },
+    {
       "agent_override_fields": null,
       "auth_provider": null,
       "category": "development",
