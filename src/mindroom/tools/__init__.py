@@ -111,6 +111,7 @@ from mindroom.tools.reddit import reddit_tools
 from mindroom.tools.redshift import redshift_tools
 from mindroom.tools.replicate import replicate_tools
 from mindroom.tools.repo_sandbox import repo_sandbox_tools
+from mindroom.tools.repo_workspace import repo_workspace_tools
 from mindroom.tools.resend import resend_tools
 from mindroom.tools.scheduler import scheduler_tools
 from mindroom.tools.scrapegraph import scrapegraph_tools
@@ -243,6 +244,7 @@ __all__ = [
     "register_thread_summary_tools",
     "replicate_tools",
     "repo_sandbox_tools",
+    "repo_workspace_tools",
     "resend_tools",
     "scheduler_tools",
     "scrapegraph_tools",
