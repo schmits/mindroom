@@ -81,7 +81,7 @@ class _MindRoomAsyncClient(nio.AsyncClient):
             encrypted_content[STREAM_STATUS_KEY] = stream_status
         return encrypted_message_type, encrypted_content
 
-    def _handle_olm_events(self, response: nio.SyncResponse) -> None:
+    def _handle_olm_events(self, response: nio.SyncResponse | nio.SlidingSyncResponse) -> None:
         """Preserve an explicit zero OTK count so nio replenishes a drained pool."""
         super()._handle_olm_events(response)
         count = response.device_key_count.signed_curve25519
@@ -205,6 +205,7 @@ def matrix_client_config(*, http_headers: Mapping[str, str] | None = None) -> ni
     """Return nio config, copying plain headers while preserving request-time mappings."""
     custom_headers = dict(http_headers) if isinstance(http_headers, dict) else http_headers
     return nio.AsyncClientConfig(
+        backfill_limited_timelines=True,
         custom_headers=cast("dict[str, str] | None", custom_headers),
         replace_rotated_device_keys=True,
     )
