@@ -2674,7 +2674,7 @@
         {
           "authored_override": true,
           "default": null,
-          "description": "Optional allowlist of Docker command functions to expose. Leave unset to expose all commands.",
+          "description": "Optional allowlist of Docker command functions to expose. Leave empty to expose all Docker commands.",
           "label": "Exposed Docker Commands",
           "name": "include_tools",
           "options": null,
@@ -4055,7 +4055,7 @@
         },
         {
           "authored_override": true,
-          "default": true,
+          "default": false,
           "description": "Allow creating new spreadsheets",
           "label": "Enable Create Operations",
           "name": "create",
@@ -4067,7 +4067,7 @@
         },
         {
           "authored_override": true,
-          "default": true,
+          "default": false,
           "description": "Allow updating existing spreadsheets",
           "label": "Enable Update Operations",
           "name": "update",
@@ -5772,6 +5772,183 @@
       "requires_room_context": false,
       "setup_type": "api_key",
       "status": "requires_config"
+    },
+    {
+      "agent_override_fields": [
+        {
+          "authored_override": true,
+          "default": null,
+          "description": "Per-agent sandbox root. Defaults to ./repo_sandbox in the worker workspace.",
+          "label": "Sandbox Root",
+          "name": "sandbox_root",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/repo-sandbox-fixture"
+          ],
+          "description": "Per-agent owner/name repositories or owner/* repository patterns this tool may access when already pre-seeded locally.",
+          "label": "Allowed GitHub Repositories",
+          "name": "allowed_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/prod",
+            "schmits/production",
+            "schmits/secrets",
+            "schmits/security"
+          ],
+          "description": "Per-agent owner/name repositories or owner/* patterns denied before allow rules are evaluated.",
+          "label": "Denied GitHub Repositories",
+          "name": "denied_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "pytest -q",
+            "python -m pytest -q",
+            "npm test",
+            "npm run test",
+            "pnpm test"
+          ],
+          "description": "Per-agent exact test commands allowed by run_tests.",
+          "label": "Allowed Test Commands",
+          "name": "allowed_test_commands",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": "schmits/repo-sandbox-fixture",
+          "description": "Per-agent default owner/name repository when a call omits repo.",
+          "label": "Default Repository",
+          "name": "default_repo",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        }
+      ],
+      "auth_provider": null,
+      "category": "development",
+      "config_fields": [
+        {
+          "authored_override": true,
+          "default": null,
+          "description": "Directory containing pre-seeded allowlisted repositories. Defaults to ./repo_sandbox in the worker workspace.",
+          "label": "Sandbox Root",
+          "name": "sandbox_root",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/repo-sandbox-fixture"
+          ],
+          "description": "Owner/name repositories or owner/* repository patterns this tool may access when already pre-seeded locally.",
+          "label": "Allowed GitHub Repositories",
+          "name": "allowed_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "schmits/prod",
+            "schmits/production",
+            "schmits/secrets",
+            "schmits/security"
+          ],
+          "description": "Owner/name repositories or owner/* patterns that are denied before allow rules are evaluated.",
+          "label": "Denied GitHub Repositories",
+          "name": "denied_repos",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": [
+            "pytest -q",
+            "python -m pytest -q",
+            "npm test",
+            "npm run test",
+            "pnpm test"
+          ],
+          "description": "Exact test commands allowed by run_tests. Commands run without a shell.",
+          "label": "Allowed Test Commands",
+          "name": "allowed_test_commands",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "string[]",
+          "validation": null
+        },
+        {
+          "authored_override": true,
+          "default": "schmits/repo-sandbox-fixture",
+          "description": "Default owner/name repository when a call omits repo.",
+          "label": "Default Repository",
+          "name": "default_repo",
+          "options": null,
+          "placeholder": null,
+          "required": false,
+          "type": "text",
+          "validation": null
+        }
+      ],
+      "consumes_workspace_paths": true,
+      "default_execution_target": "worker",
+      "dependencies": [],
+      "description": "Allowlisted pre-seeded local repository inspect/edit/test workflow confined to a sandbox directory. No GitHub clone, fetch, or authenticated network access is performed; edit, write, and test calls require explicit confirm_write=true.",
+      "display_name": "Repository Sandbox",
+      "docs_url": null,
+      "function_names": [
+        "clone_or_update",
+        "edit_file",
+        "grep",
+        "list_files",
+        "read_file",
+        "run_tests",
+        "status",
+        "write_file"
+      ],
+      "helper_text": null,
+      "icon": "GitBranch",
+      "icon_color": "text-emerald-600",
+      "name": "repo_sandbox",
+      "requires_room_context": false,
+      "setup_type": "none",
+      "status": "available"
     },
     {
       "agent_override_fields": null,
@@ -7658,41 +7835,6 @@
       "config_fields": [
         {
           "authored_override": true,
-          "default": 30,
-          "description": "Short-lived command and response timeout, from 1 to 120 seconds.",
-          "label": "Command Timeout Seconds",
-          "name": "timeout_seconds",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "number",
-          "validation": null
-        }
-      ],
-      "consumes_workspace_paths": false,
-      "default_execution_target": "primary",
-      "dependencies": null,
-      "description": "Operate exact locally allowlisted applications through accessibility state over Matrix encryption",
-      "display_name": "Matrix Desktop",
-      "docs_url": "https://docs.mindroom.chat/tools/desktop/",
-      "function_names": [
-        "desktop"
-      ],
-      "helper_text": "Ask the requester to send `!desktop setup` in a private Matrix room containing only them and one Desktop-enabled agent, plus the router when it serves the command.",
-      "icon": "MonitorUp",
-      "icon_color": "text-cyan-500",
-      "name": "desktop",
-      "requires_room_context": true,
-      "setup_type": "special",
-      "status": "requires_config"
-    },
-    {
-      "agent_override_fields": null,
-      "auth_provider": null,
-      "category": "productivity",
-      "config_fields": [
-        {
-          "authored_override": true,
           "default": null,
           "description": null,
           "label": "Db Path",
@@ -7872,7 +8014,7 @@
         },
         {
           "authored_override": true,
-          "default": true,
+          "default": false,
           "description": "Allow the agent to create, update, and delete calendar events",
           "label": "Allow Updates",
           "name": "allow_update",
@@ -8040,18 +8182,6 @@
         },
         {
           "authored_override": true,
-          "default": true,
-          "description": "Allow uploading, creating folders, moving or renaming files, and trashing files.",
-          "label": "Allow Write Operations",
-          "name": "write",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "boolean",
-          "validation": null
-        },
-        {
-          "authored_override": true,
           "default": 10485760,
           "description": "Maximum non-Google-Workspace file size to read in bytes.",
           "label": "Max Read Size",
@@ -8063,7 +8193,7 @@
           "validation": null
         }
       ],
-      "consumes_workspace_paths": true,
+      "consumes_workspace_paths": false,
       "default_execution_target": "primary",
       "dependencies": [
         "google-api-python-client",
@@ -8071,18 +8201,14 @@
         "google-auth-httplib2",
         "google-auth-oauthlib"
       ],
-      "description": "Search, read, upload, and organize files in the connected user's Google Drive",
+      "description": "Search and read files from the connected user's Google Drive",
       "display_name": "Google Drive",
       "docs_url": "https://docs.agno.com/tools/toolkits/others/google_drive",
       "function_names": [
         "google_drive_list_files",
         "google_drive_search_files",
         "google_drive_read_file",
-        "google_drive_download_file",
-        "google_drive_upload_file",
-        "google_drive_create_folder",
-        "google_drive_move_file",
-        "google_drive_trash_file"
+        "google_drive_download_file"
       ],
       "helper_text": null,
       "icon": "SiGoogledrive",
@@ -9772,7 +9898,7 @@
         {
           "authored_override": true,
           "default": null,
-          "description": "Optional host target directory for browser screenshots, PDFs, and downloads. Defaults to the active storage path's browser/ directory. The desktop target instead uses its local storage path's desktop-browser/ directory.",
+          "description": "Optional directory for browser screenshots, PDFs, and downloads. Defaults to the active storage path's browser/ directory.",
           "label": "Output Directory",
           "name": "output_dir",
           "options": null,
@@ -9791,75 +9917,6 @@
           "placeholder": null,
           "required": false,
           "type": "boolean",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": "host",
-          "description": "Use host for MindRoom's managed Playwright profile or desktop for the Playwright extension installed in the user's existing local browser profile.",
-          "label": "Default Browser Target",
-          "name": "default_target",
-          "options": [
-            {
-              "label": "MindRoom host profile",
-              "value": "host"
-            },
-            {
-              "label": "Matrix desktop profile",
-              "value": "desktop"
-            }
-          ],
-          "placeholder": null,
-          "required": false,
-          "type": "select",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": null,
-          "description": "Required for target=desktop; dedicated Matrix account used by the local desktop bridge.",
-          "label": "Desktop Matrix User ID",
-          "name": "device_user_id",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": null,
-          "description": "Required for target=desktop; exact device ID printed by 'mindroom desktop login'.",
-          "label": "Desktop Matrix Device ID",
-          "name": "device_id",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": null,
-          "description": "Required for target=desktop; exact Ed25519 fingerprint of the local bridge device.",
-          "label": "Desktop Device Fingerprint",
-          "name": "device_ed25519",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": 90,
-          "description": "Matrix and local Playwright MCP timeout from 1 to 120 seconds.",
-          "label": "Desktop Browser Timeout Seconds",
-          "name": "timeout_seconds",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "number",
           "validation": null
         }
       ],
