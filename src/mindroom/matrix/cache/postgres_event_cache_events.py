@@ -21,6 +21,8 @@ from .event_cache_events import (
 from .postgres_cursor import fetchall, fetchone, rowcount
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from psycopg import AsyncConnection
 
 _ROOM_CONTENT_TABLES = (
@@ -232,6 +234,50 @@ async def load_mxc_text(
         (namespace, room_id, event_id, mxc_url),
     )
     return None if row is None else str(row[0])
+
+
+async def load_mxc_texts(
+    db: AsyncConnection,
+    *,
+    namespace: str,
+    room_id: str,
+    references: Collection[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Return plaintext for exact visible references in one database round trip."""
+    unique_references = tuple(dict.fromkeys(references))
+    if not unique_references:
+        return {}
+    rows = await fetchall(
+        db,
+        """
+        WITH requested(event_id, mxc_url) AS (
+            SELECT *
+            FROM unnest(%s::text[], %s::text[])
+        )
+        SELECT reference.event_id, plaintext.mxc_url, plaintext.text_content
+        FROM requested
+        JOIN mindroom_event_cache_event_mxc_references AS reference
+          ON reference.event_id = requested.event_id
+         AND reference.mxc_url = requested.mxc_url
+        JOIN mindroom_event_cache_mxc_text AS plaintext
+          ON plaintext.namespace = reference.namespace
+         AND plaintext.room_id = reference.room_id
+         AND plaintext.mxc_url = reference.mxc_url
+        JOIN mindroom_event_cache_events AS events
+          ON events.namespace = reference.namespace
+         AND events.room_id = reference.room_id
+         AND events.event_id = reference.event_id
+        WHERE plaintext.namespace = %s
+          AND plaintext.room_id = %s
+        """,
+        (
+            [event_id for event_id, _mxc_url in unique_references],
+            [mxc_url for _event_id, mxc_url in unique_references],
+            namespace,
+            room_id,
+        ),
+    )
+    return {(str(event_id), str(mxc_url)): str(text_content) for event_id, mxc_url, text_content in rows}
 
 
 async def persist_mxc_text(
@@ -653,8 +699,9 @@ async def delete_event_thread_rows(
     room_id: str,
     *,
     event_ids: list[str],
+    current_self_root_ids: Collection[str] = (),
 ) -> int:
-    """Delete event mappings and unsupported roots whose proof was removed."""
+    """Delete event mappings while preserving roots proven by the current snapshot."""
     if not event_ids:
         return 0
     affected_thread_ids = await _thread_ids_for_events(
@@ -676,7 +723,7 @@ async def delete_event_thread_rows(
         namespace,
         room_id,
         candidate_root_ids=affected_thread_ids,
-        current_self_root_ids=set(),
+        current_self_root_ids=set(current_self_root_ids),
     )
     return deleted_rows
 

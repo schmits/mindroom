@@ -195,6 +195,21 @@ async def test_room_scope_is_part_of_event_and_plaintext_identity(
         assert await cache.get_mxc_text("!a:localhost", "$same", mxc_url) == "plaintext A"
         assert await cache.get_mxc_text("!b:localhost", "$same", mxc_url) == "plaintext B"
         assert await cache.get_mxc_text("!wrong:localhost", "$same", mxc_url) is None
+        room_a_epoch = await cache.room_membership_epoch("!a:localhost")
+        assert room_a_epoch is not None
+        assert await cache.get_mxc_texts(
+            "!a:localhost",
+            {("$same", mxc_url), ("$missing", mxc_url)},
+            expected_membership_epoch=room_a_epoch,
+        ) == {("$same", mxc_url): "plaintext A"}
+        assert (
+            await cache.get_mxc_texts(
+                "!a:localhost",
+                {("$same", mxc_url)},
+                expected_membership_epoch=room_a_epoch + 1,
+            )
+            == {}
+        )
     finally:
         await root.close()
 
@@ -788,6 +803,40 @@ async def test_redacting_last_thread_child_removes_orphan_root_mapping(
         assert await cache.redact_event(room_id, "$second-child")
         assert await cache.get_thread_id_for_event(room_id, "$second-child") is None
         assert await cache.get_thread_id_for_event(room_id, root_event_id) is None
+    finally:
+        await root.close()
+
+
+@pytest.mark.asyncio
+async def test_replacing_thread_without_old_children_preserves_root_mapping(
+    event_cache_factory: Callable[[], ConversationEventCache],
+) -> None:
+    """Removing stale children must not erase the replacement snapshot's root self-mapping."""
+    root = _shared_cache(event_cache_factory)
+    await root.initialize()
+    cache = root.for_principal("@alice:localhost")
+    room_id = "!room:localhost"
+    root_event_id = "$thread-root"
+    root_event = _event(root_event_id, 1)
+    child_event = _event("$old-child", 2)
+    try:
+        await replace_thread_unconditionally(
+            cache,
+            room_id,
+            root_event_id,
+            [root_event, child_event],
+        )
+
+        await replace_thread_unconditionally(
+            cache,
+            room_id,
+            root_event_id,
+            [root_event],
+        )
+
+        assert await cache.get_thread_events(room_id, root_event_id) == [root_event]
+        assert await cache.get_thread_id_for_event(room_id, root_event_id) == root_event_id
+        assert await cache.get_thread_id_for_event(room_id, "$old-child") is None
     finally:
         await root.close()
 

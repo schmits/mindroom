@@ -30,12 +30,12 @@ from .thread_cache_state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Collection
     from pathlib import Path
 
     from .agent_message_snapshot import AgentMessageSnapshot
     from .cache_maintenance import CacheMaintenanceReport
-    from .event_cache import ThreadCacheState
+    from .event_cache import ThreadCacheState, ThreadRevision
 
 _EVENT_CACHE_SCHEMA_VERSION = 12
 _EVENT_CACHE_TABLES = (
@@ -707,6 +707,7 @@ class SqliteEventCache:
         operation: str,
         disabled_result: _T,
         reader: Callable[[aiosqlite.Connection], Awaitable[_T]],
+        expected_membership_epoch: int | None = None,
     ) -> _T:
         if (
             self._runtime.is_disabled
@@ -730,12 +731,17 @@ class SqliteEventCache:
                     )
                     result = disabled_result
                 else:
-                    membership_state, _membership_epoch = await sqlite_event_cache_threads.load_room_membership_locked(
+                    membership_state, membership_epoch = await sqlite_event_cache_threads.load_room_membership_locked(
                         db,
                         principal_id=self.principal_id,
                         room_id=room_id,
                     )
-                    result = disabled_result if membership_state != "joined" else await reader(db)
+                    result = (
+                        disabled_result
+                        if membership_state != "joined"
+                        or (expected_membership_epoch is not None and membership_epoch != expected_membership_epoch)
+                        else await reader(db)
+                    )
                 await db.commit()
             except sqlite3.OperationalError as exc:
                 await _rollback_sqlite_connection_best_effort(db, operation=operation)
@@ -845,6 +851,47 @@ class SqliteEventCache:
             operation="get_thread_events",
             disabled_result=None,
             reader=lambda db: sqlite_event_cache_threads.load_thread_events(
+                db,
+                principal_id=self.principal_id,
+                room_id=room_id,
+                thread_id=thread_id,
+            ),
+        )
+
+    async def get_thread_events_written_between(
+        self,
+        room_id: str,
+        thread_id: str,
+        *,
+        after_write_seq: int,
+        through_write_seq: int,
+        after_thread_write_seq: int,
+        through_thread_write_seq: int,
+    ) -> list[dict[str, Any]]:
+        """Return thread events changed in bounded payload or thread-index intervals."""
+        return await self._read_operation(
+            room_id,
+            operation="get_thread_events_written_between",
+            disabled_result=[],
+            reader=lambda db: sqlite_event_cache_threads.load_thread_events_written_between(
+                db,
+                principal_id=self.principal_id,
+                room_id=room_id,
+                thread_id=thread_id,
+                after_write_seq=after_write_seq,
+                through_write_seq=through_write_seq,
+                after_thread_write_seq=after_thread_write_seq,
+                through_thread_write_seq=through_thread_write_seq,
+            ),
+        )
+
+    async def get_thread_revision(self, room_id: str, thread_id: str) -> ThreadRevision | None:
+        """Return the durable revision identity of one non-empty cached thread."""
+        return await self._read_operation(
+            room_id,
+            operation="get_thread_revision",
+            disabled_result=None,
+            reader=lambda db: sqlite_event_cache_threads.load_thread_revision(
                 db,
                 principal_id=self.principal_id,
                 room_id=room_id,
@@ -974,6 +1021,29 @@ class SqliteEventCache:
                 event_id=event_id,
                 mxc_url=mxc_url,
             ),
+        )
+
+    async def get_mxc_texts(
+        self,
+        room_id: str,
+        references: Collection[tuple[str, str]],
+        *,
+        expected_membership_epoch: int,
+    ) -> dict[tuple[str, str], str]:
+        """Return scoped MXC plaintext for many surviving event references in one read."""
+        if not references:
+            return {}
+        return await self._read_operation(
+            room_id,
+            operation="get_mxc_texts",
+            disabled_result={},
+            reader=lambda db: sqlite_event_cache_events.load_mxc_texts(
+                db,
+                principal_id=self.principal_id,
+                room_id=room_id,
+                references=references,
+            ),
+            expected_membership_epoch=expected_membership_epoch,
         )
 
     async def store_event(

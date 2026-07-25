@@ -33,7 +33,7 @@ from mindroom.matrix.cache.sqlite_event_cache import SqliteEventCache
 from mindroom.matrix.cache.thread_history_result import thread_history_result
 from mindroom.matrix.cache.thread_reads import ThreadReadMode
 from mindroom.matrix.cache.write_coordinator import EventCacheWriteCoordinator
-from mindroom.matrix.client_thread_history import fetch_thread_history
+from mindroom.matrix.client_thread_history import BulkThreadRefreshStats, fetch_thread_history
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.conversation_cache import MatrixConversationCache, _cached_room_get_event
 from mindroom.matrix.event_info import EventInfo
@@ -372,6 +372,7 @@ async def test_conversation_cache_thread_reads_forward_client_fetch_metadata(
                 trusted_sender_ids=conversation_cache._trusted_sender_ids(),
                 caller_label=f"caller-{method_name}",
                 coordinator_queue_wait_ms=queue_wait_ms,
+                resolution_reuse=conversation_cache._thread_resolution_reuse,
             )
     finally:
         await event_cache.close()
@@ -435,9 +436,13 @@ async def test_dispatch_thread_read_timeout_does_not_cancel_pending_cache_write(
         write_started.set()
         await release_write.wait()
 
-    pending_write_task = asyncio.create_task(pending_cache_write())
-    coordinator._thread_update_tasks[("!room:localhost", "$thread:localhost")] = pending_write_task
-    coordinator._thread_update_tasks_by_room["!room:localhost"] = {"$thread:localhost": pending_write_task}
+    pending_write_task = coordinator.queue_thread_update(
+        "!room:localhost",
+        "$thread:localhost",
+        pending_cache_write,
+        name="matrix_cache_pending_test_write",
+        coordination_scope=event_cache.principal_id,
+    )
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
     _set_dispatch_thread_read_timeout(conversation_cache, 0.01)
     baseline_wait_tasks = _pending_thread_cache_update_wait_tasks()
@@ -839,38 +844,41 @@ async def test_strict_thread_history_propagates_cache_coordinator_timeout(
 
 
 @pytest.mark.asyncio
-async def test_conversation_cache_startup_prewarm_fetch_preserves_fixed_metadata(
+async def test_conversation_cache_startup_prewarm_bulk_refresh_preserves_metadata(
     tmp_path: Path,
 ) -> None:
-    """Startup prewarm should bypass read coordination while keeping strict fetch metadata."""
+    """Startup prewarm should call the bulk room refresher with fixed metadata."""
     event_cache = SqliteEventCache(tmp_path / "event_cache.db")
     await event_cache.initialize()
     client = MagicMock()
     conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
-    fetch_dispatch_thread_snapshot = AsyncMock(return_value=thread_history_result([], is_full_history=False))
+    stats = BulkThreadRefreshStats(
+        requested_threads=1,
+        stored_threads=1,
+        missing_root_ids=frozenset(),
+        room_scan_pages=1,
+        scanned_event_count=2,
+    )
+    bulk_refresh_room_thread_histories = AsyncMock(return_value=stats)
 
     try:
-        with (
-            patch(
-                "mindroom.matrix.conversation_cache.fetch_dispatch_thread_snapshot",
-                fetch_dispatch_thread_snapshot,
-            ),
-            patch("mindroom.matrix.conversation_cache.time.time", return_value=222.0),
+        with patch(
+            "mindroom.matrix.conversation_cache.bulk_refresh_room_thread_histories",
+            bulk_refresh_room_thread_histories,
         ):
-            await conversation_cache._refresh_dispatch_thread_snapshot_for_startup_prewarm(
+            result = await conversation_cache._bulk_refresh_startup_threads(
                 "!room:localhost",
-                "$thread:localhost",
+                ["$thread:localhost"],
             )
 
-        fetch_dispatch_thread_snapshot.assert_awaited_once_with(
+        assert result == stats
+        bulk_refresh_room_thread_histories.assert_awaited_once_with(
             client,
             "!room:localhost",
-            "$thread:localhost",
-            event_cache=event_cache,
-            cache_write_guard_started_at=222.0,
-            trusted_sender_ids=conversation_cache._trusted_sender_ids(),
+            event_cache,
+            thread_root_ids=["$thread:localhost"],
             caller_label="startup_thread_prewarm",
-            coordinator_queue_wait_ms=0.0,
+            max_scan_pages=20,
         )
     finally:
         await event_cache.close()
@@ -2999,6 +3007,103 @@ async def test_mxc_text_cache_round_trips_across_event_cache_reopen(
         await reopened_cache.close()
 
     assert cached_text == "Full text sidecar"
+
+
+@pytest.mark.asyncio
+async def test_thread_revision_tracks_point_payload_updates(
+    event_cache_factory: Callable[[], ConversationEventCache],
+) -> None:
+    """Thread revisions and delta reads include changed lookup payloads."""
+    cache = event_cache_factory()
+    await cache.initialize()
+    root = {
+        "event_id": "$thread_root",
+        "origin_server_ts": 1000,
+        "type": "m.room.message",
+        "sender": "@user:localhost",
+        "content": {"msgtype": "m.text", "body": "original"},
+    }
+    try:
+        await _replace_thread(cache, "!room:localhost", "$thread_root", [root])
+        before = await cache.get_thread_revision("!room:localhost", "$thread_root")
+        updated = {**root, "content": {"msgtype": "m.text", "body": "updated"}}
+        await cache.store_event("$thread_root", "!room:localhost", updated)
+        after = await cache.get_thread_revision("!room:localhost", "$thread_root")
+        assert before is not None
+        assert after is not None
+        changed_rows = await cache.get_thread_events_written_between(
+            "!room:localhost",
+            "$thread_root",
+            after_write_seq=before.max_write_seq,
+            through_write_seq=after.max_write_seq,
+            after_thread_write_seq=before.max_thread_write_seq,
+            through_thread_write_seq=after.max_thread_write_seq,
+        )
+    finally:
+        await cache.close()
+
+    assert before.event_count == after.event_count == 1
+    assert after.max_write_seq > before.max_write_seq
+    assert after.max_thread_write_seq == before.max_thread_write_seq
+    assert changed_rows == [updated]
+
+
+@pytest.mark.asyncio
+async def test_thread_revision_tracks_index_replacements(
+    event_cache_factory: Callable[[], ConversationEventCache],
+) -> None:
+    """Thread revisions detect membership changes when payload writes are refused."""
+    cache = event_cache_factory()
+    await cache.initialize()
+    room_id = "!room:localhost"
+    thread_id = "$thread_root"
+    root = _clear_payload(thread_id, body="root", origin_server_ts=1000)
+    old_reply = _clear_payload(
+        "$old",
+        body="old",
+        thread_root_id=thread_id,
+        origin_server_ts=2000,
+    )
+    new_reply = _clear_payload(
+        "$new",
+        body="new",
+        thread_root_id=thread_id,
+        origin_server_ts=2000,
+    )
+    shared_reply = _clear_payload(
+        "$shared",
+        body="shared",
+        thread_root_id=thread_id,
+        origin_server_ts=3000,
+    )
+    try:
+        await cache.store_event("$new", room_id, new_reply)
+        await _replace_thread(cache, room_id, thread_id, [root, old_reply, shared_reply])
+        before = await cache.get_thread_revision(room_id, thread_id)
+        replacement = [
+            _opaque_payload(thread_id, origin_server_ts=1000),
+            _opaque_payload("$new", thread_root_id=thread_id, origin_server_ts=2000),
+            _opaque_payload("$shared", thread_root_id=thread_id, origin_server_ts=3000),
+        ]
+        await _replace_thread(cache, room_id, thread_id, replacement)
+        after = await cache.get_thread_revision(room_id, thread_id)
+        assert before is not None
+        assert after is not None
+        changed_rows = await cache.get_thread_events_written_between(
+            room_id,
+            thread_id,
+            after_write_seq=before.max_write_seq,
+            through_write_seq=after.max_write_seq,
+            after_thread_write_seq=before.max_thread_write_seq,
+            through_thread_write_seq=after.max_thread_write_seq,
+        )
+    finally:
+        await cache.close()
+
+    assert before.event_count == after.event_count == 3
+    assert after.max_write_seq == before.max_write_seq
+    assert after.max_thread_write_seq > before.max_thread_write_seq
+    assert [row["event_id"] for row in changed_rows] == [thread_id, "$new", "$shared"]
 
 
 @pytest.mark.asyncio

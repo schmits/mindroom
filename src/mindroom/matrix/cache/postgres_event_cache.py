@@ -29,13 +29,13 @@ from .thread_cache_state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 
     from psycopg import AsyncConnection
 
     from .agent_message_snapshot import AgentMessageSnapshot
     from .cache_maintenance import CacheMaintenanceReport
-    from .event_cache import ThreadCacheState
+    from .event_cache import ThreadCacheState, ThreadRevision
 
 
 _POSTGRES_EVENT_CACHE_SCHEMA_VERSION = 3
@@ -57,6 +57,7 @@ _TRANSIENT_SQLSTATES: frozenset[str] = frozenset(
     },
 )
 _TRANSIENT_ERROR_TEXT: tuple[str, ...] = (
+    "another command is already in progress",
     "connection is closed",
     "connection already closed",
     "connection refused",
@@ -1252,6 +1253,47 @@ class PostgresEventCache:
             ),
         )
 
+    async def get_thread_events_written_between(
+        self,
+        room_id: str,
+        thread_id: str,
+        *,
+        after_write_seq: int,
+        through_write_seq: int,
+        after_thread_write_seq: int,
+        through_thread_write_seq: int,
+    ) -> list[dict[str, Any]]:
+        """Return thread events changed in bounded payload or thread-index intervals."""
+        return await self._operation(
+            room_id,
+            operation="get_thread_events_written_between",
+            disabled_result=[],
+            callback=lambda db: postgres_event_cache_threads.load_thread_events_written_between(
+                db,
+                namespace=self._runtime.namespace,
+                room_id=room_id,
+                thread_id=thread_id,
+                after_write_seq=after_write_seq,
+                through_write_seq=through_write_seq,
+                after_thread_write_seq=after_thread_write_seq,
+                through_thread_write_seq=through_thread_write_seq,
+            ),
+        )
+
+    async def get_thread_revision(self, room_id: str, thread_id: str) -> ThreadRevision | None:
+        """Return the durable revision identity of one non-empty cached thread."""
+        return await self._operation(
+            room_id,
+            operation="get_thread_revision",
+            disabled_result=None,
+            callback=lambda db: postgres_event_cache_threads.load_thread_revision(
+                db,
+                namespace=self._runtime.namespace,
+                room_id=room_id,
+                thread_id=thread_id,
+            ),
+        )
+
     async def get_recent_room_thread_ids(self, room_id: str, *, limit: int) -> list[str]:
         """Return locally known thread IDs for one room ordered by newest cached activity."""
         return await self._operation(
@@ -1374,6 +1416,29 @@ class PostgresEventCache:
                 event_id=event_id,
                 mxc_url=mxc_url,
             ),
+        )
+
+    async def get_mxc_texts(
+        self,
+        room_id: str,
+        references: Collection[tuple[str, str]],
+        *,
+        expected_membership_epoch: int,
+    ) -> dict[tuple[str, str], str]:
+        """Return scoped MXC plaintext for many surviving event references in one read."""
+        if not references:
+            return {}
+        return await self._operation(
+            room_id,
+            operation="get_mxc_texts",
+            disabled_result={},
+            callback=lambda db: postgres_event_cache_events.load_mxc_texts(
+                db,
+                namespace=self._runtime.namespace,
+                room_id=room_id,
+                references=references,
+            ),
+            expected_membership_epoch=expected_membership_epoch,
         )
 
     async def store_event(

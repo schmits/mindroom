@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from .agent_message_snapshot import AgentMessageSnapshot
 
 
@@ -18,6 +20,16 @@ class ThreadCacheState:
     invalidation_reason: str | None
     room_invalidated_at: float | None
     room_invalidation_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ThreadRevision:
+    """Durable revision identity of one non-empty thread's raw rows."""
+
+    event_count: int
+    max_write_seq: int
+    max_thread_write_seq: int
+    max_origin_server_ts: int
 
 
 class EventCacheBackendUnavailableError(RuntimeError):
@@ -76,11 +88,26 @@ class ConversationEventCache(Protocol):
     async def get_thread_events(self, room_id: str, thread_id: str) -> list[dict[str, Any]] | None:
         """Return cached events for one thread sorted by timestamp."""
 
+    async def get_thread_events_written_between(
+        self,
+        room_id: str,
+        thread_id: str,
+        *,
+        after_write_seq: int,
+        through_write_seq: int,
+        after_thread_write_seq: int,
+        through_thread_write_seq: int,
+    ) -> list[dict[str, Any]]:
+        """Return thread events changed in bounded payload or thread-index intervals."""
+
     async def get_recent_room_thread_ids(self, room_id: str, *, limit: int) -> list[str]:
         """Return locally known thread IDs for one room ordered by newest cached activity."""
 
     async def get_thread_cache_state(self, room_id: str, thread_id: str) -> ThreadCacheState | None:
         """Return durable freshness metadata for one cached thread."""
+
+    async def get_thread_revision(self, room_id: str, thread_id: str) -> ThreadRevision | None:
+        """Return the durable revision identity of one non-empty cached thread."""
 
     async def get_event(self, room_id: str, event_id: str) -> dict[str, Any] | None:
         """Return one cached event payload by event ID."""
@@ -116,6 +143,15 @@ class ConversationEventCache(Protocol):
 
     async def get_mxc_text(self, room_id: str, event_id: str, mxc_url: str) -> str | None:
         """Return MXC plaintext only while a visible owning event still references it."""
+
+    async def get_mxc_texts(
+        self,
+        room_id: str,
+        references: Collection[tuple[str, str]],
+        *,
+        expected_membership_epoch: int,
+    ) -> dict[tuple[str, str], str]:
+        """Return scoped MXC plaintext for many surviving event references in one read."""
 
     async def store_event(
         self,
