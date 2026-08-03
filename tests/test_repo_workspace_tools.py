@@ -261,6 +261,19 @@ def test_workspace_info_rejects_local_source_without_boundary_enforcement(tmp_pa
     assert "must enforce source_path boundary" in tools.get_workspace_info("ws-test")
 
 
+def test_workspace_info_rejects_empty_workspace_with_tampered_source_path(tmp_path: Path) -> None:
+    tools = RepoWorkspaceTools(workspace_root=str(tmp_path / "workspaces"), allowed_repos=["schmits/repo-sandbox-fixture"])
+    _create_workspace(tools)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken = dict(metadata)
+    broken["provenance"] = dict(metadata["provenance"], source_path=str(tmp_path.parent / "outside"))
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "empty_workspace provenance must not include source_path" in tools.get_workspace_info("ws-test")
+
+
 def test_workspace_info_rejects_source_path_outside_recorded_allowed_roots(tmp_path: Path) -> None:
     source = tmp_path / "source"
     _init_repo(source)
@@ -280,6 +293,27 @@ def test_workspace_info_rejects_source_path_outside_recorded_allowed_roots(tmp_p
     metadata_path.write_text(json.dumps(broken), encoding="utf-8")
 
     assert "source_path is outside allowed_source_roots" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_source_path_outside_configured_allowed_roots(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-root"
+    source_root.mkdir()
+    source = source_root / "source"
+    _init_repo(source)
+    original_tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+    _create_workspace(original_tools, source_path=source)
+
+    reconfigured_tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "different-source-root")],
+    )
+
+    assert "source_path is outside configured allowed_source_roots" in reconfigured_tools.get_workspace_info("ws-test")
 
 
 def test_handoff_to_coding_sandbox_does_not_execute(tmp_path: Path) -> None:
