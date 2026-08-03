@@ -131,7 +131,7 @@ class RepoWorkspaceTools(Toolkit):
             repo_dir.mkdir(parents=True, exist_ok=False)
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             if source_path:
-                source = self._validate_source_path(source_path)
+                source = self._validate_source_path(source_path, expected_repo=repo_name)
                 source_provenance = _source_provenance(source, expected_repo=repo_name, source_ref=ref)
                 _copy_source_tree(source, repo_dir)
         except ValueError as exc:
@@ -448,7 +448,7 @@ class RepoWorkspaceTools(Toolkit):
             raise ValueError(f"ttl_minutes exceeds max_ttl_minutes ({self.max_ttl_minutes}).")
         return ttl
 
-    def _validate_source_path(self, source_path: str) -> Path:
+    def _validate_source_path(self, source_path: str, *, expected_repo: str) -> Path:
         if not self.allowed_source_roots:
             raise ValueError("source_path requires allowed_source_roots to be configured.")
         source = Path(source_path).resolve()
@@ -456,6 +456,8 @@ class RepoWorkspaceTools(Toolkit):
             raise ValueError("source_path must be an existing directory.")
         if not any(_is_relative_to(source, root) for root in self.allowed_source_roots):
             raise ValueError("source_path is outside allowed_source_roots.")
+        if not _source_path_matches_repo_layout(source, expected_repo, allowed_source_roots=self.allowed_source_roots):
+            raise ValueError("source_path must identify the requested repo root at <allowed_source_root>/<owner>/<repo>, not an owner or parent directory.")
         return source
 
     def _new_workspace_id(self, repo: str, workspace_id: str | None) -> str:
@@ -606,6 +608,11 @@ def _source_provenance(source: Path, *, expected_repo: str, source_ref: str | No
     repo_identity = _repo_identity_from_origin(redacted_origin) if redacted_origin else None
     if repo_identity and repo_identity != expected_repo:
         raise ValueError(f"source_path git origin does not match requested repo: {repo_identity}")
+    if not repo_identity:
+        # The exact allowed-root/owner/repo layout was already verified before
+        # provenance collection. A missing origin is acceptable only because the
+        # deterministic path identity boundary still identifies the requested repo.
+        repo_identity = expected_repo
     ref_result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=source)
     detected_ref = ref_result.stdout.strip() if ref_result.returncode == 0 else ""
     if not detected_ref or detected_ref == "HEAD":
@@ -614,7 +621,7 @@ def _source_provenance(source: Path, *, expected_repo: str, source_ref: str | No
     provenance.update(
         {
             "source_type": "local_git_checkout",
-            "repo_identity": repo_identity or expected_repo,
+            "repo_identity": repo_identity,
             "source_ref": source_ref or detected_ref,
             "source_head_sha": head_result.stdout.strip(),
             "origin_url": redacted_origin,
@@ -666,6 +673,21 @@ def _repo_identity_from_origin(origin_url: str | None) -> str | None:
     if path.endswith(".git"):
         path = path[:-4]
     return path if _GITHUB_REPO_RE.fullmatch(path) else None
+
+
+def _source_path_matches_repo_layout(
+    source: Path,
+    expected_repo: str,
+    *,
+    allowed_source_roots: list[Path] | None = None,
+) -> bool:
+    owner, repo = expected_repo.split("/", 1)
+    source = source.resolve()
+    if source.name != repo or source.parent.name != owner:
+        return False
+    if allowed_source_roots is None:
+        return True
+    return any(source == (root.resolve() / owner / repo).resolve() for root in allowed_source_roots)
 
 
 def _copy_source_tree(source: Path, destination: Path) -> None:
@@ -750,6 +772,9 @@ def _validate_workspace_metadata(
     *,
     configured_source_roots: list[Path] | None = None,
 ) -> str | None:
+    repo_name = metadata.get("repo")
+    if not isinstance(repo_name, str) or not _GITHUB_REPO_RE.fullmatch(repo_name):
+        return "Error: workspace metadata has invalid repo identity."
     repo_dir = Path(str(metadata.get("repo_dir", ""))).resolve()
     expected_repo_dir = (workspace_dir / "repo").resolve()
     if repo_dir != expected_repo_dir:
@@ -790,9 +815,18 @@ def _validate_workspace_metadata(
             return "Error: workspace metadata audit is missing allowed_source_roots for local source_path."
         if not any(_is_relative_to(resolved_source, root) for root in recorded_roots):
             return "Error: workspace metadata provenance source_path is outside allowed_source_roots."
+        if not _source_path_matches_repo_layout(resolved_source, repo_name, allowed_source_roots=recorded_roots):
+            return "Error: workspace metadata provenance source_path does not match repo identity boundary."
         configured_roots = [root.resolve() for root in (configured_source_roots or [])]
         if configured_roots and not any(_is_relative_to(resolved_source, root) for root in configured_roots):
             return "Error: workspace metadata provenance source_path is outside configured allowed_source_roots."
+        if configured_roots and not _source_path_matches_repo_layout(resolved_source, repo_name, allowed_source_roots=configured_roots):
+            return "Error: workspace metadata provenance source_path does not match configured repo identity boundary."
+        repo_identity = provenance.get("repo_identity")
+        if source_type == "local_git_checkout" and repo_identity != repo_name:
+            return "Error: workspace metadata provenance repo_identity does not match workspace repo."
+        if source_type == "local_copy" and repo_identity not in {repo_name, None, ""}:
+            return "Error: workspace metadata provenance repo_identity does not match workspace repo."
     return None
 
 
