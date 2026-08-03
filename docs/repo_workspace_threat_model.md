@@ -6,6 +6,7 @@
 
 - Workspace state is confined to the configured `workspace_root/<workspace_id>/repo` directory.
 - Local source materialization is permitted only when `source_path` resolves under an explicit `allowed_source_roots` allowlist.
+- `source_path` must identify the requested repository root, not an owner or parent directory: it must match the deterministic `<allowed_source_root>/<owner>/<repo>` layout, and any local git checkout origin identity must also match the requested owner/repo when present.
 - Repository identity is constrained by explicit `allowed_repos` and `denied_repos` allowlists before any workspace is created.
 - Workspace metadata records provenance and audit fields for materialization method, source boundary enforcement, write-confirmation policy, and non-execution/non-network behavior.
 
@@ -25,8 +26,9 @@ Negative gate coverage should verify rejection of:
 - direct reads of `.git` internals;
 - unauthorized repositories and denied repositories;
 - `source_path` outside configured `allowed_source_roots`;
+- owner-level, parent-level, wrong-owner, wrong-repo, or git-origin-mismatched `source_path` materialization attempts;
 - missing or invalid provenance/audit metadata;
-- metadata `repo_dir` or source path boundary violations.
+- metadata `repo_dir`, provenance repo identity, or source path boundary violations.
 
 ## Non-goals and explicit exclusions
 
