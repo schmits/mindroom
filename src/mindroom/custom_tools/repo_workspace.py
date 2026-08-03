@@ -37,71 +37,90 @@ class RepoWorkspaceTools(Toolkit):
     """Repository-scoped local workspace substrate.
 
     ``repo_workspace`` deliberately separates local file/diff handling from
-    remote GitHub writes and command execution. Workspaces are copied from
-    already-present source directories and all mutation APIs require explicit
-    confirmation.
+    remote GitHub writes and command execution:
+
+    * no arbitrary shell execution is exposed;
+    * no clone/fetch/network operation is performed by the MVP;
+    * no ambient secrets are passed to subprocesses;
+    * all file operations are confined to a workspace ``repo/`` directory;
+    * mutating operations require ``confirm_write=True``;
+    * execution requests are represented as handoff descriptors for a separate
+      coding sandbox.
     """
 
     def __init__(
         self,
         workspace_root: str | None = None,
-        *,
-        allowed_repos: list[str] | tuple[str, ...] | None = None,
-        denied_repos: list[str] | tuple[str, ...] | None = None,
-        allowed_source_roots: list[str] | tuple[str, ...] | None = None,
-        default_repo: str = "schmits/repo-sandbox-fixture",
+        allowed_repos: list[str] | str | None = None,
+        denied_repos: list[str] | str | None = None,
+        allowed_source_roots: list[str] | str | None = None,
         max_ttl_minutes: int = _DEFAULT_MAX_TTL_MINUTES,
-        **kwargs: Any,
+        allow_network: bool = False,
+        default_repo: str = "schmits/repo-sandbox-fixture",
     ) -> None:
-        super().__init__(name="repo_workspace", tools=[])
-        if kwargs:
-            unexpected = ", ".join(sorted(kwargs))
-            raise ValueError(f"Unsupported repo_workspace option(s): {unexpected}")
-        root = workspace_root or str(Path.cwd() / "repo_workspaces")
-        self.workspace_root = resolve_base_dir_path(root, option_name="workspace_root")
-        self.workspace_root.mkdir(parents=True, exist_ok=True)
-        self.allowed_repos = _normalize_patterns(allowed_repos or _DEFAULT_ALLOWED_REPOS, option_name="allowed_repos")
-        self.denied_repos = _normalize_patterns(denied_repos or _DEFAULT_DENIED_REPOS, option_name="denied_repos")
-        self.allowed_source_roots = tuple(
-            resolve_base_dir_path(path, option_name="allowed_source_roots") for path in (allowed_source_roots or [])
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else (Path.cwd() / "repo_workspace").resolve()
+        self.allowed_repos = _normalize_repo_patterns(allowed_repos, fallback=_DEFAULT_ALLOWED_REPOS, field_name="allowed_repos")
+        self.denied_repos = _normalize_repo_patterns(denied_repos, fallback=_DEFAULT_DENIED_REPOS, field_name="denied_repos")
+        self.allowed_source_roots = [
+            Path(item).resolve() for item in _normalize_string_list(allowed_source_roots)
+        ]
+        self.max_ttl_minutes = max_ttl_minutes
+        self.allow_network = allow_network
+        self.default_repo = default_repo
+        super().__init__(
+            name="repo_workspace",
+            tools=[
+                self.create_workspace,
+                self.get_workspace_info,
+                self.list_workspaces,
+                self.list_files,
+                self.read_file,
+                self.write_file,
+                self.delete_file,
+                self.apply_patch,
+                self.get_status,
+                self.get_diff,
+                self.export_patch,
+                self.handoff_to_coding_sandbox,
+                self.destroy_workspace,
+            ],
         )
-        self.default_repo = _validate_repo(default_repo)
-        self.max_ttl_minutes = max(1, int(max_ttl_minutes))
-        self.register(self.create_workspace)
-        self.register(self.list_files)
-        self.register(self.read_file)
-        self.register(self.grep)
-        self.register(self.write_file)
-        self.register(self.edit_file)
-        self.register(self.get_status)
-        self.register(self.export_patch)
-        self.register(self.get_workspace_info)
-        self.register(self.create_handoff)
-        self.register(self.cleanup_workspace)
 
     def create_workspace(
         self,
         repo: str | None = None,
-        workspace_id: str | None = None,
-        source_path: str | None = None,
         ref: str | None = None,
+        source_path: str | None = None,
+        workspace_id: str | None = None,
+        ttl_minutes: int | None = None,
+        allow_network: bool | None = None,
         confirm_write: bool = False,
     ) -> str:
-        """Create an isolated workspace from an already-present local source tree.
+        """Create an ephemeral repo-scoped workspace.
 
-        ``source_path`` is optional and must resolve beneath one of
-        ``allowed_source_roots``. No network clone/fetch/pull is performed.
+        Args:
+            repo: Repository in owner/name form. Defaults to configured ``default_repo``.
+            ref: Optional provenance ref/SHA/branch label. It is recorded, not checked out.
+            source_path: Optional local directory to copy into the workspace repo directory.
+                If provided, it must be inside one of ``allowed_source_roots``.
+            workspace_id: Optional caller-chosen id. If omitted, a random id is generated.
+            ttl_minutes: Workspace retention hint, capped by ``max_ttl_minutes``.
+            allow_network: Explicit network policy. The MVP records this value but never
+                performs network I/O.
+            confirm_write: Required because this creates local files/directories.
         """
         if not confirm_write:
             return _write_confirmation_error("create_workspace")
-        repo_name = self._authorize_repo(repo or self.default_repo)
-        if isinstance(repo_name, str) and repo_name.startswith("Error:"):
-            return repo_name
-        workspace_id = workspace_id or _new_workspace_id(repo_name)
         try:
-            workspace_id = _validate_workspace_id(workspace_id)
+            repo_name = self._validate_repo(repo)
+            workspace_id = self._new_workspace_id(repo_name, workspace_id)
+            ttl = self._validate_ttl(ttl_minutes)
         except ValueError as exc:
             return f"Error: {exc}"
+
+        effective_network = self.allow_network if allow_network is None else bool(allow_network)
+        if effective_network:
+            return "Error: network materialization is not implemented by repo_workspace MVP. Use an approved GitHub/materialization tool instead."
         workspace_dir = self._workspace_dir(workspace_id)
         if workspace_dir.exists():
             return f"Error: workspace already exists: {workspace_id}"
@@ -121,25 +140,25 @@ class RepoWorkspaceTools(Toolkit):
         except OSError as exc:
             shutil.rmtree(workspace_dir, ignore_errors=True)
             return f"Error creating workspace: {exc}"
-        now = datetime.now(UTC)
+
+        created_at = datetime.now(UTC)
         metadata = {
             "workspace_id": workspace_id,
             "repo": repo_name,
             "ref": ref,
-            "created_at": now.isoformat(),
-            "expires_at": (now + timedelta(minutes=self.max_ttl_minutes)).isoformat(),
             "workspace_dir": str(workspace_dir),
             "repo_dir": str(repo_dir),
             "artifacts_dir": str(artifacts_dir),
+            "created_at": created_at.isoformat(),
+            "expires_at": (created_at + timedelta(minutes=ttl)).isoformat(),
+            "ttl_minutes": ttl,
             "network_policy": {
-                "network_clone_allowed": False,
-                "git_fetch_allowed": False,
-                "github_write_allowed": False,
+                "requested_allow_network": effective_network,
                 "network_performed": False,
+                "note": "Network/clone/fetch is not implemented by repo_workspace MVP.",
             },
             "execution_policy": {
                 "allow_arbitrary_execution": False,
-                "allow_package_install": False,
                 "execution_performed": False,
                 "handoff_required": "coding_sandbox",
             },
@@ -155,82 +174,94 @@ class RepoWorkspaceTools(Toolkit):
             },
         }
         self._write_metadata(workspace_dir, metadata)
-        return json.dumps({"workspace": _public_metadata(metadata)}, sort_keys=True)
+        return json.dumps({"status": "created", "workspace": _public_metadata(metadata)}, indent=2, sort_keys=True)
 
-    def list_files(self, workspace_id: str, pattern: str = "**/*", limit: int = 200) -> str:
-        """List files in a workspace repo without exposing .git internals."""
-        repo_dir = self._repo_dir_for_workspace(workspace_id)
-        if isinstance(repo_dir, str):
-            return repo_dir
-        limit = max(1, min(int(limit), 1000))
-        matches: list[str] = []
-        for path in sorted(repo_dir.rglob("*")):
-            if len(matches) >= limit:
-                break
-            if not path.is_file():
-                continue
-            rel = _relative_repo_path(repo_dir, path)
-            if _is_hidden_git_path(rel):
-                continue
-            if fnmatch.fnmatch(rel, pattern):
-                matches.append(rel)
-        return "\n".join(matches) if matches else "No files matched."
+    def get_workspace_info(self, workspace_id: str) -> str:
+        """Return provenance, lifecycle, and policy metadata for a workspace."""
+        loaded = self._load_workspace(workspace_id)
+        if isinstance(loaded, str):
+            return loaded
+        metadata, workspace_dir = loaded
+        metadata = dict(metadata)
+        metadata["exists"] = workspace_dir.exists()
+        metadata["expired"] = _is_expired(metadata)
+        metadata["dirty"] = _workspace_has_changes(Path(metadata["repo_dir"]))
+        return json.dumps(_public_metadata(metadata), indent=2, sort_keys=True)
 
-    def read_file(self, workspace_id: str, path: str, start_line: int = 1, max_lines: int = 200) -> str:
-        """Read a text file with line numbers from a confined workspace repo."""
-        resolved = self._resolve_repo_file(workspace_id, path, must_exist=True)
-        if isinstance(resolved, str):
-            return resolved
-        try:
-            data = resolved.read_bytes()
-        except OSError as exc:
-            return f"Error reading file: {exc}"
-        if b"\0" in data:
-            return "Error: refusing to read binary file."
-        text = data.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        start_line = max(1, int(start_line))
-        max_lines = max(1, min(int(max_lines), 1000))
-        selected = lines[start_line - 1 : start_line - 1 + max_lines]
-        return "\n".join(f"{idx}| {line}" for idx, line in enumerate(selected, start=start_line))
-
-    def grep(self, workspace_id: str, pattern: str, glob_pattern: str = "**/*", limit: int = 100) -> str:
-        """Search UTF-8-ish text files in a workspace repo using Python regex."""
-        repo_dir = self._repo_dir_for_workspace(workspace_id)
-        if isinstance(repo_dir, str):
-            return repo_dir
-        try:
-            regex = re.compile(pattern)
-        except re.error as exc:
-            return f"Error: invalid regex: {exc}"
-        results: list[str] = []
-        limit = max(1, min(int(limit), 500))
-        for path in sorted(repo_dir.rglob("*")):
-            if len(results) >= limit:
-                break
-            if not path.is_file():
+    def list_workspaces(self, include_expired: bool = True, limit: int = 100) -> str:
+        """List known workspaces under the configured workspace root."""
+        if limit <= 0:
+            return "Error: limit must be positive."
+        if not self.workspace_root.exists():
+            return "No workspaces found."
+        items: list[dict[str, Any]] = []
+        for path in sorted(self.workspace_root.iterdir()):
+            if not path.is_dir():
                 continue
-            rel = _relative_repo_path(repo_dir, path)
-            if _is_hidden_git_path(rel) or not fnmatch.fnmatch(rel, glob_pattern):
+            metadata_path = path / "workspace.json"
+            if not metadata_path.is_file():
                 continue
             try:
-                data = path.read_bytes()
-            except OSError:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
                 continue
-            if b"\0" in data:
+            expired = _is_expired(metadata)
+            if expired and not include_expired:
                 continue
-            for line_no, line in enumerate(data.decode("utf-8", errors="replace").splitlines(), start=1):
-                if regex.search(line):
-                    results.append(f"{rel}:{line_no}: {line}")
-                    if len(results) >= limit:
-                        break
-        return "\n".join(results) if results else "No matches found."
+            metadata = _public_metadata(metadata)
+            metadata["expired"] = expired
+            items.append(metadata)
+            if len(items) >= limit:
+                break
+        if not items:
+            return "No workspaces found."
+        return json.dumps(items, indent=2, sort_keys=True)
+
+    def list_files(self, workspace_id: str, pattern: str = "**/*", limit: int = 500) -> str:
+        """List files in a workspace repo directory."""
+        repo_dir = self._repo_dir_for_workspace(workspace_id)
+        if isinstance(repo_dir, str):
+            return repo_dir
+        if limit <= 0:
+            return "Error: limit must be positive."
+        matches: list[str] = []
+        for path in repo_dir.rglob("*"):
+            rel_path = _safe_relative_path(path, repo_dir)
+            if rel_path is None or ".git" in rel_path.parts:
+                continue
+            rel = rel_path.as_posix() + ("/" if path.is_dir() else "")
+            if fnmatch.fnmatch(rel, pattern):
+                matches.append(rel)
+            if len(matches) >= limit:
+                break
+        if not matches:
+            return "No files found."
+        suffix = f"\n[limited to {limit} entries]" if len(matches) >= limit else ""
+        return "\n".join(matches) + suffix
+
+    def read_file(self, workspace_id: str, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        """Read a text file from a workspace repo with line numbers."""
+        resolved = self._resolve_workspace_file(workspace_id, path, must_exist=True)
+        if isinstance(resolved, str):
+            return resolved
+        if not resolved.is_file():
+            return f"Error: path is not a file: {path}"
+        try:
+            lines = resolved.read_text(encoding="utf-8").splitlines()
+        except UnicodeDecodeError:
+            return "Error: file is not valid UTF-8 text."
+        except OSError as exc:
+            return f"Error reading file: {exc}"
+        start = max((offset or 1) - 1, 0)
+        end = start + limit if limit is not None else len(lines)
+        selected = lines[start:end]
+        return "\n".join(f"{index + 1:>4}| {line}" for index, line in enumerate(selected, start=start))
 
     def write_file(self, workspace_id: str, path: str, content: str, confirm_write: bool = False) -> str:
-        """Write a UTF-8 text file in the confined workspace repo."""
+        """Write a UTF-8 text file inside a workspace repo. Requires confirmation."""
         if not confirm_write:
             return _write_confirmation_error("write_file")
-        resolved = self._resolve_repo_file(workspace_id, path, must_exist=False)
+        resolved = self._resolve_workspace_file(workspace_id, path, must_exist=False)
         if isinstance(resolved, str):
             return resolved
         try:
@@ -238,188 +269,216 @@ class RepoWorkspaceTools(Toolkit):
             resolved.write_text(content, encoding="utf-8")
         except OSError as exc:
             return f"Error writing file: {exc}"
-        return f"Wrote {path}"
+        return f"Wrote {path} ({len(content.encode('utf-8'))} bytes)."
 
-    def edit_file(
-        self,
-        workspace_id: str,
-        path: str,
-        old_text: str,
-        new_text: str,
-        confirm_write: bool = False,
-    ) -> str:
-        """Replace exactly one text occurrence in a workspace file."""
+    def delete_file(self, workspace_id: str, path: str, confirm_write: bool = False) -> str:
+        """Delete a file inside a workspace repo. Requires confirmation."""
         if not confirm_write:
-            return _write_confirmation_error("edit_file")
-        resolved = self._resolve_repo_file(workspace_id, path, must_exist=True)
+            return _write_confirmation_error("delete_file")
+        resolved = self._resolve_workspace_file(workspace_id, path, must_exist=True)
         if isinstance(resolved, str):
             return resolved
+        if not resolved.is_file():
+            return f"Error: path is not a file: {path}"
         try:
-            text = resolved.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return "Error: refusing to edit non-UTF-8 file."
+            resolved.unlink()
         except OSError as exc:
-            return f"Error reading file: {exc}"
-        count = text.count(old_text)
-        if count != 1:
-            return f"Error: old_text matched {count} occurrences; expected exactly 1."
+            return f"Error deleting file: {exc}"
+        return f"Deleted {path}."
+
+    def apply_patch(self, workspace_id: str, patch: str, confirm_write: bool = False) -> str:
+        """Apply a unified patch inside the workspace repo. Requires confirmation.
+
+        This uses ``git apply`` with a sanitized environment and no shell. It does
+        not fetch, clone, install dependencies, or execute project scripts.
+        """
+        if not confirm_write:
+            return _write_confirmation_error("apply_patch")
+        repo_dir = self._repo_dir_for_workspace(workspace_id)
+        if isinstance(repo_dir, str):
+            return repo_dir
         try:
-            resolved.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
-        except OSError as exc:
-            return f"Error writing file: {exc}"
-        return f"Edited {path}"
+            result = subprocess.run(
+                ["git", "apply", "--whitespace=nowarn", "-"],
+                input=patch,
+                cwd=repo_dir,
+                env=_safe_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        except FileNotFoundError:
+            return "Error: git executable not found."
+        except subprocess.TimeoutExpired:
+            return "Error: git apply timed out."
+        if result.returncode != 0:
+            return _format_completed_process("git apply failed", result)
+        return "Patch applied."
 
     def get_status(self, workspace_id: str) -> str:
-        """Return safe status information for a workspace repo."""
+        """Return workspace status and compact diff summary."""
+        repo_dir = self._repo_dir_for_workspace(workspace_id)
+        if isinstance(repo_dir, str):
+            return repo_dir
+        if (repo_dir / ".git").is_dir():
+            status_result = _run_git(["status", "--short", "--branch"], cwd=repo_dir)
+            diff_result = _run_git(["diff", "--no-ext-diff", "--no-textconv", "--stat", "--"], cwd=repo_dir)
+            parts = ["# git status", status_result.stdout or status_result.stderr]
+            if diff_result.stdout:
+                parts.extend(["\n# git diff --stat", diff_result.stdout])
+            return _truncate_output("\n".join(parts).strip())
+        files = [path for path in repo_dir.rglob("*") if path.is_file()]
+        return f"Workspace has no .git directory. Files: {len(files)}. Diff unavailable until materialized from a git checkout or patch."
+
+    def get_diff(self, workspace_id: str, path: str | None = None) -> str:
+        """Return a unified git diff for a workspace checkout."""
         repo_dir = self._repo_dir_for_workspace(workspace_id)
         if isinstance(repo_dir, str):
             return repo_dir
         if not (repo_dir / ".git").is_dir():
-            return "No .git directory copied into this workspace; use list_files/read_file/export_patch for file state."
-        status = _run_git(["status", "--short", "--branch"], cwd=repo_dir)
-        diff_stat = _run_git(["diff", "--stat", "--no-ext-diff"], cwd=repo_dir)
-        return "\n".join(
-            [
-                "# git status --short --branch",
-                _bounded_output(status.stdout, status.stderr),
-                "# git diff --stat --no-ext-diff",
-                _bounded_output(diff_stat.stdout, diff_stat.stderr) or "(no unstaged diff)",
-            ]
-        )
+            return "Error: diff requires a git checkout with a .git directory."
+        args = ["diff", "--no-ext-diff", "--no-textconv", "--"]
+        if path:
+            resolved = self._resolve_workspace_file(workspace_id, path, must_exist=False)
+            if isinstance(resolved, str):
+                return resolved
+            args.append(path)
+        result = _run_git(args, cwd=repo_dir)
+        if result.returncode != 0:
+            return _format_completed_process("git diff failed", result)
+        return _truncate_output(result.stdout or "No diff.")
 
-    def export_patch(self, workspace_id: str, patch_name: str | None = None, include_untracked: bool = True) -> str:
-        """Export a workspace diff artifact and return its confined artifact path."""
-        repo_dir = self._repo_dir_for_workspace(workspace_id)
-        if isinstance(repo_dir, str):
-            return repo_dir
-        workspace = self._workspace_tuple(workspace_id)
-        if isinstance(workspace, str):
-            return workspace
-        metadata, workspace_dir = workspace
-        artifacts_dir = Path(metadata["artifacts_dir"]).resolve()
-        if artifacts_dir != (workspace_dir / "artifacts").resolve():
-            return "Error: workspace metadata artifacts_dir does not match expected confined path."
-        patch_name = patch_name or f"{workspace_id}.patch"
-        if "/" in patch_name or "\\" in patch_name or patch_name in {"", ".", ".."}:
-            return "Error: patch_name must be a simple filename."
-        patch_path = (artifacts_dir / patch_name).resolve()
-        if not _is_relative_to(patch_path, artifacts_dir):
-            return "Error: patch path escapes artifacts directory."
-        patch_parts: list[str] = []
-        if (repo_dir / ".git").is_dir():
-            diff = _run_git(["diff", "--no-ext-diff", "--binary"], cwd=repo_dir)
-            patch_parts.append(diff.stdout)
-            if include_untracked:
-                untracked = _run_git(["ls-files", "--others", "--exclude-standard"], cwd=repo_dir)
-                for rel in untracked.stdout.splitlines():
-                    if _is_hidden_git_path(rel):
-                        continue
-                    patch_parts.append(_new_file_patch(repo_dir, rel))
-        else:
-            patch_parts.append(_tree_snapshot_patch(repo_dir))
+    def export_patch(self, workspace_id: str, artifact_name: str = "workspace.patch", confirm_write: bool = False) -> str:
+        """Export the current git diff as a patch artifact. Requires confirmation."""
+        if not confirm_write:
+            return _write_confirmation_error("export_patch")
+        loaded = self._load_workspace(workspace_id)
+        if isinstance(loaded, str):
+            return loaded
+        metadata, workspace_dir = loaded
+        repo_dir = Path(metadata["repo_dir"])
+        if not (repo_dir / ".git").is_dir():
+            return "Error: export_patch requires a git checkout with a .git directory."
+        if "/" in artifact_name or "\\" in artifact_name or artifact_name in {"", ".", ".."}:
+            return "Error: artifact_name must be a simple filename."
+        result = _run_git(["diff", "--no-ext-diff", "--no-textconv", "--binary", "--"], cwd=repo_dir)
+        if result.returncode != 0:
+            return _format_completed_process("git diff failed", result)
+        artifact_path = resolve_base_dir_path(workspace_dir / "artifacts", artifact_name)
         try:
-            patch_path.write_text("\n".join(part for part in patch_parts if part), encoding="utf-8")
+            artifact_path.write_text(result.stdout, encoding="utf-8")
         except OSError as exc:
-            return f"Error writing patch artifact: {exc}"
-        return json.dumps({"patch_path": str(patch_path), "bytes": patch_path.stat().st_size}, sort_keys=True)
+            return f"Error writing artifact: {exc}"
+        return json.dumps({"artifact": str(artifact_path), "bytes": len(result.stdout.encode("utf-8"))}, indent=2, sort_keys=True)
 
-    def get_workspace_info(self, workspace_id: str) -> str:
-        """Return public workspace metadata plus current dirty state."""
-        workspace = self._workspace_tuple(workspace_id)
-        if isinstance(workspace, str):
-            return workspace
-        metadata, _workspace_dir = workspace
-        repo_dir = Path(metadata["repo_dir"]).resolve()
-        metadata = dict(metadata)
-        metadata["exists"] = repo_dir.exists()
-        metadata["expired"] = _is_expired(metadata.get("expires_at"))
-        metadata["dirty"] = _workspace_dirty(repo_dir)
-        return json.dumps(_public_metadata(metadata), sort_keys=True)
+    def handoff_to_coding_sandbox(
+        self,
+        workspace_id: str,
+        command: str | None = None,
+        allow_network: bool = False,
+        allow_dependency_install: bool = False,
+        timeout_seconds: int = 300,
+    ) -> str:
+        """Return a controlled execution handoff descriptor for coding_sandbox.
 
-    def create_handoff(self, workspace_id: str, instructions: str, suggested_command: str | None = None) -> str:
-        """Create a non-executing handoff descriptor for a separate coding sandbox."""
-        workspace = self._workspace_tuple(workspace_id)
-        if isinstance(workspace, str):
-            return workspace
-        metadata, workspace_dir = workspace
-        handoff = {
+        No command is executed here. The descriptor is intended for an execution
+        substrate that enforces its own policy, timeout, output capture, and
+        secret isolation.
+        """
+        loaded = self._load_workspace(workspace_id)
+        if isinstance(loaded, str):
+            return loaded
+        metadata, _workspace_dir = loaded
+        if timeout_seconds <= 0 or timeout_seconds > 3600:
+            return "Error: timeout_seconds must be between 1 and 3600."
+        descriptor = {
+            "type": "coding_sandbox_handoff",
             "workspace_id": workspace_id,
             "repo": metadata.get("repo"),
+            "ref": metadata.get("ref"),
             "repo_dir": metadata.get("repo_dir"),
-            "instructions": instructions,
-            "suggested_command": suggested_command,
-            "execution_performed": False,
-            "required_executor": "coding_sandbox",
-            "security_notes": [
-                "repo_workspace did not execute commands",
-                "repo_workspace did not fetch network content",
-                "executor must enforce its own timeout, secret, and network policy",
-            ],
+            "command": command,
+            "execution_policy": {
+                "authorization_status": "not_authorized_by_repo_workspace",
+                "allow_arbitrary_execution": False,
+                "requires_external_execution_substrate": "coding_sandbox",
+                "requested_allow_network": allow_network,
+                "requested_allow_dependency_install": allow_dependency_install,
+                "timeout_seconds": timeout_seconds,
+                "capture_stdout": True,
+                "capture_stderr": True,
+                "capture_exit_code": True,
+                "no_ambient_secrets": True,
+            },
         }
-        handoff_path = (workspace_dir / "artifacts" / "handoff.json").resolve()
-        if not _is_relative_to(handoff_path, (workspace_dir / "artifacts").resolve()):
-            return "Error: handoff path escapes artifacts directory."
-        handoff_path.write_text(json.dumps(handoff, indent=2, sort_keys=True), encoding="utf-8")
-        return json.dumps({"handoff_path": str(handoff_path), "handoff": handoff}, sort_keys=True)
+        return json.dumps(descriptor, indent=2, sort_keys=True)
 
-    def cleanup_workspace(self, workspace_id: str, confirm_write: bool = False) -> str:
-        """Delete one confined workspace directory."""
+    def destroy_workspace(self, workspace_id: str, confirm_write: bool = False) -> str:
+        """Destroy a workspace directory. Requires confirmation."""
         if not confirm_write:
-            return _write_confirmation_error("cleanup_workspace")
+            return _write_confirmation_error("destroy_workspace")
+        loaded = self._load_workspace(workspace_id)
+        if isinstance(loaded, str):
+            return loaded
+        _metadata, workspace_dir = loaded
         try:
-            workspace_dir = self._workspace_dir(_validate_workspace_id(workspace_id))
-        except ValueError as exc:
-            return f"Error: {exc}"
-        if not workspace_dir.exists():
-            return f"Workspace {workspace_id} already absent."
-        if not _is_relative_to(workspace_dir, self.workspace_root):
-            return "Error: workspace path escapes workspace_root."
-        shutil.rmtree(workspace_dir)
-        return f"Deleted workspace {workspace_id}"
+            shutil.rmtree(workspace_dir)
+        except OSError as exc:
+            return f"Error destroying workspace: {exc}"
+        return f"Destroyed workspace {workspace_id}."
 
-    def _authorize_repo(self, repo: str) -> str:
-        try:
-            repo_name = _validate_repo(repo)
-        except ValueError as exc:
-            return f"Error: {exc}"
-        if _matches_any(repo_name, self.denied_repos):
-            return f"Error: repository is explicitly denied: {repo_name}"
-        if not _matches_any(repo_name, self.allowed_repos):
-            return f"Error: repository is not allowed: {repo_name}"
+    def _validate_repo(self, repo: str | None) -> str:
+        repo_name = (repo or self.default_repo).strip()
+        if not _GITHUB_REPO_RE.fullmatch(repo_name):
+            raise ValueError("repo must be in owner/name form with safe GitHub characters.")
+        if any(fnmatch.fnmatch(repo_name, pattern) for pattern in self.denied_repos):
+            raise ValueError(f"repo is explicitly denied: {repo_name}")
+        for pattern in self.allowed_repos:
+            _validate_repo_pattern(pattern, field_name="allowed_repos")
+        if not any(fnmatch.fnmatch(repo_name, pattern) for pattern in self.allowed_repos):
+            raise ValueError(f"repo is not allowlisted: {repo_name}")
         return repo_name
 
-    def _workspace_dir(self, workspace_id: str) -> Path:
-        return (self.workspace_root / workspace_id).resolve()
+    def _validate_ttl(self, ttl_minutes: int | None) -> int:
+        ttl = self.max_ttl_minutes if ttl_minutes is None else ttl_minutes
+        if ttl <= 0:
+            raise ValueError("ttl_minutes must be positive.")
+        if ttl > self.max_ttl_minutes:
+            raise ValueError(f"ttl_minutes exceeds max_ttl_minutes ({self.max_ttl_minutes}).")
+        return ttl
 
     def _validate_source_path(self, source_path: str) -> Path:
-        source = Path(source_path).expanduser().resolve()
-        if not source.exists() or not source.is_dir():
-            raise ValueError("source_path must be an existing directory.")
         if not self.allowed_source_roots:
-            raise ValueError("source_path is disabled unless allowed_source_roots is configured.")
+            raise ValueError("source_path requires allowed_source_roots to be configured.")
+        source = Path(source_path).resolve()
+        if not source.is_dir():
+            raise ValueError("source_path must be an existing directory.")
         if not any(_is_relative_to(source, root) for root in self.allowed_source_roots):
             raise ValueError("source_path is outside allowed_source_roots.")
-        _validate_source_tree_safe(source)
         return source
 
-    def _repo_dir_for_workspace(self, workspace_id: str) -> Path | str:
-        workspace = self._workspace_tuple(workspace_id)
-        if isinstance(workspace, str):
-            return workspace
-        metadata, _workspace_dir = workspace
-        return Path(metadata["repo_dir"]).resolve()
+    def _new_workspace_id(self, repo: str, workspace_id: str | None) -> str:
+        if workspace_id is None:
+            owner, name = repo.split("/", 1)
+            workspace_id = f"{owner}-{name}-{uuid.uuid4().hex[:12]}".lower()
+        if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+            raise ValueError("workspace_id contains unsupported characters.")
+        return workspace_id
 
-    def _workspace_tuple(self, workspace_id: str) -> tuple[dict[str, Any], Path] | str:
+    def _workspace_dir(self, workspace_id: str) -> Path:
+        if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
+            raise ValueError("workspace_id contains unsupported characters.")
+        return resolve_base_dir_path(self.workspace_root, workspace_id)
+
+    def _load_workspace(self, workspace_id: str) -> tuple[dict[str, Any], Path] | str:
         try:
-            workspace_id = _validate_workspace_id(workspace_id)
+            workspace_dir = self._workspace_dir(workspace_id)
         except ValueError as exc:
             return f"Error: {exc}"
-        workspace_dir = self._workspace_dir(workspace_id)
-        if not _is_relative_to(workspace_dir, self.workspace_root):
-            return "Error: workspace path escapes workspace_root."
         metadata_path = workspace_dir / "workspace.json"
-        if not metadata_path.exists():
-            return f"Error: unknown workspace: {workspace_id}"
+        if not metadata_path.is_file():
+            return f"Error: workspace not found: {workspace_id}"
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -429,107 +488,84 @@ class RepoWorkspaceTools(Toolkit):
             return validation_error
         return metadata, workspace_dir
 
-    def _resolve_repo_file(self, workspace_id: str, path: str, *, must_exist: bool) -> Path | str:
+    def _repo_dir_for_workspace(self, workspace_id: str) -> Path | str:
+        loaded = self._load_workspace(workspace_id)
+        if isinstance(loaded, str):
+            return loaded
+        metadata, _workspace_dir = loaded
+        repo_dir = Path(metadata["repo_dir"]).resolve()
+        if not repo_dir.is_dir():
+            return f"Error: workspace repo directory missing: {workspace_id}"
+        return repo_dir
+
+    def _resolve_workspace_file(self, workspace_id: str, path: str, must_exist: bool) -> Path | str:
         repo_dir = self._repo_dir_for_workspace(workspace_id)
         if isinstance(repo_dir, str):
             return repo_dir
-        if _is_hidden_git_path(path):
-            return "Error: direct .git access is not allowed."
-        target = (repo_dir / path).resolve()
-        if not _is_relative_to(target, repo_dir):
-            return "Error: path escapes workspace repo."
-        if must_exist and not target.is_file():
-            return "Error: file does not exist."
-        return target
+        try:
+            resolved = resolve_base_dir_path(repo_dir, path)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        if ".git" in Path(path).parts:
+            return "Error: direct access to .git internals is not allowed."
+        if must_exist and not resolved.exists():
+            return f"Error: path does not exist: {path}"
+        return resolved
 
     def _write_metadata(self, workspace_dir: Path, metadata: dict[str, Any]) -> None:
-        (workspace_dir / "workspace.json").write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        (workspace_dir / "workspace.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _normalize_patterns(patterns: list[str] | tuple[str, ...], *, option_name: str) -> tuple[str, ...]:
-    if not patterns:
-        raise ValueError(f"{option_name} must not be empty.")
-    normalized = []
+def _normalize_string_list(value: list[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in re.split(r"[,\n]", value) if item.strip()]
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _normalize_repo_patterns(value: list[str] | str | None, *, fallback: tuple[str, ...], field_name: str) -> list[str]:
+    patterns = _normalize_string_list(value) or list(fallback)
     for pattern in patterns:
-        if not isinstance(pattern, str):
-            raise ValueError(f"{option_name} entries must be strings.")
-        pattern = pattern.strip()
-        if not pattern:
-            raise ValueError(f"{option_name} entries must not be empty.")
-        if pattern in {"*", "*/*"} or pattern.startswith("*/") or pattern.endswith("*"):
-            raise ValueError(f"Dangerously broad repository pattern is not allowed: {pattern}")
-        if "*" in pattern and not pattern.endswith("/*"):
-            raise ValueError(f"Only owner/* wildcard repository patterns are supported: {pattern}")
-        if pattern.endswith("/*"):
-            owner = pattern[:-2]
-            if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner):
-                raise ValueError(f"Invalid repository owner pattern: {pattern}")
-        else:
-            _validate_repo(pattern)
-        normalized.append(pattern)
-    return tuple(normalized)
+        _validate_repo_pattern(pattern, field_name=field_name)
+    return patterns
 
 
-def _validate_repo(repo: str) -> str:
-    repo = repo.strip()
-    if not _GITHUB_REPO_RE.fullmatch(repo):
-        raise ValueError("repo must be an owner/name GitHub repository identifier.")
-    return repo
-
-
-def _matches_any(repo: str, patterns: tuple[str, ...]) -> bool:
-    return any(fnmatch.fnmatchcase(repo, pattern) for pattern in patterns)
-
-
-def _validate_workspace_id(workspace_id: str) -> str:
-    if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
-        raise ValueError("workspace_id must be 1-81 chars of lowercase letters, digits, dot, underscore, or dash.")
-    return workspace_id
-
-
-def _new_workspace_id(repo: str) -> str:
-    slug = repo.lower().replace("/", "-")
-    return f"{slug}-{uuid.uuid4().hex[:10]}"
-
-
-def _is_relative_to(path: Path, base: Path) -> bool:
-    try:
-        path.resolve().relative_to(base.resolve())
-        return True
-    except ValueError:
-        return False
-
-
-def _relative_repo_path(repo_dir: Path, path: Path) -> str:
-    return path.resolve().relative_to(repo_dir.resolve()).as_posix()
-
-
-def _is_hidden_git_path(path: str) -> bool:
-    return path == ".git" or path.startswith(".git/") or "/.git/" in path
+def _validate_repo_pattern(pattern: str, *, field_name: str) -> None:
+    if ".." in pattern or pattern.startswith("/") or "\\" in pattern:
+        raise ValueError(f"{field_name} contains an unsafe repository pattern: {pattern!r}")
+    if pattern in {"*", "*/*"}:
+        raise ValueError(f"{field_name} contains an overly broad repository pattern: {pattern!r}")
+    if "/" not in pattern:
+        raise ValueError(f"{field_name} must use owner/name or owner/* patterns: {pattern!r}")
+    owner, name = pattern.split("/", 1)
+    if not owner or not name or owner == "*":
+        raise ValueError(f"{field_name} contains an overly broad repository pattern: {pattern!r}")
+    if "*" in owner:
+        raise ValueError(f"{field_name} may wildcard repository names only, not owners: {pattern!r}")
+    if "*" in name and name != "*":
+        raise ValueError(f"{field_name} wildcard repository patterns must be owner/*: {pattern!r}")
 
 
 def _safe_subprocess_env() -> dict[str, str]:
-    denied_prefixes = ("GITHUB_", "GH_", "GIT_", "SSH_", "AWS_", "AZURE_", "GOOGLE_", "OPENAI_", "ANTHROPIC_")
-    env = {key: value for key, value in os.environ.items() if not key.startswith(denied_prefixes)}
-    env.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_PAGER": "cat",
-        }
-    )
+    """Return a minimal environment without ambient credentials."""
+    allowed = {"LANG", "LC_ALL", "PATH", "SYSTEMROOT", "WINDIR"}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.pop("GIT_ASKPASS", None)
+    env.pop("SSH_ASKPASS", None)
     return env
 
 
 def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", *args],
+        ["git", "-c", "diff.external=", "-c", "core.fsmonitor=false", *args],
         cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=30,
         env=_safe_subprocess_env(),
+        text=True,
+        capture_output=True,
+        timeout=30,
         check=False,
     )
 
@@ -635,65 +671,52 @@ def _copy_source_tree(source: Path, destination: Path) -> None:
         target = destination / child.name
         if child.is_dir():
             shutil.copytree(child, target, symlinks=False, ignore_dangling_symlinks=False)
-        else:
+        elif child.is_file():
             shutil.copy2(child, target)
-    _validate_source_tree_safe(destination)
 
 
 def _validate_source_tree_safe(source: Path) -> None:
-    for root, dirs, files in os.walk(source):
-        root_path = Path(root)
-        for name in dirs + files:
-            candidate = root_path / name
-            try:
-                mode = candidate.lstat().st_mode
-            except OSError as exc:
-                raise ValueError(f"cannot inspect source tree entry {candidate}: {exc}") from exc
-            if stat.S_ISLNK(mode):
-                raise ValueError(f"source tree contains symlink, which is not allowed: {candidate}")
-            if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode):
-                raise ValueError(f"source tree contains special file, which is not allowed: {candidate}")
+    for path in [source, *source.rglob("*")]:
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise ValueError(f"source_path contains an unreadable path: {path}") from exc
+        if stat.S_ISLNK(mode):
+            raise ValueError("source_path contains symlinks; refusing to materialize ambiguous paths.")
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            raise ValueError("source_path contains special files; refusing to materialize ambiguous paths.")
 
 
-def _bounded_output(stdout: str, stderr: str = "") -> str:
-    output = stdout if stdout else stderr
-    if len(output.encode("utf-8")) <= _MAX_COMMAND_OUTPUT_BYTES:
-        return output.strip()
-    encoded = output.encode("utf-8")[:_MAX_COMMAND_OUTPUT_BYTES]
-    return encoded.decode("utf-8", errors="replace").rstrip() + "\n[truncated]"
-
-
-def _new_file_patch(repo_dir: Path, rel: str) -> str:
-    path = repo_dir / rel
+def _is_relative_to(path: Path, base: Path) -> bool:
     try:
-        data = path.read_bytes()
-    except OSError:
-        return ""
-    if b"\0" in data:
-        return f"diff --git a/{rel} b/{rel}\nnew file mode 100644\nBinary files /dev/null and b/{rel} differ\n"
-    text = data.decode("utf-8", errors="replace")
-    lines = text.splitlines(keepends=True)
-    body = "".join(f"+{line}" if line.endswith("\n") else f"+{line}\n" for line in lines)
-    return f"diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{len(lines)} @@\n{body}"
-
-
-def _tree_snapshot_patch(repo_dir: Path) -> str:
-    parts = []
-    for path in sorted(repo_dir.rglob("*")):
-        if path.is_file():
-            rel = _relative_repo_path(repo_dir, path)
-            if not _is_hidden_git_path(rel):
-                parts.append(_new_file_patch(repo_dir, rel))
-    return "\n".join(parts)
-
-
-def _workspace_dirty(repo_dir: Path) -> bool:
-    if not repo_dir.exists():
+        path.resolve().relative_to(base.resolve())
+    except (OSError, ValueError):
         return False
+    return True
+
+
+def _safe_relative_path(path: Path, base: Path) -> Path | None:
+    try:
+        return path.resolve().relative_to(base.resolve())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_expired(metadata: dict[str, Any]) -> bool:
+    expires_at = metadata.get("expires_at")
+    if not isinstance(expires_at, str):
+        return False
+    try:
+        return datetime.fromisoformat(expires_at) < datetime.now(UTC)
+    except ValueError:
+        return False
+
+
+def _workspace_has_changes(repo_dir: Path) -> bool:
     if not (repo_dir / ".git").is_dir():
         return any(repo_dir.rglob("*"))
-    result = _run_git(["status", "--porcelain"], cwd=repo_dir)
-    return bool(result.stdout.strip())
+    result = _run_git(["status", "--porcelain", "--"], cwd=repo_dir)
+    return bool(result.stdout.strip()) if result.returncode == 0 else True
 
 
 def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -701,11 +724,12 @@ def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "workspace_id",
         "repo",
         "ref",
-        "created_at",
-        "expires_at",
         "workspace_dir",
         "repo_dir",
         "artifacts_dir",
+        "created_at",
+        "expires_at",
+        "ttl_minutes",
         "network_policy",
         "execution_policy",
         "provenance",
@@ -752,3 +776,16 @@ def _validate_workspace_metadata(metadata: dict[str, Any], workspace_dir: Path) 
 
 def _write_confirmation_error(action: str) -> str:
     return f"Error: {action} requires confirm_write=true because it modifies workspace state."
+
+
+def _format_completed_process(label: str, result: subprocess.CompletedProcess[str]) -> str:
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    return _truncate_output(f"Error: {label} (exit {result.returncode})\n{output}".strip())
+
+
+def _truncate_output(output: str, limit: int = _MAX_COMMAND_OUTPUT_BYTES) -> str:
+    encoded = output.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return output
+    truncated = encoded[:limit].decode("utf-8", errors="replace")
+    return f"{truncated}\n[truncated to {limit} bytes]"
