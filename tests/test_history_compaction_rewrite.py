@@ -19,9 +19,9 @@ from agno.session.summary import SessionSummary
 from mindroom.agent_storage import create_session_storage, get_agent_session
 from mindroom.config.models import CompactionOverrideConfig
 from mindroom.constants import (
-    MINDROOM_COMPACTION_CHUNK_TIMEOUT_SECONDS,
+    DEFAULT_COMPACTION_TIMEOUT_SECONDS,
 )
-from mindroom.error_handling import ModelSafeguardRefusalError
+from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE, ModelSafeguardRefusalError
 from mindroom.history.compaction import (
     _build_summary_input,
     _emit_compaction_hook,
@@ -94,6 +94,7 @@ async def _rewrite_single_run(
     summary_model: FakeModel | None = None,
     fallback_summary_model: FakeModel | None = None,
     fallback_summary_model_name: str | None = None,
+    fallback_summary_input_budget: int | None = None,
     progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None = None,
 ) -> _CompactionRewriteResult | None:
     return await _rewrite_working_session_for_compaction(
@@ -104,6 +105,13 @@ async def _rewrite_single_run(
         summary_model_name="summary-model",
         fallback_summary_model=fallback_summary_model,
         fallback_summary_model_name=fallback_summary_model_name,
+        fallback_summary_input_budget=(
+            fallback_summary_input_budget
+            if fallback_summary_input_budget is not None
+            else summary_input_budget
+            if fallback_summary_model is not None
+            else None
+        ),
         session_id=working_session.session_id,
         scope=HistoryScope(kind="agent", scope_id="test_agent"),
         state=HistoryScopeState(force_compact_before_next_run=True),
@@ -115,6 +123,7 @@ async def _rewrite_single_run(
         runs_before=len(working_session.runs or []),
         threshold_tokens=None,
         summary_prompt=COMPACTION_SUMMARY_PROMPT,
+        summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
         lifecycle_notice_event_id=None,
         progress_callback=progress_callback,
         collect_compaction_hook_messages=False,
@@ -222,7 +231,7 @@ async def test_rewrite_retries_summary_with_smaller_chunk_after_timeout(tmp_path
     async def fake_summary(*, summary_input: str, **_kwargs: object) -> SessionSummary:
         summary_inputs.append(summary_input)
         if len(summary_inputs) == 1:
-            msg = f"compaction summary timed out after {MINDROOM_COMPACTION_CHUNK_TIMEOUT_SECONDS}s"
+            msg = f"compaction summary timed out after {DEFAULT_COMPACTION_TIMEOUT_SECONDS}s"
             raise RuntimeError(msg)
         return SessionSummary(summary="merged summary", updated_at=datetime.now(UTC))
 
@@ -301,7 +310,7 @@ async def test_rewrite_switches_to_fallback_and_uses_it_for_later_chunks(tmp_pat
     fallback = FakeModel(id="fallback-model-id", provider="fake")
     summary_mock = AsyncMock(
         side_effect=[
-            ModelSafeguardRefusalError(message="Vertex Claude returned stop_reason=refusal"),
+            ModelSafeguardRefusalError(message=MODEL_SAFEGUARD_REFUSAL_MESSAGE),
             SessionSummary(summary="first chunk summary", updated_at=datetime.now(UTC)),
             SessionSummary(summary="merged summary", updated_at=datetime.now(UTC)),
         ],
@@ -369,7 +378,7 @@ async def test_rewrite_propagates_fallback_refusal_without_persisting(tmp_path: 
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
     working_session = _session("session-1", runs=[_completed_run("run-1")])
     summary_mock = AsyncMock(
-        side_effect=ModelSafeguardRefusalError(message="Vertex Claude returned stop_reason=refusal"),
+        side_effect=ModelSafeguardRefusalError(message=MODEL_SAFEGUARD_REFUSAL_MESSAGE),
     )
     retry_sleep = AsyncMock()
 
@@ -456,7 +465,7 @@ async def test_rewrite_retries_transient_provider_error_with_same_input_and_one_
     ("error", "expected_attempts", "expected_delay"),
     [
         pytest.param(
-            ModelSafeguardRefusalError(message="Vertex Claude returned stop_reason=refusal"),
+            ModelSafeguardRefusalError(message=MODEL_SAFEGUARD_REFUSAL_MESSAGE),
             1,
             False,
             id="unshrinkable-refusal",
@@ -805,6 +814,7 @@ async def test_compact_scope_history_emits_before_hook_for_each_persisted_chunk(
             replay_window_tokens=16_000,
             threshold_tokens=1,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
+            summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
         )
 
     assert outcome is not None
@@ -1311,6 +1321,38 @@ def test_private_strip_stale_anthropic_replay_fields_preserves_tool_chain_after_
     assert final_assistant.redacted_reasoning_content == "more redacted"
 
 
+@pytest.mark.parametrize("marker", [True, "persisted"], ids=["live", "persisted"])
+def test_private_strip_stale_anthropic_replay_fields_ignores_queued_notice(marker: bool | str) -> None:
+    interrupted_assistant = Message(
+        role="assistant",
+        content="tool call",
+        provider_data={"signature": "sig-tool"},
+        reasoning_content="thinking",
+        redacted_reasoning_content="redacted",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "tool", "arguments": "{}"}},
+        ],
+    )
+    messages = [
+        Message(role="user", content="question"),
+        interrupted_assistant,
+        Message(role="tool", content="tool result", tool_call_id="call-1"),
+        Message(
+            role="user",
+            content="A queued-message notice was delivered.",
+            provider_data={
+                "mindroom_queued_message_notice": marker,
+                "mindroom_queued_message_notice_response_turn_id": "response-1",
+            },
+        ),
+    ]
+
+    assert _strip_stale_anthropic_replay_fields(messages) == 0
+    assert interrupted_assistant.provider_data == {"signature": "sig-tool"}
+    assert interrupted_assistant.reasoning_content == "thinking"
+    assert interrupted_assistant.redacted_reasoning_content == "redacted"
+
+
 def test_private_strip_stale_anthropic_replay_fields_ignores_reasoning_without_signature() -> None:
     assistant = Message(
         role="assistant",
@@ -1418,6 +1460,7 @@ async def test_rewrite_working_session_for_compaction_strips_stale_replay_fields
             runs_before=2,
             threshold_tokens=None,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
+            summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
             lifecycle_notice_event_id=None,
             progress_callback=None,
             collect_compaction_hook_messages=False,
@@ -1472,6 +1515,7 @@ async def test_compact_scope_history_ignores_runs_without_stable_ids(
             replay_window_tokens=64_000,
             threshold_tokens=None,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
+            summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
         )
 
     assert outcome is None
@@ -1566,6 +1610,7 @@ async def test_compact_scope_history_persists_sanitized_remaining_runs(tmp_path:
             replay_window_tokens=16_000,
             threshold_tokens=1,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
+            summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
         )
 
     assert outcome is not None
@@ -1664,6 +1709,7 @@ async def test_rewrite_working_session_emits_progress_after_persisted_chunks(tmp
             runs_before=2,
             threshold_tokens=None,
             summary_prompt=COMPACTION_SUMMARY_PROMPT,
+            summary_timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
             lifecycle_notice_event_id="$notice",
             progress_callback=record_progress,
             collect_compaction_hook_messages=False,

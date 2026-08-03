@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import nio
 from nio.api import RelationshipType
@@ -44,14 +44,11 @@ from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_message_content, markdown_to_html
 from mindroom.matrix.message_content import extract_and_resolve_message, extract_edit_body
 from mindroom.matrix.thread_diagnostics import (
-    THREAD_HISTORY_SOURCE_CACHE,
     THREAD_HISTORY_SOURCE_DIAGNOSTIC,
     THREAD_HISTORY_SOURCE_HOMESERVER,
     is_thread_history_degraded,
 )
 from mindroom.matrix.thread_projection import (
-    SupportsVisibleThreadMessage,
-    latest_visible_thread_event_id_by_thread,
     ordered_event_ids_from_scanned_event_sources,
     resolve_thread_ids_for_event_infos,
 )
@@ -130,7 +127,6 @@ class _MessageState:
     latest_body: str | None = None
     latest_timestamp: int = 0
     latest_event_id: str = ""
-    latest_thread_event_id: str = ""
     latest_content: dict[str, Any] | None = None
     thread_id: str | None = None
     stream_status: str | None = None
@@ -334,6 +330,9 @@ async def _auto_resume_interrupted_threads(
                 target_event_id=interrupted_thread.target_event_id,
             )
             continue
+        if delay_due:
+            await asyncio.sleep(delay)
+            delay_due = False
         if not await _interrupted_target_remains_latest_human_work(
             interrupted_thread,
             config=config,
@@ -347,16 +346,6 @@ async def _auto_resume_interrupted_threads(
                 config=config,
                 runtime_paths=runtime_paths,
             )
-            if delay_due:
-                await asyncio.sleep(delay)
-                delay_due = False
-                if not await _interrupted_target_remains_latest_human_work(
-                    interrupted_thread,
-                    config=config,
-                    runtime_paths=runtime_paths,
-                    conversation_cache=conversation_cache,
-                ):
-                    continue
             delay_due = True
             delivered = await send_message_result(client, interrupted_thread.room_id, content)
             if delivered is not None:
@@ -405,7 +394,7 @@ async def _interrupted_target_remains_latest_human_work(
         return False
 
     try:
-        history = await conversation_cache.get_strict_thread_history(
+        history = await conversation_cache.refresh_startup_thread_history_from_source(
             interrupted_thread.room_id,
             interrupted_thread.thread_id,
             caller_label="startup_auto_resume_freshness",
@@ -445,7 +434,7 @@ def _authoritative_history_after_target(
     if not history.is_full_history or is_thread_history_degraded(history):
         msg = "Thread history is incomplete or degraded"
         raise ValueError(msg)
-    if history_source not in {THREAD_HISTORY_SOURCE_CACHE, THREAD_HISTORY_SOURCE_HOMESERVER}:
+    if history_source != THREAD_HISTORY_SOURCE_HOMESERVER:
         msg = f"Non-authoritative thread history source: {history_source!r}"
         raise ValueError(msg)
     target_index = next(
@@ -685,8 +674,6 @@ async def _repair_restart_marked_message_metadata(
             target_event_id=target_event_id,
             new_text=state.latest_body,
             preserved_content=_terminal_stream_content(state.latest_content),
-            thread_id=state.thread_id,
-            latest_thread_event_id=state.latest_thread_event_id or state.latest_event_id or target_event_id,
             config=config,
             runtime_paths=runtime_paths,
             conversation_cache=conversation_cache,
@@ -721,8 +708,6 @@ async def _cleanup_one_stale_message(
         target_event_id=target_event_id,
         new_text=build_restart_interrupted_body(state.latest_body),
         preserved_content=_terminal_stream_content(state.latest_content),
-        thread_id=state.thread_id,
-        latest_thread_event_id=state.latest_thread_event_id or state.latest_event_id or target_event_id,
         config=config,
         runtime_paths=runtime_paths,
         conversation_cache=conversation_cache,
@@ -844,12 +829,6 @@ async def _scan_room_message_states(
         requester_ids_by_event_id=requester_ids_by_event_id,
         scanned_message_data_by_event_id=scanned_message_data_by_event_id,
     )
-    _assign_latest_thread_event_ids(
-        message_states,
-        resolved_messages,
-        scanned_message_data_by_event_id=scanned_message_data_by_event_id,
-    )
-
     return _ScannedRoomMessageStates(
         message_states=message_states,
         auto_resume_target_event_ids=auto_resume_target_event_ids,
@@ -870,29 +849,6 @@ def _auto_resume_target_event_ids(
         if reply_to_event_id is not None:
             target_event_ids.add(reply_to_event_id)
     return target_event_ids
-
-
-def _assign_latest_thread_event_ids(
-    message_states: dict[str, _MessageState],
-    resolved_messages: dict[str, ResolvedVisibleMessage],
-    *,
-    scanned_message_data_by_event_id: dict[str, ResolvedVisibleMessage],
-) -> None:
-    """Record the latest visible event ID seen for each explicit thread."""
-    all_messages: list[ResolvedVisibleMessage] = [
-        *resolved_messages.values(),
-        *scanned_message_data_by_event_id.values(),
-    ]
-    latest_event_id_by_thread = latest_visible_thread_event_id_by_thread(
-        cast("list[SupportsVisibleThreadMessage]", all_messages),
-    )
-
-    for state in message_states.values():
-        if state.thread_id is None:
-            continue
-        latest_event = latest_event_id_by_thread.get(state.thread_id)
-        if latest_event is not None:
-            state.latest_thread_event_id = latest_event
 
 
 async def _collect_room_history_events(
@@ -998,7 +954,12 @@ def _merge_resolved_message_state(
     normalized_latest_content = {key: value for key, value in message.content.items() if isinstance(key, str)}
     state = message_states.setdefault(target_event_id, _MessageState())
     state.latest_body = message.body
-    state.latest_timestamp = message.timestamp
+    # The last time this message changed, not when it was created. ``timestamp`` deliberately
+    # stays the original event's so an edit cannot reorder a thread, which means it is the
+    # wrong clock for "is this stream still active": a placeholder posted eight hours ago and
+    # edited seconds before a restart would read as older than the cleanup window and be
+    # skipped, leaving it displaying ``streaming`` forever.
+    state.latest_timestamp = message.edited_timestamp or message.timestamp
     state.latest_event_id = message.visible_event_id
     state.latest_content = normalized_latest_content
     state.thread_id = message.thread_id or fallback_thread_id
@@ -1487,13 +1448,15 @@ async def _edit_stale_message(
     target_event_id: str,
     new_text: str,
     preserved_content: dict[str, Any] | None,
-    thread_id: str | None,
-    latest_thread_event_id: str | None,
     config: Config,
     runtime_paths: RuntimePaths,
     conversation_cache: ConversationCacheProtocol | None = None,
 ) -> bool:
-    """Edit a stale message while preserving thread context when present."""
+    """Edit a stale message.
+
+    No thread relation is built: ``build_edit_event_content`` pops ``m.relates_to`` off the
+    replacement before sending, so a relation here would never reach the wire.
+    """
     extra_content = _preserved_cleanup_content(preserved_content)
     should_preserve_visible_body = extra_content is not None and STREAM_VISIBLE_BODY_KEY in extra_content
     if should_preserve_visible_body and extra_content is not None:
@@ -1504,8 +1467,6 @@ async def _edit_stale_message(
         config,
         runtime_paths,
         new_text,
-        thread_event_id=thread_id,
-        latest_thread_event_id=latest_thread_event_id,
         extra_content=extra_content,
     )
     if should_preserve_visible_body:

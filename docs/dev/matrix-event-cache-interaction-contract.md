@@ -33,7 +33,7 @@ The following treatment is covered against both SQLite and PostgreSQL backends b
 | Member, name, topic, avatar, power, join-rule, history-visibility, guest-access, alias, encryption, and pin state | Retained when delivered in the joined timeline | Not visible | These families remain room-level |
 | Call invite, candidates, answer, select-answer, reject, negotiate, and hangup | Retained | Not visible | These families remain room-level |
 | RTC membership, focus, and notification events | Retained | Not visible | These families remain room-level |
-| Encrypted relation-bearing events | Retained as opaque events | Not visible until decryption supplies message content | Thread, reply, edit, and message-reference relations mark the known thread stale fail-closed; explicit relations stay point-indexed, the opaque payload never enters the snapshot, and the marker survives incremental appends until a decryption-capable refresh replaces the snapshot |
+| Encrypted relation-bearing events | Retained as opaque events | Not visible until decryption supplies message content | Thread, reply, edit, and message-reference relations gap-mark the known thread fail-closed; explicit relations stay point-indexed, the opaque payload never enters the snapshot, and the marker survives appends until a decryption-capable refresh replaces the snapshot |
 
 Relation names such as `m.reference` and `m.thread` are reused by non-message families.
 
@@ -95,17 +95,36 @@ Authoritative membership handling separately fences and purges retained history 
 
 ## Thread snapshot reads
 
-A durable thread snapshot is usable only when its state row exists, `validated_at` is set, and no thread or room invalidation is at least as new as that validation.
+A durable thread snapshot is usable when its rows are durably present and no gap marker is recorded against it.
+A gap is detected and refetched rather than prevented, so there is no validation timestamp and no trust comparison.
+Presence and the marker are separate questions, and both are asked: a never-cached thread carries no marker either, so a caller that checks only the marker treats every cold thread as a cache hit.
+
+A room-scoped gap is a wildcard-thread marker.
+It fans out across every thread in the room that already holds a `thread_state` row, and is also recorded once on `room_state`.
+The room-level copy covers the thread the fan-out cannot reach: one whose first fetch is still in flight and therefore has no row to update.
+Only a replacement reads it, so thread reads take no join.
+
+A replacement keeps whichever gap its fetch does not cover, at either scope, and clears the rest.
+Replacement is ordered by fetch start rather than arrival, because installing a snapshot deletes the events it omits: an older fetch is refused outright, and a successful append moves the same watermark forward so an in-flight scan cannot delete an event that landed while it was running.
+This ordering is wall-clock based, knowingly: `fetch_started_at` is captured before the homeserver round-trip, so clock skew between workers sharing one PostgreSQL namespace can misorder a replacement.
 
 A snapshot without its thread root or one still containing opaque `m.room.encrypted` payloads is rejected.
 
-A rejected or absent snapshot causes an authoritative homeserver room-history scan and guarded cache refill.
+Only a rejected or absent snapshot enters an authoritative homeserver room-history scan and cache refill.
 
-A refill whose reconstruction contains still-opaque encrypted evidence for the requested thread, or whose scan holds an opaque relation with unresolved thread impact, marks the thread stale and fails the read instead of certifying incomplete history.
+A cache-miss refill is single-flight per full read contract, so concurrent matching readers share one homeserver scan.
+There is no admission gate, failure backoff, or cooldown.
+A refill that completes without installing a snapshot still returns its homeserver history, so reads stay fail-open.
+
+A degraded dispatch proof for an unproven thread candidate retries strict proof before it may demote the event to room level.
+
+Startup thread prewarm scans outside the live write coordinator so its bulk room scan cannot starve dispatch reads.
+
+A refill whose reconstruction contains still-opaque encrypted evidence for the requested thread, or whose scan holds an opaque relation with unresolved thread impact, gap-marks the thread and fails the read instead of certifying incomplete history.
 
 Relation-less ciphertext and opaque annotations are excluded from that rejection because they cannot change any visible thread snapshot.
 
-The opaque-history trust upgrade clears only previously certified thread snapshots and their state, preserves point and relation indexes, rotates the durable certification generation, and records a one-time storage marker transactionally.
+The thread-history version marker clears only previously certified thread snapshots and their state, preserves point and relation indexes, rotates the durable certification generation, and records a one-time storage marker transactionally.
 
 A second unchanged read is served from cache and performs no homeserver scan.
 
@@ -113,7 +132,10 @@ The advisory read path may use a labelled stale-cache fallback when a required r
 
 Dispatch reads reject stale fallback and propagate the refill failure.
 
-Every completed read emits `matrix_cache_thread_history_refreshed` with `mode`, `cache_read_ms`, `homeserver_fetch_ms`, page and event counts, `cache_reject_reason`, `thread_read_source`, degradation state, and error state.
+Every completed labelled cache or source read emits its own `matrix_cache_thread_history_refreshed` event with `mode`, `cache_read_ms`, `homeserver_fetch_ms`, `homeserver_scan_parse_cpu_ms`, `resolution_ms`, `sidecar_hydration_ms`, `coordinator_queue_wait_ms`, `post_coordinator_read_ms`, `thread_read_total_ms`, `refill_singleflight_wait_ms`, `refill_singleflight_shared`, page and event counts, `cache_reject_reason`, `thread_read_source`, degradation state, and error state.
+Refilled labelled reads add `cache_store_written` and `cache_store_failed`.
+A rejected snapshot instead emits `Thread cache rejected for read` with `cache_gap_marked_at`, `cache_gap_age_ms`, and `cache_gap_reason` when its gap carries that metadata.
+A dispatch read cut short by a coordinator timeout or a fetch timeout instead emits `matrix_cache_thread_read_degraded`.
 
 ## Disposable live audit
 
@@ -139,7 +161,7 @@ The first strict read refills that isolated cache from the authenticated homeser
 
 The second read must return the same visible event IDs as the first with zero homeserver time, pages, and scanned events.
 
-The third read must use `thread_invalidated_after_validation`, omit the redacted child, and refill successfully without degradation or error.
+The third read must reject the snapshot under the gap reason the redaction recorded, omit the redacted child, and refill successfully without degradation or error.
 
 The backend-neutral owning-seam test `test_advisory_stale_fallback_is_labeled_and_dispatch_rejects_it` forces the same homeserver failure against SQLite and PostgreSQL.
 
@@ -178,17 +200,11 @@ Hosted evidence describes the deployed service as a production baseline.
 
 PR-specific classification remains proven by the SQLite and PostgreSQL owning-seam tests unless the PR itself has been deployed through a separately authorized release.
 
-## Known non-owned lifecycle and encryption gaps
-
-Membership-loss cleanup is not owned by this contract track.
-
-A deterministic reproduction is to cache a joined-room event, deliver the same room under `rooms.leave`, and observe that the point row remains while no new leave-timeline event is admitted.
+## Known storage and encryption gaps
 
 Opaque encrypted thread evidence is owned by this contract track and fails closed.
 
-An opaque `m.room.encrypted` child with a clear thread-affecting relation marks only its thread stale under a non-incremental reason, a later clear incremental event cannot weaken that reason, and thread-history refresh rejects reconstructions that still contain the opaque evidence.
-
-The remaining gap requires coordinated lifecycle changes rather than an overlapping cache-contract workaround.
+An opaque `m.room.encrypted` child with a clear thread-affecting relation gap-marks only its thread, no later append clears that marker, and thread-history refresh rejects reconstructions that still contain the opaque evidence.
 
 Thread snapshot replacement currently owns point-row deletion through the duplicated storage layout, which belongs to the storage normalization track.
 

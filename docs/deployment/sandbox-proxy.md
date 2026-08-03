@@ -221,6 +221,7 @@ The Docker backend starts one worker container per worker key and reuses it unti
 This is the simplest way to get one persistent container per agent without running Kubernetes.
 MindRoom builds a projected read-only config snapshot for each worker from `MINDROOM_DOCKER_WORKER_HOST_CONFIG_PATH`, rewrites config-relative paths into that snapshot, copies only the referenced config-relative assets needed for that worker into the snapshot, and mounts only the snapshot root into the container.
 MindRoom also sanitizes the projected worker `config.yaml`, removing sensitive config keys and authorization headers from the worker-visible snapshot before it is written.
+Control-plane-only sections that a worker never reads are cleared from that snapshot as well, including `teams`, `cultures`, `calls`, `room_models`, `bot_accounts`, `authorization`, and the Matrix room and space settings.
 Agent-scoped workers such as unscoped, `worker_scope: shared`, and `worker_scope: user_agent` snapshot only that agent's projected context files and assigned knowledge bases.
 `worker_scope: user` intentionally shares one worker across multiple agents, so it keeps the broader shared projection for that worker.
 Writable file-memory paths are rewritten into the worker's own state root instead of being mounted from the host config tree.
@@ -234,6 +235,8 @@ If you are testing unreleased code from a source checkout, start MindRoom from t
 Use `uv run mindroom run` from the repo root, or `uvx --from /path/to/mindroom mindroom run`.
 Use plain `uvx mindroom run` only after the version you want is published on PyPI.
 When you test unreleased code, build a worker image from the same checkout so the primary runtime and worker containers run the same revision.
+MindRoom checks the worker protocol exposed by `/healthz` and rejects stale or otherwise incompatible images before routing tools to them.
+If the compatibility check fails, rebuild the worker image from the active MindRoom checkout or select the matching published image tag.
 
 ```bash
 docker build -t mindroom:dev -f local/instances/deploy/Dockerfile.mindroom .

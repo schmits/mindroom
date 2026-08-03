@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from mindroom.attachments import parse_attachment_ids_from_event_source
@@ -30,6 +30,7 @@ from mindroom.handled_turns import TurnRecord
 from mindroom.inbound_turn_normalizer import TextNormalizationRequest
 from mindroom.matrix.media import is_audio_message_event, is_matrix_media_dispatch_event
 from mindroom.matrix.rooms import is_dm_room
+from mindroom.response_admission import ResponseAdmissionRefusedError
 from mindroom.response_payload_preparation import DispatchPayloadInputs
 from mindroom.timing import (
     DispatchPipelineTiming,
@@ -37,18 +38,23 @@ from mindroom.timing import (
     event_timing_scope,
     get_dispatch_pipeline_timing,
 )
-from mindroom.timing import timing_scope as timing_scope_context
+from mindroom.timing import (
+    timing_scope as timing_scope_context,
+)
+from mindroom.turn_record import canonicalize_turn_record
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     import nio
 
+    from mindroom.command_turn_executor import CommandTurnExecutor
     from mindroom.commands.parsing import Command
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.response_lifecycle import QueuedHumanNoticeReservation
     from mindroom.turn_controller import TurnController
     from mindroom.turn_policy import PreparedDispatch, ResponseAction
+    from mindroom.visible_response_reconciliation import VisibleResponseReconciler
 
 
 class _TurnPlan(Protocol):
@@ -84,6 +90,8 @@ async def dispatch_text_message(
     raw_event: TextDispatchEvent,
     requester_user_id: str,
     *,
+    command_executor: CommandTurnExecutor,
+    visible_responses: VisibleResponseReconciler,
     media_events: list[MediaDispatchEvent] | None = None,
     handled_turn: TurnRecord | None = None,
     queued_notice_reservation: QueuedHumanNoticeReservation | None = None,
@@ -121,7 +129,14 @@ async def dispatch_text_message(
         if prepared is None:
             return
         timing_scope_token = timing_scope_context.set(event_timing_scope(prepared.event.event_id))
-        if await _blocked_before_plan(controller, room, prepared, requester_user_id=requester_user_id):
+        if await _blocked_before_plan(
+            controller,
+            room,
+            prepared,
+            command_executor=command_executor,
+            visible_responses=visible_responses,
+            requester_user_id=requester_user_id,
+        ):
             return
 
         message_attachment_ids, trusted_attachment_ids, router_extra_content = _attachment_parts(
@@ -150,6 +165,7 @@ async def dispatch_text_message(
             room,
             prepared,
             plan,
+            visible_responses=visible_responses,
             message_attachment_ids=message_attachment_ids,
             trusted_attachment_ids=trusted_attachment_ids,
             media_events=media_events,
@@ -223,13 +239,13 @@ async def _prepare_text_dispatch(
     elif raw_event is not event and event.event_id in handled_turn.source_event_ids:
         refreshed_prompts = dict(handled_turn.source_event_prompts or {})
         refreshed_prompts[event.event_id] = event.body
-        handled_turn = replace(handled_turn, source_event_prompts=refreshed_prompts)
+        handled_turn = canonicalize_turn_record(handled_turn, source_event_prompts=refreshed_prompts)
     routed_original_event_id = controller.deps.ingress.router_relay_original_event_id(event)
     if routed_original_event_id is not None:
         # Keep the routed turn discoverable by the human message the router
         # relayed, so edits and redactions of that message reach this
         # responder's persisted runs.
-        handled_turn = replace(
+        handled_turn = canonicalize_turn_record(
             handled_turn,
             discovery_event_ids=(*handled_turn.discovery_event_ids, routed_original_event_id),
         )
@@ -262,7 +278,7 @@ async def _prepare_text_dispatch(
     return _PreparedTextDispatch(
         event=event,
         payload_metadata=payload_metadata,
-        handled_turn=replace(
+        handled_turn=canonicalize_turn_record(
             handled_turn,
             requester_id=prepared.dispatch.requester_user_id,
             correlation_id=prepared.dispatch.correlation_id,
@@ -293,29 +309,51 @@ def _parsed_command_for_event(
     return command_parser.parse(event.body)
 
 
+def _turn_sources_all_from_requester(handled_turn: TurnRecord, requester_user_id: str) -> bool:
+    """Return whether every replayable source in one turn was sent by ``requester_user_id``.
+
+    Whole-turn suppression settles every source in a coalesced batch, so it is only safe when the
+    turn provably belongs to that one requester, and a source the record cannot attribute fails
+    closed. Redacted sources are excluded because they own no reply.
+    """
+    return all(
+        handled_turn.requester_id_for_source(source_event_id) == requester_user_id
+        for source_event_id in handled_turn.replay_source_event_ids
+    )
+
+
 async def _blocked_before_plan(
     controller: TurnController,
     room: nio.MatrixRoom,
     prepared: _PreparedTextDispatch,
     *,
+    command_executor: CommandTurnExecutor,
+    visible_responses: VisibleResponseReconciler,
     requester_user_id: str,
 ) -> bool:
     if prepared.command is not None:
-        await controller._execute_command_if_owned(
+        command_owned = await command_executor.execute_if_owned(
             room=room,
             event=prepared.event,
             requester_user_id=requester_user_id,
             command=prepared.command,
             target=prepared.dispatch.target,
+            handled_turn=prepared.handled_turn,
         )
+        if not command_owned:
+            await visible_responses.settle_source_events_ignored(prepared.handled_turn)
         return True
     if controller._should_skip_deep_synthetic_full_dispatch(
         event_id=prepared.event.event_id,
         envelope=prepared.dispatch.envelope,
     ):
+        await visible_responses.settle_source_events_ignored(prepared.handled_turn)
         return True
 
-    may_be_superseded = prepared.dispatch.envelope.origin.may_be_superseded_by_newer_requester_turn
+    may_be_superseded = (
+        prepared.dispatch.envelope.origin.may_be_superseded_by_newer_requester_turn
+        and _turn_sources_all_from_requester(prepared.handled_turn, requester_user_id)
+    )
     if prepared.replay_guard.degraded:
         skips_turn = await controller._has_newer_unresponded_cached_thread_event(
             room_id=room.room_id,
@@ -324,7 +362,7 @@ async def _blocked_before_plan(
             thread_id=prepared.replay_guard.thread_id,
             may_be_superseded_by_newer_requester_turn=may_be_superseded,
         )
-        if not skips_turn:
+        if may_be_superseded and not skips_turn:
             controller.deps.logger.warning(
                 "Thread replay guard degraded; proceeding without negative newer-message proof",
                 event_id=prepared.event.event_id,
@@ -340,7 +378,7 @@ async def _blocked_before_plan(
             may_be_superseded_by_newer_requester_turn=may_be_superseded,
         )
     if skips_turn:
-        controller._mark_source_events_responded(prepared.handled_turn)
+        await visible_responses.settle_source_events_ignored(prepared.handled_turn)
     return skips_turn
 
 
@@ -383,6 +421,7 @@ async def _apply_turn_plan(
     prepared: _PreparedTextDispatch,
     plan: _TurnPlan,
     *,
+    visible_responses: VisibleResponseReconciler,
     message_attachment_ids: list[str],
     trusted_attachment_ids: list[str],
     media_events: list[MediaDispatchEvent] | None,
@@ -394,13 +433,20 @@ async def _apply_turn_plan(
         if plan.ignore_reason == "router":
             router_outcome = controller._router_handled_turn_outcome(prepared.handled_turn)
             if router_outcome is not None:
-                controller._mark_source_events_responded(router_outcome)
+                controller.deps.turn_store.record_responded_turn(router_outcome)
+            else:
+                await visible_responses.settle_source_events_ignored(prepared.handled_turn)
+        else:
+            await visible_responses.settle_source_events_ignored(prepared.handled_turn)
         return
     if plan.kind == "route":
         await _execute_route_plan(controller, room, prepared, plan, media_events=media_events)
         return
 
     assert plan.response_action is not None
+    reconcile_visible_response = controller.deps.turn_store.has_pending_response_intent(
+        prepared.handled_turn.source_event_ids,
+    )
     response_history_scope = (
         controller.deps.turn_store.response_history_scope(
             plan.response_action,
@@ -418,7 +464,10 @@ async def _apply_turn_plan(
         controller.deps.turn_store.record_pending_turn,
         handled_turn,
     )
-    if pending_turn is None or pending_turn.completed or pending_turn.redacted_source_event_ids:
+    if pending_turn is None or pending_turn.completed:
+        return
+    if pending_turn.redacted_source_event_ids:
+        await visible_responses.settle_source_events_ignored(pending_turn)
         return
     handled_turn = pending_turn
 
@@ -453,9 +502,17 @@ async def _apply_turn_plan(
                 matrix_run_metadata=controller.deps.turn_store.build_run_metadata(handled_turn),
                 queued_notice_reservation=queued_notice_reservation,
                 on_lifecycle_lock_acquired=response_started.set,
+                reconcile_visible_response=reconcile_visible_response,
             ),
         ),
         name=f"inbox_response:{prepared.event.event_id}",
+        recovery_proof_ready=lambda: (
+            prepared.dispatch.target.resolved_thread_id is not None
+            and controller.deps.interrupted_turn_rooms.contains(prepared.event.event_id)
+        ),
+        on_failure=lambda: (
+            controller.deps.retry_dispatch_sources(handled_turn.source_event_ids) if response_started.is_set() else None
+        ),
     )
     # Ownership moves synchronously after task creation. If this dispatch task
     # is cancelled while waiting for the lifecycle lock, its finally block must
@@ -487,6 +544,21 @@ async def _run_claimed_response(
         await response
     finally:
         controller.deps.turn_store.release_pending_turn_claim(turn_claim)
+
+
+async def _run_admitted_router_relay(
+    controller: TurnController,
+    relay: Callable[[], Awaitable[None]],
+) -> None:
+    """Keep config application outside one router selection and relay delivery."""
+    admission_gate = controller.deps.runtime.response_admission_gate
+    while not admission_gate.admit():
+        if not await controller.deps.response_runner.wait_for_admission_or_shutdown():
+            raise ResponseAdmissionRefusedError
+    try:
+        await relay()
+    finally:
+        admission_gate.release()
 
 
 async def _execute_route_plan(
@@ -523,12 +595,15 @@ async def _execute_route_plan(
         )
     if prepared.dispatch.scheduled_history_budget is not None:
         routing_kwargs["scheduled_prompt"] = prepared.event.body
-    await controller._execute_router_relay(
-        room,
-        route_event,
-        prepared.dispatch.context.thread_history,
-        prepared.dispatch.target.resolved_thread_id,
-        **routing_kwargs,
+    await _run_admitted_router_relay(
+        controller,
+        lambda: controller._execute_router_relay(
+            room,
+            route_event,
+            prepared.dispatch.context.thread_history,
+            prepared.dispatch.target.resolved_thread_id,
+            **routing_kwargs,
+        ),
     )
 
 

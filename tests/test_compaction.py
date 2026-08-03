@@ -73,6 +73,7 @@ def _make_execution_plan(**overrides: object) -> ResolvedHistoryExecutionPlan:
         "static_prompt_tokens": 0,
         "replay_budget_tokens": 10_000,
         "summary_input_budget_tokens": 20_000,
+        "compaction_timeout_seconds": 600.0,
         "hard_replay_budget_tokens": 59_904,
     }
     defaults.update(overrides)
@@ -92,6 +93,7 @@ def _make_policy_plan() -> ResolvedHistoryExecutionPlan:
         static_prompt_tokens=0,
         replay_budget_tokens=10_000,
         summary_input_budget_tokens=20_000,
+        compaction_timeout_seconds=600.0,
         hard_replay_budget_tokens=59_904,
     )
 
@@ -270,7 +272,7 @@ def test_ai_run_metadata_bounds_context_cache_split_to_displayed_context(tmp_pat
             models={
                 "default": ModelConfig(
                     provider="vertexai_claude",
-                    id="claude-opus-4-8",
+                    id="claude-opus-5",
                     context_window=200_000,
                 ),
             },
@@ -284,7 +286,7 @@ def test_ai_run_metadata_bounds_context_cache_split_to_displayed_context(tmp_pat
         run_id="run-1",
         session_id="session-1",
         status="completed",
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         model_provider="VertexAI",
         metrics={"input_tokens": 153_294, "cache_read_tokens": 281_264},
         context_input_tokens=153_294,

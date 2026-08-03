@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
 
+import agno.models.vertexai.claude as vertexai_claude_module
 import httpx
 import pytest
 import structlog
@@ -22,6 +23,7 @@ from google.auth.exceptions import DefaultCredentialsError
 from typer.testing import CliRunner
 
 import mindroom.constants as constants_module
+import mindroom.google_adc as google_adc_module
 from mindroom.agents import ensure_default_agent_workspaces
 from mindroom.cli import config as config_cli
 from mindroom.cli import migrate as migrate_cli
@@ -46,6 +48,7 @@ from mindroom.model_defaults import (
 )
 from mindroom.startup_errors import PermanentStartupError
 from mindroom.thread_export import ThreadExportStats
+from mindroom.thread_export.models import ThreadExportRoom, failure_for_room, failure_for_target
 from tests.conftest import load_config_yaml, normalize_console_output
 
 if TYPE_CHECKING:
@@ -90,6 +93,15 @@ def _write_minimal_runtime_config(path: Path) -> None:
         "authorization:\n  global_users: []\n",
         encoding="utf-8",
     )
+
+
+def test_cli_console_renders_without_ansi_escapes(capsys: pytest.CaptureFixture[str]) -> None:
+    """The root conftest must keep the import-time CLI console plain in any shell."""
+    config_cli.console.print("[bold red]MindRoom Doctor[/bold red]")
+
+    captured = capsys.readouterr().out
+    assert "\x1b" not in captured
+    assert "MindRoom Doctor" in captured
 
 
 def test_cli_import_keeps_help_path_runtime_modules_lazy() -> None:
@@ -755,6 +767,33 @@ class TestConfigInit:
         assert "mindroom connect --pair-code" in output
         assert "codex login" in output
 
+    def test_init_mindroom_chat_kimi_writes_hosted_kimi_defaults(self, tmp_path: Path) -> None:
+        """Hosted Kimi config should use Kimi defaults and hosted Matrix settings."""
+        target = tmp_path / "config.yaml"
+        result = runner.invoke(
+            app,
+            ["config", "init", "--path", str(target), "--matrix-server", "mindroom.chat", "--provider", "kimi"],
+        )
+        assert result.exit_code == 0
+
+        config = yaml.safe_load(target.read_text())
+        assert "mindroom_user" not in config
+        assert config["models"]["default"]["provider"] == "kimi"
+        assert config["models"]["default"]["id"] == CONFIG_INIT_MODEL_PRESETS["kimi"].id
+        assert config["models"]["default"]["context_window"] == CONFIG_INIT_MODEL_PRESETS["kimi"].context_window
+
+        env_content = (tmp_path / ".env").read_text()
+        assert "MATRIX_HOMESERVER=https://mindroom.chat" in env_content
+        assert "Run `kimi` and `/login` before starting MindRoom." in env_content
+        assert "# KIMI_CODE_HOME=~/.kimi-code" in env_content
+        assert "\nANTHROPIC_API_KEY=" not in env_content
+        assert "\nOPENAI_API_KEY=" not in env_content
+        assert "\nOPENROUTER_API_KEY=" not in env_content
+
+        output = normalize_console_output(result.output)
+        assert "mindroom connect --pair-code" in output
+        assert "/login" in output
+
     def test_init_mindroom_chat_ollama_writes_hosted_ollama_defaults(
         self,
         tmp_path: Path,
@@ -1231,14 +1270,16 @@ class TestConfigInit:
 
         config = yaml.safe_load(target.read_text())
         assert config["models"]["default"]["provider"] == "bedrock_claude"
-        assert config["models"]["default"]["id"] == "anthropic.claude-opus-4-8"
+        assert config["models"]["default"]["id"] == "anthropic.claude-opus-5"
         assert config["models"]["default"]["context_window"] == 1_000_000
 
         config_text = target.read_text(encoding="utf-8")
+        assert "# fable:" in config_text
+        assert "#   id: anthropic.claude-fable-5" in config_text
         assert "# sonnet:" in config_text
-        assert "#   id: global.anthropic.claude-sonnet-5" in config_text
+        assert "#   id: anthropic.claude-sonnet-5" in config_text
         assert "# haiku:" in config_text
-        assert "#   id: global.anthropic.claude-haiku-4-5" in config_text
+        assert "#   id: anthropic.claude-haiku-4-5" in config_text
 
         env_content = (tmp_path / ".env").read_text()
         assert "AWS_REGION=us-east-1" in env_content
@@ -1289,6 +1330,30 @@ class TestConfigInit:
         assert "Run `codex login` before starting MindRoom." in env_content
         assert "# CODEX_HOME=~/.codex" in env_content
         assert "OPENAI_API_KEY=your-openai-key-here" not in env_content
+
+    def test_init_kimi_preset_uses_kimi_models(self, tmp_path: Path) -> None:
+        """Config init --provider kimi uses Kimi Code CLI login defaults."""
+        target = tmp_path / "config.yaml"
+        result = runner.invoke(app, ["config", "init", "--path", str(target), "--provider", "kimi"])
+        assert result.exit_code == 0
+
+        config = yaml.safe_load(target.read_text())
+        assert config["models"]["default"]["provider"] == "kimi"
+        assert config["models"]["default"]["id"] == CONFIG_INIT_MODEL_PRESETS["kimi"].id
+        assert config["models"]["default"]["context_window"] == CONFIG_INIT_MODEL_PRESETS["kimi"].context_window
+
+        env_content = (tmp_path / ".env").read_text()
+        assert "Run `kimi` and `/login` before starting MindRoom." in env_content
+        assert "# KIMI_CODE_HOME=~/.kimi-code" in env_content
+        assert "OPENAI_API_KEY=your-openai-key-here" not in env_content
+
+    @pytest.mark.parametrize("provider", ["kimi-code", "kimi_code"])
+    def test_init_rejects_kimi_provider_aliases(self, tmp_path: Path, provider: str) -> None:
+        """Config init should accept kimi as the provider preset without extra aliases."""
+        target = tmp_path / "config.yaml"
+        result = runner.invoke(app, ["config", "init", "--path", str(target), "--provider", provider])
+        assert result.exit_code == 1
+        assert "Invalid --provider value" in normalize_console_output(result.output)
 
     @pytest.mark.parametrize("provider", ["openai-codex", "openai_codex", "c"])
     def test_init_rejects_openai_codex_provider_aliases(self, tmp_path: Path, provider: str) -> None:
@@ -1847,7 +1912,7 @@ class TestConfigValidate:
         """Config validate should warn about missing Bedrock region settings."""
         cfg = tmp_path / "config.yaml"
         cfg.write_text(
-            "models:\n  default:\n    provider: bedrock_claude\n    id: anthropic.claude-opus-4-8\n"
+            "models:\n  default:\n    provider: bedrock_claude\n    id: anthropic.claude-opus-5\n"
             "agents:\n  assistant:\n    display_name: Assistant\n    model: default\n"
             "router:\n  model: default\n",
         )
@@ -1876,7 +1941,7 @@ class TestConfigValidate:
             "models:\n"
             "  default:\n"
             "    provider: bedrock_claude\n"
-            "    id: anthropic.claude-opus-4-8\n"
+            "    id: anthropic.claude-opus-5\n"
             "    extra_kwargs:\n"
             "      aws_region: us-west-2\n"
             "agents:\n  assistant:\n    display_name: Assistant\n    model: default\n"
@@ -1905,7 +1970,7 @@ class TestConfigValidate:
             "models:\n"
             "  default:\n"
             "    provider: bedrock_claude\n"
-            "    id: anthropic.claude-opus-4-8\n"
+            "    id: anthropic.claude-opus-5\n"
             "    extra_kwargs:\n"
             "      aws_profile: dev-profile\n"
             "agents:\n  assistant:\n    display_name: Assistant\n    model: default\n"
@@ -1931,7 +1996,7 @@ class TestConfigValidate:
         """Config validate should accept Bedrock AWS_PROFILE without explicit region."""
         cfg = tmp_path / "config.yaml"
         cfg.write_text(
-            "models:\n  default:\n    provider: bedrock_claude\n    id: anthropic.claude-opus-4-8\n"
+            "models:\n  default:\n    provider: bedrock_claude\n    id: anthropic.claude-opus-5\n"
             "agents:\n  assistant:\n    display_name: Assistant\n    model: default\n"
             "router:\n  model: default\n",
         )
@@ -2007,7 +2072,7 @@ class TestRunErrorHandling:
         assert "No config found" in result.output
         assert "mindroom config init" in result.output
         provider_guidance = (
-            "mindroom config init --provider {openrouter,ollama,openai,azure,bedrock_claude,codex,claude"
+            "mindroom config init --provider {openrouter,ollama,openai,azure,bedrock_claude,codex,kimi,claude"
         )
         assert provider_guidance in result.output
         mock_main.assert_not_awaited()
@@ -2205,6 +2270,44 @@ class TestVersionAndHelp:
         assert export_kwargs["prefer_cache"] is False
         assert export_kwargs["include_invited_rooms"] is True
         assert export_kwargs["runtime_paths"].storage_root == storage_path.resolve()
+
+    def test_threads_export_formats_target_and_thread_failures(self, tmp_path: Path) -> None:
+        """Thread export output should render target failures without fake room placeholders."""
+        config_path = tmp_path / "config.yaml"
+        output_path = tmp_path / "exports"
+        _write_minimal_runtime_config(config_path)
+        room = ThreadExportRoom(
+            key="lobby",
+            room_id="!lobby:localhost",
+            alias="#lobby:localhost",
+            name="Lobby",
+        )
+        stats = ThreadExportStats(
+            output_dir=output_path,
+            failed_items=(
+                failure_for_target("overlapping output directory"),
+                failure_for_room(
+                    room,
+                    "history fetch failed",
+                    thread_id="$thread:localhost",
+                ),
+            ),
+        )
+
+        with patch(
+            "mindroom.thread_export.export_threads_once",
+            new=AsyncMock(return_value=stats),
+        ):
+            result = _invoke_with_runtime(
+                ["threads", "export", "--output", str(output_path)],
+                config_path,
+            )
+
+        output = normalize_console_output(result.output)
+        assert result.exit_code == 1
+        assert "Failed target: overlapping output directory" in output
+        assert "Failed: lobby $thread:localhost: history fetch failed" in output
+        assert "None" not in output
 
     def test_threads_export_forwards_no_invited_rooms_flag(self, tmp_path: Path) -> None:
         """The --no-invited-rooms flag should reach the exporter."""
@@ -2933,7 +3036,7 @@ class TestDoctor:
             def get_client(self) -> SimpleNamespace:
                 return SimpleNamespace(messages=_FakeMessages())
 
-        monkeypatch.setattr("mindroom.cli.doctor.VertexAIClaude", _FakeVertexModel)
+        monkeypatch.setattr(vertexai_claude_module, "Claude", _FakeVertexModel)
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
         assert result.exit_code == 0
@@ -2991,8 +3094,8 @@ class TestDoctor:
             def get_client(self) -> SimpleNamespace:
                 return SimpleNamespace(messages=_FakeMessages())
 
-        monkeypatch.setattr("mindroom.cli.doctor.load_google_application_credentials", _load_adc)
-        monkeypatch.setattr("mindroom.cli.doctor.VertexAIClaude", _FakeVertexModel)
+        monkeypatch.setattr(google_adc_module, "load_google_application_credentials", _load_adc)
+        monkeypatch.setattr(vertexai_claude_module, "Claude", _FakeVertexModel)
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
 
@@ -3039,7 +3142,7 @@ class TestDoctor:
             def get_client(self) -> SimpleNamespace:
                 return SimpleNamespace(messages=_FakeMessages())
 
-        monkeypatch.setattr("mindroom.cli.doctor.VertexAIClaude", _FakeVertexModel)
+        monkeypatch.setattr(vertexai_claude_module, "Claude", _FakeVertexModel)
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
         assert result.exit_code == 0
@@ -3100,7 +3203,7 @@ class TestDoctor:
             def get_client(self) -> SimpleNamespace:
                 return SimpleNamespace(messages=_MissingCredentialsMessages())
 
-        monkeypatch.setattr("mindroom.cli.doctor.VertexAIClaude", _MissingCredentialsModel)
+        monkeypatch.setattr(vertexai_claude_module, "Claude", _MissingCredentialsModel)
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
         assert result.exit_code == 0
@@ -3185,7 +3288,7 @@ class TestDoctor:
             def get_client(self) -> SimpleNamespace:
                 return SimpleNamespace(messages=_RejectedMessages())
 
-        monkeypatch.setattr("mindroom.cli.doctor.VertexAIClaude", _RejectedModel)
+        monkeypatch.setattr(vertexai_claude_module, "Claude", _RejectedModel)
 
         result = _invoke_with_runtime(["doctor"], cfg, storage_path=storage)
         assert result.exit_code == 1

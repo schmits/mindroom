@@ -11,8 +11,9 @@ All ordering is scoped to one ``(principal, room)`` lane.
    one lane and thread, and never start while a room update queued ahead of them is pending or active.
 
 3. A room update cancelled before it started leaves a fence in its lane: later thread updates still wait
-   for the earlier queue segment to drain, so cancellation cannot reorder writes.
-   Read-style operations may opt in to ``ignore_cancelled_room_fences`` because they mutate nothing.
+   for the earlier queue segment to drain, so cancellation cannot reorder writes. No queued update can
+   opt out. Only ``wait_for_thread_idle`` may, via ``ignore_cancelled_room_fences``, because a waiter
+   extends no queued state, so letting it past a fence cannot reorder any write.
 
 4. Readers establish the write-read barrier with ``wait_for_thread_idle``: a thread read started after a
    mutation was queued in the same lane never observes cache state older than that mutation.
@@ -60,7 +61,6 @@ class _QueuedUpdate:
     start_signal: asyncio.Future[None]
     update_state: _QueuedUpdateState
     thread_id: str | None = None
-    ignore_cancelled_room_fences: bool = False
     coalesce_key: _CoalesceKey | None = None
     started: bool = False
 
@@ -89,6 +89,9 @@ class EventCacheWriteCoordinator:
 
     logger: structlog.stdlib.BoundLogger
     background_task_owner: object = field(default_factory=object)
+    # Fail-closed markers owed by a cancelled append are owned separately, so the generic
+    # cancellation rounds cannot reach them: those rounds are what create them.
+    failure_marker_task_owner: object = field(default_factory=object)
     _room_states: dict[_CoordinationRoomKey, _RoomSchedulerState] = field(default_factory=dict, init=False)
     _room_update_tasks: dict[_CoordinationRoomKey, _UpdateTask] = field(default_factory=dict, init=False)
     _thread_update_tasks: dict[tuple[_CoordinationRoomKey, str], _UpdateTask] = field(
@@ -227,10 +230,9 @@ class EventCacheWriteCoordinator:
             return True, cancelled_room_fence_pending
 
         assert entry.thread_id is not None
-        cancelled_room_fence_blocks_entry = cancelled_room_fence_pending and not entry.ignore_cancelled_room_fences
         if (
             room_barrier_pending
-            or cancelled_room_fence_blocks_entry
+            or cancelled_room_fence_pending
             or same_thread_predecessor_pending
             or state.active_room is not None
         ):
@@ -325,8 +327,6 @@ class EventCacheWriteCoordinator:
     def _log_coalesced_update_if_needed(
         self,
         *,
-        room_id: str,
-        thread_id: str | None,
         kind: typing.Literal["room", "thread"],
         name: str,
         update_state: _QueuedUpdateState,
@@ -335,15 +335,12 @@ class EventCacheWriteCoordinator:
         if dropped_update_count <= 0:
             return
         log_context = {
-            "room_id": room_id,
             "barrier_kind": kind,
             "operation": name,
             "coalesced_update_count": dropped_update_count,
             "dropped_update_count": dropped_update_count,
             **update_state.coalesce_log_context,
         }
-        if thread_id is not None:
-            log_context["thread_id"] = thread_id
         self.logger.info("Coalesced outbound streaming edit cache updates", **log_context)
 
     def _release_active_entry(
@@ -409,9 +406,7 @@ class EventCacheWriteCoordinator:
         kind: typing.Literal["room", "thread"],
         update_coro_factory: _UpdateCoroFactory,
         name: str,
-        log_exceptions: bool,
         emit_timing: bool = False,
-        ignore_cancelled_room_fences: bool = False,
         coalesce_key: _CoalesceKey | None = None,
         coalesce_log_context: dict[str, object] | None = None,
         coordination_scope: str,
@@ -442,8 +437,6 @@ class EventCacheWriteCoordinator:
             assert current_task is not None
             with bound_log_context(task_name=current_task.get_name()):
                 self._log_coalesced_update_if_needed(
-                    room_id=room_id,
-                    thread_id=thread_id,
                     kind=kind,
                     name=name,
                     update_state=update_state,
@@ -491,8 +484,6 @@ class EventCacheWriteCoordinator:
                     emit_timing_event(
                         "Event cache update timing",
                         barrier_kind=kind,
-                        room_id=room_id,
-                        thread_id=thread_id,
                         operation=name,
                         predecessor_count=predecessor_count,
                         queued_behind_predecessor=predecessor_count > 0,
@@ -507,7 +498,6 @@ class EventCacheWriteCoordinator:
             run_when_scheduled(),
             name=name,
             owner=self.background_task_owner,
-            log_exceptions=log_exceptions,
         )
         entry = _QueuedUpdate(
             sequence=self._next_entry_sequence(),
@@ -516,7 +506,6 @@ class EventCacheWriteCoordinator:
             start_signal=start_signal,
             update_state=update_state,
             thread_id=thread_id,
-            ignore_cancelled_room_fences=ignore_cancelled_room_fences,
             coalesce_key=coalesce_key,
         )
 
@@ -590,7 +579,6 @@ class EventCacheWriteCoordinator:
         update_coro_factory: _UpdateCoroFactory,
         *,
         name: str,
-        log_exceptions: bool = True,
         emit_timing: bool = True,
         coalesce_key: _CoalesceKey | None = None,
         coalesce_log_context: dict[str, object] | None = None,
@@ -603,7 +591,6 @@ class EventCacheWriteCoordinator:
             kind="room",
             update_coro_factory=update_coro_factory,
             name=name,
-            log_exceptions=log_exceptions,
             emit_timing=emit_timing,
             coalesce_key=coalesce_key,
             coalesce_log_context=coalesce_log_context,
@@ -617,7 +604,6 @@ class EventCacheWriteCoordinator:
         update_coro_factory: _UpdateCoroFactory,
         *,
         name: str,
-        log_exceptions: bool = True,
         emit_timing: bool = False,
         coalesce_key: _CoalesceKey | None = None,
         coalesce_log_context: dict[str, object] | None = None,
@@ -630,32 +616,9 @@ class EventCacheWriteCoordinator:
             kind="thread",
             update_coro_factory=update_coro_factory,
             name=name,
-            log_exceptions=log_exceptions,
             emit_timing=emit_timing,
             coalesce_key=coalesce_key,
             coalesce_log_context=coalesce_log_context,
-            coordination_scope=coordination_scope,
-        )
-
-    async def run_thread_update(
-        self,
-        room_id: str,
-        thread_id: str,
-        update_coro_factory: _UpdateCoroFactory,
-        *,
-        name: str,
-        ignore_cancelled_room_fences: bool = False,
-        coordination_scope: str,
-    ) -> object:
-        """Run one thread-scoped operation through the ordered thread barrier and await its result."""
-        return await self._queue_update(
-            room_id=room_id,
-            thread_id=thread_id,
-            kind="thread",
-            update_coro_factory=update_coro_factory,
-            name=name,
-            log_exceptions=False,
-            ignore_cancelled_room_fences=ignore_cancelled_room_fences,
             coordination_scope=coordination_scope,
         )
 
@@ -728,8 +691,14 @@ class EventCacheWriteCoordinator:
             )
 
     async def close(self) -> None:
-        """Drain any queued cache writes for this coordinator."""
+        """Drain any queued cache writes for this coordinator.
+
+        Markers are drained after, and on their own budget. Cancelling a queued append is what makes
+        it owe one, so an owed marker does not exist until the first drain has already given up, and
+        sharing that drain would leave it to be cancelled by the very next round.
+        """
         await wait_for_background_tasks(timeout=5.0, owner=self.background_task_owner)
+        await wait_for_background_tasks(timeout=5.0, owner=self.failure_marker_task_owner)
         self._room_states.clear()
         self._room_update_tasks.clear()
         self._thread_update_tasks.clear()

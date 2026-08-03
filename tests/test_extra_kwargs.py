@@ -1,10 +1,15 @@
 """Test extra_kwargs functionality in model configuration."""
 
+import asyncio
+import gc
 import importlib
 import os
 import tempfile
+import threading
+import warnings
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from agno.models.anthropic import Claude
@@ -17,6 +22,7 @@ from agno.models.openai.like import OpenAILike
 from agno.models.response import ModelResponse
 from agno.models.vertexai.claude import Claude as VertexAIClaude
 from agno.utils.models.claude import format_messages
+from anthropic import AsyncAnthropic
 from anthropic.types import Message as AnthropicMessage
 
 from mindroom.claude_prompt_cache import (
@@ -295,7 +301,7 @@ def test_different_providers_with_extra_kwargs() -> None:
             },
             "anthropic_model": {
                 "provider": "anthropic",
-                "id": "claude-opus-4-8",
+                "id": "claude-opus-5",
                 "extra_kwargs": {
                     "temperature": 0.2,
                     "max_tokens": 2048,
@@ -435,7 +441,7 @@ def test_bedrock_claude_provider_uses_runtime_env() -> None:
         models={
             "bedrock_model": ModelConfig(
                 provider="bedrock_claude",
-                id="anthropic.claude-opus-4-8",
+                id="anthropic.claude-opus-5",
                 context_window=1_000_000,
             ),
         },
@@ -453,7 +459,7 @@ def test_bedrock_claude_provider_uses_runtime_env() -> None:
     model = get_model_instance(config, runtime_paths, "bedrock_model")
 
     assert isinstance(model, AwsBedrockClaude)
-    assert model.id == "anthropic.claude-opus-4-8"
+    assert model.id == "anthropic.claude-opus-5"
     assert model.provider == "AwsBedrock"
     assert model.aws_access_key == "aws-access"
     assert model.aws_secret_key == "aws-secret"  # noqa: S105
@@ -482,7 +488,7 @@ def test_bedrock_claude_provider_respects_explicit_profile_over_env_static_keys(
         models={
             "bedrock_model": ModelConfig(
                 provider="bedrock_claude",
-                id="anthropic.claude-opus-4-8",
+                id="anthropic.claude-opus-5",
                 context_window=1_000_000,
                 extra_kwargs={"aws_profile": "my-explicit-profile"},
             ),
@@ -523,7 +529,7 @@ def test_bedrock_claude_provider_auto_installs_boto3(
         "models": {
             "bedrock_model": {
                 "provider": "bedrock_claude",
-                "id": "anthropic.claude-opus-4-8",
+                "id": "anthropic.claude-opus-5",
                 "extra_kwargs": {
                     "aws_access_key": "aws-access",
                     "aws_secret_key": "aws-secret",
@@ -1013,7 +1019,7 @@ def _wire_tool(name: str) -> dict[str, object]:
 @pytest.mark.parametrize(
     ("provider", "model_id", "expected"),
     [
-        ("anthropic", "claude-opus-4-8", True),
+        ("anthropic", "claude-opus-5", True),
         ("anthropic", "claude-sonnet-5", True),
         ("Anthropic", "claude-sonnet-4-5-20250929", True),
         ("vertexai_claude", "claude-haiku-4-5@20251001", True),
@@ -1025,7 +1031,7 @@ def _wire_tool(name: str) -> dict[str, object]:
         ("anthropic", "claude-3-5-sonnet-20241022", False),
         ("vertexai_claude", "claude-sonnet-4@20250514", False),
         ("openai", "gpt-5.6", False),
-        ("bedrock_claude", "anthropic.claude-opus-4-8", False),
+        ("bedrock_claude", "anthropic.claude-opus-5", False),
     ],
 )
 def test_native_tool_search_supported_gating(provider: str, model_id: str, *, expected: bool) -> None:
@@ -1035,7 +1041,7 @@ def test_native_tool_search_supported_gating(provider: str, model_id: str, *, ex
 
 def test_deferred_tool_search_tags_tools_and_injects_search_tool() -> None:
     """Deferred tools ship tagged and name-sorted after the search tool and non-deferred tools."""
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=True)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=True)
     captured_kwargs = _install_fake_sync_client(model)
     # zeta_tool arrives pre-marked (as Agno's cache_tools flag would): the
     # marker must be stripped because deferred tools may not carry one.
@@ -1072,7 +1078,7 @@ def test_deferred_tool_search_skips_tools_marker_when_all_tools_deferred() -> No
     unverified, and deferred tools may never carry one, so the ladder leaves
     the tools array unmarked and relies on the system-prompt breakpoint.
     """
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=True)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=True)
     captured_kwargs = _install_fake_sync_client(model)
     vars(model)["_prepare_request_kwargs"] = lambda *_args, **_kwargs: {"tools": [_wire_tool("alpha_tool")]}
     install_claude_deferred_tool_search(model, deferred_tool_names=frozenset({"alpha_tool"}))
@@ -1087,7 +1093,7 @@ def test_deferred_tool_search_skips_tools_marker_when_all_tools_deferred() -> No
 
 def test_deferred_tool_search_applies_without_cache_ladder_when_cache_disabled() -> None:
     """Deferred tagging is independent of the cache ladder gate."""
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=False)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
     captured_kwargs = _install_fake_sync_client(model)
     vars(model)["_prepare_request_kwargs"] = lambda *_args, **_kwargs: {"tools": [_wire_tool("alpha_tool")]}
     install_claude_deferred_tool_search(model, deferred_tool_names=frozenset({"alpha_tool"}))
@@ -1103,7 +1109,7 @@ def test_deferred_tool_search_applies_without_cache_ladder_when_cache_disabled()
 
 def test_deferred_tool_search_leaves_requests_without_matching_tools_unchanged() -> None:
     """The search tool is injected only when a deferred tool is present in the request."""
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=True)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=True)
     captured_kwargs = _install_fake_sync_client(model)
     vars(model)["_prepare_request_kwargs"] = lambda *_args, **_kwargs: {"tools": [_wire_tool("always_tool")]}
     install_claude_deferred_tool_search(model, deferred_tool_names=frozenset({"other_tool"}))
@@ -1119,7 +1125,7 @@ def test_install_claude_deferred_tool_search_ignores_non_claude_and_empty_sets()
     install_claude_deferred_tool_search(llama, deferred_tool_names=frozenset({"alpha_tool"}))
     assert _DEFERRED_TOOL_NAMES_ATTR not in vars(llama)
 
-    claude = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=False)
+    claude = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
     install_claude_deferred_tool_search(claude, deferred_tool_names=frozenset())
     assert _DEFERRED_TOOL_NAMES_ATTR not in vars(claude)
 
@@ -1165,7 +1171,7 @@ def _anthropic_response(content: list[dict[str, object]]) -> AnthropicMessage:
             "id": "msg_test",
             "type": "message",
             "role": "assistant",
-            "model": "claude-opus-4-8",
+            "model": "claude-opus-5",
             "content": content,
             "stop_reason": "end_turn",
             "stop_sequence": None,
@@ -1176,7 +1182,7 @@ def _anthropic_response(content: list[dict[str, object]]) -> AnthropicMessage:
 
 def test_server_tool_search_blocks_round_trip_in_assistant_history() -> None:
     """server_tool_use and tool_search_tool_result replay verbatim, in order, exactly once."""
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=False)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
     first_response = _anthropic_response(
         [
             {"type": "text", "text": "I'll search for a weather tool."},
@@ -1392,7 +1398,7 @@ def test_replay_safe_tool_search_results_returns_original_when_references_are_av
 @pytest.mark.asyncio
 async def test_prompt_cache_hook_drops_orphaned_search_use_from_streaming_replay() -> None:
     """Mixed client/server tool history must remain valid on the next streamed request."""
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=False)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
     captured_kwargs: list[dict[str, object]] = []
 
     class _EmptyAsyncStream:
@@ -1459,6 +1465,176 @@ async def test_prompt_cache_hook_drops_orphaned_search_use_from_streaming_replay
     assert wire_messages[-1]["content"][0]["type"] == "tool_result"
 
 
+@pytest.mark.parametrize("use_beta", [False, True])
+@pytest.mark.asyncio
+async def test_prompt_cache_hook_constructs_async_stream_off_event_loop(*, use_beta: bool) -> None:
+    """Slow synchronous SDK stream setup must not block unrelated async work."""
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
+    stream_started = threading.Event()
+    heartbeat_seen = threading.Event()
+    allow_stream_return = threading.Event()
+    heartbeat_before_release: list[bool] = []
+    stream_thread_ids: list[int] = []
+    event_loop_thread_id = threading.get_ident()
+
+    class _EmptyAsyncStream:
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        def __aiter__(self) -> object:
+            return self
+
+        async def __anext__(self) -> object:
+            raise StopAsyncIteration
+
+    class _BlockingAsyncMessagesAPI:
+        def stream(self, **_kwargs: object) -> object:
+            stream_thread_ids.append(threading.get_ident())
+            stream_started.set()
+            assert allow_stream_return.wait(2.0)
+            return _EmptyAsyncStream()
+
+    class _FakeBetaAPI:
+        def __init__(self) -> None:
+            self.messages = _BlockingAsyncMessagesAPI()
+
+    class _FakeAsyncClient:
+        def __init__(self) -> None:
+            self.messages = _BlockingAsyncMessagesAPI()
+            self.beta = _FakeBetaAPI()
+
+    def release_after_heartbeat() -> None:
+        assert stream_started.wait(2.0)
+        heartbeat_before_release.append(heartbeat_seen.wait(0.5))
+        allow_stream_return.set()
+
+    vars(model)["get_async_client"] = lambda: _FakeAsyncClient()
+    vars(model)["_prepare_request_kwargs"] = lambda *_args, **_kwargs: {}
+    vars(model)["_has_beta_features"] = lambda **_kwargs: use_beta
+    install_claude_prompt_cache_hook(model)
+    release_thread = threading.Thread(target=release_after_heartbeat)
+    release_thread.start()
+
+    async def consume_stream() -> list[ModelResponse]:
+        return [
+            response
+            async for response in model.ainvoke_stream(
+                messages=[Message(role="user", content="Current turn")],
+                assistant_message=Message(role="assistant"),
+            )
+        ]
+
+    stream_task = asyncio.create_task(consume_stream())
+    try:
+        assert await asyncio.to_thread(stream_started.wait, 2.0)
+        await asyncio.sleep(0)
+        heartbeat_seen.set()
+        assert await asyncio.wait_for(stream_task, timeout=2.0) == []
+    finally:
+        allow_stream_return.set()
+        await asyncio.to_thread(release_thread.join, 2.0)
+
+    assert heartbeat_before_release == [True]
+    assert stream_thread_ids
+    assert stream_thread_ids[0] != event_loop_thread_id
+
+
+@pytest.mark.parametrize("cancel_count", [1, 2])
+@pytest.mark.parametrize("cancel_before_setup", [False, True])
+@pytest.mark.parametrize("use_beta", [False, True])
+@pytest.mark.asyncio
+async def test_cancelled_async_stream_setup_does_not_orphan_sdk_request_coroutine(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    cancel_before_setup: bool,
+    cancel_count: int,
+    use_beta: bool,
+) -> None:
+    """Cancellation during worker setup must dispose the SDK request coroutine."""
+    transport_calls = 0
+
+    class _RecordingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal transport_calls
+            transport_calls += 1
+            return httpx.Response(200, request=request)
+
+    client = AsyncAnthropic(
+        api_key="test-key",
+        http_client=httpx.AsyncClient(transport=_RecordingTransport()),
+    )
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
+    setup_started = threading.Event()
+    allow_setup = threading.Event()
+    setup_finished = threading.Event()
+    manager_created = threading.Event()
+
+    def blocking_prepare(_model: object, request_kwargs: dict[str, object]) -> dict[str, object]:
+        setup_started.set()
+        assert allow_setup.wait(2.0)
+        setup_finished.set()
+        return request_kwargs
+
+    messages_namespace = client.beta.messages if use_beta else client.messages
+    namespace_type = type(messages_namespace)
+    original_stream = namespace_type.stream
+
+    def observed_stream(self: object, **kwargs: object) -> object:
+        stream_manager = original_stream(self, **kwargs)
+        manager_created.set()
+        return stream_manager
+
+    monkeypatch.setattr("mindroom.claude_prompt_cache.prepare_claude_request_kwargs", blocking_prepare)
+    monkeypatch.setattr(namespace_type, "stream", observed_stream)
+    vars(model)["get_async_client"] = lambda: client
+    vars(model)["_prepare_request_kwargs"] = lambda *_args, **_kwargs: {"max_tokens": 1}
+    vars(model)["_has_beta_features"] = lambda **_kwargs: use_beta
+    install_claude_prompt_cache_hook(model)
+
+    async def consume_stream() -> list[ModelResponse]:
+        if cancel_before_setup:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            for _ in range(cancel_count):
+                current_task.cancel()
+        return [
+            response
+            async for response in model.ainvoke_stream(
+                messages=[Message(role="user", content="hello")],
+                assistant_message=Message(role="assistant"),
+            )
+        ]
+
+    setup_task = asyncio.create_task(consume_stream())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            assert await asyncio.to_thread(setup_started.wait, 2.0)
+            if not cancel_before_setup:
+                for _ in range(cancel_count):
+                    setup_task.cancel()
+            allow_setup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await setup_task
+        finally:
+            allow_setup.set()
+
+        assert await asyncio.to_thread(setup_finished.wait, 2.0)
+        assert await asyncio.to_thread(manager_created.wait, 2.0)
+        assert setup_task.cancelling() == cancel_count
+        del setup_task
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+    await client.close()
+    assert transport_calls == 0
+    assert not any("was never awaited" in str(warning.message) for warning in caught)
+
+
 def _dirty_replay_messages() -> list[Message]:
     """A conversation whose assistant turn replays a persisted dirty tool-search block."""
     return [
@@ -1503,7 +1679,7 @@ def test_prompt_cache_hook_sanitizes_replay_with_cache_disabled_and_no_deferred_
     model with no deferred tools must still send schema-clean history, while
     the disabled ladder stays inert.
     """
-    model = Claude(id="claude-opus-4-8", api_key="test-key", cache_system_prompt=False)
+    model = Claude(id="claude-opus-5", api_key="test-key", cache_system_prompt=False)
     captured_kwargs = _install_fake_sync_client(model)
     install_claude_prompt_cache_hook(model)
 

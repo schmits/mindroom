@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape as html_escape
 from typing import TYPE_CHECKING, Any, Literal
+
+from nio.exceptions import SendRetryError
 
 from mindroom import constants, interactive
 from mindroom.constants import SKIP_MENTIONS_KEY
@@ -29,7 +31,7 @@ from mindroom.hooks import (
     emit_final_response_transform,
     emit_transform,
 )
-from mindroom.matrix.client_delivery import build_threaded_edit_content, edit_message_result, send_message_result
+from mindroom.matrix.client_delivery import edit_message_result, send_message_result
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_message_content
 from mindroom.runtime_protocols import SupportsClientConfig  # noqa: TC001
@@ -37,6 +39,7 @@ from mindroom.streaming import (
     StreamingResponse,
     build_cancelled_response_update,
     cancel_failure_reason,
+    cancel_source_from_failure_reason,
     classify_cancel_source,
     interactive_response_for_visible_body,
     send_streaming_response,
@@ -94,7 +97,7 @@ class ResponseHookService:
 
     hook_context: HookContextSupport
 
-    async def apply_before_response(  # noqa: D102
+    async def _apply_before_response(
         self,
         *,
         identity: ResponseIdentity,
@@ -117,7 +120,7 @@ class ResponseHookService:
         )
         return await emit_transform(self.hook_context.registry, EVENT_MESSAGE_BEFORE_RESPONSE, context)
 
-    async def apply_final_response_transform(  # noqa: D102
+    async def _apply_final_response_transform(
         self,
         *,
         identity: ResponseIdentity,
@@ -196,6 +199,7 @@ class SendTextRequest:  # noqa: D101
     skip_mentions: bool = False
     tool_trace: list[ToolTraceEntry] | None = None
     extra_content: dict[str, Any] | None = None
+    retry_sync_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,7 @@ class EditTextRequest:  # noqa: D101
     new_text: str
     tool_trace: list[ToolTraceEntry] | None = None
     extra_content: dict[str, Any] | None = None
+    retry_sync_recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -252,7 +257,7 @@ class MatrixCompactionLifecycle:
 
     async def start(self, event: CompactionLifecycleStart) -> str | None:
         """Send the initial visible lifecycle notice."""
-        return await self.delivery_gateway.send_compaction_lifecycle_start(
+        return await self.delivery_gateway._send_compaction_lifecycle_start(
             target=self.target,
             reply_to_event_id=self.reply_to_event_id,
             event=event,
@@ -260,21 +265,21 @@ class MatrixCompactionLifecycle:
 
     async def progress(self, event: CompactionLifecycleProgress) -> None:
         """Edit the lifecycle notice after persisted compaction progress."""
-        await self.delivery_gateway.edit_compaction_lifecycle_progress(
+        await self.delivery_gateway._edit_compaction_lifecycle_progress(
             target=self.target,
             event=event,
         )
 
     async def complete_success(self, outcome: CompactionOutcome) -> None:
         """Edit the lifecycle notice after successful compaction."""
-        await self.delivery_gateway.edit_compaction_lifecycle_success(
+        await self.delivery_gateway._edit_compaction_lifecycle_success(
             target=self.target,
             outcome=outcome,
         )
 
     async def complete_failure(self, event: CompactionLifecycleFailure) -> None:
         """Edit the lifecycle notice after failed compaction."""
-        await self.delivery_gateway.edit_compaction_lifecycle_failure(
+        await self.delivery_gateway._edit_compaction_lifecycle_failure(
             target=self.target,
             event=event,
         )
@@ -388,8 +393,9 @@ class DeliveryGateway:
         identity: ResponseIdentity,
         redaction_reason: str,
         failure_reason: str | None = None,
+        propagate_cancelled: bool = False,
     ) -> str | None:
-        """Redact one visible response event and return a failure reason when cleanup fails."""
+        """Redact one visible event, optionally propagating cancellation, and return any cleanup failure."""
         self.deps.logger.warning(
             "Visible response was already delivered before suppression; attempting cleanup",
             response_kind=identity.response_kind,
@@ -404,6 +410,8 @@ class DeliveryGateway:
                 reason=redaction_reason,
             )
         except asyncio.CancelledError as error:
+            if propagate_cancelled:
+                raise
             return self._cancelled_error_failure_reason(error)
         except Exception as error:
             self.deps.logger.exception(
@@ -503,7 +511,17 @@ class DeliveryGateway:
             )
         if request.skip_mentions:
             content[SKIP_MENTIONS_KEY] = True
-        delivered = await send_message_result(client, resolved_target.room_id, content)
+        failure_reason = "send_message_result returned None"
+        try:
+            delivered = await send_message_result(
+                client,
+                resolved_target.room_id,
+                content,
+                retry_sync_recovery=request.retry_sync_recovery,
+            )
+        except SendRetryError:
+            delivered = None
+            failure_reason = "matrix timeline recovery still blocked the send"
         if delivered is not None:
             self.deps.resolver.deps.conversation_cache.notify_outbound_message(
                 resolved_target.room_id,
@@ -512,7 +530,11 @@ class DeliveryGateway:
             )
             self.deps.logger.info("Sent response", event_id=delivered.event_id, **resolved_target.log_context)
             return delivered.event_id
-        self.deps.logger.error("Failed to send response to room", **resolved_target.log_context)
+        self.deps.logger.error(
+            "Failed to send response to room",
+            error=failure_reason,
+            **resolved_target.log_context,
+        )
         return None
 
     async def edit_text(self, request: EditTextRequest) -> bool:
@@ -520,47 +542,28 @@ class DeliveryGateway:
         client = self._client()
         config = self.deps.runtime.config
         target = request.target
-        if (
-            config.get_entity_thread_mode(
-                self.deps.agent_name,
-                self.deps.runtime_paths,
-                room_id=target.room_id,
-            )
-            == "room"
-        ):
-            content = format_message_with_mentions(
-                config,
-                self.deps.runtime_paths,
-                request.new_text,
-                reply_to_event_id=target.reply_to_event_id,
-                tool_trace=request.tool_trace,
-                extra_content=request.extra_content,
-            )
-        else:
-            latest_thread_event_id = (
-                await self.deps.resolver.deps.conversation_cache.get_latest_thread_event_id_if_needed(
-                    target.room_id,
-                    target.resolved_thread_id,
-                    caller_label="delivery_edit_text",
-                )
-            )
-            content = build_threaded_edit_content(
-                new_text=request.new_text,
-                thread_id=target.resolved_thread_id,
-                config=config,
-                runtime_paths=self.deps.runtime_paths,
-                tool_trace=request.tool_trace,
-                extra_content=request.extra_content,
-                latest_thread_event_id=latest_thread_event_id,
-            )
-
-        delivered = await edit_message_result(
-            client,
-            target.room_id,
-            request.event_id,
-            content,
+        # The edit envelope discards any pre-existing relation before adding m.replace.
+        content = format_message_with_mentions(
+            config,
+            self.deps.runtime_paths,
             request.new_text,
+            tool_trace=request.tool_trace,
+            extra_content=request.extra_content,
         )
+
+        failure_reason = "edit_message_result returned None"
+        try:
+            delivered = await edit_message_result(
+                client,
+                target.room_id,
+                request.event_id,
+                content,
+                request.new_text,
+                retry_sync_recovery=request.retry_sync_recovery,
+            )
+        except SendRetryError:
+            delivered = None
+            failure_reason = "matrix timeline recovery still blocked the edit"
         if delivered is not None:
             self.deps.resolver.deps.conversation_cache.notify_outbound_message(
                 target.room_id,
@@ -572,7 +575,7 @@ class DeliveryGateway:
         self.deps.logger.error(
             "Failed to edit message",
             event_id=request.event_id,
-            error="edit_message_result returned None",
+            error=failure_reason,
             **target.log_context,
         )
         return False
@@ -583,7 +586,7 @@ class DeliveryGateway:
     ) -> FinalDeliveryOutcome:
         """Apply before_response hooks and perform the final send or edit."""
         try:
-            draft = await self.deps.response_hooks.apply_before_response(
+            draft = await self.deps.response_hooks._apply_before_response(
                 identity=request.identity,
                 response_text=request.response_text,
                 tool_trace=request.tool_trace,
@@ -591,6 +594,7 @@ class DeliveryGateway:
             )
         except asyncio.CancelledError as error:
             failure_reason = self._cancelled_error_failure_reason(error)
+            cancel_source = classify_cancel_source(error)
             if request.existing_event_id is not None and request.existing_event_is_placeholder:
                 cleanup_failure = await self._redact_visible_response_event(
                     room_id=request.target.room_id,
@@ -604,6 +608,7 @@ class DeliveryGateway:
                         terminal_status="error",
                         event_id=request.existing_event_id,
                         is_visible_response=True,
+                        cancel_source=cancel_source,
                         failure_reason=cleanup_failure,
                         tool_trace=tuple(request.tool_trace or ()),
                         extra_content=request.extra_content,
@@ -618,6 +623,7 @@ class DeliveryGateway:
                     identity=request.identity,
                     redaction_reason="Failed placeholder response before delivery",
                     failure_reason=failure_reason,
+                    propagate_cancelled=True,
                 )
                 if cleanup_failure is not None:
                     return FinalDeliveryOutcome(
@@ -707,6 +713,7 @@ class DeliveryGateway:
                     new_text=display_text,
                     tool_trace=draft.tool_trace,
                     extra_content=draft.extra_content,
+                    retry_sync_recovery=True,
                 ),
             )
             if edited:
@@ -747,6 +754,7 @@ class DeliveryGateway:
                 skip_mentions=request.skip_mentions,
                 tool_trace=draft.tool_trace,
                 extra_content=draft.extra_content,
+                retry_sync_recovery=True,
             ),
         )
         if event_id is None:
@@ -791,6 +799,7 @@ class DeliveryGateway:
                 is_visible_response=True,
                 final_visible_body=cancelled_text,
                 delivery_kind="edited",
+                cancel_source=request.cancel_source,
                 failure_reason=failure_reason,
                 extra_content=extra_content,
             )
@@ -800,6 +809,7 @@ class DeliveryGateway:
                 event_id=request.event_id,
                 is_visible_response=True,
                 final_visible_body=cancelled_text,
+                cancel_source=request.cancel_source,
                 failure_reason=failure_reason,
                 extra_content=extra_content,
             )
@@ -815,17 +825,31 @@ class DeliveryGateway:
                 terminal_status="error",
                 event_id=request.event_id,
                 is_visible_response=True,
+                cancel_source=request.cancel_source,
                 failure_reason=cleanup_failure,
                 extra_content=extra_content,
             )
         return FinalDeliveryOutcome(
             terminal_status="cancelled",
             event_id=None,
+            cancel_source=request.cancel_source,
             failure_reason=failure_reason,
             extra_content=extra_content,
         )
 
-    async def send_compaction_lifecycle_start(
+    async def finalize_user_stopped_response(self, target: MessageTarget, event_id: str) -> bool:
+        """Edit a recovered in-flight response into its terminal user-stop state."""
+        cancelled_text, stream_status = build_cancelled_response_update("", cancel_source="user_stop")
+        return await self.edit_text(
+            EditTextRequest(
+                target=target,
+                event_id=event_id,
+                new_text=cancelled_text,
+                extra_content={constants.STREAM_STATUS_KEY: stream_status},
+            ),
+        )
+
+    async def _send_compaction_lifecycle_start(
         self,
         *,
         target: MessageTarget,
@@ -870,7 +894,7 @@ class DeliveryGateway:
         self.deps.logger.error("Failed to send compaction lifecycle notice", **target.log_context)
         return None
 
-    async def edit_compaction_lifecycle_progress(
+    async def _edit_compaction_lifecycle_progress(
         self,
         *,
         target: MessageTarget,
@@ -886,7 +910,7 @@ class DeliveryGateway:
             metadata=event.to_notice_metadata(),
         )
 
-    async def edit_compaction_lifecycle_success(
+    async def _edit_compaction_lifecycle_success(
         self,
         *,
         target: MessageTarget,
@@ -902,7 +926,7 @@ class DeliveryGateway:
             metadata=outcome.to_notice_metadata(),
         )
 
-    async def edit_compaction_lifecycle_failure(
+    async def _edit_compaction_lifecycle_failure(
         self,
         *,
         target: MessageTarget,
@@ -937,19 +961,14 @@ class DeliveryGateway:
         body: str,
         metadata: dict[str, object],
     ) -> None:
-        latest_thread_event_id = await self.deps.resolver.deps.conversation_cache.get_latest_thread_event_id_if_needed(
-            target.room_id,
-            target.resolved_thread_id,
-            target.reply_to_event_id,
-            event_id,
-            caller_label="delivery_compaction_lifecycle_edit",
-        )
+        # Same as ``edit_text``: this content is wrapped by ``build_edit_event_content``,
+        # which discards ``m.relates_to``, so neither the thread relation nor the
+        # latest-thread lookup that completes it survives to the wire. Passing
+        # ``thread_event_id`` without a resolved fallback would also trip the thread-relation
+        # assertion in ``build_thread_relation``.
         content = build_message_content(
             body,
             formatted_body=f"<em>{html_escape(body).replace(chr(10), '<br/>')}</em>",
-            thread_event_id=target.resolved_thread_id,
-            reply_to_event_id=target.reply_to_event_id,
-            latest_thread_event_id=latest_thread_event_id,
             extra_content={
                 "msgtype": "m.notice",
                 constants.COMPACTION_NOTICE_CONTENT_KEY: metadata,
@@ -1101,6 +1120,8 @@ class DeliveryGateway:
             streamed_text = stream_outcome.visible_body_text
             final_body_candidate = stream_outcome.canonical_final_body_candidate or streamed_text
             if stream_outcome.terminal_status == "cancelled":
+                failure_reason = stream_outcome.failure_reason or "stream_finalize_cancelled"
+                cancel_source = cancel_source_from_failure_reason(failure_reason)
                 if (
                     request.initial_delivery_kind == "edited"
                     and stream_outcome.visible_body_state == "none"
@@ -1112,11 +1133,11 @@ class DeliveryGateway:
                             terminal_status="cancelled",
                             event_id=existing_visible_event_id,
                             is_visible_response=True,
-                            failure_reason=stream_outcome.failure_reason or "stream_finalize_cancelled",
+                            cancel_source=cancel_source,
+                            failure_reason=failure_reason,
                             tool_trace=tuple(request.tool_trace or ()),
                             extra_content=request.extra_content,
                         )
-                failure_reason = stream_outcome.failure_reason or "stream_finalize_cancelled"
                 if stream_outcome.visible_body_state == "placeholder_only":
                     cleanup_outcome = await self._cleanup_completed_placeholder_only_stream(
                         room_id=request.target.room_id,
@@ -1127,10 +1148,11 @@ class DeliveryGateway:
                         extra_content=request.extra_content,
                     )
                     if cleanup_outcome.event_id is not None:
-                        return cleanup_outcome
+                        return replace(cleanup_outcome, cancel_source=cancel_source)
                     return FinalDeliveryOutcome(
                         terminal_status="cancelled",
                         event_id=None,
+                        cancel_source=cancel_source,
                         failure_reason=failure_reason,
                         tool_trace=tuple(request.tool_trace or ()),
                         extra_content=request.extra_content,
@@ -1143,6 +1165,10 @@ class DeliveryGateway:
                         event_id=visible_stream_event_id,
                         is_visible_response=True,
                         final_visible_body=streamed_text or None,
+                        delivery_kind=request.initial_delivery_kind
+                        if stream_outcome.terminal_update_committed
+                        else None,
+                        cancel_source=cancel_source,
                         failure_reason=failure_reason,
                         tool_trace=tuple(request.tool_trace or ()),
                         extra_content=request.extra_content,
@@ -1152,6 +1178,7 @@ class DeliveryGateway:
                         terminal_status="cancelled",
                         event_id=request.existing_event_id,
                         is_visible_response=True,
+                        cancel_source=cancel_source,
                         failure_reason=failure_reason,
                         tool_trace=tuple(request.tool_trace or ()),
                         extra_content=request.extra_content,
@@ -1159,6 +1186,7 @@ class DeliveryGateway:
                 return FinalDeliveryOutcome(
                     terminal_status="cancelled",
                     event_id=None,
+                    cancel_source=cancel_source,
                     failure_reason=failure_reason,
                     tool_trace=tuple(request.tool_trace or ()),
                     extra_content=request.extra_content,
@@ -1334,7 +1362,7 @@ class DeliveryGateway:
                         tool_trace=tuple(request.tool_trace or ()),
                         extra_content=request.extra_content,
                     )
-                final_transform_draft = await self.deps.response_hooks.apply_final_response_transform(
+                final_transform_draft = await self.deps.response_hooks._apply_final_response_transform(
                     identity=request.identity,
                     response_text=final_body_candidate,
                 )
@@ -1393,7 +1421,7 @@ class DeliveryGateway:
                 extra_content=request.extra_content,
                 interactive_metadata=interactive_response.interactive_metadata,
             )
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             visible_event_id = stream_outcome.visible_event_id
             event_id = visible_event_id
             if event_id is None and request.existing_event_id is not None and not request.existing_event_is_placeholder:
@@ -1404,7 +1432,8 @@ class DeliveryGateway:
                 event_id=event_id,
                 is_visible_response=event_id is not None,
                 final_visible_body=final_visible_body,
-                failure_reason="stream_finalize_cancelled",
+                cancel_source=classify_cancel_source(error),
+                failure_reason=self._cancelled_error_failure_reason(error),
                 tool_trace=tuple(request.tool_trace or ()),
                 extra_content=request.extra_content,
             )
@@ -1423,6 +1452,11 @@ class DeliveryGateway:
                 event_id=event_id,
                 is_visible_response=event_id is not None,
                 final_visible_body=final_visible_body,
+                cancel_source=(
+                    cancel_source_from_failure_reason(stream_outcome.failure_reason)
+                    if stream_outcome.terminal_status == "cancelled"
+                    else None
+                ),
                 failure_reason="stream_finalize_failed",
                 tool_trace=tuple(request.tool_trace or ()),
                 extra_content=request.extra_content,

@@ -8,7 +8,7 @@ import sqlite3
 from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import nio
 import pytest
@@ -22,7 +22,8 @@ from mindroom.config.models import ModelConfig
 from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps, _ThreadIdLookup
 from mindroom.matrix.cache import (
     ConversationEventCache,
-    ThreadCacheState,
+    ThreadAppendOutcome,
+    ThreadCacheGap,
     event_normalization,
     sqlite_event_cache_events,
     sqlite_event_cache_threads,
@@ -33,11 +34,16 @@ from mindroom.matrix.cache.sqlite_event_cache import SqliteEventCache
 from mindroom.matrix.cache.thread_history_result import thread_history_result
 from mindroom.matrix.cache.thread_reads import ThreadReadMode
 from mindroom.matrix.cache.write_coordinator import EventCacheWriteCoordinator
-from mindroom.matrix.client_thread_history import BulkThreadRefreshStats, fetch_thread_history
+from mindroom.matrix.client_thread_history import (
+    BulkThreadRefreshStats,
+    fetch_thread_history,
+)
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.conversation_cache import MatrixConversationCache, _cached_room_get_event
 from mindroom.matrix.event_info import EventInfo
-from mindroom.matrix.thread_diagnostics import THREAD_HISTORY_DEGRADED_DIAGNOSTIC
+from mindroom.matrix.thread_diagnostics import (
+    THREAD_HISTORY_DEGRADED_DIAGNOSTIC,
+)
 from mindroom.timing import DispatchPipelineTiming
 from tests.conftest import (
     agent_response_should_respond,
@@ -50,7 +56,7 @@ from tests.event_cache_test_support import replace_thread_unconditionally as _re
 from tests.identity_helpers import entity_ids
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
     from mindroom.matrix.cache import ThreadHistoryResult
@@ -323,13 +329,18 @@ async def test_conversation_cache_thread_reads_forward_client_fetch_metadata(
     client = MagicMock()
     conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
     read_modes = [
-        ("get_thread_history", "fetch_thread_history", True, 101.0, 50.0),
-        ("get_dispatch_thread_snapshot", "fetch_dispatch_thread_snapshot", False, 102.0, 75.0),
-        ("get_dispatch_thread_history", "fetch_dispatch_thread_history", True, 103.0, 100.0),
+        ("get_thread_history", "fetch_thread_history", True, 50.0),
+        ("get_dispatch_thread_snapshot", "fetch_dispatch_thread_snapshot", False, 75.0),
+        ("get_dispatch_thread_history", "fetch_dispatch_thread_history", True, 100.0),
     ]
+    post_coordinator_read_starts = {
+        "get_thread_history": 1.06,
+        "get_dispatch_thread_snapshot": 2.08,
+        "get_dispatch_thread_history": 3.11,
+    }
     fetchers = {
         name: AsyncMock(return_value=thread_history_result([], is_full_history=is_full_history))
-        for _method_name, name, is_full_history, _guard_started_at, _queue_wait_ms in read_modes
+        for _method_name, name, is_full_history, _queue_wait_ms in read_modes
     }
 
     try:
@@ -343,10 +354,25 @@ async def test_conversation_cache_thread_reads_forward_client_fetch_metadata(
                 "mindroom.matrix.conversation_cache.fetch_dispatch_thread_history",
                 fetchers["fetch_dispatch_thread_history"],
             ),
-            patch("mindroom.matrix.conversation_cache.time.time", side_effect=[101.0, 102.0, 103.0]),
             patch(
                 "mindroom.matrix.cache.thread_reads.time.perf_counter",
-                side_effect=[1.0, 1.05, 2.0, 2.01, 2.075, 2.075, 2.075, 3.0, 3.01, 3.1, 3.1, 3.1],
+                side_effect=[
+                    1.0,
+                    1.05,
+                    1.06,
+                    2.0,
+                    2.01,
+                    2.075,
+                    2.075,
+                    2.075,
+                    2.08,
+                    3.0,
+                    3.01,
+                    3.1,
+                    3.1,
+                    3.1,
+                    3.11,
+                ],
             ),
         ):
             read_methods = {
@@ -354,7 +380,7 @@ async def test_conversation_cache_thread_reads_forward_client_fetch_metadata(
                 "get_dispatch_thread_snapshot": conversation_cache.get_dispatch_thread_snapshot,
                 "get_dispatch_thread_history": conversation_cache.get_dispatch_thread_history,
             }
-            for method_name, _name, is_full_history, _guard_started_at, _queue_wait_ms in read_modes:
+            for method_name, _name, is_full_history, _queue_wait_ms in read_modes:
                 result = await read_methods[method_name](
                     "!room:localhost",
                     "$thread:localhost",
@@ -362,18 +388,20 @@ async def test_conversation_cache_thread_reads_forward_client_fetch_metadata(
                 )
                 assert result.is_full_history is is_full_history
 
-        for method_name, name, _is_full_history, guard_started_at, queue_wait_ms in read_modes:
+        for method_name, name, _is_full_history, queue_wait_ms in read_modes:
             fetchers[name].assert_awaited_once_with(
                 client,
                 "!room:localhost",
                 "$thread:localhost",
                 event_cache=event_cache,
-                cache_write_guard_started_at=guard_started_at,
                 trusted_sender_ids=conversation_cache._trusted_sender_ids(),
                 caller_label=f"caller-{method_name}",
                 coordinator_queue_wait_ms=queue_wait_ms,
-                resolution_reuse=conversation_cache._thread_resolution_reuse,
+                post_coordinator_read_started=post_coordinator_read_starts[method_name],
+                # Always supplied now: the refill no longer depends on a write coordinator.
+                refill=ANY,
             )
+            assert callable(fetchers[name].await_args.kwargs["refill"])
     finally:
         await event_cache.close()
 
@@ -393,7 +421,6 @@ async def test_dispatch_thread_read_degrades_when_cache_coordinator_never_drains
 
     coordinator = MagicMock()
     coordinator.wait_for_thread_idle = AsyncMock(side_effect=never_idle)
-    coordinator.run_thread_update = AsyncMock(side_effect=AssertionError("timed-out reads must not enter refresh"))
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
     _set_dispatch_thread_read_timeout(conversation_cache, 0.01)
 
@@ -416,7 +443,6 @@ async def test_dispatch_thread_read_degrades_when_cache_coordinator_never_drains
     assert result.diagnostics["thread_read_source"] == "degraded"
     assert result.diagnostics["caller_label"] == "dispatch_context"
     coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -474,45 +500,6 @@ async def test_dispatch_thread_read_timeout_does_not_cancel_pending_cache_write(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_thread_read_bypasses_refresh_queue_after_idle_wait(
-    tmp_path: Path,
-) -> None:
-    """Dispatch fetches should bypass coordinator queuing after the bounded idle wait."""
-    event_cache = SqliteEventCache(tmp_path / "event_cache.db")
-    await event_cache.initialize()
-    client = MagicMock()
-    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
-
-    coordinator = MagicMock()
-    coordinator.wait_for_thread_idle = AsyncMock(return_value=None)
-    coordinator.run_thread_update = AsyncMock(side_effect=AssertionError("dispatch reads should bypass refresh queue"))
-    conversation_cache.runtime.event_cache_write_coordinator = coordinator
-    fetched_history = thread_history_result([], is_full_history=True)
-
-    try:
-        with patch(
-            "mindroom.matrix.conversation_cache.fetch_dispatch_thread_history",
-            AsyncMock(return_value=fetched_history),
-        ) as fetch_dispatch_thread_history:
-            result = await asyncio.wait_for(
-                conversation_cache.get_dispatch_thread_history(
-                    "!room:localhost",
-                    "$thread:localhost",
-                    caller_label="dispatch_context",
-                ),
-                timeout=0.2,
-            )
-    finally:
-        await event_cache.close()
-
-    assert result == []
-    assert result.is_full_history is True
-    coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_not_awaited()
-    fetch_dispatch_thread_history.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_dispatch_thread_read_degrades_when_fetcher_stalls(
     tmp_path: Path,
 ) -> None:
@@ -522,12 +509,13 @@ async def test_dispatch_thread_read_degrades_when_fetcher_stalls(
     client = MagicMock()
     conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
 
-    async def never_returns(*_args: object, **_kwargs: object) -> ThreadHistoryResult:
-        await asyncio.Event().wait()
+    release_fetch = asyncio.Event()
 
-    coordinator = MagicMock()
-    coordinator.wait_for_thread_idle = AsyncMock(return_value=None)
-    coordinator.run_thread_update = AsyncMock(side_effect=AssertionError("dispatch reads should bypass refresh queue"))
+    async def never_returns(*_args: object, **_kwargs: object) -> ThreadHistoryResult:
+        await release_fetch.wait()
+        return thread_history_result([], is_full_history=False)
+
+    coordinator = EventCacheWriteCoordinator(logger=MagicMock())
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
     _set_dispatch_thread_read_timeout(conversation_cache, 0.01)
 
@@ -545,6 +533,8 @@ async def test_dispatch_thread_read_degrades_when_fetcher_stalls(
                 timeout=0.2,
             )
     finally:
+        release_fetch.set()
+        await coordinator.close()
         await event_cache.close()
 
     assert result == []
@@ -554,8 +544,6 @@ async def test_dispatch_thread_read_degrades_when_fetcher_stalls(
     assert result.diagnostics["thread_read_source"] == "degraded"
     assert result.diagnostics["caller_label"] == "dispatch_context"
     assert "dispatch_fetch_wait_ms" in result.diagnostics
-    coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -675,7 +663,6 @@ async def test_dispatch_thread_read_uses_single_deadline_after_coordinator_wait(
 
     coordinator = MagicMock()
     coordinator.wait_for_thread_idle = AsyncMock(return_value=None)
-    coordinator.run_thread_update = AsyncMock(side_effect=AssertionError("dispatch reads should bypass refresh queue"))
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
     _set_dispatch_thread_read_timeout(conversation_cache, 1.0)
 
@@ -707,7 +694,6 @@ async def test_dispatch_thread_read_uses_single_deadline_after_coordinator_wait(
     assert result.diagnostics["thread_read_source"] == "degraded"
     assert "dispatch_fetch_wait_ms" in result.diagnostics
     coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_not_awaited()
     fetch_dispatch_thread_snapshot.assert_not_awaited()
 
 
@@ -721,26 +707,21 @@ async def test_strict_thread_history_uses_no_stale_fetch_without_dispatch_timeou
     client = MagicMock()
     conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
 
-    async def run_thread_update(
-        _room_id: str,
-        _thread_id: str,
-        update_coro_factory: Callable[[], Awaitable[ThreadHistoryResult]],
-        **_kwargs: object,
-    ) -> ThreadHistoryResult:
-        return await update_coro_factory()
-
-    coordinator = MagicMock()
-    coordinator.wait_for_thread_idle = AsyncMock(return_value=None)
-    coordinator.run_thread_update = AsyncMock(side_effect=run_thread_update)
+    coordinator = EventCacheWriteCoordinator(logger=conversation_cache.logger)
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
     fetched_history = thread_history_result([], is_full_history=True)
 
     try:
         with (
+            patch.object(
+                coordinator,
+                "wait_for_thread_idle",
+                wraps=coordinator.wait_for_thread_idle,
+            ) as wait_for_thread_idle,
             patch(
-                "mindroom.matrix.conversation_cache.fetch_dispatch_thread_history",
+                "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
                 AsyncMock(return_value=fetched_history),
-            ) as fetch_dispatch_thread_history,
+            ) as refresh_thread_history,
             patch(
                 "mindroom.matrix.conversation_cache.fetch_thread_history",
                 AsyncMock(side_effect=AssertionError("strict reads must not allow stale fallback")),
@@ -752,66 +733,304 @@ async def test_strict_thread_history_uses_no_stale_fetch_without_dispatch_timeou
                 caller_label="dispatch_post_lock_refresh",
             )
     finally:
+        await coordinator.close()
         await event_cache.close()
 
     assert result.is_full_history is True
-    coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_awaited_once()
-    assert coordinator.run_thread_update.await_args.kwargs["name"] == "matrix_cache_refresh_strict_thread_history"
-    fetch_dispatch_thread_history.assert_awaited_once()
+    wait_for_thread_idle.assert_awaited_once()
+    refresh_thread_history.assert_awaited_once()
+    assert refresh_thread_history.await_args.kwargs["allow_stale_fallback"] is False
 
 
 @pytest.mark.asyncio
-async def test_fresh_strict_history_bypasses_inherited_turn_memoization(tmp_path: Path) -> None:
-    """Background tasks should see post-delivery history despite copied ContextVars."""
+async def test_strict_source_refresh_bypasses_usable_cache(
+    tmp_path: Path,
+) -> None:
+    """Explicit source refresh should serialize one Matrix fetch without accepting a cache hit."""
     event_cache = SqliteEventCache(tmp_path / "event_cache.db")
     await event_cache.initialize()
-    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=MagicMock())
-
-    async def run_thread_update(
-        _room_id: str,
-        _thread_id: str,
-        update_coro_factory: Callable[[], Awaitable[ThreadHistoryResult]],
-        **_kwargs: object,
-    ) -> ThreadHistoryResult:
-        return await update_coro_factory()
-
-    coordinator = MagicMock()
-    coordinator.wait_for_thread_idle = AsyncMock(return_value=None)
-    coordinator.run_thread_update = AsyncMock(side_effect=run_thread_update)
+    client = object()
+    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
+    coordinator = EventCacheWriteCoordinator(logger=conversation_cache.logger)
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
-    before_delivery = thread_history_result(
-        [ResolvedVisibleMessage.synthetic(sender="@user:localhost", body="Question", event_id="$question")],
-        is_full_history=True,
+    barrier_entered = asyncio.Event()
+    release_write = asyncio.Event()
+    write_started = asyncio.Event()
+    wait_for_thread_idle = coordinator.wait_for_thread_idle
+
+    async def pending_cache_write() -> None:
+        write_started.set()
+        await release_write.wait()
+
+    async def observed_wait_for_thread_idle(
+        room_id: str,
+        thread_id: str,
+        *,
+        ignore_cancelled_room_fences: bool = False,
+        coordination_scope: str,
+    ) -> None:
+        barrier_entered.set()
+        await wait_for_thread_idle(
+            room_id,
+            thread_id,
+            ignore_cancelled_room_fences=ignore_cancelled_room_fences,
+            coordination_scope=coordination_scope,
+        )
+
+    pending_write_task = coordinator.queue_thread_update(
+        "!room:localhost",
+        "$thread:localhost",
+        pending_cache_write,
+        name="matrix_cache_pending_source_refresh_test_write",
+        coordination_scope=event_cache.principal_id,
     )
-    after_delivery = thread_history_result(
-        [
-            *before_delivery,
-            ResolvedVisibleMessage.synthetic(sender="@bot:localhost", body="Answer", event_id="$answer"),
-        ],
+    fetched_history = thread_history_result(
+        [ResolvedVisibleMessage.synthetic(sender="@bot:localhost", body="Target", event_id="$target")],
         is_full_history=True,
     )
 
     try:
-        with patch(
-            "mindroom.matrix.conversation_cache.fetch_dispatch_thread_history",
-            new=AsyncMock(side_effect=[before_delivery, after_delivery]),
-        ) as fetch:
-            async with conversation_cache.turn_scope():
-                first = await conversation_cache.get_strict_thread_history("!room:localhost", "$thread")
-                inherited = await asyncio.create_task(
-                    conversation_cache.get_strict_thread_history("!room:localhost", "$thread"),
-                )
-                fresh = await asyncio.create_task(
-                    conversation_cache.get_fresh_strict_thread_history("!room:localhost", "$thread"),
-                )
+        await asyncio.wait_for(write_started.wait(), timeout=5.0)
+        with (
+            patch.object(
+                coordinator,
+                "wait_for_thread_idle",
+                side_effect=observed_wait_for_thread_idle,
+            ),
+            patch(
+                "mindroom.matrix.conversation_cache.fetch_dispatch_thread_history",
+                AsyncMock(side_effect=AssertionError("source refresh must bypass cache selection")),
+            ) as cache_thread_history,
+            patch(
+                "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
+                AsyncMock(return_value=fetched_history),
+            ) as refresh_thread_history,
+        ):
+            read_task = asyncio.create_task(
+                conversation_cache.refresh_strict_thread_history_from_source(
+                    "!room:localhost",
+                    "$thread:localhost",
+                    caller_label="startup_auto_resume_freshness",
+                ),
+            )
+            await asyncio.wait_for(barrier_entered.wait(), timeout=5.0)
+            refresh_thread_history.assert_not_awaited()
+            release_write.set()
+            result = await asyncio.wait_for(read_task, timeout=5.0)
     finally:
+        release_write.set()
+        await pending_write_task
+        await coordinator.close()
         await event_cache.close()
 
-    assert [message.event_id for message in first] == ["$question"]
-    assert [message.event_id for message in inherited] == ["$question"]
-    assert [message.event_id for message in fresh] == ["$question", "$answer"]
-    assert fetch.await_count == 2
+    assert [message.event_id for message in result] == ["$target"]
+    assert result.is_full_history is True
+    refresh_thread_history.assert_awaited_once()
+    assert refresh_thread_history.await_args.args[:4] == (
+        client,
+        "!room:localhost",
+        "$thread:localhost",
+        event_cache,
+    )
+    assert refresh_thread_history.await_args.kwargs["allow_stale_fallback"] is False
+    cache_thread_history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_source_refresh_does_not_join_foreground_refill(
+    tmp_path: Path,
+) -> None:
+    """Startup refresh should finish without joining a blocked foreground refill."""
+    event_cache = SqliteEventCache(tmp_path / "event_cache.db")
+    await event_cache.initialize()
+    client = object()
+    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
+    coordinator = EventCacheWriteCoordinator(logger=conversation_cache.logger)
+    conversation_cache.runtime.event_cache_write_coordinator = coordinator
+    first_source_call_started = asyncio.Event()
+    release_first_source_call = asyncio.Event()
+    second_source_call_started = asyncio.Event()
+    source_call_count = 0
+    foreground_refill: asyncio.Task[ThreadHistoryResult] | None = None
+    startup_refresh: asyncio.Task[ThreadHistoryResult] | None = None
+    foreground_history = thread_history_result(
+        [ResolvedVisibleMessage.synthetic(sender="@bot:localhost", body="Foreground", event_id="$foreground")],
+        is_full_history=True,
+    )
+    startup_history = thread_history_result(
+        [ResolvedVisibleMessage.synthetic(sender="@bot:localhost", body="Startup", event_id="$startup")],
+        is_full_history=True,
+        diagnostics={"thread_read_source": "homeserver"},
+    )
+
+    async def source_refresh(*_args: object, **kwargs: object) -> ThreadHistoryResult:
+        nonlocal source_call_count
+        source_call_count += 1
+        if source_call_count == 1:
+            first_source_call_started.set()
+            await release_first_source_call.wait()
+            return foreground_history
+        assert kwargs["hydrate_sidecars"] is True
+        assert kwargs["allow_stale_fallback"] is False
+        assert kwargs["caller_label"] == "startup_auto_resume_freshness"
+        second_source_call_started.set()
+        return startup_history
+
+    try:
+        with patch(
+            "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
+            AsyncMock(side_effect=source_refresh),
+        ):
+            foreground_refill = asyncio.create_task(
+                conversation_cache._refill_thread_from_client(
+                    "!room:localhost",
+                    "$thread:localhost",
+                    cache_reject_diagnostics=None,
+                    wants_full_history=True,
+                    allows_stale_fallback=False,
+                ),
+            )
+            await asyncio.wait_for(first_source_call_started.wait(), timeout=1.0)
+            foreground_single_flight = dict(conversation_cache._refill_single_flight._in_flight)
+            assert len(foreground_single_flight) == 1
+
+            startup_refresh = asyncio.create_task(
+                conversation_cache.refresh_startup_thread_history_from_source(
+                    "!room:localhost",
+                    "$thread:localhost",
+                    caller_label="startup_auto_resume_freshness",
+                ),
+            )
+            await asyncio.wait_for(second_source_call_started.wait(), timeout=1.0)
+            startup_result = await asyncio.wait_for(startup_refresh, timeout=1.0)
+
+            assert [message.event_id for message in startup_result] == ["$startup"]
+            assert startup_result.is_full_history is True
+            assert foreground_refill.done() is False
+            assert conversation_cache._refill_single_flight._in_flight == foreground_single_flight
+
+            release_first_source_call.set()
+            foreground_result = await asyncio.wait_for(foreground_refill, timeout=1.0)
+            assert [message.event_id for message in foreground_result] == ["$foreground"]
+    finally:
+        release_first_source_call.set()
+        await asyncio.gather(
+            *(task for task in (foreground_refill, startup_refresh) if task is not None),
+            return_exceptions=True,
+        )
+        await coordinator.close()
+        await event_cache.close()
+
+
+@pytest.mark.asyncio
+async def test_live_read_does_not_wait_for_running_startup_source_refresh(
+    tmp_path: Path,
+) -> None:
+    """A running startup scan must not occupy the live same-thread read lane."""
+    room_id = "!room:localhost"
+    thread_id = "$thread:localhost"
+    event_cache = SqliteEventCache(tmp_path / "event_cache.db")
+    await event_cache.initialize()
+    await _replace_thread(event_cache, room_id, thread_id, [_clear_payload(thread_id, body="Cached root")])
+    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=MagicMock())
+    coordinator = EventCacheWriteCoordinator(logger=conversation_cache.logger)
+    conversation_cache.runtime.event_cache_write_coordinator = coordinator
+    source_call_started = asyncio.Event()
+    release_source_call = asyncio.Event()
+    startup_refresh: asyncio.Task[ThreadHistoryResult] | None = None
+    live_read: asyncio.Task[ThreadHistoryResult] | None = None
+
+    async def blocking_source_refresh(*_args: object, **_kwargs: object) -> ThreadHistoryResult:
+        source_call_started.set()
+        await release_source_call.wait()
+        return thread_history_result([], is_full_history=True)
+
+    try:
+        with patch(
+            "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
+            AsyncMock(side_effect=blocking_source_refresh),
+        ):
+            startup_refresh = asyncio.create_task(
+                conversation_cache.refresh_startup_thread_history_from_source(
+                    room_id,
+                    thread_id,
+                    caller_label="startup_auto_resume_freshness",
+                ),
+            )
+            await asyncio.wait_for(source_call_started.wait(), timeout=1.0)
+
+            live_read = asyncio.create_task(
+                conversation_cache.get_dispatch_thread_history(
+                    room_id,
+                    thread_id,
+                    caller_label="live_dispatch",
+                ),
+            )
+            live_result = await asyncio.wait_for(live_read, timeout=1.0)
+
+            assert [message.event_id for message in live_result] == [thread_id]
+            assert startup_refresh.done() is False
+
+            release_source_call.set()
+            startup_result = await asyncio.wait_for(startup_refresh, timeout=1.0)
+            assert startup_result == []
+            assert startup_result.is_full_history is True
+    finally:
+        release_source_call.set()
+        await asyncio.gather(
+            *(task for task in (startup_refresh, live_read) if task is not None),
+            return_exceptions=True,
+        )
+        await coordinator.close()
+        await event_cache.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_startup_source_refresh_leaves_no_shared_refill_state(
+    tmp_path: Path,
+) -> None:
+    """Cancelling startup refresh should not retain coordinator or singleflight state."""
+    event_cache = SqliteEventCache(tmp_path / "event_cache.db")
+    await event_cache.initialize()
+    conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=object())
+    coordinator = EventCacheWriteCoordinator(logger=conversation_cache.logger)
+    conversation_cache.runtime.event_cache_write_coordinator = coordinator
+    source_call_started = asyncio.Event()
+    release_source_call = asyncio.Event()
+    startup_refresh: asyncio.Task[ThreadHistoryResult] | None = None
+
+    async def blocking_source_refresh(*_args: object, **_kwargs: object) -> ThreadHistoryResult:
+        source_call_started.set()
+        await release_source_call.wait()
+        return thread_history_result([], is_full_history=True)
+
+    try:
+        with patch(
+            "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
+            AsyncMock(side_effect=blocking_source_refresh),
+        ):
+            startup_refresh = asyncio.create_task(
+                conversation_cache.refresh_startup_thread_history_from_source(
+                    "!room:localhost",
+                    "$thread:localhost",
+                    caller_label="startup_auto_resume_freshness",
+                ),
+            )
+            await asyncio.wait_for(source_call_started.wait(), timeout=1.0)
+            startup_refresh.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(startup_refresh, timeout=1.0)
+
+            assert conversation_cache._refill_single_flight._in_flight == {}
+            assert coordinator._room_states == {}
+    finally:
+        release_source_call.set()
+        await asyncio.gather(
+            *(task for task in (startup_refresh,) if task is not None),
+            return_exceptions=True,
+        )
+        await coordinator.close()
+        await event_cache.close()
 
 
 @pytest.mark.asyncio
@@ -826,11 +1045,16 @@ async def test_strict_thread_history_propagates_cache_coordinator_timeout(
 
     coordinator = MagicMock()
     coordinator.wait_for_thread_idle = AsyncMock(side_effect=TimeoutError("strict wait timed out"))
-    coordinator.run_thread_update = AsyncMock(side_effect=AssertionError("strict read should not fetch after timeout"))
     conversation_cache.runtime.event_cache_write_coordinator = coordinator
 
     try:
-        with pytest.raises(TimeoutError, match="strict wait timed out"):
+        with (
+            patch(
+                "mindroom.matrix.conversation_cache.refresh_thread_history_from_source",
+                AsyncMock(side_effect=AssertionError("strict read should not fetch after timeout")),
+            ) as refresh_thread_history,
+            pytest.raises(TimeoutError, match="strict wait timed out"),
+        ):
             await conversation_cache.get_strict_thread_history(
                 "!room:localhost",
                 "$thread:localhost",
@@ -840,7 +1064,7 @@ async def test_strict_thread_history_propagates_cache_coordinator_timeout(
         await event_cache.close()
 
     coordinator.wait_for_thread_idle.assert_awaited_once()
-    coordinator.run_thread_update.assert_not_awaited()
+    refresh_thread_history.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -854,7 +1078,7 @@ async def test_conversation_cache_startup_prewarm_bulk_refresh_preserves_metadat
     conversation_cache = _conversation_cache_for_thread_reads(tmp_path, event_cache, client=client)
     stats = BulkThreadRefreshStats(
         requested_threads=1,
-        stored_threads=1,
+        usable_threads=1,
         missing_root_ids=frozenset(),
         room_scan_pages=1,
         scanned_event_count=2,
@@ -885,14 +1109,14 @@ async def test_conversation_cache_startup_prewarm_bulk_refresh_preserves_metadat
 
 
 @pytest.mark.asyncio
-async def test_thread_snapshot_storage_exposes_direct_cache_state_reads(tmp_path: Path) -> None:
-    """Thread snapshot ownership should expose joined thread and room cache state."""
+async def test_thread_snapshot_storage_exposes_direct_gap_reads(tmp_path: Path) -> None:
+    """A stored snapshot should expose the newest gap marker recorded against its thread."""
     db, _maintenance_report, _generation = await event_cache_module._initialize_event_cache_db(
         tmp_path / "event_cache.db",
     )
 
     try:
-        await sqlite_event_cache_threads._replace_thread_locked(
+        await sqlite_event_cache_threads.replace_thread_locked(
             db,
             principal_id="__mindroom_default_principal__",
             room_id="!room:localhost",
@@ -906,17 +1130,18 @@ async def test_thread_snapshot_storage_exposes_direct_cache_state_reads(tmp_path
                     "content": {"body": "Root message", "msgtype": "m.text"},
                 },
             ],
-            validated_at=100.0,
+            stored_at=100.0,
+            fetch_started_at=100.0,
         )
         with patch("mindroom.matrix.cache.sqlite_event_cache_threads.time.time", return_value=200.0):
-            await sqlite_event_cache_threads.mark_thread_stale_locked(
+            await sqlite_event_cache_threads.mark_thread_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
                 thread_id="$thread_root",
                 reason="thread_stale",
             )
-            await sqlite_event_cache_threads.mark_room_stale_locked(
+            await sqlite_event_cache_threads.mark_room_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
@@ -924,7 +1149,7 @@ async def test_thread_snapshot_storage_exposes_direct_cache_state_reads(tmp_path
             )
         await db.commit()
 
-        state = await sqlite_event_cache_threads.load_thread_cache_state(
+        gap = await sqlite_event_cache_threads.load_thread_cache_gap(
             db,
             principal_id="__mindroom_default_principal__",
             room_id="!room:localhost",
@@ -933,46 +1158,45 @@ async def test_thread_snapshot_storage_exposes_direct_cache_state_reads(tmp_path
     finally:
         await db.close()
 
-    assert state is not None
-    assert state.validated_at == 100.0
-    assert state.invalidated_at == 200.0
-    assert state.invalidation_reason == "thread_stale"
-    assert state.room_invalidated_at == 200.0
-    assert state.room_invalidation_reason == "room_stale"
-    assert thread_cache_rejection_reason(state) == "thread_invalidated_after_validation"
+    # One marker per thread, not a thread column joined against a room column: the room-scoped
+    # marker fanned out onto this thread's row and, arriving no earlier, owns the reason.
+    assert gap is not None
+    assert gap.gap_marked_at == 200.0
+    assert gap.gap_reason == "room_stale"
+    assert thread_cache_rejection_reason(gap) == "room_stale"
 
 
 @pytest.mark.asyncio
-async def test_sqlite_stale_markers_are_monotonic(tmp_path: Path) -> None:
-    """Older stale markers should not downgrade newer thread or room invalidations."""
+async def test_sqlite_gap_markers_are_monotonic(tmp_path: Path) -> None:
+    """An older gap marker must not downgrade a newer one, at either scope."""
     db, _maintenance_report, _generation = await event_cache_module._initialize_event_cache_db(
         tmp_path / "event_cache.db",
     )
 
     try:
         with patch("mindroom.matrix.cache.sqlite_event_cache_threads.time.time", return_value=200.0):
-            await sqlite_event_cache_threads.mark_thread_stale_locked(
+            await sqlite_event_cache_threads.mark_thread_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
                 thread_id="$thread_root",
                 reason="newer_thread_marker",
             )
-            await sqlite_event_cache_threads.mark_room_stale_locked(
+            await sqlite_event_cache_threads.mark_room_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
                 reason="newer_room_marker",
             )
         with patch("mindroom.matrix.cache.sqlite_event_cache_threads.time.time", return_value=100.0):
-            await sqlite_event_cache_threads.mark_thread_stale_locked(
+            await sqlite_event_cache_threads.mark_thread_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
                 thread_id="$thread_root",
                 reason="older_thread_marker",
             )
-            await sqlite_event_cache_threads.mark_room_stale_locked(
+            await sqlite_event_cache_threads.mark_room_gap_locked(
                 db,
                 principal_id="__mindroom_default_principal__",
                 room_id="!room:localhost",
@@ -980,7 +1204,7 @@ async def test_sqlite_stale_markers_are_monotonic(tmp_path: Path) -> None:
             )
         await db.commit()
 
-        state = await sqlite_event_cache_threads.load_thread_cache_state(
+        gap = await sqlite_event_cache_threads.load_thread_cache_gap(
             db,
             principal_id="__mindroom_default_principal__",
             room_id="!room:localhost",
@@ -989,79 +1213,38 @@ async def test_sqlite_stale_markers_are_monotonic(tmp_path: Path) -> None:
     finally:
         await db.close()
 
-    assert state is not None
-    assert state.invalidated_at == 200.0
-    assert state.invalidation_reason == "newer_thread_marker"
-    assert state.room_invalidated_at == 200.0
-    assert state.room_invalidation_reason == "newer_room_marker"
-
-
-def _thread_cache_state(
-    *,
-    validated_at: float | None = None,
-    invalidated_at: float | None = None,
-    invalidation_reason: str | None = None,
-    room_invalidated_at: float | None = None,
-    room_invalidation_reason: str | None = None,
-) -> ThreadCacheState:
-    return ThreadCacheState(
-        validated_at=validated_at,
-        invalidated_at=invalidated_at,
-        invalidation_reason=invalidation_reason,
-        room_invalidated_at=room_invalidated_at,
-        room_invalidation_reason=room_invalidation_reason,
-    )
+    assert gap is not None
+    assert gap.gap_marked_at == 200.0
+    assert gap.gap_reason == "newer_room_marker"
 
 
 @pytest.mark.parametrize(
-    ("cache_state", "expected_reason"),
+    ("gap", "expected_reason"),
     [
-        pytest.param(None, "no_cache_state", id="missing_state_rejects"),
+        pytest.param(None, None, id="no_marker_is_usable"),
         pytest.param(
-            _thread_cache_state(invalidated_at=100.0, invalidation_reason="live_thread_mutation"),
-            "cache_never_validated",
-            id="never_validated_rejects",
+            ThreadCacheGap(gap_marked_at=100.0, gap_reason="limited_sync_timeline"),
+            "limited_sync_timeline",
+            id="marker_reports_its_reason",
         ),
         pytest.param(
-            _thread_cache_state(validated_at=100.0, invalidated_at=100.0, invalidation_reason="tie"),
-            "thread_invalidated_after_validation",
-            id="thread_invalidation_tie_rejects",
-        ),
-        pytest.param(
-            _thread_cache_state(validated_at=100.0, room_invalidated_at=100.0, room_invalidation_reason="tie"),
-            "room_invalidated_after_validation",
-            id="room_invalidation_tie_rejects",
-        ),
-        pytest.param(
-            _thread_cache_state(validated_at=200.0, invalidated_at=100.0, invalidation_reason="superseded"),
-            None,
-            id="invalidation_before_validation_accepts",
-        ),
-        pytest.param(
-            _thread_cache_state(validated_at=200.0, room_invalidated_at=100.0, room_invalidation_reason="superseded"),
-            None,
-            id="room_invalidation_before_validation_accepts",
-        ),
-        # PR #731 removed the age rule and PR #734 removed the restart rule: an arbitrarily old
-        # validation stays trusted until an invalidation marker lands at or after it.
-        pytest.param(
-            _thread_cache_state(validated_at=1.0),
-            None,
-            id="ancient_validation_accepts",
+            ThreadCacheGap(gap_marked_at=100.0, gap_reason=None),
+            "thread_gap_marked",
+            id="reasonless_marker_still_rejects",
         ),
     ],
 )
 def test_thread_cache_rejection_reason_rule_table(
-    cache_state: ThreadCacheState | None,
+    gap: ThreadCacheGap | None,
     expected_reason: str | None,
 ) -> None:
-    """The durable trust gate must reject exactly on missing/never-validated/invalidated-at-or-after state."""
-    assert thread_cache_rejection_reason(cache_state) == expected_reason
+    """The snapshot gate asks exactly one question: is a gap recorded against this thread."""
+    assert thread_cache_rejection_reason(gap) == expected_reason
 
 
 @pytest.mark.asyncio
-async def test_replace_thread_if_not_newer_refuses_after_midflight_invalidation(tmp_path: Path) -> None:
-    """A fetch that raced with a thread or room invalidation must not bury the newer stale marker."""
+async def test_thread_gap_marked_midflight_survives_the_replacement(tmp_path: Path) -> None:
+    """A gap marked after a fetch began is not covered by that fetch, so it outlives it."""
     cache = SqliteEventCache(tmp_path / "event_cache.db")
     await cache.initialize()
     root_source = {
@@ -1073,49 +1256,46 @@ async def test_replace_thread_if_not_newer_refuses_after_midflight_invalidation(
     }
 
     try:
-        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source], validated_at=100.0)
+        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source], fetch_started_at=100.0)
         with patch("mindroom.matrix.cache.sqlite_event_cache_threads.time.time", return_value=200.0):
-            await cache.mark_thread_stale("!room:localhost", "$thread_root", reason="live_thread_mutation")
+            await cache.mark_thread_gap("!room:localhost", "$thread_root", reason="live_thread_mutation")
 
-        replaced_behind_marker = await cache.replace_thread_if_not_newer(
+        # This fetch started before the marker, so it cannot have seen what the marker describes.
+        stored_behind_marker = await cache.replace_thread(
             "!room:localhost",
             "$thread_root",
             [root_source],
             expected_membership_epoch=await cache.room_membership_epoch("!room:localhost"),
             fetch_started_at=150.0,
-            validated_at=300.0,
         )
-        state_after_refusal = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
+        gap_after_uncovered_fetch = await cache.get_thread_cache_gap("!room:localhost", "$thread_root")
 
-        replaced_after_marker = await cache.replace_thread_if_not_newer(
+        # This one started after it, so it covers the marker and clears it.
+        stored_after_marker = await cache.replace_thread(
             "!room:localhost",
             "$thread_root",
             [root_source],
             expected_membership_epoch=await cache.room_membership_epoch("!room:localhost"),
             fetch_started_at=250.0,
-            validated_at=300.0,
         )
-        state_after_replace = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
+        gap_after_covering_fetch = await cache.get_thread_cache_gap("!room:localhost", "$thread_root")
     finally:
         await cache.close()
 
-    assert replaced_behind_marker is False
-    assert state_after_refusal is not None
-    assert state_after_refusal.invalidated_at == 200.0
-    assert thread_cache_rejection_reason(state_after_refusal) == "thread_invalidated_after_validation"
+    # The snapshot installs either way -- refusing it would strand the thread -- but the marker is
+    # what decides whether the next read may use it.
+    assert stored_behind_marker
+    assert gap_after_uncovered_fetch is not None
+    assert gap_after_uncovered_fetch.gap_marked_at == 200.0
+    assert thread_cache_rejection_reason(gap_after_uncovered_fetch) == "live_thread_mutation"
 
-    assert replaced_after_marker is True
-    assert state_after_replace is not None
-    # The stored validation time is clamped to fetch start, so an invalidation landing during the
-    # fetch still outranks this snapshot at read time even if it slipped past the replace guard.
-    assert state_after_replace.validated_at == 250.0
-    assert state_after_replace.invalidated_at is None
-    assert thread_cache_rejection_reason(state_after_replace) is None
+    assert stored_after_marker
+    assert gap_after_covering_fetch is None
 
 
 @pytest.mark.asyncio
-async def test_replace_thread_if_not_newer_refuses_after_midflight_room_invalidation(tmp_path: Path) -> None:
-    """A room-wide stale marker that landed after fetch start must also refuse snapshot replacement."""
+async def test_room_gap_marked_midflight_survives_the_replacement(tmp_path: Path) -> None:
+    """The room-scoped marker follows the same covering rule once it has fanned out."""
     cache = SqliteEventCache(tmp_path / "event_cache.db")
     await cache.initialize()
     root_source = {
@@ -1127,72 +1307,25 @@ async def test_replace_thread_if_not_newer_refuses_after_midflight_room_invalida
     }
 
     try:
-        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source], validated_at=100.0)
+        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source], fetch_started_at=100.0)
         with patch("mindroom.matrix.cache.sqlite_event_cache_threads.time.time", return_value=200.0):
-            await cache.mark_room_threads_stale("!room:localhost", reason="sync_thread_lookup_unavailable")
+            await cache.mark_room_threads_gap("!room:localhost", reason="sync_thread_lookup_unavailable")
 
-        replaced = await cache.replace_thread_if_not_newer(
+        stored = await cache.replace_thread(
             "!room:localhost",
             "$thread_root",
             [root_source],
             expected_membership_epoch=await cache.room_membership_epoch("!room:localhost"),
             fetch_started_at=150.0,
-            validated_at=300.0,
         )
-        state = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
+        gap = await cache.get_thread_cache_gap("!room:localhost", "$thread_root")
     finally:
         await cache.close()
 
-    assert replaced is False
-    assert state is not None
-    assert state.room_invalidated_at == 200.0
-    assert thread_cache_rejection_reason(state) == "room_invalidated_after_validation"
-
-
-@pytest.mark.asyncio
-async def test_incremental_revalidation_requires_incremental_invalidation_reason(tmp_path: Path) -> None:
-    """Appends may only clear invalidations caused by incremental mutations, never other reasons."""
-    cache = SqliteEventCache(tmp_path / "event_cache.db")
-    await cache.initialize()
-    root_source = {
-        "event_id": "$thread_root",
-        "sender": "@user:localhost",
-        "origin_server_ts": 1000,
-        "type": "m.room.message",
-        "content": {"body": "Root message", "msgtype": "m.text"},
-    }
-
-    try:
-        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source], validated_at=100.0)
-
-        not_invalidated = await cache.revalidate_thread_after_incremental_update("!room:localhost", "$thread_root")
-
-        await cache.mark_thread_stale("!room:localhost", "$thread_root", reason="live_append_failed")
-        non_incremental = await cache.revalidate_thread_after_incremental_update("!room:localhost", "$thread_root")
-        state_after_non_incremental = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
-
-        await cache.mark_thread_stale("!room:localhost", "$thread_root", reason="live_thread_mutation")
-        weakened = await cache.revalidate_thread_after_incremental_update("!room:localhost", "$thread_root")
-        state_after_weakening_attempt = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
-
-        await _replace_thread(cache, "!room:localhost", "$thread_root", [root_source])
-        await cache.mark_thread_stale("!room:localhost", "$thread_root", reason="live_thread_mutation")
-        incremental = await cache.revalidate_thread_after_incremental_update("!room:localhost", "$thread_root")
-        state_after_incremental = await cache.get_thread_cache_state("!room:localhost", "$thread_root")
-    finally:
-        await cache.close()
-
-    assert not_invalidated is False
-    assert non_incremental is False
-    assert state_after_non_incremental is not None
-    assert thread_cache_rejection_reason(state_after_non_incremental) == "thread_invalidated_after_validation"
-    assert weakened is False
-    assert state_after_weakening_attempt is not None
-    assert state_after_weakening_attempt.invalidation_reason == "live_append_failed"
-    assert thread_cache_rejection_reason(state_after_weakening_attempt) == "thread_invalidated_after_validation"
-    assert incremental is True
-    assert state_after_incremental is not None
-    assert thread_cache_rejection_reason(state_after_incremental) is None
+    assert stored
+    assert gap is not None
+    assert gap.gap_marked_at == 200.0
+    assert thread_cache_rejection_reason(gap) == "sync_thread_lookup_unavailable"
 
 
 @pytest.mark.asyncio
@@ -1601,6 +1734,142 @@ async def test_duplicate_ids_in_one_batch_converge_on_clear_payload(
 
 
 @pytest.mark.asyncio
+async def test_chained_thread_relations_keep_the_middle_event_as_its_own_root(
+    event_cache: ConversationEventCache,
+) -> None:
+    """An event that is both a thread child and another event's root maps to itself.
+
+    The derived index rows repeat that middle event ID under two different thread IDs: once as a
+    child of the outer root, and once as the self row every learned root gets. A batched upsert has
+    to collapse the repeat to the row the sequential write left behind, because
+    ``ON CONFLICT DO UPDATE`` cannot touch the same row twice in one statement.
+    """
+    room_id = "!room:localhost"
+    child_id = "$child:localhost"
+    middle_id = "$middle:localhost"
+    outer_id = "$outer:localhost"
+
+    await event_cache.store_events_batch(
+        [
+            (child_id, room_id, _clear_payload(child_id, body="child", thread_root_id=middle_id)),
+            (middle_id, room_id, _clear_payload(middle_id, body="middle", thread_root_id=outer_id)),
+        ],
+    )
+
+    assert await event_cache.get_thread_id_for_event(room_id, child_id) == middle_id
+    assert await event_cache.get_thread_id_for_event(room_id, middle_id) == middle_id
+    assert await event_cache.get_thread_id_for_event(room_id, outer_id) == outer_id
+
+
+@pytest.mark.asyncio
+async def test_repeated_edit_ids_in_one_batch_keep_the_last_edit_index_row(
+    event_cache: ConversationEventCache,
+) -> None:
+    """A batch naming one edit event twice indexes that edit once, keeping the last payload.
+
+    Both occurrences are accepted -- clear content never loses to clear content -- so the derived
+    edit-index rows repeat the same ``edit_event_id``, which a batched upsert has to collapse.
+    """
+    room_id = "!room:localhost"
+    original_id = "$original:localhost"
+    edit_id = "$edit:localhost"
+
+    await event_cache.store_events_batch(
+        [(original_id, room_id, _clear_payload(original_id, body="original"))],
+    )
+    await event_cache.store_events_batch(
+        [
+            (edit_id, room_id, _clear_payload(edit_id, body="first edit", edit_of=original_id)),
+            (edit_id, room_id, _clear_payload(edit_id, body="second edit", edit_of=original_id)),
+        ],
+    )
+
+    latest_edit = await event_cache.get_latest_edit(room_id, original_id)
+    assert latest_edit is not None
+    assert latest_edit["event_id"] == edit_id
+    assert latest_edit["content"]["m.new_content"]["body"] == "second edit"
+
+
+@pytest.mark.asyncio
+async def test_one_write_settles_proven_and_unproven_thread_roots_together(
+    event_cache: ConversationEventCache,
+) -> None:
+    """Re-parenting the only child proves the new root and unproves the old one in one write."""
+    room_id = "!room:localhost"
+    child_id = "$child:localhost"
+    old_root_id = "$old-root:localhost"
+    new_root_id = "$new-root:localhost"
+
+    await event_cache.store_events_batch(
+        [(child_id, room_id, _clear_payload(child_id, body="first", thread_root_id=old_root_id))],
+    )
+    assert await event_cache.get_thread_id_for_event(room_id, old_root_id) == old_root_id
+
+    await event_cache.store_events_batch(
+        [(child_id, room_id, _clear_payload(child_id, body="reparented", thread_root_id=new_root_id))],
+    )
+
+    assert await event_cache.get_thread_id_for_event(room_id, child_id) == new_root_id
+    assert await event_cache.get_thread_id_for_event(room_id, new_root_id) == new_root_id
+    assert await event_cache.get_thread_id_for_event(room_id, old_root_id) is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_event_in_a_snapshot_keeps_its_last_position_on_every_backend(
+    event_cache: ConversationEventCache,
+) -> None:
+    """A snapshot of ``A, B, A-last`` reads back as ``B, A`` on both backends.
+
+    Membership rows are ordered by ``origin_server_ts`` and then by the sequence value each write
+    draws, so when the timestamps tie the write order decides the read order. The sequential loop
+    rewrote ``A`` after ``B``, leaving ``A`` newer. A batched upsert that collapsed the repeat to
+    ``A``'s *first* position would draw ``A``'s sequence value before ``B``'s and silently reverse
+    the pair against SQLite.
+    """
+    room_id = "!room:localhost"
+    thread_id = "$root:localhost"
+    first_id = "$a:localhost"
+    second_id = "$b:localhost"
+    tied_ts = 1000
+
+    await _replace_thread(
+        event_cache,
+        room_id,
+        thread_id,
+        [
+            _clear_payload(thread_id, body="root", origin_server_ts=tied_ts),
+            _clear_payload(first_id, body="a-first", thread_root_id=thread_id, origin_server_ts=tied_ts),
+            _clear_payload(second_id, body="b", thread_root_id=thread_id, origin_server_ts=tied_ts),
+            _clear_payload(first_id, body="a-last", thread_root_id=thread_id, origin_server_ts=tied_ts),
+        ],
+    )
+
+    thread_events = await event_cache.get_thread_events(room_id, thread_id)
+    assert thread_events is not None
+    assert [event["event_id"] for event in thread_events] == [thread_id, second_id, first_id]
+    assert thread_events[-1]["content"]["body"] == "a-last"
+
+
+@pytest.mark.asyncio
+async def test_repeated_event_in_one_thread_snapshot_binds_the_thread_once(
+    event_cache: ConversationEventCache,
+) -> None:
+    """A snapshot naming one event twice binds it to the thread exactly once."""
+    room_id = "!room:localhost"
+    thread_id = "$thread-root:localhost"
+    duplicated_id = "$duplicated:localhost"
+    root_source = _clear_payload(thread_id, body="root", origin_server_ts=1000)
+    reply = _clear_payload(duplicated_id, body="reply", thread_root_id=thread_id, origin_server_ts=1100)
+
+    await _replace_thread(event_cache, room_id, thread_id, [root_source, reply, reply])
+
+    thread_events = await event_cache.get_thread_events(room_id, thread_id)
+    assert thread_events is not None
+    assert [event["event_id"] for event in thread_events] == [thread_id, duplicated_id]
+    assert await event_cache.get_thread_id_for_event(room_id, duplicated_id) == thread_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("arrival_order", [("clear", "opaque"), ("opaque", "clear")])
 async def test_separate_cache_clients_cannot_downgrade_decrypted_payload(
     event_cache_factory: Callable[[], ConversationEventCache],
@@ -1658,7 +1927,13 @@ async def test_thread_append_preserves_decrypted_payload_across_arrival_orders(
     }
 
     for payload_kind in arrival_order:
-        assert await event_cache.append_event(room_id, thread_id, payloads[payload_kind])
+        outcome = await event_cache.apply_thread_mutation_append(
+            room_id,
+            thread_id,
+            payloads[payload_kind],
+            append_failed_reason="live_append_failed",
+        )
+        assert outcome is ThreadAppendOutcome.APPENDED
 
     thread_events = await event_cache.get_thread_events(room_id, thread_id)
     assert thread_events is not None
@@ -3007,103 +3282,6 @@ async def test_mxc_text_cache_round_trips_across_event_cache_reopen(
         await reopened_cache.close()
 
     assert cached_text == "Full text sidecar"
-
-
-@pytest.mark.asyncio
-async def test_thread_revision_tracks_point_payload_updates(
-    event_cache_factory: Callable[[], ConversationEventCache],
-) -> None:
-    """Thread revisions and delta reads include changed lookup payloads."""
-    cache = event_cache_factory()
-    await cache.initialize()
-    root = {
-        "event_id": "$thread_root",
-        "origin_server_ts": 1000,
-        "type": "m.room.message",
-        "sender": "@user:localhost",
-        "content": {"msgtype": "m.text", "body": "original"},
-    }
-    try:
-        await _replace_thread(cache, "!room:localhost", "$thread_root", [root])
-        before = await cache.get_thread_revision("!room:localhost", "$thread_root")
-        updated = {**root, "content": {"msgtype": "m.text", "body": "updated"}}
-        await cache.store_event("$thread_root", "!room:localhost", updated)
-        after = await cache.get_thread_revision("!room:localhost", "$thread_root")
-        assert before is not None
-        assert after is not None
-        changed_rows = await cache.get_thread_events_written_between(
-            "!room:localhost",
-            "$thread_root",
-            after_write_seq=before.max_write_seq,
-            through_write_seq=after.max_write_seq,
-            after_thread_write_seq=before.max_thread_write_seq,
-            through_thread_write_seq=after.max_thread_write_seq,
-        )
-    finally:
-        await cache.close()
-
-    assert before.event_count == after.event_count == 1
-    assert after.max_write_seq > before.max_write_seq
-    assert after.max_thread_write_seq == before.max_thread_write_seq
-    assert changed_rows == [updated]
-
-
-@pytest.mark.asyncio
-async def test_thread_revision_tracks_index_replacements(
-    event_cache_factory: Callable[[], ConversationEventCache],
-) -> None:
-    """Thread revisions detect membership changes when payload writes are refused."""
-    cache = event_cache_factory()
-    await cache.initialize()
-    room_id = "!room:localhost"
-    thread_id = "$thread_root"
-    root = _clear_payload(thread_id, body="root", origin_server_ts=1000)
-    old_reply = _clear_payload(
-        "$old",
-        body="old",
-        thread_root_id=thread_id,
-        origin_server_ts=2000,
-    )
-    new_reply = _clear_payload(
-        "$new",
-        body="new",
-        thread_root_id=thread_id,
-        origin_server_ts=2000,
-    )
-    shared_reply = _clear_payload(
-        "$shared",
-        body="shared",
-        thread_root_id=thread_id,
-        origin_server_ts=3000,
-    )
-    try:
-        await cache.store_event("$new", room_id, new_reply)
-        await _replace_thread(cache, room_id, thread_id, [root, old_reply, shared_reply])
-        before = await cache.get_thread_revision(room_id, thread_id)
-        replacement = [
-            _opaque_payload(thread_id, origin_server_ts=1000),
-            _opaque_payload("$new", thread_root_id=thread_id, origin_server_ts=2000),
-            _opaque_payload("$shared", thread_root_id=thread_id, origin_server_ts=3000),
-        ]
-        await _replace_thread(cache, room_id, thread_id, replacement)
-        after = await cache.get_thread_revision(room_id, thread_id)
-        assert before is not None
-        assert after is not None
-        changed_rows = await cache.get_thread_events_written_between(
-            room_id,
-            thread_id,
-            after_write_seq=before.max_write_seq,
-            through_write_seq=after.max_write_seq,
-            after_thread_write_seq=before.max_thread_write_seq,
-            through_thread_write_seq=after.max_thread_write_seq,
-        )
-    finally:
-        await cache.close()
-
-    assert before.event_count == after.event_count == 3
-    assert after.max_write_seq == before.max_write_seq
-    assert after.max_thread_write_seq > before.max_thread_write_seq
-    assert [row["event_id"] for row in changed_rows] == [thread_id, "$new", "$shared"]
 
 
 @pytest.mark.asyncio

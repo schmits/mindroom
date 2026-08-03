@@ -44,7 +44,9 @@ AI agents that live in Matrix and work everywhere via bridges.
   [cyan]mindroom config init[/cyan]   Create a starter config
   [cyan]mindroom run[/cyan]           Start the system\
 """
-_CONFIG_INIT_PROVIDER_CHOICES = "{openrouter,ollama,openai,azure,bedrock_claude,codex,claude,llama.cpp,vertexai_claude}"
+_CONFIG_INIT_PROVIDER_CHOICES = (
+    "{openrouter,ollama,openai,azure,bedrock_claude,codex,kimi,claude,llama.cpp,vertexai_claude}"
+)
 
 app = typer.Typer(
     help=_HELP,
@@ -388,6 +390,9 @@ def _print_thread_export_stats(stats: ThreadExportStats) -> None:
     if stats.truncated_rooms:
         console.print(f"[yellow]Warning:[/yellow] {stats.truncated_rooms} room(s) hit the thread enumeration limit")
     for failure in stats.failed_items:
+        if failure.room_key is None:
+            console.print(f"[red]Failed target:[/red] {failure.error}")
+            continue
         target = failure.thread_id or failure.room_id
         console.print(f"[red]Failed:[/red] {failure.room_key} {target}: {failure.error}")
 

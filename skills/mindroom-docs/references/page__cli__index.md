@@ -559,7 +559,20 @@ By default it writes to `<storage>/thread_exports`.
 A thread file is only rewritten when its content changed, so `exported_at` reflects the last content-changing export.
 Each thread document includes the latest MindRoom thread summary as `thread.summary` when one exists.
 Each room directory also gets an `index.json` mapping every thread file to its message count, participants, latest summary, and last activity, sorted by most recent activity.
-Complete passes remove exported room and thread files that are no longer present or authorized; a `--room` pass only reconciles the selected room.
+Complete passes normally remove exported room and thread files that are no longer present or authorized; a `--room` pass only reconciles the selected room.
+The zero-room guard skips only final directory-wide reconciliation of rooms absent from the pass, while definitive per-room category or membership revocations still delete their exports.
+A warning is logged when that guard preserves existing target state because the pass has no positive room evidence.
+A complete room enumeration that returns zero threads preserves existing YAML exports for that room and logs a warning because an anomalous empty response cannot be distinguished from deletion of the final thread.
+After either warning, verify the source state and remove the preserved export manually only when the deletion is confirmed; workspace git history remains the recovery path for mistaken cleanup.
+Enabled targets whose resolved output directories are equal or nested are all skipped before Matrix work.
+MindRoom claims an output root by writing a `.mindroom-thread-exports` ownership marker, and it claims automatically when the root is empty or already holds a room directory containing an exported thread file.
+A directory that merely contains an `index.json` is not treated as evidence, so pointing `--output` at an unrelated project or build directory is refused rather than adopted.
+Unrelated entries beside those room directories, such as `.DS_Store`, a `.git` directory, or your own notes, neither block the claim nor ever get deleted.
+A root MindRoom cannot recognize is skipped for the entire pass, so it is neither exported to nor cleaned up, and the skip is reported as a target failure.
+Adopt such a root by creating `.mindroom-thread-exports` inside it containing exactly `{"format":"mindroom-thread-exports","version":1}` followed by a newline.
+Cleanup then removes only recognizable room directories and thread YAML files, leaving unrelated entries untouched and logged.
+Retracting a room whose directory still holds unrelated entries removes only the exported files and leaves the directory in place, and repeating the pass stays a quiet no-op.
+Output paths with a terminal `.`, `..`, or empty leaf are rejected, as are symlinked final output and room directories.
 With `--prefer-cache` thread bodies are served from the durable event cache and only fetched from the homeserver on miss or invalidation; use it alongside a running MindRoom that keeps the cache fresh.
 
 <!-- CODE:START -->
@@ -614,7 +627,7 @@ With `--prefer-cache` thread bodies are served from the durable event cache and 
 <!-- OUTPUT:END -->
 
 ```bash
-mindroom threads export --storage-path mindroom_data --output /tmp/mindroom-thread-exports
+mindroom threads export --storage-path mindroom_data --output "$HOME/mindroom-thread-exports"
 mindroom threads export --storage-path mindroom_data --room lobby
 mindroom threads export --storage-path mindroom_data --watch --interval 300
 mindroom threads export --storage-path mindroom_data --prefer-cache
@@ -623,7 +636,8 @@ mindroom threads export --storage-path mindroom_data --prefer-cache
 ## service
 
 Install and manage MindRoom as a background user service.
-MindRoom runs through `uv tool run` and starts automatically at login.
+MindRoom runs the version installed by this command through `uv tool run` and starts automatically at login.
+Rerun `mindroom service install` after upgrading MindRoom.
 On macOS, MindRoom uses launchd user agents.
 On Linux, MindRoom uses systemd user services.
 
@@ -644,7 +658,9 @@ On Linux, MindRoom uses systemd user services.
 
  Install and manage MindRoom as a background user service.
 
- MindRoom runs through `uv tool run` and starts automatically at login.
+ MindRoom runs the version installed by this command through `uv tool run` and starts
+ automatically at login.
+ Rerun `mindroom service install` after upgrading MindRoom.
 
  Supported platforms:
  - macOS: launchd (`~/Library/LaunchAgents/`)
@@ -856,7 +872,7 @@ The `config` subgroup contains commands for creating, viewing, editing, and vali
 Create a starter `config.yaml` with the personal Mind agent, one model, file-based memory, and sensible defaults.
 
 Matrix server presets (`--matrix-server`) choose where MindRoom should create Matrix users and rooms: `mindroom.chat` (default hosted Matrix) or `self-hosted` (your own homeserver).
-Provider presets (`--provider`) set the default model: `anthropic`, `codex`, `llama.cpp`, `ollama`, `openai`, `openrouter`, or `vertexai_claude`.
+Provider presets (`--provider`) set the default model: `anthropic`, `codex`, `kimi`, `llama.cpp`, `ollama`, `openai`, `openrouter`, or `vertexai_claude`.
 Generated configs include commented model alternatives for providers that have common variants, such as OpenAI mini/nano models.
 
 ```bash
@@ -892,6 +908,9 @@ The `--provider codex` preset generates `provider: codex` with `id: gpt-5.6` and
 They set `extra_kwargs.reasoning_effort: medium`.
 Prompt caching is enabled automatically per active agent session; leave `prompt_cache_key` unset unless you intentionally want to override the derived key.
 Run `codex login` first so MindRoom can read `~/.codex/auth.json`.
+
+The `--provider kimi` preset generates `provider: kimi` with `id: k3` and `context_window: 1048576`.
+Run `kimi` and `/login` first so MindRoom can read `~/.kimi-code/credentials/kimi-code.json`.
 
 The `--provider ollama` preset generates `provider: ollama` with `id: gemma4`, an additional `qwen3_6_27b` model using `qwen3.6:27b`, and `OLLAMA_HOST=http://localhost:11434`.
 Pull both local models before running MindRoom:
