@@ -36,6 +36,29 @@ def test_mcp_server_config_rejects_invalid_transport_mix() -> None:
         MCPServerConfig(transport="streamable-http", url="http://localhost:8000/mcp", command="npx")
 
 
+
+def test_mcp_server_config_accepts_and_normalizes_private_url_prefixes() -> None:
+    """Remote MCP servers can explicitly approve narrow private egress URL prefixes."""
+    config = MCPServerConfig(
+        transport="streamable-http",
+        url="http://127.0.0.1:8123/mcp",
+        allowed_private_url_prefixes=[" http://127.0.0.1:8123/mcp ", "  "],
+    )
+
+    assert config.allowed_private_url_prefixes == ["http://127.0.0.1:8123/mcp"]
+    assert config.allow_private_networks is False
+
+
+def test_mcp_server_config_accepts_legacy_private_network_opt_in() -> None:
+    """Keep broad private-network opt-in available for existing remote MCP configs."""
+    config = MCPServerConfig(
+        transport="sse",
+        url="http://localhost:8000/sse",
+        allow_private_networks=True,
+    )
+
+    assert config.allow_private_networks is True
+
 def test_mcp_server_config_rejects_overlapping_filters() -> None:
     """Reject overlapping include and exclude tool filters."""
     with pytest.raises(ValueError, match="MCP include_tools and exclude_tools overlap") as exc_info:

@@ -181,6 +181,51 @@ def test_validate_server_fetch_url_blocks_link_local_dns_when_private_is_enabled
     assert exc_info.value.reason == "blocked_address"
 
 
+
+def test_validate_server_fetch_url_allows_private_url_with_exact_prefix() -> None:
+    """Explicit URL-prefix approval should allow a trusted private MCP endpoint."""
+    assert (
+        validate_server_fetch_url(
+            "http://127.0.0.1:8123/mcp",
+            allowed_private_url_prefixes=["http://127.0.0.1:8123/mcp"],
+        )
+        == "http://127.0.0.1:8123/mcp"
+    )
+
+
+def test_validate_server_fetch_url_rejects_private_url_outside_approved_prefix() -> None:
+    """Private-network approval is narrow and does not allow sibling paths."""
+    with pytest.raises(ServerFetchUrlError) as exc_info:
+        validate_server_fetch_url(
+            "http://127.0.0.1:8123/admin",
+            allowed_private_url_prefixes=["http://127.0.0.1:8123/mcp"],
+        )
+
+    assert exc_info.value.reason == "private_address"
+
+
+def test_validate_server_fetch_url_keeps_metadata_blocked_even_when_prefix_approved() -> None:
+    """Explicit private URL-prefix approval must not open cloud metadata endpoints."""
+    with pytest.raises(ServerFetchUrlError) as exc_info:
+        validate_server_fetch_url(
+            "http://169.254.169.254/latest/meta-data/",
+            allowed_private_url_prefixes=["http://169.254.169.254/latest/meta-data/"],
+        )
+
+    assert exc_info.value.reason == "metadata_address"
+
+
+def test_validate_server_fetch_redirect_url_honors_private_url_prefix_approval() -> None:
+    """Redirect validation should preserve explicit private URL-prefix approval."""
+    assert (
+        validate_server_fetch_redirect_url(
+            "http://127.0.0.1:8123/mcp",
+            "?cursor=next",
+            allowed_private_url_prefixes=["http://127.0.0.1:8123/mcp"],
+        )
+        == "http://127.0.0.1:8123/mcp?cursor=next"
+    )
+
 def test_validate_server_fetch_redirect_url_rejects_internal_absolute_redirect() -> None:
     """Redirect targets should get the same server-side fetch URL validation."""
     with pytest.raises(ServerFetchUrlError) as exc_info:

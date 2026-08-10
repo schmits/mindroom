@@ -241,8 +241,46 @@ def _validate_server_fetch_url(url: str, *, allow_private_networks: bool, resolv
     return normalized_url
 
 
-def validate_server_fetch_url(url: str, *, allow_private_networks: bool = False) -> str:
+def _private_url_matches_allowlist(url: str, allowed_private_url_prefixes: Iterable[str]) -> bool:
+    """Return whether a URL is covered by an explicit private URL prefix allowlist."""
+    normalized_url = url.strip()
+    for prefix in allowed_private_url_prefixes:
+        normalized_prefix = prefix.strip()
+        if normalized_prefix and normalized_url.startswith(normalized_prefix):
+            return True
+    return False
+
+
+def _validate_server_fetch_url_with_private_allowlist(
+    url: str,
+    *,
+    allowed_private_url_prefixes: Iterable[str],
+    resolve_hostnames: bool,
+) -> str:
+    """Validate a URL, allowing private networks only for explicit URL prefixes."""
+    try:
+        return _validate_server_fetch_url(url, allow_private_networks=False, resolve_hostnames=resolve_hostnames)
+    except ServerFetchUrlError as exc:
+        if exc.reason not in {"private_address", "private_hostname"}:
+            raise
+        if not _private_url_matches_allowlist(url, allowed_private_url_prefixes):
+            raise
+    return _validate_server_fetch_url(url, allow_private_networks=True, resolve_hostnames=resolve_hostnames)
+
+
+def validate_server_fetch_url(
+    url: str,
+    *,
+    allow_private_networks: bool = False,
+    allowed_private_url_prefixes: Iterable[str] = (),
+) -> str:
     """Validate that a URL is safe for a server-side HTTP(S) request."""
+    if allowed_private_url_prefixes:
+        return _validate_server_fetch_url_with_private_allowlist(
+            url,
+            allowed_private_url_prefixes=allowed_private_url_prefixes,
+            resolve_hostnames=True,
+        )
     return _validate_server_fetch_url(
         url,
         allow_private_networks=allow_private_networks,
@@ -255,11 +293,16 @@ def validate_server_fetch_redirect_url(
     location: str | None,
     *,
     allow_private_networks: bool = False,
+    allowed_private_url_prefixes: Iterable[str] = (),
 ) -> str:
     """Resolve and validate an HTTP redirect Location value."""
     if not location:
         _deny("missing_redirect_location")
-    return validate_server_fetch_url(urljoin(current_url, location), allow_private_networks=allow_private_networks)
+    return validate_server_fetch_url(
+        urljoin(current_url, location),
+        allow_private_networks=allow_private_networks,
+        allowed_private_url_prefixes=allowed_private_url_prefixes,
+    )
 
 
 def _validated_connect_addresses(
@@ -391,6 +434,7 @@ class ServerFetchHTTPTransport(httpx.HTTPTransport):
         self,
         *,
         allow_private_networks: bool = False,
+        allowed_private_url_prefixes: Iterable[str] = (),
         verify: ssl.SSLContext | str | bool = True,
         cert: CertTypes | None = None,
         trust_env: bool = True,
@@ -402,6 +446,7 @@ class ServerFetchHTTPTransport(httpx.HTTPTransport):
         socket_options: Iterable[SOCKET_OPTION] | None = None,
     ) -> None:
         self._allow_private_networks = allow_private_networks
+        self._allowed_private_url_prefixes = tuple(allowed_private_url_prefixes)
         ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
         self._pool: httpcore.ConnectionPool = httpcore.ConnectionPool(
             ssl_context=ssl_context,
@@ -418,11 +463,18 @@ class ServerFetchHTTPTransport(httpx.HTTPTransport):
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         """Validate each request before HTTPX sends it."""
-        _validate_server_fetch_url(
-            str(request.url),
-            allow_private_networks=self._allow_private_networks,
-            resolve_hostnames=False,
-        )
+        if self._allowed_private_url_prefixes:
+            _validate_server_fetch_url_with_private_allowlist(
+                str(request.url),
+                allowed_private_url_prefixes=self._allowed_private_url_prefixes,
+                resolve_hostnames=False,
+            )
+        else:
+            _validate_server_fetch_url(
+                str(request.url),
+                allow_private_networks=self._allow_private_networks,
+                resolve_hostnames=False,
+            )
         return super().handle_request(request)
 
     def close(self) -> None:
@@ -437,6 +489,7 @@ class ServerFetchAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         self,
         *,
         allow_private_networks: bool = False,
+        allowed_private_url_prefixes: Iterable[str] = (),
         verify: ssl.SSLContext | str | bool = True,
         cert: CertTypes | None = None,
         trust_env: bool = True,
@@ -448,6 +501,7 @@ class ServerFetchAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         socket_options: Iterable[SOCKET_OPTION] | None = None,
     ) -> None:
         self._allow_private_networks = allow_private_networks
+        self._allowed_private_url_prefixes = tuple(allowed_private_url_prefixes)
         ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
         self._pool: httpcore.AsyncConnectionPool = httpcore.AsyncConnectionPool(
             ssl_context=ssl_context,
@@ -464,11 +518,18 @@ class ServerFetchAsyncHTTPTransport(httpx.AsyncHTTPTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         """Validate each async request before HTTPX sends it."""
-        _validate_server_fetch_url(
-            str(request.url),
-            allow_private_networks=self._allow_private_networks,
-            resolve_hostnames=False,
-        )
+        if self._allowed_private_url_prefixes:
+            _validate_server_fetch_url_with_private_allowlist(
+                str(request.url),
+                allowed_private_url_prefixes=self._allowed_private_url_prefixes,
+                resolve_hostnames=False,
+            )
+        else:
+            _validate_server_fetch_url(
+                str(request.url),
+                allow_private_networks=self._allow_private_networks,
+                resolve_hostnames=False,
+            )
         return await super().handle_async_request(request)
 
     async def aclose(self) -> None:

@@ -36,6 +36,22 @@ def _runtime_paths(tmp_path: Path) -> RuntimePaths:
     )
 
 
+async def _assert_client_factory_policy(
+    factory: object,
+    *,
+    allow_private_networks: bool,
+    allowed_private_url_prefixes: tuple[str, ...] = (),
+) -> None:
+    assert callable(factory)
+    client = factory()
+    transport = client._transport
+    try:
+        assert transport._allow_private_networks is allow_private_networks
+        assert transport._allowed_private_url_prefixes == allowed_private_url_prefixes
+    finally:
+        await client.aclose()
+
+
 @pytest.fixture(autouse=True)
 def _public_dns_for_mcp_transport_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep remote transport tests focused on URL policy instead of live DNS."""
@@ -126,7 +142,7 @@ async def test_open_sse_interpolates_headers_and_passes_timeouts(
         assert opened_streams == streams
 
     httpx_client_factory = captured.pop("httpx_client_factory")
-    assert httpx_client_factory is _server_fetch_mcp_http_client
+    await _assert_client_factory_policy(httpx_client_factory, allow_private_networks=False)
     assert captured == {
         "url": "https://mcp.example/sse",
         "headers": {"Authorization": "Bearer secret-token"},
@@ -169,7 +185,7 @@ async def test_open_streamable_http_interpolates_headers_passes_timeouts_and_dro
         assert streams == (read_stream, write_stream)
 
     httpx_client_factory = captured.pop("httpx_client_factory")
-    assert httpx_client_factory is _server_fetch_mcp_http_client
+    await _assert_client_factory_policy(httpx_client_factory, allow_private_networks=False)
     assert captured == {
         "url": "https://mcp.example/mcp",
         "headers": {"X-Token": "secret-token"},
@@ -309,3 +325,74 @@ async def test_mcp_http_client_factory_rejects_private_request_url() -> None:
             await client.get("http://127.0.0.1:8000/mcp")
 
     assert exc_info.value.reason == "private_address"
+
+
+@pytest.mark.asyncio
+async def test_open_streamable_http_allows_private_transport_url_when_allowlisted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Per-server URL-prefix allowlist should allow trusted private-network MCP transports."""
+    runtime_paths = _runtime_paths(tmp_path)
+    streams = cast("_TransportStreams", (object(), object()))
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def fake_streamablehttp_client(
+        url: str,
+        **kwargs: object,
+    ) -> AsyncIterator[tuple[object, object, object]]:
+        captured.update(url=url, **kwargs)
+        yield streams[0], streams[1], lambda: "session-id"
+
+    monkeypatch.setattr(transport_module, "streamablehttp_client", fake_streamablehttp_client)
+    server_config = MCPServerConfig(
+        transport="streamable-http",
+        url="http://127.0.0.1:8123/mcp",
+        allowed_private_url_prefixes=["http://127.0.0.1:8123/mcp"],
+    )
+    handle = build_transport_handle("demo", server_config, runtime_paths)
+
+    async with handle.opener() as opened_streams:
+        assert opened_streams == streams
+
+    httpx_client_factory = captured.pop("httpx_client_factory")
+    await _assert_client_factory_policy(
+        httpx_client_factory,
+        allow_private_networks=False,
+        allowed_private_url_prefixes=("http://127.0.0.1:8123/mcp",),
+    )
+    assert captured["url"] == "http://127.0.0.1:8123/mcp"
+
+
+@pytest.mark.asyncio
+async def test_open_streamable_http_still_rejects_metadata_url_when_private_networks_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Private-network opt-in must not allow cloud metadata endpoints."""
+    runtime_paths = _runtime_paths(tmp_path)
+
+    @asynccontextmanager
+    async def fake_streamablehttp_client(
+        url: str,
+        **kwargs: object,
+    ) -> AsyncIterator[tuple[object, object, object]]:
+        del url, kwargs
+        msg = "metadata MCP URL should be rejected before the streamable HTTP client opens"
+        raise AssertionError(msg)
+        yield object(), object(), lambda: "session-id"
+
+    monkeypatch.setattr(transport_module, "streamablehttp_client", fake_streamablehttp_client)
+    server_config = MCPServerConfig(
+        transport="streamable-http",
+        url="http://169.254.169.254/latest/meta-data/",
+        allowed_private_url_prefixes=["http://169.254.169.254/latest/meta-data/"],
+    )
+    handle = build_transport_handle("demo", server_config, runtime_paths)
+
+    with pytest.raises(ServerFetchUrlError) as exc_info:
+        async with handle.opener():
+            pass
+
+    assert exc_info.value.reason == "metadata_address"
