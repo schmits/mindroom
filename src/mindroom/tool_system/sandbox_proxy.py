@@ -479,7 +479,7 @@ def attachment_save_uses_worker(
 ) -> bool:
     """Return whether attachment saves should land where workspace consumers run."""
     return any(
-        _sandbox_proxy_enabled_for_tool(
+        sandbox_proxy_enabled_for_tool(
             tool_name,
             runtime_paths=runtime_paths,
             worker_tools_override=worker_tools_override,
@@ -702,7 +702,7 @@ def _sandbox_proxy_requested_for_tool(
     return requested
 
 
-def _sandbox_proxy_enabled_for_tool(
+def sandbox_proxy_enabled_for_tool(
     tool_name: str,
     *,
     runtime_paths: RuntimePaths,
@@ -929,7 +929,7 @@ def maybe_wrap_toolkit_for_sandbox_proxy(
     Note: mutates ``toolkit.functions`` and ``toolkit.async_functions`` in place.
     Callers must pass a freshly-created toolkit (``get_tool_by_name`` does this).
     """
-    if not _sandbox_proxy_enabled_for_tool(
+    if not sandbox_proxy_enabled_for_tool(
         tool_name,
         runtime_paths=runtime_paths,
         worker_tools_override=worker_tools_override,

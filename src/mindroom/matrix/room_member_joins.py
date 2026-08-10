@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from itertools import chain
 from threading import Lock
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
@@ -287,6 +288,8 @@ def room_member_sync_state_plan(
     config: Config,
     runtime_paths: RuntimePaths,
     record_only: bool = False,
+    include_timeline_baseline: bool = False,
+    dispatch_snapshot_joins: bool = False,
 ) -> _RoomMemberSyncPlan:
     """Classify state events into durable hook dispatches and baseline markers."""
     dispatch_events: list[tuple[nio.MatrixRoom, nio.RoomMemberEvent]] = []
@@ -294,8 +297,29 @@ def room_member_sync_state_plan(
     limited_room_ids = frozenset(
         room_id for room_id, join_info in response.rooms.join.items() if join_info.timeline.limited
     )
-    for room, event in _room_member_events_from_sync_state(response, rooms=rooms):
-        if record_only or room.room_id in limited_room_ids:
+    events = _room_member_events_from_sync_state(response, rooms=rooms)
+    if include_timeline_baseline:
+        events = chain(
+            events,
+            _room_member_events_from_sync_timeline(response, rooms=rooms),
+        )
+    for room, event in events:
+        if record_only:
+            record_events.append((room, event))
+            continue
+        if dispatch_snapshot_joins and (
+            _room_member_join_from_event(
+                room,
+                event,
+                config=config,
+                runtime_paths=runtime_paths,
+                require_previous_membership=False,
+            )
+            is not None
+        ):
+            dispatch_events.append((room, event))
+            continue
+        if room.room_id in limited_room_ids:
             record_events.append((room, event))
             continue
         if (
