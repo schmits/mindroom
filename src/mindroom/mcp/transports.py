@@ -65,12 +65,18 @@ def _server_fetch_mcp_http_client(
     headers: dict[str, str] | None = None,
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
+    *,
+    allow_private_networks: bool = False,
+    allowed_private_url_prefixes: tuple[str, ...] = (),
     **_ignored: object,
 ) -> httpx.AsyncClient:
     """Create an MCP HTTP client that validates requests, redirects, and dialed addresses."""
     kwargs: dict[str, Any] = {
         "follow_redirects": True,
-        "transport": ServerFetchAsyncHTTPTransport(),
+        "transport": ServerFetchAsyncHTTPTransport(
+            allow_private_networks=allow_private_networks,
+            allowed_private_url_prefixes=allowed_private_url_prefixes,
+        ),
     }
     if timeout is not None:
         kwargs["timeout"] = timeout
@@ -124,17 +130,32 @@ async def _open_remote_transport(
     if server_config.url is None:
         msg = f"{transport} MCP servers require url"
         raise ValueError(msg)
-    url = await asyncio.to_thread(validate_server_fetch_url, server_config.url)
+    allowed_private_url_prefixes = tuple(server_config.allowed_private_url_prefixes)
+    allow_private_networks = server_config.allow_private_networks
+    url = await asyncio.to_thread(
+        validate_server_fetch_url,
+        server_config.url,
+        allow_private_networks=allow_private_networks,
+        allowed_private_url_prefixes=allowed_private_url_prefixes,
+    )
     headers = {
         **_interpolate_mcp_headers(server_config.headers, runtime_paths),
         **(dict(extra_headers) if extra_headers is not None else {}),
     }
+
+    def httpx_client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return _server_fetch_mcp_http_client(
+            **kwargs,
+            allow_private_networks=allow_private_networks,
+            allowed_private_url_prefixes=allowed_private_url_prefixes,
+        )
+
     async with client(
         url,
         headers=headers,
         timeout=server_config.startup_timeout_seconds,
         sse_read_timeout=server_config.call_timeout_seconds,
-        httpx_client_factory=_server_fetch_mcp_http_client,
+        httpx_client_factory=httpx_client_factory,
     ) as streams:
         yield cast("_TransportStreams", streams[:2])
 
