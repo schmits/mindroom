@@ -17,6 +17,7 @@ It is intended only for deployments where the built-in `repo_workspace` tool is 
 - `mindroom.plugin.json` declares the plugin and its tool module.
 - `tools.py` registers the `repo_workspace` tool metadata.
 - `repo_workspace_impl.py` contains the toolkit implementation adapted from the built-in `src/mindroom/custom_tools/repo_workspace.py` implementation.
+- `artifact_lease_links.py` packages the plugin-scoped metadata-only link model for durable handoff artifact ↔ workspace lease records.
 
 ## Safety boundaries
 
