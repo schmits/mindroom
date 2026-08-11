@@ -44,6 +44,41 @@ class LinkedRecordAuthority(StrEnum):
 
 
 _SCHEMA_FIELDS = frozenset({"artifact", "lease", "artifact_ref", "lease_ref", "authority", "sha256"})
+_HANDOFF_ARTIFACT_SCHEMA_FIELDS = frozenset({
+    "artifact_id",
+    "classification",
+    "producer",
+    "consumer",
+    "trust",
+    "authority",
+    "refs",
+    "manifest",
+    "sha256",
+    "expires_at",
+    "lease_ref",
+    "materialize_allowed",
+    "metadata",
+})
+_WORKSPACE_LEASE_SCHEMA_FIELDS = frozenset({
+    "lease_id",
+    "state",
+    "workspace_ref",
+    "owner",
+    "consumer",
+    "classification",
+    "trust",
+    "authority",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "released_at",
+    "revoked_at",
+    "artifact_refs",
+    "handoff_refs",
+    "provenance",
+    "metadata",
+    "sha256",
+})
 _STRUCTURAL_HASH_FIELDS = ("artifact", "lease", "artifact_ref", "lease_ref", "authority")
 _NON_AUTHORITATIVE_HANDOFF_CLASSES = {
     HandoffSourceClassification.DESIGN_REFERENCE,
@@ -181,6 +216,26 @@ def _require_ref(value: object, *, field_name: str) -> str:
     return ref
 
 
+def _require_exact_mapping_fields(
+    value: object,
+    *,
+    field_name: str,
+    expected_fields: frozenset[str],
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        msg = f"artifact lease link {field_name} must be a mapping"
+        raise ArtifactLeaseLinkValidationError(msg)
+    missing_keys = expected_fields - set(value)
+    if missing_keys:
+        msg = f"artifact lease link {field_name} is missing required keys: {', '.join(sorted(missing_keys))}"
+        raise ArtifactLeaseLinkValidationError(msg)
+    extra_keys = set(value) - expected_fields
+    if extra_keys:
+        msg = f"artifact lease link {field_name} has unknown keys: {', '.join(sorted(extra_keys))}"
+        raise ArtifactLeaseLinkValidationError(msg)
+    return value
+
+
 def _canonical_payload(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
@@ -248,9 +303,19 @@ class ArtifactLeaseLink:
         if extra_keys:
             msg = f"artifact lease link payload has unknown keys: {', '.join(sorted(extra_keys))}"
             raise ArtifactLeaseLinkValidationError(msg)
+        artifact_payload = _require_exact_mapping_fields(
+            payload["artifact"],
+            field_name="artifact",
+            expected_fields=_HANDOFF_ARTIFACT_SCHEMA_FIELDS,
+        )
+        lease_payload = _require_exact_mapping_fields(
+            payload["lease"],
+            field_name="lease",
+            expected_fields=_WORKSPACE_LEASE_SCHEMA_FIELDS,
+        )
         try:
-            artifact = HandoffArtifact.from_mapping(payload["artifact"])  # type: ignore[arg-type]
-            lease = WorkspaceLease.from_mapping(payload["lease"])  # type: ignore[arg-type]
+            artifact = HandoffArtifact.from_mapping(artifact_payload)
+            lease = WorkspaceLease.from_mapping(lease_payload)
         except (HandoffArtifactValidationError, WorkspaceLeaseValidationError) as exc:
             msg = f"artifact lease link contains invalid linked record: {exc}"
             raise ArtifactLeaseLinkValidationError(msg) from exc

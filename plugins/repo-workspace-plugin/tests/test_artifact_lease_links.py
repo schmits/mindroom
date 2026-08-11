@@ -11,11 +11,20 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from mindroom.artifact_lease_links import (
-    ArtifactLeaseLink,
-    ArtifactLeaseLinkValidationError,
-    LinkedRecordAuthority,
-)
+import importlib.util
+import sys
+from pathlib import Path
+
+_PLUGIN_MODULE_PATH = Path(__file__).resolve().parents[1] / "artifact_lease_links.py"
+_SPEC = importlib.util.spec_from_file_location("repo_workspace_artifact_lease_links", _PLUGIN_MODULE_PATH)
+assert _SPEC is not None
+artifact_lease_links = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+sys.modules[_SPEC.name] = artifact_lease_links
+_SPEC.loader.exec_module(artifact_lease_links)
+ArtifactLeaseLink = artifact_lease_links.ArtifactLeaseLink
+ArtifactLeaseLinkValidationError = artifact_lease_links.ArtifactLeaseLinkValidationError
+LinkedRecordAuthority = artifact_lease_links.LinkedRecordAuthority
 from mindroom.handoff_artifacts import HandoffArtifact, HandoffAuthority, HandoffSourceClassification, HandoffTrust
 from mindroom.workspace_leases import (
     WorkspaceLease,
