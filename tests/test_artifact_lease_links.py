@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from mindroom.artifact_lease_links import (
     ArtifactLeaseLink,
@@ -81,6 +84,78 @@ def test_artifact_lease_link_round_trips_metadata_only() -> None:
     assert link.artifact_ref == "artifact://handoff-summary.json"
     assert link.lease_ref == "lease://lease-1"
     assert ArtifactLeaseLink.from_mapping(link.to_mapping()) == link
+
+
+@pytest.mark.parametrize(
+    ("artifact_classification", "lease_classification"),
+    [
+        (HandoffSourceClassification.DESIGN_REFERENCE, WorkspaceLeaseSourceClassification.DESIGN_REFERENCE),
+        (HandoffSourceClassification.TARGET_REPO, WorkspaceLeaseSourceClassification.TARGET_REPO),
+        (HandoffSourceClassification.RUNTIME_CONFIG, WorkspaceLeaseSourceClassification.RUNTIME_RECORD),
+        (HandoffSourceClassification.ARTIFACT, WorkspaceLeaseSourceClassification.ARTIFACT),
+        (HandoffSourceClassification.ARTIFACT, WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT),
+        (HandoffSourceClassification.UNTRUSTED_REPO_CONTENT, WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT),
+        (HandoffSourceClassification.IMPLEMENTATION_EVIDENCE, WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT),
+        (HandoffSourceClassification.REVIEW_FINDING, WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT),
+    ],
+)
+def test_link_accepts_explicit_supported_classification_combinations(
+    artifact_classification: HandoffSourceClassification,
+    lease_classification: WorkspaceLeaseSourceClassification,
+) -> None:
+    trust = HandoffTrust.UNTRUSTED
+    lease_trust = WorkspaceLeaseTrust.UNTRUSTED
+    authority = HandoffAuthority.NON_AUTHORITATIVE
+    lease_authority = WorkspaceLeaseAuthority.NON_AUTHORITATIVE
+    if artifact_classification not in {
+        HandoffSourceClassification.DESIGN_REFERENCE,
+        HandoffSourceClassification.UNTRUSTED_REPO_CONTENT,
+    }:
+        trust = HandoffTrust.VERIFIED_ARTIFACT
+        lease_trust = WorkspaceLeaseTrust.VERIFIED_METADATA
+        authority = HandoffAuthority.EVIDENCE
+        lease_authority = WorkspaceLeaseAuthority.EVIDENCE
+
+    link = ArtifactLeaseLink.create(
+        artifact=_artifact(
+            classification=artifact_classification,
+            trust=trust,
+            authority=authority,
+        ),
+        lease=_lease(
+            classification=lease_classification,
+            trust=lease_trust,
+            authority=lease_authority,
+        ),
+    )
+
+    assert link.lease.classification is lease_classification
+
+
+@pytest.mark.parametrize(
+    "artifact_classification",
+    [
+        HandoffSourceClassification.RUNTIME_CONFIG,
+        HandoffSourceClassification.IMPLEMENTATION_EVIDENCE,
+        HandoffSourceClassification.REVIEW_FINDING,
+    ],
+)
+def test_previously_unmapped_artifact_classifications_fail_closed_on_incompatible_lease(
+    artifact_classification: HandoffSourceClassification,
+) -> None:
+    with pytest.raises(ArtifactLeaseLinkValidationError, match="source classifications are inconsistent"):
+        ArtifactLeaseLink.create(
+            artifact=_artifact(classification=artifact_classification),
+            lease=_lease(classification=WorkspaceLeaseSourceClassification.ARTIFACT),
+        )
+
+
+def test_link_rejects_operator_request_lease_classification() -> None:
+    with pytest.raises(ArtifactLeaseLinkValidationError, match="source classifications are inconsistent"):
+        ArtifactLeaseLink.create(
+            artifact=_artifact(classification=HandoffSourceClassification.ARTIFACT),
+            lease=_lease(classification=WorkspaceLeaseSourceClassification.OPERATOR_REQUEST),
+        )
 
 
 def test_link_accepts_lease_handoff_refs_for_handoff_artifacts() -> None:
