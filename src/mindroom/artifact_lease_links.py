@@ -53,12 +53,53 @@ _NON_AUTHORITATIVE_LEASE_CLASSES = {
     WorkspaceLeaseSourceClassification.DESIGN_REFERENCE,
     WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT,
 }
-_CLASSIFICATION_PAIRS = {
-    HandoffSourceClassification.DESIGN_REFERENCE: WorkspaceLeaseSourceClassification.DESIGN_REFERENCE,
-    HandoffSourceClassification.TARGET_REPO: WorkspaceLeaseSourceClassification.TARGET_REPO,
-    HandoffSourceClassification.ARTIFACT: WorkspaceLeaseSourceClassification.ARTIFACT,
-    HandoffSourceClassification.UNTRUSTED_REPO_CONTENT: WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT,
+# Artifact/lease classification compatibility is intentionally total over
+# HandoffSourceClassification.  Do not use dict.get() here: a newly added
+# artifact class must fail closed until this table explicitly maps or rejects
+# it.  Lease-side OPERATOR_REQUEST is intentionally unsupported for
+# artifact↔lease links because it is a request provenance class, not durable
+# handoff artifact evidence.
+_CLASSIFICATION_COMPATIBILITY: dict[
+    HandoffSourceClassification, frozenset[WorkspaceLeaseSourceClassification],
+] = {
+    HandoffSourceClassification.DESIGN_REFERENCE: frozenset({
+        WorkspaceLeaseSourceClassification.DESIGN_REFERENCE,
+    }),
+    HandoffSourceClassification.TARGET_REPO: frozenset({
+        WorkspaceLeaseSourceClassification.TARGET_REPO,
+    }),
+    HandoffSourceClassification.RUNTIME_CONFIG: frozenset({
+        WorkspaceLeaseSourceClassification.RUNTIME_RECORD,
+    }),
+    HandoffSourceClassification.ARTIFACT: frozenset({
+        WorkspaceLeaseSourceClassification.ARTIFACT,
+        WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT,
+    }),
+    HandoffSourceClassification.UNTRUSTED_REPO_CONTENT: frozenset({
+        WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT,
+    }),
+    HandoffSourceClassification.IMPLEMENTATION_EVIDENCE: frozenset({
+        WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT,
+    }),
+    HandoffSourceClassification.REVIEW_FINDING: frozenset({
+        WorkspaceLeaseSourceClassification.HANDOFF_ARTIFACT,
+    }),
 }
+_UNSUPPORTED_LINK_LEASE_CLASSIFICATIONS = frozenset({
+    WorkspaceLeaseSourceClassification.OPERATOR_REQUEST,
+})
+_SUPPORTED_LINK_LEASE_CLASSIFICATIONS = frozenset().union(*_CLASSIFICATION_COMPATIBILITY.values())
+if set(_CLASSIFICATION_COMPATIBILITY) != set(HandoffSourceClassification):
+    msg = "artifact lease link classification compatibility is not total over handoff classifications"
+    raise RuntimeError(msg)
+if set(WorkspaceLeaseSourceClassification) != (
+    _SUPPORTED_LINK_LEASE_CLASSIFICATIONS | _UNSUPPORTED_LINK_LEASE_CLASSIFICATIONS
+):
+    msg = "artifact lease link lease classification support/rejection table is not total"
+    raise RuntimeError(msg)
+if _SUPPORTED_LINK_LEASE_CLASSIFICATIONS & _UNSUPPORTED_LINK_LEASE_CLASSIFICATIONS:
+    msg = "artifact lease link lease classification support table overlaps unsupported classes"
+    raise RuntimeError(msg)
 _TRUST_PAIRS = {
     HandoffTrust.TRUSTED_RUNTIME: WorkspaceLeaseTrust.TRUSTED_RUNTIME,
     HandoffTrust.VERIFIED_ARTIFACT: WorkspaceLeaseTrust.VERIFIED_METADATA,
@@ -69,6 +110,57 @@ _AUTHORITY_PAIRS = {
     HandoffAuthority.EVIDENCE: WorkspaceLeaseAuthority.EVIDENCE,
     HandoffAuthority.NON_AUTHORITATIVE: WorkspaceLeaseAuthority.NON_AUTHORITATIVE,
 }
+
+
+def _expected_lease_classifications(
+    artifact_classification: HandoffSourceClassification,
+) -> frozenset[WorkspaceLeaseSourceClassification]:
+    try:
+        expected_classifications = _CLASSIFICATION_COMPATIBILITY[artifact_classification]
+    except KeyError as exc:
+        msg = f"unsupported handoff artifact classification for lease link: {artifact_classification.value}"
+        raise ArtifactLeaseLinkValidationError(msg) from exc
+    if not expected_classifications:
+        msg = f"unsupported handoff artifact classification for lease link: {artifact_classification.value}"
+        raise ArtifactLeaseLinkValidationError(msg)
+    return expected_classifications
+
+
+def _validate_classifications(artifact: HandoffArtifact, lease: WorkspaceLease) -> None:
+    expected_classifications = _expected_lease_classifications(artifact.classification)
+    if lease.classification in expected_classifications:
+        return
+    expected_values = ", ".join(sorted(classification.value for classification in expected_classifications))
+    msg = (
+        "linked artifact and lease source classifications are inconsistent "
+        f"(expected lease classification: {expected_values})"
+    )
+    raise ArtifactLeaseLinkValidationError(msg)
+
+
+def _validate_trust_and_authority(artifact: HandoffArtifact, lease: WorkspaceLease) -> None:
+    expected_trust = _TRUST_PAIRS[artifact.trust]
+    if lease.trust is not expected_trust:
+        msg = "linked artifact and lease trust labels are inconsistent"
+        raise ArtifactLeaseLinkValidationError(msg)
+    expected_authority = _AUTHORITY_PAIRS[artifact.authority]
+    if lease.authority is not expected_authority:
+        msg = "linked artifact and lease authority labels are inconsistent"
+        raise ArtifactLeaseLinkValidationError(msg)
+
+
+def _validate_non_authoritative_materialization(link: ArtifactLeaseLink) -> None:
+    if (
+        link.artifact.classification not in _NON_AUTHORITATIVE_HANDOFF_CLASSES
+        and link.lease.classification not in _NON_AUTHORITATIVE_LEASE_CLASSES
+    ):
+        return
+    if link.artifact.materialize_allowed:
+        msg = "design reference and repo-authored instruction links must not allow materialization"
+        raise ArtifactLeaseLinkValidationError(msg)
+    if link.authority is not LinkedRecordAuthority.NON_AUTHORITATIVE:
+        msg = "design reference and repo-authored instruction links are non-authoritative"
+        raise ArtifactLeaseLinkValidationError(msg)
 
 
 def _require_non_empty_string(value: object, *, field_name: str) -> str:
@@ -130,7 +222,6 @@ class ArtifactLeaseLink:
         lease_ref: str | None = None,
     ) -> Self:
         """Create a validated link and attach its canonical integrity hash."""
-
         base = cls(
             artifact=artifact,
             lease=lease,
@@ -146,7 +237,6 @@ class ArtifactLeaseLink:
     @classmethod
     def from_mapping(cls, payload: dict[str, object]) -> Self:
         """Build and validate a link from JSON-like data, failing closed."""
-
         if not isinstance(payload, dict):
             msg = "artifact lease link payload must be a mapping"
             raise ArtifactLeaseLinkValidationError(msg)
@@ -186,7 +276,6 @@ class ArtifactLeaseLink:
 
     def structural_mapping(self) -> dict[str, object]:
         """Return the link payload covered by ``sha256``."""
-
         return {
             field_name: self.to_mapping(include_integrity=False)[field_name]
             for field_name in _STRUCTURAL_HASH_FIELDS
@@ -194,12 +283,10 @@ class ArtifactLeaseLink:
 
     def integrity_hash(self) -> str:
         """Return the canonical SHA-256 over linked metadata and record hashes."""
-
         return sha256(_canonical_payload(self.structural_mapping())).hexdigest()
 
     def to_mapping(self, *, include_integrity: bool = True) -> dict[str, object]:
         """Return a JSON-safe representation with exact, fail-closed keys."""
-
         payload: dict[str, object] = {
             "artifact": self.artifact.to_mapping(),
             "lease": self.lease.to_mapping(),
@@ -213,7 +300,6 @@ class ArtifactLeaseLink:
 
     def validate(self) -> None:
         """Validate linked record integrity, labels, and cross references."""
-
         self.artifact.validate()
         self.lease.validate()
         _require_ref(self.artifact_ref, field_name="artifact_ref")
@@ -230,31 +316,12 @@ class ArtifactLeaseLink:
         if self.artifact_ref not in self.lease.artifact_refs and self.artifact_ref not in self.lease.handoff_refs:
             msg = "workspace lease must reference the linked artifact_ref"
             raise ArtifactLeaseLinkValidationError(msg)
-        expected_classification = _CLASSIFICATION_PAIRS.get(self.artifact.classification)
-        if expected_classification is not None and self.lease.classification is not expected_classification:
-            msg = "linked artifact and lease source classifications are inconsistent"
-            raise ArtifactLeaseLinkValidationError(msg)
-        expected_trust = _TRUST_PAIRS[self.artifact.trust]
-        if self.lease.trust is not expected_trust:
-            msg = "linked artifact and lease trust labels are inconsistent"
-            raise ArtifactLeaseLinkValidationError(msg)
-        expected_authority = _AUTHORITY_PAIRS[self.artifact.authority]
-        if self.lease.authority is not expected_authority:
-            msg = "linked artifact and lease authority labels are inconsistent"
-            raise ArtifactLeaseLinkValidationError(msg)
+        _validate_classifications(self.artifact, self.lease)
+        _validate_trust_and_authority(self.artifact, self.lease)
         if self.authority is not _link_authority(self.artifact, self.lease):
             msg = "artifact lease link authority does not match linked records"
             raise ArtifactLeaseLinkValidationError(msg)
-        if (
-            self.artifact.classification in _NON_AUTHORITATIVE_HANDOFF_CLASSES
-            or self.lease.classification in _NON_AUTHORITATIVE_LEASE_CLASSES
-        ):
-            if self.artifact.materialize_allowed:
-                msg = "design reference and repo-authored instruction links must not allow materialization"
-                raise ArtifactLeaseLinkValidationError(msg)
-            if self.authority is not LinkedRecordAuthority.NON_AUTHORITATIVE:
-                msg = "design reference and repo-authored instruction links are non-authoritative"
-                raise ArtifactLeaseLinkValidationError(msg)
+        _validate_non_authoritative_materialization(self)
         if self.sha256 != self.integrity_hash():
             msg = "artifact lease link integrity hash is missing or invalid"
             raise ArtifactLeaseLinkValidationError(msg)
