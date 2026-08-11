@@ -66,6 +66,21 @@ _NON_AUTHORITATIVE_CLASSES = {
     HandoffSourceClassification.DESIGN_REFERENCE,
     HandoffSourceClassification.UNTRUSTED_REPO_CONTENT,
 }
+_SCHEMA_FIELDS = frozenset({
+    "artifact_id",
+    "classification",
+    "producer",
+    "consumer",
+    "trust",
+    "authority",
+    "refs",
+    "manifest",
+    "sha256",
+    "expires_at",
+    "lease_ref",
+    "materialize_allowed",
+    "metadata",
+})
 
 
 def _require_non_empty_string(value: object, *, field_name: str) -> str:
@@ -174,6 +189,18 @@ class HandoffArtifact:
     @classmethod
     def from_mapping(cls, payload: dict[str, object]) -> Self:
         """Build and validate a handoff artifact from JSON-like data."""
+
+        if not isinstance(payload, dict):
+            msg = "handoff artifact payload must be a mapping"
+            raise HandoffArtifactValidationError(msg)
+        missing_keys = _SCHEMA_FIELDS - set(payload)
+        if missing_keys:
+            msg = f"handoff artifact payload is missing required keys: {', '.join(sorted(missing_keys))}"
+            raise HandoffArtifactValidationError(msg)
+        extra_keys = set(payload) - _SCHEMA_FIELDS
+        if extra_keys:
+            msg = f"handoff artifact payload has unknown keys: {', '.join(sorted(extra_keys))}"
+            raise HandoffArtifactValidationError(msg)
 
         artifact = cls(
             artifact_id=_require_non_empty_string(payload.get("artifact_id"), field_name="artifact_id"),

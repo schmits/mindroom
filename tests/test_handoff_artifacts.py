@@ -78,19 +78,19 @@ def test_repo_authored_instructions_are_untrusted_repo_content() -> None:
 
 
 def test_required_metadata_is_validated() -> None:
+    payload = HandoffArtifact.create(
+        artifact_id="missing-classification",
+        classification=HandoffSourceClassification.UNTRUSTED_REPO_CONTENT,
+        producer="producer",
+        consumer="consumer",
+        trust=HandoffTrust.UNTRUSTED,
+        authority=HandoffAuthority.NON_AUTHORITATIVE,
+        refs=("repo://owner/name/path",),
+        manifest={"path": "path"},
+    ).to_mapping()
+    payload["classification"] = None
     with pytest.raises(HandoffArtifactValidationError, match="classification is required"):
-        HandoffArtifact.from_mapping(
-            {
-                "artifact_id": "missing-classification",
-                "producer": "producer",
-                "consumer": "consumer",
-                "trust": "untrusted",
-                "authority": "non_authoritative",
-                "refs": ["repo://owner/name/path"],
-                "manifest": {"path": "path"},
-                "sha256": "irrelevant",
-            },
-        )
+        HandoffArtifact.from_mapping(payload)
 
     with pytest.raises(HandoffArtifactValidationError, match="refs must include at least one reference"):
         HandoffArtifact.create(
@@ -174,3 +174,37 @@ def test_from_mapping_rejects_non_boolean_materialize_allowed() -> None:
         payload["materialize_allowed"] = invalid_materialize_allowed
         with pytest.raises(HandoffArtifactValidationError, match="materialize_allowed must be a boolean"):
             HandoffArtifact.from_mapping(payload)
+
+
+def test_from_mapping_rejects_unknown_keys() -> None:
+    payload = HandoffArtifact.create(
+        artifact_id="unknown-key",
+        classification=HandoffSourceClassification.ARTIFACT,
+        producer="producer",
+        consumer="consumer",
+        trust=HandoffTrust.VERIFIED_ARTIFACT,
+        authority=HandoffAuthority.EVIDENCE,
+        refs=("artifact://report.json",),
+        manifest={"path": "report.json"},
+    ).to_mapping()
+    payload["extra"] = "nope"
+
+    with pytest.raises(HandoffArtifactValidationError, match="unknown keys: extra"):
+        HandoffArtifact.from_mapping(payload)
+
+
+def test_from_mapping_requires_full_schema_even_for_defaults() -> None:
+    payload = HandoffArtifact.create(
+        artifact_id="missing-defaulted",
+        classification=HandoffSourceClassification.ARTIFACT,
+        producer="producer",
+        consumer="consumer",
+        trust=HandoffTrust.VERIFIED_ARTIFACT,
+        authority=HandoffAuthority.EVIDENCE,
+        refs=("artifact://report.json",),
+        manifest={"path": "report.json"},
+    ).to_mapping()
+    del payload["metadata"]
+
+    with pytest.raises(HandoffArtifactValidationError, match="missing required keys: metadata"):
+        HandoffArtifact.from_mapping(payload)
