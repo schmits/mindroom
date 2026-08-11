@@ -1,423 +1,435 @@
-"""Metadata-only workspace lease lifecycle registry.
+"""Durable workspace lease metadata and fail-closed lifecycle validation.
 
-The registry records best-effort ownership/lifecycle metadata for workspace roots.
-It is intentionally not an authorization boundary and does not create, delete, or
-otherwise mutate workspace contents.
+This module models metadata-only leases for durable workspaces. A lease points
+at workspace and handoff/artifact references, but creating or validating it must
+not create directories, fetch repositories, route messages, or persist runtime
+state. Consumers can use the closed lifecycle and integrity hash to reject
+ambiguous or tampered lease records before acting on any referenced workspace.
 """
 
 from __future__ import annotations
 
-import json
-import time
-import uuid
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
-
-from mindroom.durable_write import write_json_file_durable
-from mindroom.file_locks import advisory_file_lock
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
-
-WORKSPACE_LEASE_REGISTRY_VERSION = 1
-WORKSPACE_LEASE_REGISTRY_RELATIVE_PATH = Path(".runtime") / "workspace_leases.json"
-_WORKSPACE_LEASE_REGISTRY_LOCK_SUFFIX = ".lock"
-_MAX_OWNER_KIND_LENGTH = 64
-_MAX_OWNER_ID_LENGTH = 256
-_MAX_PURPOSE_LENGTH = 256
-_MAX_METADATA_KEY_LENGTH = 128
-_MAX_METADATA_VALUE_LENGTH = 1024
-_MAX_METADATA_ITEMS = 32
-
-WorkspaceLeaseStatus = Literal["active", "released", "expired"]
-WorkspaceLeaseMetadataValue = str | int | float | bool | None
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+from hashlib import sha256
+from typing import Any, Self
 
 
-class WorkspaceLeaseRegistryError(ValueError):
-    """Raised when workspace lease registry input is invalid."""
+class WorkspaceLeaseValidationError(ValueError):
+    """Raised when a workspace lease record is unsafe or ambiguous."""
 
 
-class WorkspaceLeaseRecordPayload(TypedDict, total=False):
-    """JSON payload for one workspace lease record."""
+class WorkspaceLeaseState(StrEnum):
+    """Closed lifecycle states for durable workspace leases."""
 
-    lease_id: str
-    workspace_root: str
-    owner_kind: str
-    owner_id: str
-    purpose: str | None
-    status: WorkspaceLeaseStatus
-    metadata: dict[str, WorkspaceLeaseMetadataValue]
-    created_at: float
-    updated_at: float
-    expires_at: float | None
-    released_at: float | None
+    REQUESTED = "requested"
+    ACTIVE = "active"
+    RELEASED = "released"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
 
 
-class WorkspaceLeaseRegistryPayload(TypedDict):
-    """JSON payload for the workspace lease registry."""
+class WorkspaceLeaseSourceClassification(StrEnum):
+    """Closed source classes for lease provenance and referenced material."""
 
-    version: int
-    leases: dict[str, WorkspaceLeaseRecordPayload]
-
-
-@dataclass(frozen=True)
-class WorkspaceLeaseRecord:
-    """One metadata-only workspace lifecycle lease."""
-
-    lease_id: str
-    workspace_root: Path
-    owner_kind: str
-    owner_id: str
-    purpose: str | None
-    status: WorkspaceLeaseStatus
-    metadata: Mapping[str, WorkspaceLeaseMetadataValue]
-    created_at: float
-    updated_at: float
-    expires_at: float | None = None
-    released_at: float | None = None
-
-    def is_active_at(self, now: float | None = None) -> bool:
-        """Return whether this lease is active at ``now`` without mutating it."""
-        check_time = _current_time() if now is None else now
-        return self.status == "active" and (self.expires_at is None or self.expires_at > check_time)
+    RUNTIME_RECORD = "runtime_record"
+    TARGET_REPO = "target_repo"
+    ARTIFACT = "artifact"
+    HANDOFF_ARTIFACT = "handoff_artifact"
+    DESIGN_REFERENCE = "design_reference"
+    UNTRUSTED_REPO_CONTENT = "untrusted_repo_content"
+    OPERATOR_REQUEST = "operator_request"
 
 
-@dataclass(frozen=True)
-class WorkspaceLeaseRegistry:
-    """Durable metadata-only registry rooted under one MindRoom storage path."""
+class WorkspaceLeaseTrust(StrEnum):
+    """How much consumers may trust a lease record's metadata."""
 
-    storage_root: Path
-    registry_path: Path | None = None
-
-    def __post_init__(self) -> None:
-        """Normalize registry paths after dataclass initialization."""
-        object.__setattr__(self, "storage_root", self.storage_root.expanduser().resolve())
-        registry_path = self.registry_path
-        if registry_path is None:
-            registry_path = self.storage_root / WORKSPACE_LEASE_REGISTRY_RELATIVE_PATH
-        object.__setattr__(self, "registry_path", registry_path.expanduser().resolve())
-
-    @property
-    def lock_path(self) -> Path:
-        """Return the advisory lock path for registry mutations."""
-        registry_path = _require_registry_path(self.registry_path)
-        return registry_path.with_name(f"{registry_path.name}{_WORKSPACE_LEASE_REGISTRY_LOCK_SUFFIX}")
-
-    def acquire(
-        self,
-        workspace_root: Path,
-        *,
-        owner_kind: str,
-        owner_id: str,
-        purpose: str | None = None,
-        metadata: Mapping[str, object] | None = None,
-        ttl_seconds: float | None = None,
-        now: float | None = None,
-        lease_id: str | None = None,
-    ) -> WorkspaceLeaseRecord:
-        """Record a new active workspace lease.
-
-        The call only writes registry metadata under ``storage_root/.runtime``; it
-        never creates or modifies ``workspace_root`` itself.
-        """
-        timestamp = _current_time() if now is None else now
-        normalized_ttl = _validate_ttl_seconds(ttl_seconds)
-        record = WorkspaceLeaseRecord(
-            lease_id=_validate_lease_id(lease_id or uuid.uuid4().hex),
-            workspace_root=_resolve_workspace_root(workspace_root, storage_root=self.storage_root),
-            owner_kind=_validate_limited_text(owner_kind, "owner_kind", max_length=_MAX_OWNER_KIND_LENGTH),
-            owner_id=_validate_limited_text(owner_id, "owner_id", max_length=_MAX_OWNER_ID_LENGTH),
-            purpose=_validate_optional_limited_text(purpose, "purpose", max_length=_MAX_PURPOSE_LENGTH),
-            status="active",
-            metadata=_validate_metadata(metadata or {}),
-            created_at=timestamp,
-            updated_at=timestamp,
-            expires_at=(timestamp + normalized_ttl) if normalized_ttl is not None else None,
-            released_at=None,
-        )
-        with advisory_file_lock(self.lock_path):
-            records = self._read_records_unlocked()
-            if record.lease_id in records:
-                msg = f"workspace lease already exists: {record.lease_id}"
-                raise WorkspaceLeaseRegistryError(msg)
-            records[record.lease_id] = record
-            self._write_records_unlocked(records)
-        return record
-
-    def refresh(
-        self,
-        lease_id: str,
-        *,
-        ttl_seconds: float | None = None,
-        now: float | None = None,
-    ) -> WorkspaceLeaseRecord:
-        """Refresh one active lease's heartbeat and optional expiry."""
-        normalized_lease_id = _validate_lease_id(lease_id)
-        timestamp = _current_time() if now is None else now
-        normalized_ttl = _validate_ttl_seconds(ttl_seconds)
-        with advisory_file_lock(self.lock_path):
-            records = self._read_records_unlocked()
-            record = _lease_with_effective_status(_require_record(records, normalized_lease_id), now=timestamp)
-            if record.status != "active":
-                records[normalized_lease_id] = record
-                self._write_records_unlocked(records)
-                msg = f"workspace lease is not active: {normalized_lease_id}"
-                raise WorkspaceLeaseRegistryError(msg)
-            refreshed = replace(
-                record,
-                updated_at=timestamp,
-                expires_at=(timestamp + normalized_ttl) if normalized_ttl is not None else record.expires_at,
-            )
-            records[normalized_lease_id] = refreshed
-            self._write_records_unlocked(records)
-        return refreshed
-
-    def release(self, lease_id: str, *, now: float | None = None) -> WorkspaceLeaseRecord:
-        """Mark one lease as released while retaining lifecycle metadata."""
-        normalized_lease_id = _validate_lease_id(lease_id)
-        timestamp = _current_time() if now is None else now
-        with advisory_file_lock(self.lock_path):
-            records = self._read_records_unlocked()
-            record = _require_record(records, normalized_lease_id)
-            if record.status == "released":
-                return record
-            released = replace(record, status="released", updated_at=timestamp, released_at=timestamp)
-            records[normalized_lease_id] = released
-            self._write_records_unlocked(records)
-        return released
-
-    def list(self, *, include_inactive: bool = True, now: float | None = None) -> tuple[WorkspaceLeaseRecord, ...]:
-        """Return leases sorted by creation time and id."""
-        timestamp = _current_time() if now is None else now
-        with advisory_file_lock(self.lock_path, exclusive=False):
-            records = self._read_records_unlocked()
-        values: Iterable[WorkspaceLeaseRecord] = (
-            _lease_with_effective_status(record, now=timestamp) for record in records.values()
-        )
-        if not include_inactive:
-            values = (record for record in values if record.status == "active")
-        return tuple(sorted(values, key=lambda record: (record.created_at, record.lease_id)))
-
-    def prune_expired(self, *, now: float | None = None) -> tuple[WorkspaceLeaseRecord, ...]:
-        """Mark elapsed active leases as expired and persist the lifecycle transition."""
-        timestamp = _current_time() if now is None else now
-        with advisory_file_lock(self.lock_path):
-            records = self._read_records_unlocked()
-            expired: list[WorkspaceLeaseRecord] = []
-            for lease_id, record in records.items():
-                if record.status == "active" and record.expires_at is not None and record.expires_at <= timestamp:
-                    expired_record = replace(record, status="expired", updated_at=timestamp)
-                    records[lease_id] = expired_record
-                    expired.append(expired_record)
-            if expired:
-                self._write_records_unlocked(records)
-        return tuple(sorted(expired, key=lambda record: (record.created_at, record.lease_id)))
-
-    def _read_records_unlocked(self) -> dict[str, WorkspaceLeaseRecord]:
-        registry_path = _require_registry_path(self.registry_path)
-        try:
-            payload = json.loads(registry_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            return {}
-        if not isinstance(payload, dict):
-            return {}
-        leases = payload.get("leases")
-        if not isinstance(leases, dict):
-            return {}
-        records: dict[str, WorkspaceLeaseRecord] = {}
-        for lease_id, record_payload in leases.items():
-            if not isinstance(lease_id, str) or not isinstance(record_payload, dict):
-                continue
-            try:
-                record = _record_from_payload(lease_id, record_payload, storage_root=self.storage_root)
-            except WorkspaceLeaseRegistryError:
-                continue
-            records[record.lease_id] = record
-        return records
-
-    def _write_records_unlocked(self, records: Mapping[str, WorkspaceLeaseRecord]) -> None:
-        registry_path = _require_registry_path(self.registry_path)
-        payload: WorkspaceLeaseRegistryPayload = {
-            "version": WORKSPACE_LEASE_REGISTRY_VERSION,
-            "leases": {lease_id: _record_to_payload(record) for lease_id, record in sorted(records.items())},
-        }
-        write_json_file_durable(registry_path, payload, indent=2, sort_keys=True, trailing_newline=True)
+    TRUSTED_RUNTIME = "trusted_runtime"
+    VERIFIED_METADATA = "verified_metadata"
+    UNTRUSTED = "untrusted"
 
 
-def workspace_lease_registry_path(storage_root: Path) -> Path:
-    """Return the default durable registry path for ``storage_root``."""
-    return storage_root.expanduser().resolve() / WORKSPACE_LEASE_REGISTRY_RELATIVE_PATH
+class WorkspaceLeaseAuthority(StrEnum):
+    """Authority a lease record may exert over runtime decisions."""
+
+    AUTHORITATIVE = "authoritative"
+    EVIDENCE = "evidence"
+    NON_AUTHORITATIVE = "non_authoritative"
 
 
-def _current_time() -> float:
-    return time.time()
+_ALLOWED_TRANSITIONS = {
+    WorkspaceLeaseState.REQUESTED: {WorkspaceLeaseState.ACTIVE, WorkspaceLeaseState.REVOKED},
+    WorkspaceLeaseState.ACTIVE: {
+        WorkspaceLeaseState.RELEASED,
+        WorkspaceLeaseState.EXPIRED,
+        WorkspaceLeaseState.REVOKED,
+    },
+    WorkspaceLeaseState.RELEASED: set(),
+    WorkspaceLeaseState.EXPIRED: set(),
+    WorkspaceLeaseState.REVOKED: set(),
+}
+
+_NON_AUTHORITATIVE_CLASSES = {
+    WorkspaceLeaseSourceClassification.DESIGN_REFERENCE,
+    WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT,
+}
+
+_STRUCTURAL_HASH_FIELDS = (
+    "lease_id",
+    "state",
+    "workspace_ref",
+    "owner",
+    "consumer",
+    "classification",
+    "trust",
+    "authority",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "released_at",
+    "revoked_at",
+    "handoff_refs",
+    "artifact_refs",
+    "provenance",
+    "metadata",
+)
 
 
-def _require_registry_path(registry_path: Path | None) -> Path:
-    if registry_path is None:  # pragma: no cover - dataclass invariant guard
-        msg = "workspace lease registry path was not initialized"
-        raise WorkspaceLeaseRegistryError(msg)
-    return registry_path
-
-
-def _resolve_workspace_root(workspace_root: Path, *, storage_root: Path) -> Path:
-    resolved = workspace_root.expanduser().resolve()
-    try:
-        resolved.relative_to(storage_root)
-    except ValueError:
-        msg = f"workspace_root must stay within storage_root: {storage_root}"
-        raise WorkspaceLeaseRegistryError(msg) from None
-    return resolved
-
-
-def _validate_lease_id(lease_id: str) -> str:
-    value = _validate_limited_text(lease_id, "lease_id", max_length=128)
-    if any(character in value for character in ("/", "\\", "\x00")):
-        msg = "lease_id must not contain path separators or NUL bytes"
-        raise WorkspaceLeaseRegistryError(msg)
+def _require_non_empty_string(value: object, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        msg = f"workspace lease {field_name} must be a non-empty string"
+        raise WorkspaceLeaseValidationError(msg)
     return value
 
 
-def _validate_limited_text(value: object, field_name: str, *, max_length: int) -> str:
-    if not isinstance(value, str):
-        msg = f"{field_name} must be a string"
-        raise WorkspaceLeaseRegistryError(msg)
-    normalized = value.strip()
-    if not normalized:
-        msg = f"{field_name} must not be empty"
-        raise WorkspaceLeaseRegistryError(msg)
-    if len(normalized) > max_length:
-        msg = f"{field_name} must be at most {max_length} characters"
-        raise WorkspaceLeaseRegistryError(msg)
-    return normalized
+def _enum_value(enum_type: type[StrEnum], value: object, *, field_name: str) -> StrEnum:
+    if isinstance(value, enum_type):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_type(value)
+        except ValueError as exc:
+            msg = f"workspace lease {field_name} has invalid value {value!r}"
+            raise WorkspaceLeaseValidationError(msg) from exc
+    msg = f"workspace lease {field_name} is required"
+    raise WorkspaceLeaseValidationError(msg)
 
 
-def _validate_optional_limited_text(value: object, field_name: str, *, max_length: int) -> str | None:
+def _parse_datetime(value: object, *, field_name: str, required: bool = False) -> datetime | None:
     if value is None:
+        if required:
+            msg = f"workspace lease {field_name} is required"
+            raise WorkspaceLeaseValidationError(msg)
         return None
-    return _validate_limited_text(value, field_name, max_length=max_length)
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            msg = f"workspace lease {field_name} must be ISO-8601"
+            raise WorkspaceLeaseValidationError(msg) from exc
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    msg = f"workspace lease {field_name} must be ISO-8601"
+    raise WorkspaceLeaseValidationError(msg)
 
 
-def _validate_ttl_seconds(ttl_seconds: float | None) -> float | None:
-    if ttl_seconds is None:
-        return None
-    if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int | float):
-        msg = "ttl_seconds must be a number when provided"
-        raise WorkspaceLeaseRegistryError(msg)
-    ttl = float(ttl_seconds)
-    if ttl <= 0:
-        msg = "ttl_seconds must be greater than zero"
-        raise WorkspaceLeaseRegistryError(msg)
-    return ttl
+def _string_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        msg = f"workspace lease {field_name} must be a list of non-empty strings"
+        raise WorkspaceLeaseValidationError(msg)
+    return tuple(_require_non_empty_string(item, field_name=field_name) for item in value)
 
 
-def _validate_metadata(metadata: Mapping[str, object]) -> dict[str, WorkspaceLeaseMetadataValue]:
-    if len(metadata) > _MAX_METADATA_ITEMS:
-        msg = f"metadata must contain at most {_MAX_METADATA_ITEMS} items"
-        raise WorkspaceLeaseRegistryError(msg)
-    normalized: dict[str, WorkspaceLeaseMetadataValue] = {}
-    for key, value in metadata.items():
-        if not isinstance(key, str) or not key.strip():
-            msg = "metadata keys must be non-empty strings"
-            raise WorkspaceLeaseRegistryError(msg)
-        normalized_key = key.strip()
-        if len(normalized_key) > _MAX_METADATA_KEY_LENGTH:
-            msg = f"metadata keys must be at most {_MAX_METADATA_KEY_LENGTH} characters"
-            raise WorkspaceLeaseRegistryError(msg)
-        if isinstance(value, str):
-            if len(value) > _MAX_METADATA_VALUE_LENGTH:
-                msg = f"metadata values must be at most {_MAX_METADATA_VALUE_LENGTH} characters"
-                raise WorkspaceLeaseRegistryError(msg)
-            normalized[normalized_key] = value
-        elif isinstance(value, bool | int | float) or value is None:
-            normalized[normalized_key] = value
-        else:
-            msg = "metadata values must be scalar JSON values"
-            raise WorkspaceLeaseRegistryError(msg)
-    return normalized
+def _string_mapping(value: object, *, field_name: str) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        msg = f"workspace lease {field_name} must be a non-empty mapping"
+        raise WorkspaceLeaseValidationError(msg)
+    mapping: dict[str, str] = {}
+    for key, item in value.items():
+        mapping[_require_non_empty_string(key, field_name=f"{field_name} key")] = _require_non_empty_string(
+            item,
+            field_name=f"{field_name} value",
+        )
+    return mapping
 
 
-def _record_from_payload(
-    lease_id: str,
-    payload: Mapping[object, object],
+def _canonical_payload(payload: dict[str, Any]) -> bytes:
+    import json
+
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceLease:
+    """Metadata-only durable workspace lease record.
+
+    ``workspace_ref``, ``handoff_refs``, and ``artifact_refs`` are references
+    only. The model intentionally performs no IO and grants no access by itself.
+    """
+
+    lease_id: str
+    state: WorkspaceLeaseState
+    workspace_ref: str
+    owner: str
+    consumer: str
+    classification: WorkspaceLeaseSourceClassification
+    trust: WorkspaceLeaseTrust
+    authority: WorkspaceLeaseAuthority
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime
+    sha256: str
+    released_at: datetime | None = None
+    revoked_at: datetime | None = None
+    handoff_refs: tuple[str, ...] = ()
+    artifact_refs: tuple[str, ...] = ()
+    provenance: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        lease_id: str,
+        workspace_ref: str,
+        owner: str,
+        consumer: str,
+        classification: WorkspaceLeaseSourceClassification,
+        trust: WorkspaceLeaseTrust,
+        authority: WorkspaceLeaseAuthority,
+        created_at: datetime,
+        expires_at: datetime,
+        state: WorkspaceLeaseState = WorkspaceLeaseState.REQUESTED,
+        updated_at: datetime | None = None,
+        released_at: datetime | None = None,
+        revoked_at: datetime | None = None,
+        handoff_refs: tuple[str, ...] = (),
+        artifact_refs: tuple[str, ...] = (),
+        provenance: dict[str, str] | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> Self:
+        """Create a lease and attach its canonical integrity hash."""
+
+        base = cls(
+            lease_id=lease_id,
+            state=state,
+            workspace_ref=workspace_ref,
+            owner=owner,
+            consumer=consumer,
+            classification=classification,
+            trust=trust,
+            authority=authority,
+            created_at=created_at,
+            updated_at=updated_at or created_at,
+            expires_at=expires_at,
+            released_at=released_at,
+            revoked_at=revoked_at,
+            handoff_refs=handoff_refs,
+            artifact_refs=artifact_refs,
+            provenance=provenance or {"schema": "workspace-lease-v1"},
+            metadata=metadata or {"schema": "workspace-lease-v1"},
+            sha256="pending",
+        )
+        lease = replace(base, sha256=base.integrity_hash())
+        lease.validate()
+        return lease
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, object]) -> Self:
+        """Build and validate a lease from JSON-like data."""
+
+        lease = cls(
+            lease_id=_require_non_empty_string(payload.get("lease_id"), field_name="lease_id"),
+            state=_enum_value(WorkspaceLeaseState, payload.get("state"), field_name="state"),  # type: ignore[arg-type]
+            workspace_ref=_require_non_empty_string(payload.get("workspace_ref"), field_name="workspace_ref"),
+            owner=_require_non_empty_string(payload.get("owner"), field_name="owner"),
+            consumer=_require_non_empty_string(payload.get("consumer"), field_name="consumer"),
+            classification=_enum_value(  # type: ignore[arg-type]
+                WorkspaceLeaseSourceClassification,
+                payload.get("classification"),
+                field_name="classification",
+            ),
+            trust=_enum_value(WorkspaceLeaseTrust, payload.get("trust"), field_name="trust"),  # type: ignore[arg-type]
+            authority=_enum_value(  # type: ignore[arg-type]
+                WorkspaceLeaseAuthority,
+                payload.get("authority"),
+                field_name="authority",
+            ),
+            created_at=_parse_datetime(payload.get("created_at"), field_name="created_at", required=True),  # type: ignore[arg-type]
+            updated_at=_parse_datetime(payload.get("updated_at"), field_name="updated_at", required=True),  # type: ignore[arg-type]
+            expires_at=_parse_datetime(payload.get("expires_at"), field_name="expires_at", required=True),  # type: ignore[arg-type]
+            released_at=_parse_datetime(payload.get("released_at"), field_name="released_at"),
+            revoked_at=_parse_datetime(payload.get("revoked_at"), field_name="revoked_at"),
+            handoff_refs=_string_tuple(payload.get("handoff_refs"), field_name="handoff_refs"),
+            artifact_refs=_string_tuple(payload.get("artifact_refs"), field_name="artifact_refs"),
+            provenance=_string_mapping(payload.get("provenance"), field_name="provenance"),
+            metadata=_string_mapping(payload.get("metadata", {"schema": "workspace-lease-v1"}), field_name="metadata"),
+            sha256=_require_non_empty_string(payload.get("sha256"), field_name="sha256"),
+        )
+        lease.validate()
+        return lease
+
+    def structural_mapping(self) -> dict[str, object]:
+        """Return the payload covered by ``sha256``."""
+
+        return {field_name: self.to_mapping(include_integrity=False)[field_name] for field_name in _STRUCTURAL_HASH_FIELDS}
+
+    def integrity_hash(self) -> str:
+        """Return the canonical SHA-256 over trust-critical lease metadata."""
+
+        return sha256(_canonical_payload(self.structural_mapping())).hexdigest()
+
+    def to_mapping(self, *, include_integrity: bool = True) -> dict[str, object]:
+        """Return a JSON-safe lease representation."""
+
+        payload: dict[str, object] = {
+            "lease_id": self.lease_id,
+            "state": self.state.value,
+            "workspace_ref": self.workspace_ref,
+            "owner": self.owner,
+            "consumer": self.consumer,
+            "classification": self.classification.value,
+            "trust": self.trust.value,
+            "authority": self.authority.value,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "released_at": self.released_at.isoformat() if self.released_at is not None else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at is not None else None,
+            "handoff_refs": list(self.handoff_refs),
+            "artifact_refs": list(self.artifact_refs),
+            "provenance": dict(self.provenance),
+            "metadata": dict(self.metadata),
+        }
+        if include_integrity:
+            payload["sha256"] = self.sha256
+        return payload
+
+    def validate(self) -> None:
+        """Fail closed for ambiguous trust, authority, TTL, lifecycle, or integrity."""
+
+        _require_non_empty_string(self.lease_id, field_name="lease_id")
+        _require_non_empty_string(self.workspace_ref, field_name="workspace_ref")
+        _require_non_empty_string(self.owner, field_name="owner")
+        _require_non_empty_string(self.consumer, field_name="consumer")
+        _string_tuple(self.handoff_refs, field_name="handoff_refs")
+        _string_tuple(self.artifact_refs, field_name="artifact_refs")
+        _string_mapping(self.provenance, field_name="provenance")
+        _string_mapping(self.metadata, field_name="metadata")
+        if self.updated_at < self.created_at:
+            msg = "workspace lease updated_at cannot be before created_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.expires_at <= self.created_at:
+            msg = "workspace lease expires_at must be after created_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.released_at is not None and self.released_at < self.created_at:
+            msg = "workspace lease released_at cannot be before created_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.revoked_at is not None and self.revoked_at < self.created_at:
+            msg = "workspace lease revoked_at cannot be before created_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.state is WorkspaceLeaseState.RELEASED and self.released_at is None:
+            msg = "released workspace leases require released_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.state is WorkspaceLeaseState.REVOKED and self.revoked_at is None:
+            msg = "revoked workspace leases require revoked_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.state is WorkspaceLeaseState.EXPIRED and self.updated_at < self.expires_at:
+            msg = "expired workspace leases must be updated at or after expires_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.state not in {WorkspaceLeaseState.RELEASED, WorkspaceLeaseState.REVOKED} and (
+            self.released_at is not None or self.revoked_at is not None
+        ):
+            msg = "non-terminal release/revoke timestamps must match lease state"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.classification in _NON_AUTHORITATIVE_CLASSES:
+            if self.authority is not WorkspaceLeaseAuthority.NON_AUTHORITATIVE:
+                msg = f"{self.classification.value} workspace leases must be non-authoritative"
+                raise WorkspaceLeaseValidationError(msg)
+            if self.trust is not WorkspaceLeaseTrust.UNTRUSTED:
+                msg = f"{self.classification.value} workspace leases must be marked untrusted"
+                raise WorkspaceLeaseValidationError(msg)
+        if self.trust is WorkspaceLeaseTrust.UNTRUSTED and self.authority is WorkspaceLeaseAuthority.AUTHORITATIVE:
+            msg = "untrusted workspace leases cannot be authoritative"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.authority is WorkspaceLeaseAuthority.AUTHORITATIVE and self.trust is not WorkspaceLeaseTrust.TRUSTED_RUNTIME:
+            msg = "authoritative workspace leases require trusted_runtime trust"
+            raise WorkspaceLeaseValidationError(msg)
+        if not self.sha256 or self.sha256 != self.integrity_hash():
+            msg = "workspace lease integrity hash is missing or invalid"
+            raise WorkspaceLeaseValidationError(msg)
+
+    def is_expired(self, *, at: datetime | None = None) -> bool:
+        """Return whether the lease TTL has elapsed by ``at``."""
+
+        check_at = at or datetime.now(UTC)
+        if check_at.tzinfo is None:
+            check_at = check_at.replace(tzinfo=UTC)
+        return self.state is WorkspaceLeaseState.EXPIRED or check_at >= self.expires_at
+
+    def transition(self, new_state: WorkspaceLeaseState, *, at: datetime) -> Self:
+        """Return a new lease record after a valid lifecycle transition."""
+
+        if new_state not in _ALLOWED_TRANSITIONS[self.state]:
+            msg = f"workspace lease cannot transition from {self.state.value} to {new_state.value}"
+            raise WorkspaceLeaseValidationError(msg)
+        released_at = self.released_at
+        revoked_at = self.revoked_at
+        if new_state is WorkspaceLeaseState.RELEASED:
+            released_at = at
+        elif new_state is WorkspaceLeaseState.REVOKED:
+            revoked_at = at
+        elif new_state is WorkspaceLeaseState.EXPIRED and at < self.expires_at:
+            msg = "workspace lease cannot expire before expires_at"
+            raise WorkspaceLeaseValidationError(msg)
+        base = replace(
+            self,
+            state=new_state,
+            updated_at=at,
+            released_at=released_at,
+            revoked_at=revoked_at,
+            sha256="pending",
+        )
+        lease = replace(base, sha256=base.integrity_hash())
+        lease.validate()
+        return lease
+
+
+def requested_workspace_lease(
     *,
-    storage_root: Path,
-) -> WorkspaceLeaseRecord:
-    payload_lease_id = payload.get("lease_id", lease_id)
-    if payload_lease_id != lease_id:
-        msg = "lease_id mismatch"
-        raise WorkspaceLeaseRegistryError(msg)
-    workspace_root = payload.get("workspace_root")
-    if not isinstance(workspace_root, str):
-        msg = "workspace_root must be a string"
-        raise WorkspaceLeaseRegistryError(msg)
-    status = payload.get("status")
-    if status not in ("active", "released", "expired"):
-        msg = "status must be active, released, or expired"
-        raise WorkspaceLeaseRegistryError(msg)
-    created_at = _payload_number(payload.get("created_at"), "created_at")
-    updated_at = _payload_number(payload.get("updated_at"), "updated_at")
-    expires_at = _payload_optional_number(payload.get("expires_at"), "expires_at")
-    released_at = _payload_optional_number(payload.get("released_at"), "released_at")
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
-    return WorkspaceLeaseRecord(
-        lease_id=_validate_lease_id(lease_id),
-        workspace_root=_resolve_workspace_root(Path(workspace_root), storage_root=storage_root),
-        owner_kind=_validate_limited_text(payload.get("owner_kind"), "owner_kind", max_length=_MAX_OWNER_KIND_LENGTH),
-        owner_id=_validate_limited_text(payload.get("owner_id"), "owner_id", max_length=_MAX_OWNER_ID_LENGTH),
-        purpose=_validate_optional_limited_text(payload.get("purpose"), "purpose", max_length=_MAX_PURPOSE_LENGTH),
-        status=cast("WorkspaceLeaseStatus", status),
-        metadata=_validate_metadata(cast("Mapping[str, object]", metadata)),
-        created_at=created_at,
-        updated_at=updated_at,
-        expires_at=expires_at,
-        released_at=released_at,
+    lease_id: str,
+    workspace_ref: str,
+    owner: str,
+    consumer: str,
+    ttl: timedelta,
+    created_at: datetime | None = None,
+    handoff_refs: tuple[str, ...] = (),
+    artifact_refs: tuple[str, ...] = (),
+    provenance: dict[str, str] | None = None,
+) -> WorkspaceLease:
+    """Return a trusted runtime lease request with explicit TTL semantics."""
+
+    if ttl <= timedelta(0):
+        msg = "workspace lease ttl must be positive"
+        raise WorkspaceLeaseValidationError(msg)
+    now = created_at or datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return WorkspaceLease.create(
+        lease_id=lease_id,
+        workspace_ref=workspace_ref,
+        owner=owner,
+        consumer=consumer,
+        classification=WorkspaceLeaseSourceClassification.RUNTIME_RECORD,
+        trust=WorkspaceLeaseTrust.TRUSTED_RUNTIME,
+        authority=WorkspaceLeaseAuthority.AUTHORITATIVE,
+        created_at=now,
+        expires_at=now + ttl,
+        handoff_refs=handoff_refs,
+        artifact_refs=artifact_refs,
+        provenance=provenance or {"schema": "workspace-lease-v1", "source": "trusted-runtime"},
     )
-
-
-def _payload_number(value: object, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        msg = f"{field_name} must be a number"
-        raise WorkspaceLeaseRegistryError(msg)
-    return float(value)
-
-
-def _payload_optional_number(value: object, field_name: str) -> float | None:
-    if value is None:
-        return None
-    return _payload_number(value, field_name)
-
-
-def _lease_with_effective_status(record: WorkspaceLeaseRecord, *, now: float) -> WorkspaceLeaseRecord:
-    if record.status == "active" and record.expires_at is not None and record.expires_at <= now:
-        return replace(record, status="expired", updated_at=now)
-    return record
-
-
-def _record_to_payload(record: WorkspaceLeaseRecord) -> WorkspaceLeaseRecordPayload:
-    return {
-        "lease_id": record.lease_id,
-        "workspace_root": str(record.workspace_root),
-        "owner_kind": record.owner_kind,
-        "owner_id": record.owner_id,
-        "purpose": record.purpose,
-        "status": record.status,
-        "metadata": dict(record.metadata),
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
-        "expires_at": record.expires_at,
-        "released_at": record.released_at,
-    }
-
-
-def _require_record(records: Mapping[str, WorkspaceLeaseRecord], lease_id: str) -> WorkspaceLeaseRecord:
-    try:
-        return records[lease_id]
-    except KeyError:
-        msg = f"workspace lease not found: {lease_id}"
-        raise WorkspaceLeaseRegistryError(msg) from None
