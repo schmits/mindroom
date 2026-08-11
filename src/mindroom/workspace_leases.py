@@ -13,6 +13,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
+import re
 from typing import Any, Self
 
 
@@ -75,6 +76,31 @@ _NON_AUTHORITATIVE_CLASSES = {
     WorkspaceLeaseSourceClassification.UNTRUSTED_REPO_CONTENT,
 }
 
+_SCHEMA_FIELDS = frozenset({
+    "lease_id",
+    "state",
+    "workspace_ref",
+    "owner",
+    "consumer",
+    "classification",
+    "trust",
+    "authority",
+    "created_at",
+    "updated_at",
+    "expires_at",
+    "released_at",
+    "revoked_at",
+    "handoff_refs",
+    "artifact_refs",
+    "provenance",
+    "metadata",
+    "sha256",
+})
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SIMPLE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_MATRIX_IDENTIFIER_RE = re.compile(r"^@[A-Za-z0-9_.=-]+:[A-Za-z0-9.-]+$")
+
 _STRUCTURAL_HASH_FIELDS = (
     "lease_id",
     "state",
@@ -97,10 +123,40 @@ _STRUCTURAL_HASH_FIELDS = (
 
 
 def _require_non_empty_string(value: object, *, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value:
         msg = f"workspace lease {field_name} must be a non-empty string"
         raise WorkspaceLeaseValidationError(msg)
+    if value != value.strip():
+        msg = f"workspace lease {field_name} must not contain leading or trailing whitespace"
+        raise WorkspaceLeaseValidationError(msg)
+    if any(char.isspace() for char in value):
+        msg = f"workspace lease {field_name} must not contain whitespace"
+        raise WorkspaceLeaseValidationError(msg)
     return value
+
+
+def _require_identifier(value: object, *, field_name: str) -> str:
+    identifier = _require_non_empty_string(value, field_name=field_name)
+    if _MATRIX_IDENTIFIER_RE.fullmatch(identifier) or _SIMPLE_IDENTIFIER_RE.fullmatch(identifier):
+        return identifier
+    msg = f"workspace lease {field_name} has ambiguous identifier format"
+    raise WorkspaceLeaseValidationError(msg)
+
+
+def _require_ref(value: object, *, field_name: str) -> str:
+    ref = _require_non_empty_string(value, field_name=field_name)
+    if "://" not in ref:
+        msg = f"workspace lease {field_name} must be an opaque URI reference"
+        raise WorkspaceLeaseValidationError(msg)
+    return ref
+
+
+def _require_integrity_hash(value: object) -> str:
+    digest = _require_non_empty_string(value, field_name="sha256")
+    if _SHA256_RE.fullmatch(digest) is None:
+        msg = "workspace lease sha256 must be exactly 64 lowercase hex characters"
+        raise WorkspaceLeaseValidationError(msg)
+    return digest
 
 
 def _enum_value(enum_type: type[StrEnum], value: object, *, field_name: str) -> StrEnum:
@@ -116,6 +172,13 @@ def _enum_value(enum_type: type[StrEnum], value: object, *, field_name: str) -> 
     raise WorkspaceLeaseValidationError(msg)
 
 
+def _require_aware_datetime(value: datetime, *, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        msg = f"workspace lease {field_name} must be timezone-aware"
+        raise WorkspaceLeaseValidationError(msg)
+    return value
+
+
 def _parse_datetime(value: object, *, field_name: str, required: bool = False) -> datetime | None:
     if value is None:
         if required:
@@ -123,25 +186,34 @@ def _parse_datetime(value: object, *, field_name: str, required: bool = False) -
             raise WorkspaceLeaseValidationError(msg)
         return None
     if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return _require_aware_datetime(value, field_name=field_name)
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as exc:
-            msg = f"workspace lease {field_name} must be ISO-8601"
+            msg = f"workspace lease {field_name} must be timezone-aware ISO-8601"
             raise WorkspaceLeaseValidationError(msg) from exc
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
-    msg = f"workspace lease {field_name} must be ISO-8601"
+        return _require_aware_datetime(parsed, field_name=field_name)
+    msg = f"workspace lease {field_name} must be timezone-aware ISO-8601"
     raise WorkspaceLeaseValidationError(msg)
 
 
-def _string_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
+def _canonical_datetime(value: datetime) -> str:
+    return _require_aware_datetime(value, field_name="timestamp").astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _string_tuple(value: object, *, field_name: str, refs: bool = False) -> tuple[str, ...]:
     if value is None:
         return ()
     if not isinstance(value, (list, tuple)):
         msg = f"workspace lease {field_name} must be a list of non-empty strings"
         raise WorkspaceLeaseValidationError(msg)
-    return tuple(_require_non_empty_string(item, field_name=field_name) for item in value)
+    validator = _require_ref if refs else _require_non_empty_string
+    values = tuple(validator(item, field_name=field_name) for item in value)
+    if len(values) != len(set(values)):
+        msg = f"workspace lease {field_name} must not contain duplicate refs"
+        raise WorkspaceLeaseValidationError(msg)
+    return values
 
 
 def _string_mapping(value: object, *, field_name: str) -> dict[str, str]:
@@ -242,12 +314,24 @@ class WorkspaceLease:
     def from_mapping(cls, payload: dict[str, object]) -> Self:
         """Build and validate a lease from JSON-like data."""
 
+        if not isinstance(payload, dict):
+            msg = "workspace lease payload must be a mapping"
+            raise WorkspaceLeaseValidationError(msg)
+        missing_keys = _SCHEMA_FIELDS - set(payload)
+        if missing_keys:
+            msg = f"workspace lease payload is missing required keys: {', '.join(sorted(missing_keys))}"
+            raise WorkspaceLeaseValidationError(msg)
+        extra_keys = set(payload) - _SCHEMA_FIELDS
+        if extra_keys:
+            msg = f"workspace lease payload has unknown keys: {', '.join(sorted(extra_keys))}"
+            raise WorkspaceLeaseValidationError(msg)
+
         lease = cls(
             lease_id=_require_non_empty_string(payload.get("lease_id"), field_name="lease_id"),
             state=_enum_value(WorkspaceLeaseState, payload.get("state"), field_name="state"),  # type: ignore[arg-type]
-            workspace_ref=_require_non_empty_string(payload.get("workspace_ref"), field_name="workspace_ref"),
-            owner=_require_non_empty_string(payload.get("owner"), field_name="owner"),
-            consumer=_require_non_empty_string(payload.get("consumer"), field_name="consumer"),
+            workspace_ref=_require_ref(payload.get("workspace_ref"), field_name="workspace_ref"),
+            owner=_require_identifier(payload.get("owner"), field_name="owner"),
+            consumer=_require_identifier(payload.get("consumer"), field_name="consumer"),
             classification=_enum_value(  # type: ignore[arg-type]
                 WorkspaceLeaseSourceClassification,
                 payload.get("classification"),
@@ -264,11 +348,11 @@ class WorkspaceLease:
             expires_at=_parse_datetime(payload.get("expires_at"), field_name="expires_at", required=True),  # type: ignore[arg-type]
             released_at=_parse_datetime(payload.get("released_at"), field_name="released_at"),
             revoked_at=_parse_datetime(payload.get("revoked_at"), field_name="revoked_at"),
-            handoff_refs=_string_tuple(payload.get("handoff_refs"), field_name="handoff_refs"),
-            artifact_refs=_string_tuple(payload.get("artifact_refs"), field_name="artifact_refs"),
+            handoff_refs=_string_tuple(payload.get("handoff_refs"), field_name="handoff_refs", refs=True),
+            artifact_refs=_string_tuple(payload.get("artifact_refs"), field_name="artifact_refs", refs=True),
             provenance=_string_mapping(payload.get("provenance"), field_name="provenance"),
             metadata=_string_mapping(payload.get("metadata", {"schema": "workspace-lease-v1"}), field_name="metadata"),
-            sha256=_require_non_empty_string(payload.get("sha256"), field_name="sha256"),
+            sha256=_require_integrity_hash(payload.get("sha256")),
         )
         lease.validate()
         return lease
@@ -295,11 +379,11 @@ class WorkspaceLease:
             "classification": self.classification.value,
             "trust": self.trust.value,
             "authority": self.authority.value,
-            "created_at": self.created_at.isoformat(),
-            "updated_at": self.updated_at.isoformat(),
-            "expires_at": self.expires_at.isoformat(),
-            "released_at": self.released_at.isoformat() if self.released_at is not None else None,
-            "revoked_at": self.revoked_at.isoformat() if self.revoked_at is not None else None,
+            "created_at": _canonical_datetime(self.created_at),
+            "updated_at": _canonical_datetime(self.updated_at),
+            "expires_at": _canonical_datetime(self.expires_at),
+            "released_at": _canonical_datetime(self.released_at) if self.released_at is not None else None,
+            "revoked_at": _canonical_datetime(self.revoked_at) if self.revoked_at is not None else None,
             "handoff_refs": list(self.handoff_refs),
             "artifact_refs": list(self.artifact_refs),
             "provenance": dict(self.provenance),
@@ -313,13 +397,23 @@ class WorkspaceLease:
         """Fail closed for ambiguous trust, authority, TTL, lifecycle, or integrity."""
 
         _require_non_empty_string(self.lease_id, field_name="lease_id")
-        _require_non_empty_string(self.workspace_ref, field_name="workspace_ref")
-        _require_non_empty_string(self.owner, field_name="owner")
-        _require_non_empty_string(self.consumer, field_name="consumer")
-        _string_tuple(self.handoff_refs, field_name="handoff_refs")
-        _string_tuple(self.artifact_refs, field_name="artifact_refs")
+        _require_ref(self.workspace_ref, field_name="workspace_ref")
+        _require_identifier(self.owner, field_name="owner")
+        _require_identifier(self.consumer, field_name="consumer")
+        _string_tuple(self.handoff_refs, field_name="handoff_refs", refs=True)
+        _string_tuple(self.artifact_refs, field_name="artifact_refs", refs=True)
+        _require_aware_datetime(self.created_at, field_name="created_at")
+        _require_aware_datetime(self.updated_at, field_name="updated_at")
+        _require_aware_datetime(self.expires_at, field_name="expires_at")
+        if self.released_at is not None:
+            _require_aware_datetime(self.released_at, field_name="released_at")
+        if self.revoked_at is not None:
+            _require_aware_datetime(self.revoked_at, field_name="revoked_at")
         _string_mapping(self.provenance, field_name="provenance")
         _string_mapping(self.metadata, field_name="metadata")
+        if _SHA256_RE.fullmatch(self.sha256) is None or self.sha256 != self.integrity_hash():
+            msg = "workspace lease integrity hash is missing or invalid"
+            raise WorkspaceLeaseValidationError(msg)
         if self.updated_at < self.created_at:
             msg = "workspace lease updated_at cannot be before created_at"
             raise WorkspaceLeaseValidationError(msg)
@@ -331,6 +425,21 @@ class WorkspaceLease:
             raise WorkspaceLeaseValidationError(msg)
         if self.revoked_at is not None and self.revoked_at < self.created_at:
             msg = "workspace lease revoked_at cannot be before created_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.state in {WorkspaceLeaseState.REQUESTED, WorkspaceLeaseState.ACTIVE} and self.updated_at >= self.expires_at:
+            msg = "requested and active workspace leases must not be structurally expired"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.released_at is not None and self.updated_at < self.released_at:
+            msg = "workspace lease updated_at cannot be before released_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.revoked_at is not None and self.updated_at < self.revoked_at:
+            msg = "workspace lease updated_at cannot be before revoked_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.released_at is not None and self.released_at >= self.expires_at:
+            msg = "workspace lease cannot be released at or after expires_at"
+            raise WorkspaceLeaseValidationError(msg)
+        if self.revoked_at is not None and self.revoked_at >= self.expires_at:
+            msg = "workspace lease cannot be revoked at or after expires_at"
             raise WorkspaceLeaseValidationError(msg)
         if self.state is WorkspaceLeaseState.RELEASED and self.released_at is None:
             msg = "released workspace leases require released_at"
@@ -359,21 +468,21 @@ class WorkspaceLease:
         if self.authority is WorkspaceLeaseAuthority.AUTHORITATIVE and self.trust is not WorkspaceLeaseTrust.TRUSTED_RUNTIME:
             msg = "authoritative workspace leases require trusted_runtime trust"
             raise WorkspaceLeaseValidationError(msg)
-        if not self.sha256 or self.sha256 != self.integrity_hash():
-            msg = "workspace lease integrity hash is missing or invalid"
-            raise WorkspaceLeaseValidationError(msg)
 
     def is_expired(self, *, at: datetime | None = None) -> bool:
         """Return whether the lease TTL has elapsed by ``at``."""
 
         check_at = at or datetime.now(UTC)
-        if check_at.tzinfo is None:
-            check_at = check_at.replace(tzinfo=UTC)
+        _require_aware_datetime(check_at, field_name="at")
         return self.state is WorkspaceLeaseState.EXPIRED or check_at >= self.expires_at
 
     def transition(self, new_state: WorkspaceLeaseState, *, at: datetime) -> Self:
         """Return a new lease record after a valid lifecycle transition."""
 
+        if not isinstance(new_state, WorkspaceLeaseState):
+            msg = "workspace lease transition state must be a WorkspaceLeaseState"
+            raise WorkspaceLeaseValidationError(msg)
+        _require_aware_datetime(at, field_name="at")
         if new_state not in _ALLOWED_TRANSITIONS[self.state]:
             msg = f"workspace lease cannot transition from {self.state.value} to {new_state.value}"
             raise WorkspaceLeaseValidationError(msg)
@@ -414,11 +523,10 @@ def requested_workspace_lease(
     """Return a trusted runtime lease request with explicit TTL semantics."""
 
     if ttl <= timedelta(0):
-        msg = "workspace lease ttl must be positive"
+        msg = "workspace lease ttl must be positive".substring?; // No, okay
         raise WorkspaceLeaseValidationError(msg)
     now = created_at or datetime.now(UTC)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
+    _require_aware_datetime(now, field_name="created_at")
     return WorkspaceLease.create(
         lease_id=lease_id,
         workspace_ref=workspace_ref,
