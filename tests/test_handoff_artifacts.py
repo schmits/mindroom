@@ -135,3 +135,42 @@ def test_integrity_hash_is_required_and_checked() -> None:
 
     with pytest.raises(HandoffArtifactValidationError, match="integrity hash is missing or invalid"):
         HandoffArtifact.from_mapping(payload)
+
+
+def test_from_mapping_rejects_invalid_lease_ref_types() -> None:
+    artifact = HandoffArtifact.create(
+        artifact_id="lease-ref-type",
+        classification=HandoffSourceClassification.ARTIFACT,
+        producer="producer",
+        consumer="consumer",
+        trust=HandoffTrust.VERIFIED_ARTIFACT,
+        authority=HandoffAuthority.EVIDENCE,
+        refs=("artifact://report.json",),
+        manifest={"path": "report.json"},
+        lease_ref="lease://valid",
+    )
+
+    for invalid_lease_ref in (False, 1, [], {}, object()):
+        payload = artifact.to_mapping()
+        payload["lease_ref"] = invalid_lease_ref
+        with pytest.raises(HandoffArtifactValidationError, match="lease_ref must be a non-empty string"):
+            HandoffArtifact.from_mapping(payload)
+
+
+def test_from_mapping_rejects_non_boolean_materialize_allowed() -> None:
+    artifact = HandoffArtifact.create(
+        artifact_id="materialize-type",
+        classification=HandoffSourceClassification.ARTIFACT,
+        producer="producer",
+        consumer="consumer",
+        trust=HandoffTrust.VERIFIED_ARTIFACT,
+        authority=HandoffAuthority.EVIDENCE,
+        refs=("artifact://report.json",),
+        manifest={"path": "report.json"},
+    )
+
+    for invalid_materialize_allowed in ("false", "no", 1, [], None):
+        payload = artifact.to_mapping()
+        payload["materialize_allowed"] = invalid_materialize_allowed
+        with pytest.raises(HandoffArtifactValidationError, match="materialize_allowed must be a boolean"):
+            HandoffArtifact.from_mapping(payload)
