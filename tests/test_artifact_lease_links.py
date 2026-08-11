@@ -230,6 +230,18 @@ def test_link_rejects_missing_cross_reference() -> None:
         ArtifactLeaseLink.create(artifact=_artifact(), lease=_lease(artifact_ref="artifact://other.json"))
 
 
+def test_link_rejects_custom_artifact_ref_not_in_artifact_refs() -> None:
+    with pytest.raises(
+        ArtifactLeaseLinkValidationError,
+        match="handoff artifact must reference the linked artifact_ref",
+    ):
+        ArtifactLeaseLink.create(
+            artifact=_artifact(),
+            lease=_lease(artifact_ref="artifact://custom.json"),
+            artifact_ref="artifact://custom.json",
+        )
+
+
 def test_link_rejects_mismatched_lease_ref() -> None:
     with pytest.raises(ArtifactLeaseLinkValidationError, match="lease_ref must match linked lease_ref"):
         ArtifactLeaseLink.create(artifact=_artifact(lease_ref="lease://different"), lease=_lease())
