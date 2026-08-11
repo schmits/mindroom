@@ -1,0 +1,1 @@
+$(cat plugin_artifact_lease_links.py)
