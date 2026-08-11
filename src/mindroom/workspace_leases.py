@@ -523,7 +523,7 @@ def requested_workspace_lease(
     """Return a trusted runtime lease request with explicit TTL semantics."""
 
     if ttl <= timedelta(0):
-        msg = "workspace lease ttl must be positive".substring?; // No, okay
+        msg = "workspace lease ttl must be positive"
         raise WorkspaceLeaseValidationError(msg)
     now = created_at or datetime.now(UTC)
     _require_aware_datetime(now, field_name="created_at")
