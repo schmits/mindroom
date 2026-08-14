@@ -52,12 +52,10 @@ plugins:
       notify_thread_id: "$thread"   # optional
       # Or send back to the source room/thread instead of notify_room_id.
       send_to_source_room: false
-      # Optional plugin-local dedupe persisted below ctx.state_root by default.
-      # dedupe_state_dir may be absolute or relative, but must resolve inside ctx.state_root.
+      # Optional plugin-local dedupe persisted below ctx.state_root.
       # The state file is bounded, atomically replaced, and process-local locked
       # so duplicate concurrent terminal hooks do not both notify.
       dedup_enabled: true
-      dedupe_state_dir: .   # optional; defaults to ctx.state_root
       dedup_max_entries: 512
       # Optional dynamic scoping when decorator-level static scoping is not enough.
       agents: [mind]
@@ -70,9 +68,9 @@ Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plu
 
 ## Dedupe state
 
-When `dedup_enabled` is true, the plugin records terminal notification keys in `dedupe.json` under the plugin `ctx.state_root`, or under configured `dedupe_state_dir` when that directory resolves inside `ctx.state_root`. The file contains only minimized event identifiers and timestamps, never response text. Existing list-shaped dedupe files from the initial plugin release are still accepted and are rewritten to the structured bounded format on the next successful notification.
+When `dedup_enabled` is true, the plugin records terminal notification keys in `dedupe.json` under the plugin `ctx.state_root`. The file contains only minimized event identifiers and timestamps, never response text. Existing list-shaped dedupe files from the initial plugin release are still accepted and are rewritten to the structured bounded format on the next successful notification.
 
-Dedupe state is written to runtime plugin state, not the plugin source directory. If an older deployment already has `dedupe.json` in this plugin directory, the plugin copies those minimized dedupe keys into the runtime state file on first use for backward compatibility and then continues using runtime state.
+Dedupe state is written to runtime plugin state, not the plugin source directory.
 
 ## Plugin-only limitations
 
