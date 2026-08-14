@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -173,4 +175,64 @@ async def test_after_response_hook_can_send_matrix_notification_and_dedupes(tmp_
     assert call.args[0] == "!ops:localhost"
     assert '"response_text"' not in call.args[1]
     assert call.args[4]["mindroom.session_completion"]["status"] == "completed"
-    assert (ctx.state_root / "dedupe.json").exists()
+    state = json.loads((ctx.state_root / "dedupe.json").read_text(encoding="utf-8"))
+    assert state["version"] == 1
+    assert len(state["entries"]) == 1
+    assert state["entries"][0]["key"].startswith("completed|corr-1|$source|$response|")
+
+
+@pytest.mark.asyncio
+async def test_dedupe_state_migrates_legacy_list_and_bounds_entries(tmp_path: Path) -> None:
+    """Legacy list state remains readable and is rewritten as bounded structured state."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"notify_room_id": "!ops:localhost", "log_payload": False, "dedup_max_entries": 2},
+    )
+    dedupe_path = ctx.state_root / "dedupe.json"
+    dedupe_path.parent.mkdir(parents=True, exist_ok=True)
+    dedupe_path.write_text('["legacy-key"]\n', encoding="utf-8")
+
+    with patch.object(hooks, "time", return_value=1234.5):
+        await hooks.notify_after_response(ctx)
+
+    state = json.loads(dedupe_path.read_text(encoding="utf-8"))
+    assert state == {
+        "version": 1,
+        "entries": [
+            {"key": "legacy-key"},
+            {"key": "completed|corr-1|$source|$response|", "first_seen_at": 1234.5},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_dedupe_state_serializes_concurrent_terminal_events(tmp_path: Path) -> None:
+    """Concurrent duplicate hook invocations share plugin-local state before sending."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"notify_room_id": "!ops:localhost", "log_payload": False},
+    )
+
+    await asyncio.gather(hooks.notify_after_response(ctx), hooks.notify_after_response(ctx))
+
+    assert ctx.message_sender.await_count == 1
+    state = json.loads((ctx.state_root / "dedupe.json").read_text(encoding="utf-8"))
+    assert len(state["entries"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_dedupe_disabled_does_not_write_state(tmp_path: Path) -> None:
+    """Operators can opt out of persistence when idempotency is handled elsewhere."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"notify_room_id": "!ops:localhost", "log_payload": False, "dedup_enabled": False},
+    )
+
+    await hooks.notify_after_response(ctx)
+    await hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 2
+    assert not (ctx.state_root / "dedupe.json").exists()
