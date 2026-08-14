@@ -237,7 +237,7 @@ async def _emit_notification(
         ctx.logger.debug("Skipping duplicate session completion notification", payload=payload)
         return
 
-    if _as_bool(ctx.settings.get("log_payload"), default=True):
+    if _as_bool(ctx.settings.get("log_payload"), default=False):
         ctx.logger.info("Session completion notification", payload=payload)
 
     room_id = ctx.settings.get("notify_room_id")
