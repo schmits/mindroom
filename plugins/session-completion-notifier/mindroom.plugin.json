@@ -1,0 +1,4 @@
+{
+  "name": "session-completion-notifier",
+  "hooks_module": "hooks.py"
+}
