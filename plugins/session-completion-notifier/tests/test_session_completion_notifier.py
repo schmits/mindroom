@@ -93,6 +93,8 @@ def _after_context(tmp_path: Path, *, settings: dict[str, object] | None = None)
         logger=get_logger("tests.session_completion_notifier"),
         correlation_id="corr-1",
         message_sender=AsyncMock(return_value="$notice"),
+        room_state_querier=AsyncMock(return_value=None),
+        room_state_putter=AsyncMock(return_value=True),
         result=ResponseResult(
             response_text="secret response text",
             response_event_id="$response",
@@ -114,6 +116,8 @@ def _cancelled_context(tmp_path: Path, *, failure_reason: str | None = None) -> 
         logger=get_logger("tests.session_completion_notifier"),
         correlation_id="corr-2",
         message_sender=AsyncMock(return_value="$notice"),
+        room_state_querier=AsyncMock(return_value=None),
+        room_state_putter=AsyncMock(return_value=True),
         info=CancelledResponseInfo(
             envelope=_envelope(),
             visible_response_event_id="$partial",
@@ -156,6 +160,29 @@ def test_cancelled_payload_distinguishes_error_terminal_outcome(tmp_path: Path) 
     assert payload["status"] == "error"
     assert payload["response_event_id"] == "$partial"
     assert payload["delivery"] == {"kind": "failed", "failure_reason": "delivery failed"}
+
+
+def test_ledger_summary_excludes_response_text(tmp_path: Path) -> None:
+    """The parent-ledger representation stores only minimized terminal metadata."""
+    hooks = _load_hooks_module()
+    payload = hooks._completed_payload(_after_context(tmp_path, settings={"include_response_text": True}))
+
+    summary = hooks._ledger_summary(payload)
+
+    assert summary == {
+        "key": "completed|corr-1|$source|$response|",
+        "status": "completed",
+        "agent": "mind",
+        "room_id": "!room:localhost",
+        "thread_id": "$thread",
+        "source_event_id": "$source",
+        "response_event_id": "$response",
+        "correlation_id": "corr-1",
+        "response_kind": "ai",
+        "delivery_kind": "sent",
+        "failure_reason": None,
+    }
+    assert "response_text" not in summary
 
 
 @pytest.mark.asyncio
@@ -237,6 +264,107 @@ async def test_dedupe_state_serializes_concurrent_terminal_events(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_parent_ledger_updates_matrix_state_with_bounded_entries(tmp_path: Path) -> None:
+    """The optional parent ledger is represented as bounded Matrix state content."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={
+            "parent_ledger_enabled": True,
+            "parent_ledger_room_id": "!parent:localhost",
+            "parent_ledger_state_key": "parent-ledger",
+            "parent_ledger_max_entries": 2,
+            "notify_room_id": "!ops:localhost",
+            "log_payload": False,
+        },
+    )
+    ctx.room_state_querier.return_value = {
+        "version": 1,
+        "completions": [
+            {"key": "older", "status": "completed"},
+            {"key": "newer", "status": "completed"},
+        ],
+    }
+
+    with patch.object(hooks, "time", return_value=4567.0):
+        await hooks.notify_after_response(ctx)
+
+    ctx.room_state_querier.assert_awaited_once_with(
+        "!parent:localhost",
+        "mindroom.session_completion.ledger",
+        "parent-ledger",
+    )
+    ctx.room_state_putter.assert_awaited_once()
+    call = ctx.room_state_putter.await_args
+    assert call.args[:3] == (
+        "!parent:localhost",
+        "mindroom.session_completion.ledger",
+        "parent-ledger",
+    )
+    content = call.args[3]
+    assert content["version"] == 1
+    assert content["updated_at"] == 4567.0
+    assert [entry["key"] for entry in content["completions"]] == [
+        "newer",
+        "completed|corr-1|$source|$response|",
+    ]
+    terminal_entry = content["completions"][-1]
+    assert terminal_entry["first_seen_at"] == 4567.0
+    assert terminal_entry["updated_at"] == 4567.0
+    assert "response_text" not in terminal_entry
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_replaces_duplicate_entry_without_growing(tmp_path: Path) -> None:
+    """A repeated terminal key updates the existing parent-ledger entry in place."""
+    hooks = _load_hooks_module()
+    terminal_key = "completed|corr-1|$source|$response|"
+    ctx = _after_context(
+        tmp_path,
+        settings={
+            "parent_ledger_enabled": True,
+            "parent_ledger_room_id": "!parent:localhost",
+            "dedup_enabled": False,
+        },
+    )
+    ctx.room_state_querier.return_value = {
+        "version": 1,
+        "completions": [{"key": terminal_key, "first_seen_at": 111.0, "status": "completed"}],
+    }
+
+    with patch.object(hooks, "time", return_value=222.0):
+        await hooks.notify_after_response(ctx)
+
+    content = ctx.room_state_putter.await_args.args[3]
+    assert len(content["completions"]) == 1
+    assert content["completions"][0]["key"] == terminal_key
+    assert content["completions"][0]["first_seen_at"] == 111.0
+    assert content["completions"][0]["updated_at"] == 222.0
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_failure_is_isolated_from_notification(tmp_path: Path) -> None:
+    """Ledger write failures are warning-only and do not block notification delivery."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={
+            "parent_ledger_enabled": True,
+            "parent_ledger_room_id": "!parent:localhost",
+            "notify_room_id": "!ops:localhost",
+        },
+    )
+    ctx.room_state_putter.side_effect = RuntimeError("state write failed")
+    logger = MagicMock()
+    ctx.logger = logger
+
+    await hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 1
+    logger.warning.assert_called()
+
+
+@pytest.mark.asyncio
 async def test_dedupe_disabled_does_not_write_state(tmp_path: Path) -> None:
     """Operators can opt out of persistence when idempotency is handled elsewhere."""
     hooks = _load_hooks_module()
@@ -250,4 +378,3 @@ async def test_dedupe_disabled_does_not_write_state(tmp_path: Path) -> None:
 
     assert ctx.message_sender.await_count == 2
     assert not (ctx.state_root / "dedupe.json").exists()
-# noqa: W292
