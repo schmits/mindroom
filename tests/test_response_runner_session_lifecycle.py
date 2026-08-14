@@ -38,10 +38,12 @@ from mindroom.history.types import HistoryScope, PreparedHistoryState
 from mindroom.hooks import (
     BUILTIN_EVENT_NAMES,
     EVENT_MESSAGE_CANCELLED,
+    EVENT_SESSION_COMPLETED,
     EVENT_SESSION_STARTED,
     CancelledResponseContext,
     HookRegistry,
     MessageEnvelope,
+    SessionCompletedContext,
     SessionHookContext,
     hook,
 )
@@ -329,13 +331,16 @@ async def test_process_and_respond_streaming_preserves_user_stop_outcome(
     )
 
 
-def test_session_started_event_is_registered() -> None:
-    """session:started should be a built-in event with the expected default timeout."""
+def test_session_events_are_registered() -> None:
+    """session lifecycle events should be built-in with expected default timeouts."""
     assert EVENT_SESSION_STARTED in BUILTIN_EVENT_NAMES
+    assert EVENT_SESSION_COMPLETED in BUILTIN_EVENT_NAMES
     assert validate_event_name(EVENT_SESSION_STARTED) == EVENT_SESSION_STARTED
+    assert validate_event_name(EVENT_SESSION_COMPLETED) == EVENT_SESSION_COMPLETED
     with pytest.raises(ValueError, match="reserved namespace"):
         validate_event_name("session:custom")
     assert default_timeout_ms_for_event(EVENT_SESSION_STARTED) == 5000
+    assert default_timeout_ms_for_event(EVENT_SESSION_COMPLETED) == 5000
 
 
 @pytest.mark.asyncio
@@ -2321,16 +2326,23 @@ async def test_generate_response_preserves_retry_model_prompt(tmp_path: Path) ->
     assert "Available attachment IDs: att_1" in cast("str", persisted_run.messages[0].content)
 
 @pytest.mark.asyncio
-async def test_generate_response_emits_session_completion_callback_once_after_terminal_outcome(
+async def test_generate_response_emits_session_completed_hook_once_after_terminal_outcome(
     tmp_path: Path,
 ) -> None:
-    """A completed agent run should notify the parent/coordinator seam once with terminal facts."""
+    """A completed agent run should emit one data-minimized session:completed hook."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(_config(), runtime_paths)
     bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths)
-    callbacks = AsyncMock()
+    seen: list[SessionCompletedContext] = []
+
+    @hook(EVENT_SESSION_COMPLETED)
+    async def completed(ctx: SessionCompletedContext) -> None:
+        seen.append(ctx)
+
+    registry = HookRegistry.from_plugins([_plugin("session-completion", [completed])])
 
     with (
+        patch("mindroom.response_runner.should_use_streaming", new=AsyncMock(return_value=False)),
         patch("mindroom.response_runner.ai_response", new=AsyncMock(return_value="Hello!")),
         patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
     ):
@@ -2340,22 +2352,20 @@ async def test_generate_response_emits_session_completion_callback_once_after_te
             runtime_paths=runtime_paths,
             storage_path=tmp_path,
             requester_id="@alice:localhost",
+            hook_registry=registry,
             enable_streaming=False,
         )
         response_event_id = await coordinator.generate_response(
-            replace(
-                _response_request(
-                    prompt="Hello",
-                    user_id="@alice:localhost",
-                    correlation_id="corr-1",
-                ),
-                on_session_completed=callbacks,
+            _response_request(
+                prompt="Hello",
+                user_id="@alice:localhost",
+                correlation_id="corr-1",
             ),
         )
 
     assert response_event_id == _visible_response_event_id()
-    callbacks.assert_awaited_once()
-    event = callbacks.await_args.args[0]
+    assert len(seen) == 1
+    event = seen[0]
     assert event.session_id == MessageTarget.resolve("!test:localhost", None, "$user_msg", room_mode=True).session_id
     assert event.response_event_id == _visible_response_event_id()
     assert event.terminal_status == "completed"
@@ -2367,19 +2377,34 @@ async def test_generate_response_emits_session_completion_callback_once_after_te
     assert event.source_event_id == "$user_msg"
     assert event.correlation_id == "corr-1"
     assert event.failure_reason is None
+    assert event.agent_name == "general"
+    assert event.scope == HistoryScope("agent", "general")
 
 
 @pytest.mark.asyncio
-async def test_session_completion_callback_is_idempotent_and_fail_open(
+async def test_session_completed_hook_is_fail_open(
     tmp_path: Path,
 ) -> None:
-    """Callback failures should be logged and must not make a settled response retry."""
+    """Hook failures should be isolated and must not make a settled response retry."""
     runtime_paths = _runtime_paths(tmp_path)
     config = bind_runtime_paths(_config(), runtime_paths)
     bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths)
-    callbacks = AsyncMock(side_effect=RuntimeError("callback down"))
+    seen: list[str] = []
+
+    @hook(EVENT_SESSION_COMPLETED, priority=10)
+    async def failing(_ctx: SessionCompletedContext) -> None:
+        seen.append("failing")
+        msg = "hook down"
+        raise RuntimeError(msg)
+
+    @hook(EVENT_SESSION_COMPLETED, priority=20)
+    async def later(ctx: SessionCompletedContext) -> None:
+        seen.append(f"later:{ctx.terminal_status}")
+
+    registry = HookRegistry.from_plugins([_plugin("session-completion", [failing, later])])
 
     with (
+        patch("mindroom.response_runner.should_use_streaming", new=AsyncMock(return_value=False)),
         patch("mindroom.response_runner.ai_response", new=AsyncMock(return_value="Hello!")),
         patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
     ):
@@ -2389,19 +2414,12 @@ async def test_session_completion_callback_is_idempotent_and_fail_open(
             runtime_paths=runtime_paths,
             storage_path=tmp_path,
             requester_id="@alice:localhost",
+            hook_registry=registry,
             enable_streaming=False,
         )
         response_event_id = await coordinator.generate_response(
-            replace(
-                _response_request(prompt="Hello", user_id="@alice:localhost"),
-                on_session_completed=callbacks,
-            ),
+            _response_request(prompt="Hello", user_id="@alice:localhost"),
         )
 
     assert response_event_id == _visible_response_event_id()
-    callbacks.assert_awaited_once()
-    assert [
-        call.args[0]
-        for call in bot.logger.warning.call_args_list
-        if call.args and call.args[0] == "session_completion_callback_failed"
-    ] == ["session_completion_callback_failed"]
+    assert seen == ["failing", "later:completed"]

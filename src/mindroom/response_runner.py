@@ -30,7 +30,8 @@ from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
 from mindroom.history.storage import has_pending_force_compaction_scope, read_scope_state
 from mindroom.history.turn_recorder import TurnRecorder
-from mindroom.hooks import EnrichmentItem
+from mindroom.history.types import HistoryScope
+from mindroom.hooks import EVENT_SESSION_COMPLETED, EnrichmentItem, SessionCompletedContext, emit
 from mindroom.matrix.client_visible_messages import replace_visible_message
 from mindroom.matrix.presence import should_use_streaming
 from mindroom.matrix.typing import typing_indicator
@@ -71,7 +72,12 @@ from mindroom.teams import TeamMode, select_model_for_team, team_response, team_
 from mindroom.thread_summary import thread_summary_message_count_hint
 from mindroom.timing import DispatchPipelineTiming, timed
 from mindroom.tool_system.dynamic_toolkits import visible_tool_surface
-from mindroom.tool_system.runtime_context import ToolDispatchContext, runtime_context_from_dispatch_context
+from mindroom.tool_system.runtime_context import (
+    ToolDispatchContext,
+    ToolRuntimeContext,
+    resolve_tool_runtime_hook_bindings,
+    runtime_context_from_dispatch_context,
+)
 from mindroom.tool_system.worker_routing import run_with_tool_execution_identity, stream_with_tool_execution_identity
 from mindroom.user_turn_time import prefix_user_turn_time
 
@@ -109,7 +115,6 @@ if TYPE_CHECKING:
     from mindroom.conversation_resolver import ConversationResolver
     from mindroom.conversation_state_writer import ConversationStateWriter
     from mindroom.dispatch_source import ScheduledHistoryBudget
-    from mindroom.history.types import HistoryScope
     from mindroom.hooks import MessageEnvelope
     from mindroom.knowledge import KnowledgeAccessSupport
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
@@ -289,23 +294,6 @@ def prepare_memory_and_model_context(
     return prompt, thread_history, model_prompt_content, model_thread_history
 
 
-@dataclass(frozen=True)
-class SessionCompletionEvent:
-    """Terminal facts emitted once when a response session reaches a final outcome."""
-
-    session_id: str | None
-    run_id: str
-    response_event_id: str | None
-    terminal_status: Literal["completed", "cancelled", "error"]
-    run_succeeded: bool
-    source_handled: bool
-    room_id: str
-    thread_id: str | None
-    reply_to_event_id: str | None
-    source_event_id: str
-    correlation_id: str
-    failure_reason: str | None = None
-
 
 @dataclass(frozen=True)
 class ResponseRequest:
@@ -339,7 +327,6 @@ class ResponseRequest:
     on_deferred_outcome_handled: Callable[[str], Awaitable[None]] | None = None
     on_user_stop_handled: Callable[[str, int], Awaitable[None]] | None = None
     on_visible_response: Callable[[str], Awaitable[None]] | None = None
-    on_session_completed: Callable[[SessionCompletionEvent], Awaitable[None]] | None = None
 
     @property
     def room_id(self) -> str:
@@ -1248,52 +1235,66 @@ class ResponseRunner:
         request.on_interrupted_response_recoverable()
         return True
 
-    async def _emit_session_completion(
+    async def _emit_session_completed_hook(
         self,
         request: ResponseRequest,
         final_outcome: FinalDeliveryOutcome,
         *,
+        tool_context: ToolRuntimeContext | None,
         run_id: str,
         post_response_outcome: ResponseOutcome,
         source_handled: bool,
     ) -> None:
-        """Notify the parent/coordinator seam that this response session is terminal.
-
-        The callback is best-effort and deliberately runs after lifecycle finalization
-        has established the canonical delivery outcome.  Failures here must not
-        make an already-visible response retry or roll back; scheduled/polling
-        recovery remains the fallback.
-        """
-        on_session_completed = request.on_session_completed
-        if on_session_completed is None:
+        """Emit the plugin-first session:completed lifecycle hook with failure isolation."""
+        if tool_context is None or not tool_context.hook_registry.has_hooks(EVENT_SESSION_COMPLETED):
             return
-        event = SessionCompletionEvent(
-            session_id=post_response_outcome.session_id,
-            run_id=post_response_outcome.response_run_id or run_id,
+        hook_run_id = post_response_outcome.response_run_id or run_id
+        bindings = resolve_tool_runtime_hook_bindings(tool_context)
+        context = SessionCompletedContext(
+            event_name=EVENT_SESSION_COMPLETED,
+            plugin_name="",
+            settings={},
+            config=tool_context.config,
+            runtime_paths=tool_context.runtime_paths,
+            logger=self.deps.logger.bind(
+                event_name=EVENT_SESSION_COMPLETED,
+                session_id=post_response_outcome.session_id,
+                run_id=hook_run_id,
+            ),
+            correlation_id=self._correlation_id_for_request(request),
+            message_sender=bindings.message_sender,
+            matrix_admin=bindings.matrix_admin,
+            room_state_querier=bindings.room_state_querier,
+            room_state_putter=bindings.room_state_putter,
+            agent_name=tool_context.agent_name,
+            scope=HistoryScope(
+                "team" if tool_context.agent_name in tool_context.config.teams else "agent",
+                tool_context.agent_name,
+            ),
+            session_id=post_response_outcome.session_id or tool_context.session_id,
+            room_id=request.room_id,
+            thread_id=request.thread_id,
+            run_id=hook_run_id,
             response_event_id=final_outcome.final_visible_event_id,
             terminal_status=final_outcome.terminal_status,
             run_succeeded=post_response_outcome.run_succeeded,
             source_handled=source_handled,
-            room_id=request.room_id,
-            thread_id=request.thread_id,
             reply_to_event_id=request.reply_to_event_id,
             source_event_id=request.response_envelope.source_event_id,
-            correlation_id=self._correlation_id_for_request(request),
             failure_reason=final_outcome.failure_reason,
         )
         try:
-            await on_session_completed(event)
+            await emit(tool_context.hook_registry, EVENT_SESSION_COMPLETED, context)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.deps.logger.warning(
-                "session_completion_callback_failed",
-                session_id=event.session_id,
-                run_id=event.run_id,
-                response_event_id=event.response_event_id,
-                terminal_status=event.terminal_status,
+            self.deps.logger.exception(
+                "Failed to emit session:completed",
+                session_id=context.session_id,
+                run_id=context.run_id,
+                response_event_id=context.response_event_id,
+                terminal_status=context.terminal_status,
                 failure_reason=str(error),
-                exception_type=error.__class__.__name__,
             )
 
     async def _record_user_stop_handled(
@@ -1564,6 +1565,7 @@ class ResponseRunner:
         run_id: str,
         build_post_response_outcome: Callable[[FinalDeliveryOutcome], ResponseOutcome],
         post_response_deps: PostResponseEffectsDeps | Callable[[], PostResponseEffectsDeps],
+        tool_context: ToolRuntimeContext | None = None,
         streaming_delivery_error_handler: Callable[
             [StreamingDeliveryError],
             Awaitable[FinalDeliveryOutcome],
@@ -1654,9 +1656,10 @@ class ResponseRunner:
             cancel_source=cancel_source,
             source_handled=source_handled,
         )
-        await self._emit_session_completion(
+        await self._emit_session_completed_hook(
             request,
             final_outcome,
+            tool_context=tool_context,
             run_id=run_id,
             post_response_outcome=post_response_outcome,
             source_handled=source_handled,
@@ -1841,6 +1844,7 @@ class ResponseRunner:
                     room_id=request.room_id,
                     interactive_agent_name=self.deps.agent_name,
                 ),
+                tool_context=None,
             )
         requester_user_id = request.user_id or ""
         _memory_prompt, _memory_thread_history, prepared_prompt, model_thread_history = (
@@ -2315,6 +2319,7 @@ class ResponseRunner:
                 interactive_agent_name=self.deps.agent_name,
                 persist_response_event_id=persist_response_event_id,
             ),
+            tool_context=runtime_context_from_dispatch_context(tool_dispatch),
             streaming_delivery_error_handler=settle_team_streaming_delivery_error,
         )
 

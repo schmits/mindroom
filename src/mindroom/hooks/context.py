@@ -612,6 +612,25 @@ class SessionHookContext(HookContext):
 
 
 @dataclass(slots=True)
+class SessionCompletedContext(SessionHookContext):
+    """Context for session:completed observer hooks.
+
+    The payload is intentionally limited to routing and terminal lifecycle facts;
+    response text, model messages, tool arguments/results, and other transcript
+    content are not exposed.
+    """
+
+    run_id: str
+    response_event_id: str | None
+    terminal_status: str
+    run_succeeded: bool
+    source_handled: bool
+    reply_to_event_id: str | None
+    source_event_id: str
+    failure_reason: str | None = None
+
+
+@dataclass(slots=True)
 class CustomEventContext(HookContext):
     """Context for custom plugin-emitted hook events."""
 
