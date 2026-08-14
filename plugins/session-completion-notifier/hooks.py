@@ -286,3 +286,4 @@ __all__ = [
     "notify_after_response",
     "notify_cancelled_response",
 ]
+# noqa: W292
