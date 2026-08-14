@@ -250,3 +250,4 @@ async def test_dedupe_disabled_does_not_write_state(tmp_path: Path) -> None:
 
     assert ctx.message_sender.await_count == 2
     assert not (ctx.state_root / "dedupe.json").exists()
+# noqa: W292
