@@ -29,6 +29,11 @@ _DEDUP_STATE_VERSION = 1
 _DEFAULT_DEDUP_MAX_ENTRIES = 512
 _DEDUP_LOCKS: dict[str, asyncio.Lock] = {}
 _DEDUP_LOCKS_GUARD = asyncio.Lock()
+_LEDGER_LOCKS: dict[str, asyncio.Lock] = {}
+_LEDGER_LOCKS_GUARD = asyncio.Lock()
+_PARENT_LEDGER_STATE_EVENT_TYPE = "mindroom.session_completion.ledger"
+_PARENT_LEDGER_STATE_VERSION = 1
+_DEFAULT_PARENT_LEDGER_MAX_ENTRIES = 256
 
 
 def _as_bool(value: object, *, default: bool = False) -> bool:
@@ -126,7 +131,7 @@ def _cancelled_payload(ctx: CancelledResponseContext) -> dict[str, object]:
     }
 
 
-def _dedupe_key(payload: Mapping[str, object]) -> str:
+def _terminal_key(payload: Mapping[str, object]) -> str:
     delivery = payload.get("delivery")
     failure_reason = delivery.get("failure_reason") if isinstance(delivery, Mapping) else None
     parts = (
@@ -137,6 +142,138 @@ def _dedupe_key(payload: Mapping[str, object]) -> str:
         failure_reason,
     )
     return "|".join("" if part is None else str(part) for part in parts)
+
+
+def _as_non_empty_string(value: object) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return None
+
+
+def _parent_ledger_enabled(settings: Mapping[str, object]) -> bool:
+    return _as_bool(settings.get("parent_ledger_enabled"), default=False)
+
+
+def _parent_ledger_room_id(settings: Mapping[str, object], envelope: MessageEnvelope) -> str | None:
+    room_id = _as_non_empty_string(settings.get("parent_ledger_room_id"))
+    if room_id is not None:
+        return room_id
+    if _as_bool(settings.get("parent_ledger_to_source_room"), default=False):
+        return envelope.room_id
+    return None
+
+
+def _parent_ledger_state_event_type(settings: Mapping[str, object]) -> str:
+    return _as_non_empty_string(settings.get("parent_ledger_state_event_type")) or _PARENT_LEDGER_STATE_EVENT_TYPE
+
+
+def _parent_ledger_state_key(ctx: AfterResponseContext | CancelledResponseContext, envelope: MessageEnvelope) -> str:
+    configured = _as_non_empty_string(ctx.settings.get("parent_ledger_state_key"))
+    if configured is not None:
+        return configured
+    return envelope.agent_name or ctx.plugin_name
+
+
+def _ledger_summary(payload: Mapping[str, object]) -> dict[str, object]:
+    """Return minimized ledger material, deliberately excluding response text."""
+    room = payload.get("room")
+    room_id = room.get("id") if isinstance(room, Mapping) else None
+    thread_id = room.get("thread_id") if isinstance(room, Mapping) else None
+    delivery = payload.get("delivery")
+    delivery_kind = delivery.get("kind") if isinstance(delivery, Mapping) else None
+    failure_reason = delivery.get("failure_reason") if isinstance(delivery, Mapping) else None
+    return {
+        "key": _terminal_key(payload),
+        "status": payload.get("status"),
+        "agent": payload.get("agent"),
+        "room_id": room_id,
+        "thread_id": thread_id,
+        "source_event_id": payload.get("source_event_id"),
+        "response_event_id": payload.get("response_event_id"),
+        "correlation_id": payload.get("correlation_id"),
+        "response_kind": payload.get("response_kind"),
+        "delivery_kind": delivery_kind,
+        "failure_reason": failure_reason,
+    }
+
+
+def _coerce_parent_ledger(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, Mapping):
+        return []
+    raw_entries = raw.get("completions")
+    if not isinstance(raw_entries, list):
+        return []
+    entries: list[dict[str, object]] = []
+    for entry in raw_entries:
+        if not isinstance(entry, Mapping):
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        entries.append(dict(entry))
+    return entries
+
+
+async def _ledger_lock(room_id: str, event_type: str, state_key: str) -> asyncio.Lock:
+    lock_key = f"{room_id}\0{event_type}\0{state_key}"
+    async with _LEDGER_LOCKS_GUARD:
+        lock = _LEDGER_LOCKS.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _LEDGER_LOCKS[lock_key] = lock
+        return lock
+
+
+async def _update_parent_ledger(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    payload: Mapping[str, object],
+    envelope: MessageEnvelope,
+) -> None:
+    """Best-effort Matrix-state parent ledger update using public hook helpers only."""
+    if not _parent_ledger_enabled(ctx.settings):
+        return
+    room_id = _parent_ledger_room_id(ctx.settings, envelope)
+    if room_id is None:
+        ctx.logger.warning("Session completion parent ledger enabled without a ledger room")
+        return
+    event_type = _parent_ledger_state_event_type(ctx.settings)
+    state_key = _parent_ledger_state_key(ctx, envelope)
+    max_entries = _as_positive_int(
+        ctx.settings.get("parent_ledger_max_entries"),
+        default=_DEFAULT_PARENT_LEDGER_MAX_ENTRIES,
+    )
+    try:
+        async with await _ledger_lock(room_id, event_type, state_key):
+            existing = await ctx.query_room_state(room_id, event_type, state_key)
+            entries = _coerce_parent_ledger(existing)
+            summary = _ledger_summary(payload)
+            now = time()
+            summary["updated_at"] = now
+            replaced = False
+            for index, entry in enumerate(entries):
+                if entry.get("key") == summary["key"]:
+                    first_seen_at = entry.get("first_seen_at")
+                    if isinstance(first_seen_at, int | float):
+                        summary["first_seen_at"] = float(first_seen_at)
+                    else:
+                        summary["first_seen_at"] = now
+                    entries[index] = summary
+                    replaced = True
+                    break
+            if not replaced:
+                summary["first_seen_at"] = now
+                entries.append(summary)
+            content = {
+                "version": _PARENT_LEDGER_STATE_VERSION,
+                "updated_at": now,
+                "completions": entries[-max_entries:],
+            }
+            ok = await ctx.put_room_state(room_id, event_type, state_key, content)
+            if not ok:
+                ctx.logger.warning("Session completion parent ledger write was not accepted")
+    except Exception as exc:  # pragma: no cover - defensive isolation around optional bridge.
+        ctx.logger.warning("Session completion parent ledger update failed", error=str(exc))
 
 
 def _entry_key(entry: object) -> str | None:
@@ -212,7 +349,7 @@ async def _dedupe_lock(path: Path) -> asyncio.Lock:
 async def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, payload: Mapping[str, object]) -> bool:
     if not _as_bool(ctx.settings.get("dedup_enabled"), default=True):
         return False
-    key = _dedupe_key(payload)
+    key = _terminal_key(payload)
     try:
         dedupe_path = ctx.state_root / _DEDUP_FILE
         async with await _dedupe_lock(dedupe_path):
@@ -236,6 +373,8 @@ async def _emit_notification(
     if await _mark_seen(ctx, payload):
         ctx.logger.debug("Skipping duplicate session completion notification", payload=payload)
         return
+
+    await _update_parent_ledger(ctx, payload, envelope)
 
     if _as_bool(ctx.settings.get("log_payload"), default=False):
         ctx.logger.info("Session completion notification", payload=payload)
@@ -283,7 +422,7 @@ async def notify_cancelled_response(ctx: CancelledResponseContext) -> None:
 __all__ = [
     "_cancelled_payload",
     "_completed_payload",
+    "_ledger_summary",
     "notify_after_response",
     "notify_cancelled_response",
 ]
-# noqa: W292
