@@ -7,10 +7,13 @@ facts exposed by ``message:after_response`` and ``message:cancelled``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import time
 
 from mindroom.hooks import (
     EVENT_MESSAGE_AFTER_RESPONSE,
@@ -22,7 +25,10 @@ from mindroom.hooks import (
 )
 
 _DEDUP_FILE = "dedupe.json"
+_DEDUP_STATE_VERSION = 1
 _DEFAULT_DEDUP_MAX_ENTRIES = 512
+_DEDUP_LOCKS: dict[str, asyncio.Lock] = {}
+_DEDUP_LOCKS_GUARD = asyncio.Lock()
 
 
 def _as_bool(value: object, *, default: bool = False) -> bool:
@@ -133,39 +139,89 @@ def _dedupe_key(payload: Mapping[str, object]) -> str:
     return "|".join("" if part is None else str(part) for part in parts)
 
 
-def _load_dedupe(path: Path) -> list[str]:
+def _entry_key(entry: object) -> str | None:
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, Mapping):
+        key = entry.get("key")
+        return key if isinstance(key, str) else None
+    return None
+
+
+def _load_dedupe(path: Path) -> list[dict[str, object]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []
     except (OSError, json.JSONDecodeError):
         return []
-    if not isinstance(raw, list):
+
+    raw_entries: object
+    if isinstance(raw, list):
+        # Backward compatibility with the original plugin-local list[str] state.
+        raw_entries = raw
+    elif isinstance(raw, Mapping):
+        raw_entries = raw.get("entries")
+    else:
         return []
-    return [item for item in raw if isinstance(item, str)]
+
+    if not isinstance(raw_entries, list):
+        return []
+
+    entries: list[dict[str, object]] = []
+    for raw_entry in raw_entries:
+        key = _entry_key(raw_entry)
+        if key is None:
+            continue
+        entry: dict[str, object] = {"key": key}
+        if isinstance(raw_entry, Mapping):
+            first_seen_at = raw_entry.get("first_seen_at")
+            if isinstance(first_seen_at, int | float):
+                entry["first_seen_at"] = float(first_seen_at)
+        entries.append(entry)
+    return entries
 
 
-def _write_dedupe(path: Path, entries: list[str]) -> None:
+def _write_dedupe(path: Path, entries: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(entries, handle, separators=(",", ":"))
-        handle.write("\n")
-        temp_name = handle.name
-    Path(temp_name).replace(path)
+    state = {"version": _DEDUP_STATE_VERSION, "entries": entries}
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            json.dump(state, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise
 
 
-def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, payload: Mapping[str, object]) -> bool:
+async def _dedupe_lock(path: Path) -> asyncio.Lock:
+    lock_key = str(path.resolve())
+    async with _DEDUP_LOCKS_GUARD:
+        lock = _DEDUP_LOCKS.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _DEDUP_LOCKS[lock_key] = lock
+        return lock
+
+
+async def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, payload: Mapping[str, object]) -> bool:
     if not _as_bool(ctx.settings.get("dedup_enabled"), default=True):
         return False
     key = _dedupe_key(payload)
     try:
         dedupe_path = ctx.state_root / _DEDUP_FILE
-        entries = _load_dedupe(dedupe_path)
-        if key in entries:
-            return True
-        max_entries = _as_positive_int(ctx.settings.get("dedup_max_entries"), default=_DEFAULT_DEDUP_MAX_ENTRIES)
-        entries.append(key)
-        _write_dedupe(dedupe_path, entries[-max_entries:])
+        async with await _dedupe_lock(dedupe_path):
+            entries = _load_dedupe(dedupe_path)
+            if any(entry.get("key") == key for entry in entries):
+                return True
+            max_entries = _as_positive_int(ctx.settings.get("dedup_max_entries"), default=_DEFAULT_DEDUP_MAX_ENTRIES)
+            entries.append({"key": key, "first_seen_at": time()})
+            _write_dedupe(dedupe_path, entries[-max_entries:])
     except Exception as exc:  # pragma: no cover - defensive isolation around plugin-local state.
         ctx.logger.warning("Session completion dedupe state unavailable", error=str(exc))
         return False
@@ -177,7 +233,7 @@ async def _emit_notification(
     payload: dict[str, object],
     envelope: MessageEnvelope,
 ) -> None:
-    if _mark_seen(ctx, payload):
+    if await _mark_seen(ctx, payload):
         ctx.logger.debug("Skipping duplicate session completion notification", payload=payload)
         return
 
