@@ -57,6 +57,15 @@ plugins:
       # so duplicate concurrent terminal hooks do not both notify.
       dedup_enabled: true
       dedup_max_entries: 512
+      # Optional parent-ledger bridge. This writes minimized, bounded Matrix
+      # room state with public hook helpers only; no config apply or grants.
+      parent_ledger_enabled: false
+      parent_ledger_room_id: "!parent:example.org"
+      parent_ledger_state_key: mind     # defaults to the responding agent
+      parent_ledger_state_event_type: mindroom.session_completion.ledger
+      parent_ledger_max_entries: 256
+      # Or write the ledger into the source room instead of parent_ledger_room_id.
+      parent_ledger_to_source_room: false
       # Optional dynamic scoping when decorator-level static scoping is not enough.
       agents: [mind]
       rooms: ["!room:example.org"]
@@ -65,6 +74,36 @@ plugins:
 ```
 
 Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plugin failures from response delivery. The plugin also catches Matrix notification-send failures and logs a warning.
+
+## Parent ledger bridge
+
+When `parent_ledger_enabled` is true, the plugin updates one Matrix state event using the public `query_room_state` and `put_room_state` hook helpers. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The content is bounded and versioned:
+
+```json
+{
+  "version": 1,
+  "updated_at": 4567.0,
+  "completions": [
+    {
+      "key": "completed|corr|$source|$response|",
+      "status": "completed",
+      "agent": "mind",
+      "room_id": "!room:example.org",
+      "thread_id": "$thread_or_null",
+      "source_event_id": "$source",
+      "response_event_id": "$response_or_null",
+      "correlation_id": "corr",
+      "response_kind": "ai",
+      "delivery_kind": "sent",
+      "failure_reason": null,
+      "first_seen_at": 4567.0,
+      "updated_at": 4567.0
+    }
+  ]
+}
+```
+
+The bridge never includes `response_text`, even when notification payloads opt in to response text. Repeated terminal keys replace the existing ledger entry rather than appending a duplicate. A process-local lock serializes read/modify/write for the same `(room_id, event_type, state_key)`, and failures to read or write the optional parent ledger are warning-only so response delivery and ordinary notifications remain isolated.
 
 ## Dedupe state
 
@@ -82,4 +121,4 @@ Because this is intentionally plugin-only, it does not expose the exact internal
 - `source_handled`
 - post-`ResponseLifecycle.finalize` facts
 
-Consumers should treat this as a best-effort terminal notification based on the public `message:after_response` and `message:cancelled` hook contexts.
+Consumers should treat this as a best-effort terminal notification and parent-ledger projection based on the public `message:after_response` and `message:cancelled` hook contexts.
