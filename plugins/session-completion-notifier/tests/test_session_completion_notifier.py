@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -156,6 +156,20 @@ def test_cancelled_payload_distinguishes_error_terminal_outcome(tmp_path: Path) 
     assert payload["status"] == "error"
     assert payload["response_event_id"] == "$partial"
     assert payload["delivery"] == {"kind": "failed", "failure_reason": "delivery failed"}
+
+
+@pytest.mark.asyncio
+async def test_after_response_omitted_log_payload_does_not_log_payload_by_default(tmp_path: Path) -> None:
+    """Omitting log_payload sends configured notifications without logging payload content."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(tmp_path, settings={"notify_room_id": "!ops:localhost"})
+    logger = MagicMock()
+    ctx.logger = logger
+
+    await hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 1
+    logger.info.assert_not_called()
 
 
 @pytest.mark.asyncio
