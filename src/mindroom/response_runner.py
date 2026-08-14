@@ -290,6 +290,24 @@ def prepare_memory_and_model_context(
 
 
 @dataclass(frozen=True)
+class SessionCompletionEvent:
+    """Terminal facts emitted once when a response session reaches a final outcome."""
+
+    session_id: str | None
+    run_id: str
+    response_event_id: str | None
+    terminal_status: Literal["completed", "cancelled", "error"]
+    run_succeeded: bool
+    source_handled: bool
+    room_id: str
+    thread_id: str | None
+    reply_to_event_id: str | None
+    source_event_id: str
+    correlation_id: str
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
 class ResponseRequest:
     """Typed carrier for one response lifecycle request."""
 
@@ -321,6 +339,7 @@ class ResponseRequest:
     on_deferred_outcome_handled: Callable[[str], Awaitable[None]] | None = None
     on_user_stop_handled: Callable[[str, int], Awaitable[None]] | None = None
     on_visible_response: Callable[[str], Awaitable[None]] | None = None
+    on_session_completed: Callable[[SessionCompletionEvent], Awaitable[None]] | None = None
 
     @property
     def room_id(self) -> str:
@@ -1229,6 +1248,54 @@ class ResponseRunner:
         request.on_interrupted_response_recoverable()
         return True
 
+    async def _emit_session_completion(
+        self,
+        request: ResponseRequest,
+        final_outcome: FinalDeliveryOutcome,
+        *,
+        run_id: str,
+        post_response_outcome: ResponseOutcome,
+        source_handled: bool,
+    ) -> None:
+        """Notify the parent/coordinator seam that this response session is terminal.
+
+        The callback is best-effort and deliberately runs after lifecycle finalization
+        has established the canonical delivery outcome.  Failures here must not
+        make an already-visible response retry or roll back; scheduled/polling
+        recovery remains the fallback.
+        """
+        on_session_completed = request.on_session_completed
+        if on_session_completed is None:
+            return
+        event = SessionCompletionEvent(
+            session_id=post_response_outcome.session_id,
+            run_id=post_response_outcome.response_run_id or run_id,
+            response_event_id=final_outcome.final_visible_event_id,
+            terminal_status=final_outcome.terminal_status,
+            run_succeeded=post_response_outcome.run_succeeded,
+            source_handled=source_handled,
+            room_id=request.room_id,
+            thread_id=request.thread_id,
+            reply_to_event_id=request.reply_to_event_id,
+            source_event_id=request.response_envelope.source_event_id,
+            correlation_id=self._correlation_id_for_request(request),
+            failure_reason=final_outcome.failure_reason,
+        )
+        try:
+            await on_session_completed(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self.deps.logger.warning(
+                "session_completion_callback_failed",
+                session_id=event.session_id,
+                run_id=event.run_id,
+                response_event_id=event.response_event_id,
+                terminal_status=event.terminal_status,
+                failure_reason=str(error),
+                exception_type=error.__class__.__name__,
+            )
+
     async def _record_user_stop_handled(
         self,
         request: ResponseRequest,
@@ -1564,10 +1631,11 @@ class ResponseRunner:
         if final_delivery_outcome is None:
             msg = "Response generation did not settle a delivery outcome"
             raise RuntimeError(msg)
+        post_response_outcome = build_post_response_outcome(final_delivery_outcome)
         final_outcome = await self._finalize_locked_outcome(
             lifecycle,
             final_delivery_outcome,
-            post_response_outcome=build_post_response_outcome(final_delivery_outcome),
+            post_response_outcome=post_response_outcome,
             post_response_deps=post_response_deps,
         )
         interruption_recovery_registered = self._notify_interrupted_response_recoverable(request, final_outcome)
@@ -1584,6 +1652,13 @@ class ResponseRunner:
             request,
             final_outcome,
             cancel_source=cancel_source,
+            source_handled=source_handled,
+        )
+        await self._emit_session_completion(
+            request,
+            final_outcome,
+            run_id=run_id,
+            post_response_outcome=post_response_outcome,
             source_handled=source_handled,
         )
         if deferred_error is not None:
