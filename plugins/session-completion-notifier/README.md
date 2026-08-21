@@ -57,8 +57,9 @@ plugins:
       # so duplicate concurrent terminal hooks do not both notify.
       dedup_enabled: true
       dedup_max_entries: 512
-      # Optional parent-ledger bridge. This writes minimized, bounded Matrix
-      # room state with public hook helpers only; no config apply or grants.
+      # Optional parent ledger. Without parent_ledger_room_id, this writes
+      # minimized, bounded plugin-local state under ctx.state_root. Setting
+      # parent_ledger_room_id explicitly opts in to a Matrix-state mirror.
       parent_ledger_enabled: false
       parent_ledger_room_id: "!parent:example.org"
       parent_ledger_state_key: mind     # defaults to the responding agent
@@ -77,7 +78,9 @@ Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plu
 
 ## Parent ledger bridge
 
-When `parent_ledger_enabled` is true, the plugin updates one Matrix state event using the public `query_room_state` and `put_room_state` hook helpers. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The content is bounded and versioned:
+When `parent_ledger_enabled` is true without `parent_ledger_room_id` or `parent_ledger_to_source_room`, the plugin writes minimized, bounded state to `parent_ledger.json` under the plugin runtime state root. If the runtime state root is misbased inside this plugin source tree, the plugin falls back to a runtime/control-state path outside the watched source tree to avoid reload churn.
+
+Setting `parent_ledger_room_id` or `parent_ledger_to_source_room: true` explicitly opts in to a Matrix-state mirror using the public `query_room_state` and `put_room_state` hook helpers. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The local and Matrix ledger content is bounded and versioned:
 
 ```json
 {
@@ -103,13 +106,13 @@ When `parent_ledger_enabled` is true, the plugin updates one Matrix state event 
 }
 ```
 
-The bridge never includes `response_text`, even when notification payloads opt in to response text. Repeated terminal keys replace the existing ledger entry rather than appending a duplicate. A process-local lock serializes read/modify/write for the same `(room_id, event_type, state_key)`, and failures to read or write the optional parent ledger are warning-only so response delivery and ordinary notifications remain isolated.
+The ledger never includes `response_text`, even when notification payloads opt in to response text. Repeated terminal keys replace the existing ledger entry rather than appending a duplicate. A process-local lock serializes local file updates and Matrix read/modify/write for the same `(room_id, event_type, state_key)`. Malformed local or Matrix state is ignored and rewritten as bounded versioned content on the next successful update. Failures to read or write the optional parent ledger are warning-only so response delivery and ordinary notifications remain isolated.
 
 ## Dedupe state
 
 When `dedup_enabled` is true, the plugin records terminal notification keys in `dedupe.json` under the plugin `ctx.state_root`. The file contains only minimized event identifiers and timestamps, never response text. Existing list-shaped dedupe files from the initial plugin release are still accepted and are rewritten to the structured bounded format on the next successful notification.
 
-Dedupe state is written to runtime plugin state, not the plugin source directory.
+Dedupe and plugin-local parent-ledger state are written to runtime plugin state, not the plugin source directory. The plugin defensively redirects state outside its source tree if a misconfigured runtime makes `ctx.state_root` resolve under `plugins/session-completion-notifier/`.
 
 ## Plugin-only limitations
 
