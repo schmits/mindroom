@@ -231,6 +231,25 @@ def _ledger_summary(payload: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+_PARENT_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "key",
+        "status",
+        "agent",
+        "room_id",
+        "thread_id",
+        "source_event_id",
+        "response_event_id",
+        "correlation_id",
+        "response_kind",
+        "delivery_kind",
+        "failure_reason",
+        "first_seen_at",
+        "updated_at",
+    }
+)
+
+
 def _coerce_parent_ledger(raw: object) -> list[dict[str, object]]:
     if not isinstance(raw, Mapping):
         return []
@@ -244,7 +263,7 @@ def _coerce_parent_ledger(raw: object) -> list[dict[str, object]]:
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
-        entries.append(dict(entry))
+        entries.append({field: entry[field] for field in _PARENT_LEDGER_ENTRY_FIELDS if field in entry})
     return entries
 
 
