@@ -1,1 +1,1 @@
-PLACEHOLDER
+$(cat pr21_local_tests_full.txt)
