@@ -25,6 +25,7 @@ from mindroom.hooks import (
 )
 
 _DEDUP_FILE = "dedupe.json"
+_PARENT_LEDGER_FILE = "parent_ledger.json"
 _DEDUP_STATE_VERSION = 1
 _DEFAULT_DEDUP_MAX_ENTRIES = 512
 _DEDUP_LOCKS: dict[str, asyncio.Lock] = {}
@@ -168,6 +169,38 @@ def _parent_ledger_state_event_type(settings: Mapping[str, object]) -> str:
     return _as_non_empty_string(settings.get("parent_ledger_state_event_type")) or _PARENT_LEDGER_STATE_EVENT_TYPE
 
 
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _plugin_source_root() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _safe_state_root(ctx: AfterResponseContext | CancelledResponseContext) -> Path:
+    """Return plugin state outside this plugin source tree, even for misbased runtime state."""
+    source_root = _plugin_source_root()
+    candidate = ctx.state_root.resolve()
+    if not _path_is_relative_to(candidate, source_root):
+        return candidate
+
+    runtime_paths = ctx.runtime_paths
+    if runtime_paths.control_state_root is not None:
+        fallback_base = runtime_paths.control_state_root
+    else:
+        fallback_base = runtime_paths.storage_root / "control_state"
+    fallback = (fallback_base / "plugins" / ctx.plugin_name).resolve()
+    if _path_is_relative_to(fallback, source_root):
+        fallback = (runtime_paths.config_dir / "mindroom_data" / "plugins" / ctx.plugin_name).resolve()
+    if _path_is_relative_to(fallback, source_root):
+        fallback = (source_root.parent / f".{ctx.plugin_name}-state").resolve()
+    return fallback
+
+
 def _parent_ledger_state_key(ctx: AfterResponseContext | CancelledResponseContext, envelope: MessageEnvelope) -> str:
     configured = _as_non_empty_string(ctx.settings.get("parent_ledger_state_key"))
     if configured is not None:
@@ -198,6 +231,25 @@ def _ledger_summary(payload: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+_PARENT_LEDGER_ENTRY_FIELDS = frozenset(
+    {
+        "key",
+        "status",
+        "agent",
+        "room_id",
+        "thread_id",
+        "source_event_id",
+        "response_event_id",
+        "correlation_id",
+        "response_kind",
+        "delivery_kind",
+        "failure_reason",
+        "first_seen_at",
+        "updated_at",
+    }
+)
+
+
 def _coerce_parent_ledger(raw: object) -> list[dict[str, object]]:
     if not isinstance(raw, Mapping):
         return []
@@ -211,7 +263,7 @@ def _coerce_parent_ledger(raw: object) -> list[dict[str, object]]:
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
-        entries.append(dict(entry))
+        entries.append({field: entry[field] for field in _PARENT_LEDGER_ENTRY_FIELDS if field in entry})
     return entries
 
 
@@ -225,6 +277,81 @@ async def _ledger_lock(room_id: str, event_type: str, state_key: str) -> asyncio
         return lock
 
 
+def _parent_ledger_content(
+    entries: list[dict[str, object]],
+    *,
+    updated_at: float,
+    max_entries: int,
+) -> dict[str, object]:
+    return {
+        "version": _PARENT_LEDGER_STATE_VERSION,
+        "updated_at": updated_at,
+        "completions": entries[-max_entries:],
+    }
+
+
+def _merge_parent_ledger_entry(
+    entries: list[dict[str, object]],
+    summary: dict[str, object],
+    *,
+    now: float,
+) -> list[dict[str, object]]:
+    summary["updated_at"] = now
+    for index, entry in enumerate(entries):
+        if entry.get("key") == summary["key"]:
+            first_seen_at = entry.get("first_seen_at")
+            summary["first_seen_at"] = float(first_seen_at) if isinstance(first_seen_at, int | float) else now
+            entries[index] = summary
+            return entries
+    summary["first_seen_at"] = now
+    entries.append(summary)
+    return entries
+
+
+def _write_json_state(path: Path, content: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            json.dump(content, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _load_parent_ledger(path: Path) -> list[dict[str, object]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError):
+        return []
+    return _coerce_parent_ledger(raw)
+
+
+async def _update_plugin_parent_ledger(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    payload: Mapping[str, object],
+) -> None:
+    max_entries = _as_positive_int(
+        ctx.settings.get("parent_ledger_max_entries"),
+        default=_DEFAULT_PARENT_LEDGER_MAX_ENTRIES,
+    )
+    state_path = _safe_state_root(ctx) / _PARENT_LEDGER_FILE
+    try:
+        async with await _dedupe_lock(state_path):
+            now = time()
+            entries = _merge_parent_ledger_entry(_load_parent_ledger(state_path), _ledger_summary(payload), now=now)
+            _write_json_state(state_path, _parent_ledger_content(entries, updated_at=now, max_entries=max_entries))
+    except Exception as exc:  # pragma: no cover - defensive isolation around plugin-local state.
+        ctx.logger.warning("Session completion parent ledger state unavailable", error=str(exc))
+
+
 async def _update_parent_ledger(
     ctx: AfterResponseContext | CancelledResponseContext,
     payload: Mapping[str, object],
@@ -235,7 +362,7 @@ async def _update_parent_ledger(
         return
     room_id = _parent_ledger_room_id(ctx.settings, envelope)
     if room_id is None:
-        ctx.logger.warning("Session completion parent ledger enabled without a ledger room")
+        await _update_plugin_parent_ledger(ctx, payload)
         return
     event_type = _parent_ledger_state_event_type(ctx.settings)
     state_key = _parent_ledger_state_key(ctx, envelope)
@@ -246,29 +373,9 @@ async def _update_parent_ledger(
     try:
         async with await _ledger_lock(room_id, event_type, state_key):
             existing = await ctx.query_room_state(room_id, event_type, state_key)
-            entries = _coerce_parent_ledger(existing)
-            summary = _ledger_summary(payload)
             now = time()
-            summary["updated_at"] = now
-            replaced = False
-            for index, entry in enumerate(entries):
-                if entry.get("key") == summary["key"]:
-                    first_seen_at = entry.get("first_seen_at")
-                    if isinstance(first_seen_at, int | float):
-                        summary["first_seen_at"] = float(first_seen_at)
-                    else:
-                        summary["first_seen_at"] = now
-                    entries[index] = summary
-                    replaced = True
-                    break
-            if not replaced:
-                summary["first_seen_at"] = now
-                entries.append(summary)
-            content = {
-                "version": _PARENT_LEDGER_STATE_VERSION,
-                "updated_at": now,
-                "completions": entries[-max_entries:],
-            }
+            entries = _merge_parent_ledger_entry(_coerce_parent_ledger(existing), _ledger_summary(payload), now=now)
+            content = _parent_ledger_content(entries, updated_at=now, max_entries=max_entries)
             ok = await ctx.put_room_state(room_id, event_type, state_key, content)
             if not ok:
                 ctx.logger.warning("Session completion parent ledger write was not accepted")
@@ -320,20 +427,7 @@ def _load_dedupe(path: Path) -> list[dict[str, object]]:
 
 
 def _write_dedupe(path: Path, entries: list[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    state = {"version": _DEDUP_STATE_VERSION, "entries": entries}
-    temp_path: Path | None = None
-    try:
-        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-            json.dump(state, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
-            temp_path = Path(handle.name)
-        temp_path.replace(path)
-    except Exception:
-        if temp_path is not None:
-            with suppress(OSError):
-                temp_path.unlink(missing_ok=True)
-        raise
+    _write_json_state(path, {"version": _DEDUP_STATE_VERSION, "entries": entries})
 
 
 async def _dedupe_lock(path: Path) -> asyncio.Lock:
@@ -351,7 +445,7 @@ async def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, paylo
         return False
     key = _terminal_key(payload)
     try:
-        dedupe_path = ctx.state_root / _DEDUP_FILE
+        dedupe_path = _safe_state_root(ctx) / _DEDUP_FILE
         async with await _dedupe_lock(dedupe_path):
             entries = _load_dedupe(dedupe_path)
             if any(entry.get("key") == key for entry in entries):
@@ -423,6 +517,7 @@ __all__ = [
     "_cancelled_payload",
     "_completed_payload",
     "_ledger_summary",
+    "_safe_state_root",
     "notify_after_response",
     "notify_cancelled_response",
 ]
