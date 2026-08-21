@@ -47,11 +47,15 @@ plugins:
       enabled: true
       # Log the payload through the MindRoom logger. Defaults to false.
       log_payload: false
-      # Optional Matrix notification sink. If omitted, the plugin only logs.
+      # Optional Matrix notification sink. If omitted, but parent_ledger_room_id
+      # is configured, completion wake notifications are sent to that parent room.
       notify_room_id: "!ops:example.org"
       notify_thread_id: "$thread"   # optional
       # Or send back to the source room/thread instead of notify_room_id.
       send_to_source_room: false
+      # Wake Mind by default with a minimized body and trigger_dispatch=True.
+      wake_bridge_enabled: true
+      mind_mention_mxid: "@mindroom_mind_mm3j9z5u:mindroom.chat"
       # Optional plugin-local dedupe persisted below ctx.state_root.
       # The state file is bounded, atomically replaced, and process-local locked
       # so duplicate concurrent terminal hooks do not both notify.
@@ -76,11 +80,13 @@ plugins:
 
 Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plugin failures from response delivery. The plugin also catches Matrix notification-send failures and logs a warning.
 
+When `wake_bridge_enabled` is true (the default), Matrix notifications use a data-minimized plaintext body that explicitly mentions `@mindroom_mind_mm3j9z5u:mindroom.chat` and includes only resumable correlation metadata such as status, agent, room/thread IDs, source/response event IDs, correlation ID, response kind, delivery kind, and failure reason. The hook sends these with `trigger_dispatch=True` so Mind can resume from a configured parent/notify thread or room. The full minimized payload is also attached as `mindroom.session_completion` extra content for machine readers. Response text is not included in the wake body. Set `wake_bridge_enabled: false` to keep the earlier JSON notification body with no dispatch trigger.
+
 ## Parent ledger bridge
 
 When `parent_ledger_enabled` is true without `parent_ledger_room_id` or `parent_ledger_to_source_room`, the plugin writes minimized, bounded state to `parent_ledger.json` under the plugin runtime state root. If the runtime state root is misbased inside this plugin source tree, the plugin falls back to a runtime/control-state path outside the watched source tree to avoid reload churn.
 
-Setting `parent_ledger_room_id` or `parent_ledger_to_source_room: true` explicitly opts in to a Matrix-state mirror using the public `query_room_state` and `put_room_state` hook helpers. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The local and Matrix ledger content is bounded and versioned:
+Setting `parent_ledger_room_id` or `parent_ledger_to_source_room: true` explicitly opts in to a Matrix-state mirror using the public `query_room_state` and `put_room_state` hook helpers. If no separate `notify_room_id` is configured, `parent_ledger_room_id` is also used as the wake-notification destination. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The local and Matrix ledger content is bounded and versioned:
 
 ```json
 {
