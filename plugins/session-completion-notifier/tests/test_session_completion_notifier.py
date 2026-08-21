@@ -14,7 +14,7 @@ import pytest
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import RuntimePaths, resolve_runtime_paths
+from mindroom.constants import RuntimePaths, resolve_runtime_paths, runtime_paths_with_storage_root
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
 from mindroom.hooks import (
     AfterResponseContext,
@@ -378,3 +378,143 @@ async def test_dedupe_disabled_does_not_write_state(tmp_path: Path) -> None:
 
     assert ctx.message_sender.await_count == 2
     assert not (ctx.state_root / "dedupe.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_enabled_without_room_writes_plugin_state(tmp_path: Path) -> None:
+    """Without a Matrix ledger room, parent ledger falls back to plugin-local state."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True, "parent_ledger_max_entries": 2, "dedup_enabled": False},
+    )
+
+    with patch.object(hooks, "time", return_value=3456.0):
+        await hooks.notify_after_response(ctx)
+
+    ctx.room_state_querier.assert_not_awaited()
+    ctx.room_state_putter.assert_not_awaited()
+    state_path = ctx.state_root / "parent_ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["version"] == 1
+    assert state["updated_at"] == 3456.0
+    assert [entry["key"] for entry in state["completions"]] == ["completed|corr-1|$source|$response|"]
+    assert "response_text" not in state["completions"][0]
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_plugin_state_is_bounded_idempotent_and_tolerates_malformed_state(tmp_path: Path) -> None:
+    """Plugin-local parent ledger ignores malformed state and rewrites bounded content."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True, "parent_ledger_max_entries": 1, "dedup_enabled": False},
+    )
+    state_path = ctx.state_root / "parent_ledger.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text('{"completions":[{"key":"old"},42,{"key":""}], "extra": true}\n', encoding="utf-8")
+
+    with patch.object(hooks, "time", side_effect=[100.0, 200.0]):
+        await hooks.notify_after_response(ctx)
+        await hooks.notify_after_response(ctx)
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(state["completions"]) == 1
+    entry = state["completions"][0]
+    assert entry["key"] == "completed|corr-1|$source|$response|"
+    assert entry["first_seen_at"] == 100.0
+    assert entry["updated_at"] == 200.0
+
+
+@pytest.mark.asyncio
+async def test_matrix_mirror_is_explicit_opt_in_and_minimized(tmp_path: Path) -> None:
+    """The parent-ledger Matrix mirror only runs when a destination room is explicitly configured."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={
+            "include_response_text": True,
+            "parent_ledger_enabled": True,
+            "parent_ledger_room_id": "!parent:localhost",
+            "dedup_enabled": False,
+        },
+    )
+
+    await hooks.notify_after_response(ctx)
+
+    assert not (ctx.state_root / "parent_ledger.json").exists()
+    content = ctx.room_state_putter.await_args.args[3]
+    assert len(content["completions"]) == 1
+    assert "response_text" not in content["completions"][0]
+    assert ctx.message_sender.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_safe_state_root_avoids_plugin_source_when_runtime_state_points_at_source(tmp_path: Path) -> None:
+    """Dedupe/ledger state never writes inside the watched plugin source tree."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True, "notify_room_id": "!ops:localhost"},
+    )
+    ctx.runtime_paths = runtime_paths_with_storage_root(ctx.runtime_paths, PLUGIN_ROOT.parent.parent)
+
+    assert ctx.state_root.resolve() == PLUGIN_ROOT.resolve()
+    safe_root = hooks._safe_state_root(ctx)
+    assert PLUGIN_ROOT.resolve() not in [safe_root, *safe_root.parents]
+
+    await hooks.notify_after_response(ctx)
+
+    assert not (PLUGIN_ROOT / "dedupe.json").exists()
+    assert not (PLUGIN_ROOT / "parent_ledger.json").exists()
+    assert (safe_root / "dedupe.json").is_file()
+    assert (safe_root / "parent_ledger.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_no_response_text_by_default_even_when_response_has_text(tmp_path: Path) -> None:
+    """Notifications and plugin-local ledger omit response text unless explicit payload opt-in is set."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"notify_room_id": "!ops:localhost", "parent_ledger_enabled": True, "dedup_enabled": False},
+    )
+
+    await hooks.notify_after_response(ctx)
+
+    notify_body = ctx.message_sender.await_args.args[1]
+    ledger = json.loads((ctx.state_root / "parent_ledger.json").read_text(encoding="utf-8"))
+    assert "secret response text" not in notify_body
+    assert "response_text" not in notify_body
+    assert "response_text" not in ledger["completions"][0]
+
+
+@pytest.mark.asyncio
+async def test_reload_churn_reuses_plugin_state_without_duplicate_notify(tmp_path: Path) -> None:
+    """Reloaded hook modules still honor existing plugin-local dedupe state."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(tmp_path, settings={"notify_room_id": "!ops:localhost"})
+    await hooks.notify_after_response(ctx)
+
+    reloaded_hooks = _load_hooks_module()
+    await reloaded_hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 1
+    state = json.loads((ctx.state_root / "dedupe.json").read_text(encoding="utf-8"))
+    assert len(state["entries"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_plugin_parent_ledger_updates_are_idempotent(tmp_path: Path) -> None:
+    """Concurrent duplicate parent-ledger updates share plugin-local state before writing."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True, "dedup_enabled": False},
+    )
+
+    await asyncio.gather(hooks.notify_after_response(ctx), hooks.notify_after_response(ctx))
+
+    state = json.loads((ctx.state_root / "parent_ledger.json").read_text(encoding="utf-8"))
+    assert len(state["completions"]) == 1
+    assert state["completions"][0]["key"] == "completed|corr-1|$source|$response|"
