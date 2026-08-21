@@ -271,7 +271,7 @@ async def test_safe_state_root_avoids_plugin_source_and_reload_dedupe_prevents_s
             "parent_ledger_enabled": True,
             "notify_room_id": "!ops:localhost",
             "wake_bridge_enabled": True,
-            "dedup_enabled": False,
+            "dedup_enabled": True,
         },
     )
     ctx.runtime_paths = runtime_paths_with_storage_root(ctx.runtime_paths, PLUGIN_ROOT.parent.parent)
@@ -283,7 +283,7 @@ async def test_safe_state_root_avoids_plugin_source_and_reload_dedupe_prevents_s
     await hooks.notify_after_response(ctx)
     await _load_hooks_module().notify_after_response(ctx)
 
-    assert ctx.message_sender.await_count == 2
+    assert ctx.message_sender.await_count == 1
     assert not (PLUGIN_ROOT / "dedupe.json").exists()
     assert not (PLUGIN_ROOT / "parent_ledger.json").exists()
     assert (safe_root / "dedupe.json").is_file()
