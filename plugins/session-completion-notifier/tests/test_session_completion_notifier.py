@@ -412,7 +412,10 @@ async def test_parent_ledger_plugin_state_is_bounded_idempotent_and_tolerates_ma
     )
     state_path = ctx.state_root / "parent_ledger.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text('{"completions":[{"key":"old"},42,{"key":""}], "extra": true}\n', encoding="utf-8")
+    state_path.write_text(
+        '{"completions":[{"key":"old","response_text":"secret","extra":"leak"},42,{"key":""}], "extra": true}\n',
+        encoding="utf-8",
+    )
 
     with patch.object(hooks, "time", side_effect=[100.0, 200.0]):
         await hooks.notify_after_response(ctx)
@@ -424,6 +427,34 @@ async def test_parent_ledger_plugin_state_is_bounded_idempotent_and_tolerates_ma
     assert entry["key"] == "completed|corr-1|$source|$response|"
     assert entry["first_seen_at"] == 100.0
     assert entry["updated_at"] == 200.0
+    assert "response_text" not in json.dumps(state, sort_keys=True)
+    assert "extra" not in json.dumps(state, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_matrix_state_drops_unknown_existing_entry_fields(tmp_path: Path) -> None:
+    """Matrix parent ledger state is sanitized before being mirrored back."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={
+            "parent_ledger_enabled": True,
+            "parent_ledger_room_id": "!parent:localhost",
+            "parent_ledger_max_entries": 2,
+            "dedup_enabled": False,
+        },
+    )
+    ctx.room_state_querier = AsyncMock(
+        return_value={"completions": [{"key": "old", "response_text": "secret", "extra": "leak"}]}
+    )
+
+    with patch.object(hooks, "time", return_value=123.0):
+        await hooks.notify_after_response(ctx)
+
+    content = ctx.room_state_putter.await_args.args[3]
+    assert [entry["key"] for entry in content["completions"]] == ["old", "completed|corr-1|$source|$response|"]
+    assert "response_text" not in json.dumps(content, sort_keys=True)
+    assert "extra" not in json.dumps(content, sort_keys=True)
 
 
 @pytest.mark.asyncio
