@@ -129,6 +129,14 @@ class MCPServerConfig(BaseModel):
     auth: MCPOAuthConfig | None = Field(default=None, description="Optional requester-scoped MCP auth")
     include_tools: list[str] = Field(default_factory=list, description="Optional remote tool allowlist")
     exclude_tools: list[str] = Field(default_factory=list, description="Optional remote tool denylist")
+    allowed_private_url_prefixes: list[str] = Field(
+        default_factory=list,
+        description="Explicit URL prefixes for this remote MCP server transport that may reach trusted private, local, or loopback network addresses. Cloud metadata and link-local addresses stay blocked.",
+    )
+    allow_private_networks: bool = Field(
+        default=False,
+        description="Allow this remote MCP server transport to reach trusted private, local, or loopback network addresses. Prefer allowed_private_url_prefixes for narrow access. Cloud metadata and link-local addresses stay blocked.",
+    )
     startup_timeout_seconds: float = Field(default=20.0, gt=0, description="Startup timeout")
     call_timeout_seconds: float = Field(default=120.0, gt=0, description="Default call timeout")
     max_concurrent_calls: int = Field(default=1, ge=1, description="Maximum concurrent calls")
@@ -142,16 +150,16 @@ class MCPServerConfig(BaseModel):
             return None
         return value.strip() or None
 
-    @field_validator("include_tools", "exclude_tools", mode="before")
+    @field_validator("include_tools", "exclude_tools", "allowed_private_url_prefixes", mode="before")
     @classmethod
-    def normalize_tool_filters(cls, value: object) -> object:
+    def normalize_string_lists(cls, value: object) -> object:
         """Strip tool filter names at parse time so matching stays predictable."""
         if value is None or not isinstance(value, list):
             return value
         normalized: list[str] = []
         for entry in value:
             if not isinstance(entry, str):
-                msg = "MCP tool filters must be strings"
+                msg = "MCP string list values must be strings"
                 raise TypeError(msg)
             stripped = entry.strip()
             if stripped:
