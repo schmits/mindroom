@@ -35,6 +35,7 @@ _LEDGER_LOCKS_GUARD = asyncio.Lock()
 _PARENT_LEDGER_STATE_EVENT_TYPE = "mindroom.session_completion.ledger"
 _PARENT_LEDGER_STATE_VERSION = 1
 _DEFAULT_PARENT_LEDGER_MAX_ENTRIES = 256
+_DEFAULT_MIND_MENTION_MXID = "@mindroom_mind_mm3j9z5u:mindroom.chat"
 
 
 def _as_bool(value: object, *, default: bool = False) -> bool:
@@ -156,6 +157,14 @@ def _parent_ledger_enabled(settings: Mapping[str, object]) -> bool:
     return _as_bool(settings.get("parent_ledger_enabled"), default=False)
 
 
+def _wake_bridge_enabled(settings: Mapping[str, object]) -> bool:
+    return _as_bool(settings.get("wake_bridge_enabled"), default=True)
+
+
+def _mind_mention_mxid(settings: Mapping[str, object]) -> str:
+    return _as_non_empty_string(settings.get("mind_mention_mxid")) or _DEFAULT_MIND_MENTION_MXID
+
+
 def _parent_ledger_room_id(settings: Mapping[str, object], envelope: MessageEnvelope) -> str | None:
     room_id = _as_non_empty_string(settings.get("parent_ledger_room_id"))
     if room_id is not None:
@@ -246,7 +255,7 @@ _PARENT_LEDGER_ENTRY_FIELDS = frozenset(
         "failure_reason",
         "first_seen_at",
         "updated_at",
-    }
+    },
 )
 
 
@@ -459,6 +468,36 @@ async def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, paylo
     return False
 
 
+def _notification_destination(
+    settings: Mapping[str, object],
+    envelope: MessageEnvelope,
+) -> tuple[str, str | None] | None:
+    room_id = settings.get("notify_room_id")
+    send_to_source = _as_bool(settings.get("send_to_source_room"), default=False)
+    if not isinstance(room_id, str) or not room_id.strip():
+        if send_to_source:
+            room_id = envelope.room_id
+        elif _parent_ledger_enabled(settings):
+            room_id = _parent_ledger_room_id(settings, envelope)
+        else:
+            room_id = None
+    if room_id is None:
+        return None
+
+    configured_thread = settings.get("notify_thread_id")
+    thread_id = configured_thread.strip() if isinstance(configured_thread, str) and configured_thread.strip() else None
+    if thread_id is None and send_to_source:
+        thread_id = envelope.target.resolved_thread_id
+    return room_id.strip(), thread_id
+
+
+def _wake_notification_text(settings: Mapping[str, object], payload: Mapping[str, object]) -> str:
+    mention = _mind_mention_mxid(settings)
+    minimized = _ledger_summary(payload)
+    metadata = json.dumps(minimized, sort_keys=True, separators=(",", ":"))
+    return f"{mention} session completion: {metadata}"
+
+
 async def _emit_notification(
     ctx: AfterResponseContext | CancelledResponseContext,
     payload: dict[str, object],
@@ -473,24 +512,25 @@ async def _emit_notification(
     if _as_bool(ctx.settings.get("log_payload"), default=False):
         ctx.logger.info("Session completion notification", payload=payload)
 
-    room_id = ctx.settings.get("notify_room_id")
-    send_to_source = _as_bool(ctx.settings.get("send_to_source_room"), default=False)
-    if not isinstance(room_id, str) or not room_id.strip():
-        room_id = envelope.room_id if send_to_source else None
-    if room_id is None:
+    destination = _notification_destination(ctx.settings, envelope)
+    if destination is None:
         return
+    room_id, thread_id = destination
 
-    configured_thread = ctx.settings.get("notify_thread_id")
-    thread_id = configured_thread.strip() if isinstance(configured_thread, str) and configured_thread.strip() else None
-    if thread_id is None and send_to_source:
-        thread_id = envelope.target.resolved_thread_id
+    wake_bridge_enabled = _wake_bridge_enabled(ctx.settings)
+    text = (
+        _wake_notification_text(ctx.settings, payload)
+        if wake_bridge_enabled
+        else json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    )
 
     try:
         await ctx.send_message(
-            room_id.strip(),
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            room_id,
+            text,
             thread_id=thread_id,
             extra_content={"mindroom.session_completion": payload},
+            trigger_dispatch=wake_bridge_enabled,
         )
     except Exception as exc:  # pragma: no cover - defensive isolation around transport adapters.
         ctx.logger.warning("Session completion notification send failed", error=str(exc), payload=payload)
