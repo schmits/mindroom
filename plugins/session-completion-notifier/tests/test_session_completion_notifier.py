@@ -413,7 +413,24 @@ async def test_parent_ledger_plugin_state_is_bounded_idempotent_and_tolerates_ma
     state_path = ctx.state_root / "parent_ledger.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(
-        '{"completions":[{"key":"old","response_text":"secret","extra":"leak"},42,{"key":""}], "extra": true}\n',
+        json.dumps(
+            {
+                "completions": [
+                    {
+                        "key": "old",
+                        "status": "completed",
+                        "agent": "legacy-agent",
+                        "first_seen_at": 50.0,
+                        "response_text": "secret",
+                        "extra": "leak",
+                    },
+                    42,
+                    {"key": ""},
+                ],
+                "extra": True,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -425,6 +442,8 @@ async def test_parent_ledger_plugin_state_is_bounded_idempotent_and_tolerates_ma
     assert len(state["completions"]) == 1
     entry = state["completions"][0]
     assert entry["key"] == "completed|corr-1|$source|$response|"
+    assert entry["status"] == "completed"
+    assert entry["agent"] == "mind"
     assert entry["first_seen_at"] == 100.0
     assert entry["updated_at"] == 200.0
     assert "response_text" not in json.dumps(state, sort_keys=True)
@@ -445,7 +464,18 @@ async def test_parent_ledger_matrix_state_drops_unknown_existing_entry_fields(tm
         },
     )
     ctx.room_state_querier = AsyncMock(
-        return_value={"completions": [{"key": "old", "response_text": "secret", "extra": "leak"}]}
+        return_value={
+            "completions": [
+                {
+                    "key": "old",
+                    "status": "completed",
+                    "agent": "legacy-agent",
+                    "first_seen_at": 50.0,
+                    "response_text": "secret",
+                    "extra": "leak",
+                }
+            ]
+        }
     )
 
     with patch.object(hooks, "time", return_value=123.0):
@@ -453,6 +483,18 @@ async def test_parent_ledger_matrix_state_drops_unknown_existing_entry_fields(tm
 
     content = ctx.room_state_putter.await_args.args[3]
     assert [entry["key"] for entry in content["completions"]] == ["old", "completed|corr-1|$source|$response|"]
+    legacy_entry = content["completions"][0]
+    assert legacy_entry == {
+        "key": "old",
+        "status": "completed",
+        "agent": "legacy-agent",
+        "first_seen_at": 50.0,
+    }
+    terminal_entry = content["completions"][1]
+    assert terminal_entry["status"] == "completed"
+    assert terminal_entry["agent"] == "mind"
+    assert terminal_entry["first_seen_at"] == 123.0
+    assert terminal_entry["updated_at"] == 123.0
     assert "response_text" not in json.dumps(content, sort_keys=True)
     assert "extra" not in json.dumps(content, sort_keys=True)
 
