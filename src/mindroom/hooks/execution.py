@@ -26,6 +26,7 @@ from .context import (
     ResponseDraft,
     RoomMemberJoinedContext,
     ScheduleFiredContext,
+    SessionCompletedContext,
     SessionHookContext,
     SystemEnrichContext,
     ToolAfterCallContext,
@@ -68,7 +69,7 @@ def _scope_agent_name(context: _HookExecutionContext) -> str | None:
             agent_name = context.target_entity_name
         elif isinstance(context, AgentLifecycleContext):
             agent_name = context.entity_name
-        elif isinstance(context, CompactionHookContext | SessionHookContext | RoomMemberJoinedContext):
+        elif isinstance(context, CompactionHookContext | SessionHookContext | SessionCompletedContext | RoomMemberJoinedContext):
             agent_name = context.agent_name
     return agent_name
 
@@ -85,7 +86,7 @@ def _scope_room_ids(context: _HookExecutionContext) -> tuple[str, ...]:  # noqa:
         return context.rooms
     if isinstance(context, CompactionHookContext):
         return (context.room_id,)
-    if isinstance(context, SessionHookContext):
+    if isinstance(context, SessionHookContext | SessionCompletedContext):
         return (context.room_id,)
     if isinstance(context, CustomEventContext) and context.room_id:
         return (context.room_id,)
