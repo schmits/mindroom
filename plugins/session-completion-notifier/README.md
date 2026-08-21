@@ -47,11 +47,19 @@ plugins:
       enabled: true
       # Log the payload through the MindRoom logger. Defaults to false.
       log_payload: false
-      # Optional Matrix notification sink. If omitted, the plugin only logs.
+      # Optional Matrix notification sink. If omitted, but parent_ledger_room_id
+      # is configured with parent_ledger_enabled:true, completion wake notifications
+      # are sent to that parent room. With no destination, no Matrix notification is sent.
       notify_room_id: "!ops:example.org"
       notify_thread_id: "$thread"   # optional
       # Or send back to the source room/thread instead of notify_room_id.
       send_to_source_room: false
+      # Optional wake bridge override. If omitted, explicit parent-ledger intent
+      # (parent_ledger_enabled:true plus notify_room_id/parent_ledger_room_id or
+      # parent_ledger_to_source_room:true) wakes Mind. Set false for passive
+      # legacy JSON notifications. Set true to wake for notify/source destinations.
+      wake_bridge_enabled: true
+      mind_mention_mxid: "@mindroom_mind_mm3j9z5u:mindroom.chat"
       # Optional plugin-local dedupe persisted below ctx.state_root.
       # The state file is bounded, atomically replaced, and process-local locked
       # so duplicate concurrent terminal hooks do not both notify.
@@ -76,11 +84,15 @@ plugins:
 
 Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plugin failures from response delivery. The plugin also catches Matrix notification-send failures and logs a warning.
 
+Wake notifications are intent-gated. With no configured destination (`notify_room_id`, `send_to_source_room:true`, `parent_ledger_room_id`, or `parent_ledger_to_source_room:true`), no Matrix notification is sent. If `wake_bridge_enabled: false` is explicit, the plugin keeps the legacy passive JSON notification body with `trigger_dispatch=False` (or only the passive ledger when no destination is configured). If `wake_bridge_enabled` is omitted, existing explicit operator intent still wakes Mind when `parent_ledger_enabled: true` is combined with a configured notify or parent-ledger destination. Operators may also set `wake_bridge_enabled: true` explicitly for notify/source destinations. The default for `send_to_source_room` remains `false`, so source-room delivery is opt-in.
+
+Wake notifications use a data-minimized plaintext body that explicitly mentions `@mindroom_mind_mm3j9z5u:mindroom.chat` and includes only resumable correlation metadata such as status, agent, room/thread IDs, source/response event IDs, correlation ID, response kind, delivery kind, and failure reason. The hook sends these with `trigger_dispatch=True` so Mind can resume from a configured parent/notify thread or room. The full minimized payload is also attached as `mindroom.session_completion` extra content for machine readers. Response text is not included in the wake body or persisted plugin state; `include_response_text` and `log_payload` both default to `false`.
+
 ## Parent ledger bridge
 
 When `parent_ledger_enabled` is true without `parent_ledger_room_id` or `parent_ledger_to_source_room`, the plugin writes minimized, bounded state to `parent_ledger.json` under the plugin runtime state root. If the runtime state root is misbased inside this plugin source tree, the plugin falls back to a runtime/control-state path outside the watched source tree to avoid reload churn.
 
-Setting `parent_ledger_room_id` or `parent_ledger_to_source_room: true` explicitly opts in to a Matrix-state mirror using the public `query_room_state` and `put_room_state` hook helpers. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The local and Matrix ledger content is bounded and versioned:
+Setting `parent_ledger_room_id` or `parent_ledger_to_source_room: true` explicitly opts in to a Matrix-state mirror using the public `query_room_state` and `put_room_state` hook helpers. If no separate `notify_room_id` is configured, `parent_ledger_room_id` is also used as the wake-notification destination. The default event type is `mindroom.session_completion.ledger`; the default state key is the responding agent name. The local and Matrix ledger content is bounded and versioned:
 
 ```json
 {
