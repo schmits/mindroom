@@ -196,12 +196,15 @@ async def test_after_response_omitted_log_payload_does_not_log_payload_by_defaul
     await hooks.notify_after_response(ctx)
 
     assert ctx.message_sender.await_count == 1
+    call = ctx.message_sender.await_args
+    assert call.kwargs["trigger_dispatch"] is True
+    assert call.args[1].startswith("@mindroom_mind_mm3j9z5u:mindroom.chat session completion: ")
     logger.info.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_after_response_hook_can_send_matrix_notification_and_dedupes(tmp_path: Path) -> None:
-    """The hook can send a JSON notification and suppress duplicate terminal events."""
+    """The hook can send a minimized wake notification and suppress duplicate terminal events."""
     hooks = _load_hooks_module()
     ctx = _after_context(
         tmp_path,
@@ -214,8 +217,15 @@ async def test_after_response_hook_can_send_matrix_notification_and_dedupes(tmp_
     assert ctx.message_sender.await_count == 1
     call = ctx.message_sender.await_args
     assert call.args[0] == "!ops:localhost"
+    assert call.kwargs["thread_id"] is None
+    assert call.kwargs["trigger_dispatch"] is True
+    assert call.args[1].startswith("@mindroom_mind_mm3j9z5u:mindroom.chat session completion: ")
+    assert "secret response text" not in call.args[1]
     assert '"response_text"' not in call.args[1]
-    assert call.args[4]["mindroom.session_completion"]["status"] == "completed"
+    assert '"correlation_id":"corr-1"' in call.args[1]
+    assert '"source_event_id":"$source"' in call.args[1]
+    assert '"response_event_id":"$response"' in call.args[1]
+    assert call.kwargs["extra_content"]["mindroom.session_completion"]["status"] == "completed"
     state = json.loads((ctx.state_root / "dedupe.json").read_text(encoding="utf-8"))
     assert state["version"] == 1
     assert len(state["entries"]) == 1
@@ -519,7 +529,13 @@ async def test_matrix_mirror_is_explicit_opt_in_and_minimized(tmp_path: Path) ->
     content = ctx.room_state_putter.await_args.args[3]
     assert len(content["completions"]) == 1
     assert "response_text" not in content["completions"][0]
-    assert ctx.message_sender.await_count == 0
+    assert ctx.message_sender.await_count == 1
+    call = ctx.message_sender.await_args
+    assert call.args[0] == "!parent:localhost"
+    assert call.kwargs["trigger_dispatch"] is True
+    assert call.args[1].startswith("@mindroom_mind_mm3j9z5u:mindroom.chat session completion: ")
+    assert "secret response text" not in call.args[1]
+    assert "response_text" not in call.args[1]
 
 
 @pytest.mark.asyncio
@@ -591,3 +607,73 @@ async def test_concurrent_plugin_parent_ledger_updates_are_idempotent(tmp_path: 
     state = json.loads((ctx.state_root / "parent_ledger.json").read_text(encoding="utf-8"))
     assert len(state["completions"]) == 1
     assert state["completions"][0]["key"] == "completed|corr-1|$source|$response|"
+
+
+@pytest.mark.asyncio
+async def test_parent_ledger_room_is_wake_destination_when_notify_room_omitted(tmp_path: Path) -> None:
+    """A configured parent-ledger room doubles as the minimized wake destination by default."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True, "parent_ledger_room_id": "!parent:localhost"},
+    )
+
+    await hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 1
+    call = ctx.message_sender.await_args
+    assert call.args[0] == "!parent:localhost"
+    assert call.kwargs["thread_id"] is None
+    assert call.kwargs["trigger_dispatch"] is True
+    assert call.args[1].startswith("@mindroom_mind_mm3j9z5u:mindroom.chat session completion: ")
+    assert '"correlation_id":"corr-1"' in call.args[1]
+    assert '"room_id":"!room:localhost"' in call.args[1]
+    assert "secret response text" not in call.args[1]
+    assert "response_text" not in call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_no_matrix_notification_when_no_destination_configured(tmp_path: Path) -> None:
+    """Plain plugin-local parent ledger writes stay passive when no notify or parent room is configured."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"parent_ledger_enabled": True},
+    )
+
+    await hooks.notify_after_response(ctx)
+
+    assert ctx.message_sender.await_count == 0
+    assert (ctx.state_root / "parent_ledger.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_wake_bridge_can_be_disabled_for_legacy_json_notification(tmp_path: Path) -> None:
+    """Operators can keep the prior passive JSON notification body if explicitly configured."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(
+        tmp_path,
+        settings={"notify_room_id": "!ops:localhost", "wake_bridge_enabled": False},
+    )
+
+    await hooks.notify_after_response(ctx)
+
+    call = ctx.message_sender.await_args
+    assert call.kwargs["trigger_dispatch"] is False
+    assert call.args[1].startswith("{")
+    assert "@mindroom_mind_mm3j9z5u:mindroom.chat" not in call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_send_to_source_room_wake_bridge_uses_source_thread(tmp_path: Path) -> None:
+    """Source-room delivery remains opt-in and includes dispatchable minimized wake text."""
+    hooks = _load_hooks_module()
+    ctx = _after_context(tmp_path, settings={"send_to_source_room": True})
+
+    await hooks.notify_after_response(ctx)
+
+    call = ctx.message_sender.await_args
+    assert call.args[0] == "!room:localhost"
+    assert call.kwargs["thread_id"] == "$thread"
+    assert call.kwargs["trigger_dispatch"] is True
+    assert call.args[1].startswith("@mindroom_mind_mm3j9z5u:mindroom.chat session completion: ")
