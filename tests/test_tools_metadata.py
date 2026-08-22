@@ -23,6 +23,7 @@ from mindroom.constants import resolve_runtime_paths
 from mindroom.redaction import REDACTED
 from mindroom.server_fetch_url import ServerFetchUrlError
 from mindroom.tool_system.bootstrap import ensure_tool_registry_loaded
+from mindroom.tool_system.declarations import SetupType
 from mindroom.tool_system.metadata import (
     _AUTHORED_OVERRIDE_INHERIT,
     ConfigField,
@@ -66,6 +67,12 @@ def _restore_builtin_tool_metadata_state() -> None:
     TOOL_REGISTRY.update(_BASE_TOOL_REGISTRY)
     TOOL_METADATA.clear()
     TOOL_METADATA.update(_BASE_TOOL_METADATA)
+
+
+def _clear_module_origin_caches() -> None:
+    """Clear module-origin caches between tests."""
+    metadata_module._resolved_module_file.cache_clear()
+    metadata_module._module_file_within_root.cache_clear()
 
 
 def test_reconcile_dynamic_tool_state_replaces_only_owned_entries() -> None:
@@ -153,6 +160,11 @@ def test_export_tools_metadata_json() -> None:
         for field in required_fields:
             assert field in first_tool, f"Missing required field: {field}"
         assert "managed_init_args" not in first_tool
+
+
+def test_oauth_connections_requires_live_room_context() -> None:
+    """OAuth reset must not be advertised without a requester-bound live context."""
+    assert TOOL_METADATA["oauth_connections"].requires_room_context is True
 
 
 def test_export_tools_metadata_json_resets_leaked_registry_entries() -> None:
@@ -401,15 +413,48 @@ def test_module_origin_within_root_caches_path_resolution(
             resolve_calls += 1
         return original_resolve(self, *args, **kwargs)
 
-    metadata_module._resolved_module_file.cache_clear()
+    _clear_module_origin_caches()
     monkeypatch.setattr(metadata_module.Path, "resolve", counted_resolve)
     try:
         assert metadata_module._module_origin_within_root(module, plugin_root)
         assert metadata_module._module_origin_within_root(module, plugin_root)
     finally:
-        metadata_module._resolved_module_file.cache_clear()
+        _clear_module_origin_caches()
 
     assert resolve_calls == 1
+
+
+def test_module_origin_within_root_caches_containment_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plugin validation rescans all of sys.modules, so containment must resolve once."""
+    plugin_root = tmp_path / "plugins" / "demo"
+    plugin_root.mkdir(parents=True)
+    module_path = plugin_root / "helper.py"
+    module_path.write_text("VALUE = 1\n", encoding="utf-8")
+    module = ModuleType("demo.helper")
+    module.__file__ = str(module_path)
+    outside_module = ModuleType("outside.helper")
+    outside_module.__file__ = str(tmp_path / "outside.py")
+    containment_calls = 0
+    original_is_relative_to = Path.is_relative_to
+
+    def counted_is_relative_to(self: Path, *args: object, **kwargs: object) -> bool:
+        nonlocal containment_calls
+        containment_calls += 1
+        return original_is_relative_to(self, *args, **kwargs)
+
+    _clear_module_origin_caches()
+    monkeypatch.setattr(metadata_module.Path, "is_relative_to", counted_is_relative_to)
+    try:
+        for _ in range(5):
+            assert metadata_module._module_origin_within_root(module, plugin_root)
+            assert not metadata_module._module_origin_within_root(outside_module, plugin_root)
+    finally:
+        _clear_module_origin_caches()
+
+    assert containment_calls == 2
 
 
 def test_restore_tool_registry_snapshot_uses_sys_modules_snapshot(
@@ -457,6 +502,43 @@ def test_tool_metadata_consistency() -> None:
                 f"{tool_name} is metadata-only and should not declare managed init args: "
                 f"{[managed_arg.value for managed_arg in metadata.managed_init_args]}"
             )
+
+
+def test_github_metadata_declares_oauth_and_manual_token_fallback() -> None:
+    """GitHub metadata should describe both managed OAuth and manual-token construction."""
+    metadata = TOOL_METADATA["github"]
+
+    assert metadata.setup_type == SetupType.OAUTH
+    assert metadata.auth_provider == "github"
+    assert metadata.oauth_fallback_fields == ("access_token",)
+    assert metadata.managed_init_args == (
+        ToolManagedInitArg.RUNTIME_PATHS,
+        ToolManagedInitArg.CREDENTIALS_MANAGER,
+        ToolManagedInitArg.WORKER_TARGET,
+        ToolManagedInitArg.AUTHORIZATION,
+    )
+    assert {field.name for field in metadata.config_fields or []} == {"access_token", "base_url"}
+
+    exported = next(tool for tool in export_tools_metadata() if tool["name"] == "github")
+    assert exported["oauth_fallback_fields"] == ["access_token"]
+    assert "managed_init_args" not in exported
+
+
+def test_registration_rejects_missing_oauth_fallback_config_field() -> None:
+    """Fallback metadata should never reference a field the dashboard cannot configure."""
+    with pytest.raises(ValueError, match="missing_field"):
+
+        @register_tool_with_metadata(
+            name="invalid_oauth_fallback",
+            display_name="Invalid OAuth Fallback",
+            description="Invalid test metadata.",
+            category=ToolCategory.DEVELOPMENT,
+            setup_type=SetupType.OAUTH,
+            config_fields=[],
+            oauth_fallback_fields=("missing_field",),
+        )
+        def _invalid_oauth_fallback() -> type[Toolkit]:
+            return Toolkit
 
 
 def test_dynamic_tools_is_durable_metadata_only_builtin(tmp_path: Path) -> None:
@@ -822,6 +904,28 @@ def test_file_empty_exclude_patterns_override_reaches_constructor(tmp_path: Path
     )
 
     assert tool.exclude_patterns == []
+
+
+def test_script_integral_number_overrides_reach_integer_limits(tmp_path: Path) -> None:
+    """JSON number fields such as 3.0 must satisfy integer-valued script limits."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+    )
+
+    tool = get_tool_by_name(
+        "script",
+        runtime_paths,
+        tool_config_overrides={
+            "max_concurrent_runs": 3.0,
+            "max_tool_calls_per_minute": 30.0,
+        },
+        disable_sandbox_proxy=True,
+        worker_target=None,
+    )
+
+    assert tool.limits.max_concurrent_runs == 3
+    assert tool.limits.max_tool_calls_per_minute == 30
 
 
 def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path: Path) -> None:

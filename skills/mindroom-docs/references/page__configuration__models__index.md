@@ -9,14 +9,17 @@ Models define the AI providers and model IDs used by agents.
 - `azure` - OpenAI models through Azure OpenAI deployments
 - `openai` - GPT models and OpenAI-compatible endpoints
 - `codex` or `openai_codex` - OpenAI models available through a local Codex CLI ChatGPT login
+- `kimi` or `kimi_code` - Kimi models available through a local Kimi Code CLI login
 - `google` or `gemini` - Google Gemini models
 - `vertexai_claude` - Anthropic Claude models on Google Vertex AI
 - `ollama` - Local models via Ollama
+- `llama_cpp` - Local models through an OpenAI-compatible llama.cpp server
 - `groq` - Groq-hosted models (fast inference)
 - `openrouter` - OpenRouter-hosted models (access to many providers)
 - `cerebras` - Cerebras-hosted models
 - `deepseek` - DeepSeek models
 - `zai` - Z.ai GLM models
+- `synthetic` - Built-in Lorem Ipsum model for local conversations and load generation
 
 ## Model Config Fields
 
@@ -27,9 +30,11 @@ Each model configuration supports the following fields:
 | `provider` | Yes | - | The AI provider (see supported providers above) |
 | `id` | Yes | - | Model ID specific to the provider |
 | `host` | No | `null` | Host URL for self-hosted models (e.g., Ollama) |
-| `api_key` | No | `null` | API key (usually read from environment variables) |
 | `extra_kwargs` | No | `null` | Additional provider-specific parameters |
-| `context_window` | No | `null` | Actual provider context window size in tokens; MindRoom uses it as the default replay-planning window unless compaction sets a smaller `replay_window_tokens`; an explicit `compaction.model` or `compaction.fallback_model` needs its own `context_window` for summary generation; on `vertexai_claude` it also enables request-time fitting |
+| `context_window` | No | `null` | Actual provider context window size in tokens; MindRoom uses it for compaction summary input and as the default replay-planning window unless compaction sets a smaller `replay_window_tokens`; an explicit `compaction.model` or `compaction.fallback_model` needs its own `context_window` for summary generation; on `vertexai_claude` it also enables request-time fitting |
+
+For Azure OpenAI, `id` is the Azure deployment name, not the underlying base-model name.
+Provider credentials come from supported environment variables, stored credentials, CLI authentication, or deliberately supplied `extra_kwargs`; the top-level `ModelConfig.api_key` field is not used during model construction.
 
 ## Configuration Examples
 
@@ -41,6 +46,16 @@ models:
     id: claude-sonnet-5
     context_window: 1000000
 
+  fable:
+    provider: anthropic
+    id: claude-fable-5
+    context_window: 1000000
+
+  opus:
+    provider: anthropic
+    id: claude-opus-5
+    context_window: 1000000
+
   haiku:
     provider: anthropic
     id: claude-haiku-4-5
@@ -49,7 +64,7 @@ models:
   # Anthropic Claude on Amazon Bedrock
   bedrock_opus:
     provider: bedrock_claude
-    id: anthropic.claude-opus-4-8
+    id: anthropic.claude-opus-5
     context_window: 1000000
 
   # OpenAI
@@ -69,10 +84,17 @@ models:
     id: gpt-5.6
     context_window: 258000
 
+  # Kimi K3 via a Kimi Code CLI login
+  kimi:
+    provider: kimi
+    id: k3
+    context_window: 1048576
+
   # Google Gemini (both 'google' and 'gemini' work as provider names)
   gemini:
     provider: google
-    id: gemini-3.1-pro-preview
+    id: gemini-3.6-flash
+    context_window: 1048576
 
   # Anthropic Claude on Vertex AI
   vertex_claude:
@@ -106,7 +128,8 @@ models:
   # DeepSeek
   deepseek:
     provider: deepseek
-    id: deepseek-chat
+    id: deepseek-v4-pro
+    context_window: 1048576
 
   # Z.ai (GLM models)
   glm:
@@ -121,6 +144,38 @@ models:
     extra_kwargs:
       base_url: http://localhost:8080/v1
 ```
+
+## Built-In Synthetic Model
+
+Use `provider: synthetic` to exercise normal MindRoom conversations without an API key or model server.
+The model streams a seeded random amount of Lorem Ipsum at a fixed character rate.
+When the agent has the `shell` tool, the model occasionally calls `run_shell_command` with `echo hi` and then continues its response.
+
+```yaml
+models:
+  synthetic:
+    provider: synthetic
+    id: lorem-ipsum
+    extra_kwargs:
+      seed: 1
+      min_response_chars: 320
+      max_response_chars: 960
+      chunk_chars: 40
+      chars_per_second: 80
+      tool_call_probability: 0.2
+
+agents:
+  load_test:
+    display_name: Load Test
+    role: Generate synthetic traffic.
+    model: synthetic
+    tools: [shell]
+    rooms: [lobby]
+```
+
+Tag `@load_test` in Lobby to receive a streamed synthetic reply through the same Matrix path as any other agent.
+Set `tool_call_probability: 1` to force the shell call on every turn, or `0` to disable tool calls.
+Changing `seed` changes the repeatable response length, split point, and tool-call choice for each conversation history.
 
 ## OpenAI API Models
 
@@ -178,6 +233,37 @@ Live testing against the Codex ChatGPT endpoint reported `cached_tokens` only wh
 Repeated long requests then reported cache hits, while requests without those headers stayed at `cached_tokens: 0`, and `prompt_cache_retention` was rejected.
 Treat Codex prompt caching as best-effort rather than guaranteed.
 
+## Kimi Models with Kimi Code Login
+
+Use `provider: kimi` when you want MindRoom to call Kimi models through an authenticated local Kimi Code CLI session (Kimi Code subscription) instead of the billed Moonshot API.
+Run `kimi` and `/login` first so `~/.kimi-code/credentials/kimi-code.json` contains OAuth tokens.
+MindRoom refreshes the access token when needed and sends requests to the Kimi Code OpenAI-compatible endpoint at `https://api.kimi.com/coding/v1`.
+
+| Model | Model ID | Best fit |
+|-------|----------|----------|
+| Kimi K3 | `k3` | Flagship reasoning, long-horizon coding, and agent work with a 1M-token context |
+| Kimi K3 256k | `k3-256k` | The same K3 generation with a 256k-token context |
+| Kimi for Coding | `kimi-for-coding` | Coding-tuned tier exposed by the Kimi Code CLI |
+
+The CLI-config-style form `kimi-code/k3` is accepted as an alternative to the bare slug.
+If you keep Kimi Code state outside `~/.kimi-code`, set `KIMI_CODE_HOME` or pass `extra_kwargs.kimi_home`; user-home prefixes such as `~/custom-kimi` are expanded.
+For starter config generation, use `mindroom config init --provider kimi`.
+
+```yaml
+models:
+  default:
+    provider: kimi
+    id: k3
+    context_window: 1048576
+```
+
+Kimi K3 always reasons before replying, so responses include reasoning tokens even for short answers.
+This adapter follows the local Kimi Code CLI authentication-file and backend contracts, so upstream Kimi Code changes can require a MindRoom update.
+
+Prompt caching is automatic on the Kimi Code endpoint: repeated request prefixes come back as `cached_tokens` with no opt-in.
+Like the Kimi Code CLI, MindRoom pins each active agent session to a stable `prompt_cache_key` derived from the execution identity (the same derivation the Codex provider uses), which keeps cache routing stable per Matrix thread.
+You can set `extra_kwargs.prompt_cache_key` to override the derived key for a model.
+
 ## OpenRouter Provider Routing
 
 OpenRouter routes each request to one of several upstream providers serving the model, and upstream quality varies (we have seen a third-party host leak raw tool-call markup into a visible reply).
@@ -222,15 +308,16 @@ For starter config generation, use `mindroom config init --provider azure`.
 ## Amazon Bedrock Claude
 
 Use `provider: bedrock_claude` when you want MindRoom to call Anthropic Claude through Amazon Bedrock.
-MindRoom uses Agno's AWS Bedrock Claude model wrapper and auto-installs the `aws_bedrock` optional extra on first use unless `MINDROOM_NO_AUTO_INSTALL_TOOLS=1` is set.
+MindRoom uses Anthropic's Bedrock Mantle Messages client and auto-installs the `aws_bedrock` optional extra on first use unless `MINDROOM_NO_AUTO_INSTALL_TOOLS=1` is set.
 The `id` field should be the Bedrock model ID or inference profile ID enabled in your AWS account and region.
-Use Opus when you want the highest Claude tier available through Bedrock.
+Bedrock lists Fable 5 as open access, while Opus 5 access can depend on the AWS account and region.
+The generated Bedrock starter config defaults to Opus 5, so confirm access or choose Fable 5 or Sonnet 5 instead.
 
 ```yaml
 models:
   default:
     provider: bedrock_claude
-    id: anthropic.claude-opus-4-8
+    id: anthropic.claude-opus-5
     context_window: 1000000
 ```
 
@@ -254,13 +341,14 @@ It runs only when history exceeds the hard replay budget for the next reply.
 You can tune compaction behavior with these settings:
 
 - Use `threshold_tokens` or `threshold_percent` to set the soft trigger budget. Crossing this soft trigger while still within the hard budget leaves the stored session unchanged and relies on replay fitting for that reply.
-- Use `replay_window_tokens` to keep persisted replay, required-compaction planning, and summary input chunks within a smaller operational window without presenting that smaller value as the provider's request limit.
+- Use `replay_window_tokens` to keep persisted replay and required-compaction planning within a smaller operational window without presenting that smaller value as the provider's request limit.
 - Use `reserve_tokens` to leave hard-budget headroom for the current prompt and output.
-- Use `model` to choose the summary model, and `fallback_model` to name a different model config that resends the unchanged summary prompt and input once (only the target model differs) when the summary model refuses for safeguards; after a successful fallback, that model serves the remaining compaction chunks and is reported as the summary model.
+- Use `model` to choose the summary model, and `fallback_model` to name a different model config retried once when the summary model refuses for safeguards; the same input is reused when it fits, otherwise it is rebuilt under the fallback model's own context budget, and after success that model serves the remaining chunks.
+- Use `timeout_seconds` to bound each primary, retry, or fallback summary request; it defaults to 600 seconds, while an explicitly shorter provider timeout remains the stricter cap.
 
 When the active runtime model window is known, replay safety uses the smaller of it and `replay_window_tokens`.
 When that model window is unknown, an explicit `replay_window_tokens` still supplies the replay-planning window.
-The effective replay window also caps each compaction summary input chunk.
+Each compaction summary input chunk is sized independently from the selected compaction model's real `context_window`, after reserve, prompt overhead, and a safety margin.
 Destructive compaction requires the resolved summary input budget to exceed 2,000 tokens.
 With the default `reserve_tokens`, this makes destructive compaction unavailable when the compaction model's context window is roughly 10,000 tokens or smaller; lowering `reserve_tokens` restores availability for such small windows.
 
@@ -288,19 +376,23 @@ models:
 
 defaults:
   compaction:
-    replay_window_tokens: 200000  # Cap persisted replay and compaction summary chunks
+    replay_window_tokens: 200000  # Compact persisted replay around a smaller operational window
 ```
 
 This is useful for models with smaller context windows or long-running conversations that accumulate persisted history.
 
 ## Extra Kwargs
 
-The `extra_kwargs` field passes additional parameters directly to the underlying [Agno](https://docs.agno.com/) model class. Common options include:
+The `extra_kwargs` field configures additional parameters on the underlying [Agno](https://docs.agno.com/) model class.
+Common options include:
 
 - `base_url` - Custom API endpoint (useful for OpenAI-compatible servers)
 - `temperature` - Sampling temperature
 - `max_tokens` - Maximum tokens in response
 - `extra_body` - Extra JSON body fields for OpenAI-compatible providers (e.g., OpenRouter provider routing above)
+
+Claude Fable 5, Opus 5, and Sonnet 5 reject non-default `temperature`, `top_p`, and `top_k` values, so MindRoom omits those controls on Anthropic, Bedrock, and Vertex requests.
+MindRoom also omits those deprecated controls for direct Gemini 3.6 Flash and Gemini 3.5 Flash-Lite requests.
 
 ## Environment Variables
 
@@ -350,7 +442,7 @@ Authenticate with `gcloud auth application-default login` or set `GOOGLE_APPLICA
 
 ### File-based Secrets
 
-For container environments (Kubernetes, Docker Swarm), you can also use file-based secrets by appending `_FILE` to any environment variable name:
+For container environments (Kubernetes, Docker Swarm), supported API-key and secret variables can also use a `_FILE` suffix:
 
 ```bash
 # Instead of setting the key directly:

@@ -79,6 +79,28 @@ def _render_runtime_chart() -> list[dict[str, Any]]:
     )
 
 
+def test_runtime_chart_exposes_exact_script_resource_profiles_to_primary() -> None:
+    """The primary receives the same three bounded quantities configured in Helm values."""
+    deployment = _resource(_render_runtime_chart(), "Deployment", "mindroom-runtime")
+    env = _env_by_name(_container(deployment, "mindroom"))
+
+    assert env["MINDROOM_KUBERNETES_DEFAULT_SCRIPT_RESOURCE_PROFILE"]["value"] == "small"
+    assert json.loads(env["MINDROOM_KUBERNETES_SCRIPT_RESOURCE_PROFILES_JSON"]["value"]) == {
+        "small": {
+            "requests": {"cpu": "100m", "memory": "256Mi"},
+            "limits": {"cpu": "500m", "memory": "1Gi"},
+        },
+        "standard": {
+            "requests": {"cpu": "250m", "memory": "512Mi"},
+            "limits": {"cpu": "1", "memory": "2Gi"},
+        },
+        "large": {
+            "requests": {"cpu": "500m", "memory": "2Gi"},
+            "limits": {"cpu": "2", "memory": "8Gi"},
+        },
+    }
+
+
 def _render_runtime_chart_with_separate_worker_namespace() -> list[dict[str, Any]]:
     return _render_chart(
         Path("cluster/k8s/runtime"),
@@ -2386,10 +2408,10 @@ def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permis
                         "mountPath": "/app/agent_data/encryption_keys",
                         "subPath": "encryption_keys",
                     },
-                    "syncTokens": {
+                    "syncContinuity": {
                         "enabled": True,
-                        "mountPath": "/app/agent_data/sync_tokens",
-                        "subPath": "sync_tokens",
+                        "mountPath": "/app/agent_data/sync_continuity",
+                        "subPath": "sync_continuity",
                     },
                     "initPermissions": {
                         "enabled": True,
@@ -2433,10 +2455,10 @@ def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permis
         "mountPath": "/app/agent_data/encryption_keys",
         "subPath": "encryption_keys",
     }
-    assert volume_mounts["/app/agent_data/sync_tokens"] == {
+    assert volume_mounts["/app/agent_data/sync_continuity"] == {
         "name": "state-storage",
-        "mountPath": "/app/agent_data/sync_tokens",
-        "subPath": "sync_tokens",
+        "mountPath": "/app/agent_data/sync_continuity",
+        "subPath": "sync_continuity",
     }
     assert volume_mounts["/etc/custom"] == {"name": "custom-config", "mountPath": "/etc/custom"}
 
@@ -2452,9 +2474,9 @@ def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permis
     }
     assert init_containers["prepare-state-storage"]["command"][:2] == ["sh", "-c"]
     state_command = init_containers["prepare-state-storage"]["command"][2]
-    assert 'mkdir -p "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
-    assert 'chown -R 1000:1000 "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
-    assert 'chmod 2775 "/state" "/state/encryption_keys" "/state/sync_tokens"' in state_command
+    assert 'mkdir -p "/state" "/state/encryption_keys" "/state/sync_continuity"' in state_command
+    assert 'chown -R 1000:1000 "/state" "/state/encryption_keys" "/state/sync_continuity"' in state_command
+    assert 'chmod 2775 "/state" "/state/encryption_keys" "/state/sync_continuity"' in state_command
 
 
 def test_runtime_chart_state_storage_can_create_pvc() -> None:
@@ -2485,28 +2507,32 @@ def test_runtime_chart_state_storage_can_create_pvc() -> None:
             "stateStorage.mountPath must differ from stateStorage.encryptionKeys.mountPath",
         ),
         (
-            ("stateStorage.mountPath=/app/agent_data/sync_tokens",),
-            "stateStorage.mountPath must differ from stateStorage.syncTokens.mountPath",
+            ("stateStorage.mountPath=/app/agent_data/sync_continuity",),
+            "stateStorage.mountPath must differ from stateStorage.syncContinuity.mountPath",
         ),
         (
             ("stateStorage.encryptionKeys.mountPath=/app/agent_data",),
             "stateStorage.encryptionKeys.mountPath must differ from storage.mountPath",
         ),
         (
-            ("stateStorage.syncTokens.mountPath=/app/agent_data",),
-            "stateStorage.syncTokens.mountPath must differ from storage.mountPath",
+            ("stateStorage.syncContinuity.mountPath=/app/agent_data",),
+            "stateStorage.syncContinuity.mountPath must differ from storage.mountPath",
         ),
         (
-            ("stateStorage.syncTokens.mountPath=/app/agent_data/encryption_keys",),
-            "stateStorage.encryptionKeys.mountPath must differ from stateStorage.syncTokens.mountPath",
+            ("stateStorage.syncContinuity.mountPath=/app/agent_data/encryption_keys",),
+            "stateStorage.encryptionKeys.mountPath must differ from stateStorage.syncContinuity.mountPath",
+        ),
+        (
+            ("stateStorage.syncContinuity.subPath=encryption_keys",),
+            "stateStorage.encryptionKeys.subPath must differ from stateStorage.syncContinuity.subPath",
         ),
     ],
 )
-def test_runtime_chart_state_storage_rejects_mount_path_conflicts(
+def test_runtime_chart_state_storage_rejects_path_conflicts(
     conflict_args: tuple[str, ...],
     expected_error: str,
 ) -> None:
-    """Generated runtime volumeMount paths must stay unique."""
+    """Generated runtime volume mount paths and PVC subpaths must stay unique."""
     completed = _run_helm_template(
         Path("cluster/k8s/runtime"),
         "eventCache.postgres.auth.password=test-password",

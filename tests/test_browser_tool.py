@@ -30,7 +30,10 @@ from mindroom.message_target import MessageTarget
 from mindroom.server_fetch_url import ServerFetchUrlError
 from mindroom.tool_system.metadata import TOOL_METADATA
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from tests.conftest import make_conversation_cache_mock, make_event_cache_mock
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import make_conversation_reader_mock, make_relation_lookup
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -211,7 +214,7 @@ def test_resolve_output_dir_prefers_tool_runtime_context_storage_path(tmp_path: 
     )
     tool = BrowserTools(runtime_paths)
     context_storage_path = tmp_path / "context-storage"
-    context = ToolRuntimeContext(
+    context = make_test_tool_runtime_context(
         agent_name="general",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -222,8 +225,8 @@ def test_resolve_output_dir_prefers_tool_runtime_context_storage_path(tmp_path: 
         client=MagicMock(),
         config=MagicMock(),
         runtime_paths=runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         storage_path=context_storage_path,
     )
 
@@ -244,7 +247,7 @@ def test_resolve_output_dir_does_not_reuse_previous_context_storage_path(tmp_pat
     tool = BrowserTools(runtime_paths)
 
     def runtime_context(storage_path: Path) -> ToolRuntimeContext:
-        return ToolRuntimeContext(
+        return make_test_tool_runtime_context(
             agent_name="general",
             target=MessageTarget.resolve(
                 room_id="!room:example.org",
@@ -255,8 +258,8 @@ def test_resolve_output_dir_does_not_reuse_previous_context_storage_path(tmp_pat
             client=MagicMock(),
             config=MagicMock(),
             runtime_paths=runtime_paths,
-            event_cache=make_event_cache_mock(),
-            conversation_cache=make_conversation_cache_mock(),
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
             storage_path=storage_path,
         )
 
@@ -918,7 +921,7 @@ def test_browser_upload_roots_do_not_reuse_previous_context_output_dir(tmp_path:
     tool = BrowserTools(runtime_paths)
 
     def runtime_context(storage_path: Path) -> ToolRuntimeContext:
-        return ToolRuntimeContext(
+        return make_test_tool_runtime_context(
             agent_name="general",
             target=MessageTarget.resolve(
                 room_id="!room:example.org",
@@ -929,8 +932,8 @@ def test_browser_upload_roots_do_not_reuse_previous_context_output_dir(tmp_path:
             client=MagicMock(),
             config=MagicMock(),
             runtime_paths=runtime_paths,
-            event_cache=make_event_cache_mock(),
-            conversation_cache=make_conversation_cache_mock(),
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
             storage_path=storage_path,
         )
 

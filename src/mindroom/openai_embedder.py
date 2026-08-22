@@ -27,6 +27,7 @@ from mindroom.embedding_errors import (
     EMBEDDER_EMPTY_VECTOR_DETAIL,
     EmbedderRequestError,
     describe_embedder_error,
+    embedder_retry_after_seconds,
 )
 from mindroom.model_defaults import OPENAI_EMBEDDING_DIMENSIONS
 
@@ -38,7 +39,9 @@ def _classified_request_error(exc: Exception, health_recorder: EmbedderHealthRec
     """Record and return the classified failure for one provider exception."""
     detail = describe_embedder_error(exc)
     health_recorder.record(detail)
-    return EmbedderRequestError(detail)
+    # The classified error replaces the provider exception, so carry the
+    # provider's own backoff hint across the boundary before it is discarded.
+    return EmbedderRequestError(detail, retry_after_seconds=embedder_retry_after_seconds(exc))
 
 
 def _validated_embeddings(
@@ -81,8 +84,13 @@ class MindRoomOpenAIEmbedder(OpenAIEmbedder):
         return self.dimensions is not None and (self._dimensions_explicit or self.id in OPENAI_EMBEDDING_DIMENSIONS)
 
     def _request_params(self, input_value: str | list[str]) -> dict[str, Any]:
+        # LiteLLM reserves files/... for Gemini file references; MindRoom inputs are text.
+        if isinstance(input_value, str):
+            request_input = f" {input_value}" if input_value.startswith("files/") else input_value
+        else:
+            request_input = [f" {text}" if text.startswith("files/") else text for text in input_value]
         request: dict[str, Any] = {
-            "input": input_value,
+            "input": request_input,
             "model": self.id,
             "encoding_format": self.encoding_format,
         }

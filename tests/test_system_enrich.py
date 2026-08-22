@@ -18,7 +18,6 @@ from agno.session.team import TeamSession
 from agno.team import Team
 
 from mindroom.ai import _prepare_agent_and_prompt
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
@@ -48,6 +47,7 @@ from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode, build_materialized_team_instance, prepare_materialized_team_execution
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
     bind_runtime_paths,
@@ -62,6 +62,8 @@ from tests.conftest import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
+
+    from mindroom.bot import AgentBot
 
 
 def _config(tmp_path: Path) -> Config:
@@ -171,7 +173,7 @@ def _make_bot(tmp_path: Path) -> AgentBot:
         display_name="CodeAgent",
         password=TEST_PASSWORD,
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -631,7 +633,7 @@ async def test_process_and_respond_threads_system_enrichment_items(tmp_path: Pat
             ai_response=AsyncMock(side_effect=fake_ai_response),
         ),
     ):
-        generation = await bot._response_runner.process_and_respond(
+        generation = await bot._response_runner._process_and_respond(
             ResponseRequest(
                 thread_history=[],
                 prompt="Please reply",
@@ -683,7 +685,7 @@ async def test_process_and_respond_streaming_threads_system_enrichment_items(tmp
             stream_agent_response=fake_stream_agent_response,
         ),
     ):
-        generation = await bot._response_runner.process_and_respond_streaming(
+        generation = await bot._response_runner._process_and_respond_streaming(
             ResponseRequest(
                 thread_history=[],
                 prompt="Please reply",

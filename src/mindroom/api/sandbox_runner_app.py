@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from mindroom import __version__
 from mindroom.api.sandbox_runner import (
     app_runner_token,
     app_runtime_config,
@@ -14,6 +15,11 @@ from mindroom.api.sandbox_runner import (
     startup_runner_token_from_env,
 )
 from mindroom.api.sandbox_runner import router as sandbox_runner_router
+from mindroom.api.sandbox_runner_scripts import (
+    prepare_script_worker_before_serving,
+)
+from mindroom.api.sandbox_runner_scripts import router as sandbox_runner_scripts_router
+from mindroom.workers.compatibility import worker_health_payload
 
 
 @asynccontextmanager
@@ -32,14 +38,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         config=config,
         runner_token=runner_token,
     )
+    await prepare_script_worker_before_serving(app)
     yield
 
 
 app = FastAPI(title="MindRoom Sandbox Runner", lifespan=_lifespan)
 app.include_router(sandbox_runner_router)
+app.include_router(sandbox_runner_scripts_router)
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    """Minimal readiness/liveness probe for dedicated worker pods."""
-    return {"status": "ok"}
+async def healthz() -> dict[str, str | int]:
+    """Return readiness plus the worker compatibility contract."""
+    payload = worker_health_payload(mindroom_version=__version__)
+    return {
+        "status": payload.status,
+        "mindroom_version": payload.mindroom_version,
+        "worker_protocol": payload.worker_protocol,
+    }

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import nio
 from nio.api import RelationshipType
@@ -43,15 +43,8 @@ from mindroom.matrix.event_info import EventInfo
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_message_content, markdown_to_html
 from mindroom.matrix.message_content import extract_and_resolve_message, extract_edit_body
-from mindroom.matrix.thread_diagnostics import (
-    THREAD_HISTORY_SOURCE_CACHE,
-    THREAD_HISTORY_SOURCE_DIAGNOSTIC,
-    THREAD_HISTORY_SOURCE_HOMESERVER,
-    is_thread_history_degraded,
-)
+from mindroom.matrix.room_history_reads import fetch_thread_messages_from_source
 from mindroom.matrix.thread_projection import (
-    SupportsVisibleThreadMessage,
-    latest_visible_thread_event_id_by_thread,
     ordered_event_ids_from_scanned_event_sources,
     resolve_thread_ids_for_event_infos,
 )
@@ -67,7 +60,6 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.matrix.conversation_cache import ConversationCacheProtocol, ThreadReadResult
 
 logger = get_logger(__name__)
 
@@ -107,14 +99,6 @@ class _InterruptedThread:
 
 
 @dataclass(frozen=True)
-class StaleStreamCleanupActor:
-    """One bot account that may repair its own stale messages."""
-
-    client: nio.AsyncClient
-    conversation_cache: ConversationCacheProtocol | None
-
-
-@dataclass(frozen=True)
 class _StaleStreamRecoveryResult:
     """Aggregate outcome from one startup recovery sweep."""
 
@@ -130,7 +114,6 @@ class _MessageState:
     latest_body: str | None = None
     latest_timestamp: int = 0
     latest_event_id: str = ""
-    latest_thread_event_id: str = ""
     latest_content: dict[str, Any] | None = None
     thread_id: str | None = None
     stream_status: str | None = None
@@ -157,6 +140,14 @@ class _CleanupScanPolicy:
     max_extra_old_pages: int
 
 
+@dataclass(frozen=True)
+class _JoinedRoomState:
+    """Actor rooms to scan plus the independent resume identity membership."""
+
+    room_actors: dict[str, dict[str, nio.AsyncClient]]
+    resume_room_ids: frozenset[str] | None
+
+
 def _cleanup_scan_policy(
     config: Config,
     *,
@@ -171,6 +162,34 @@ def _cleanup_scan_policy(
         terminal_interrupted_only=terminal_interrupted_only,
         max_extra_old_pages=(_MAX_EXTRA_INTERRUPTED_HISTORY_PAGES if collect_terminal_interrupted_for_resume else 0),
     )
+
+
+def _auto_resume_threads_for_room(
+    room_id: str,
+    interrupted_threads: list[_InterruptedThread],
+    *,
+    auto_resume_enabled: bool,
+    resume_client: nio.AsyncClient | None,
+    resume_room_ids: frozenset[str] | None,
+    scanned_room_ids: set[str],
+) -> list[_InterruptedThread]:
+    """Keep eligible work and leave membership-deferred rooms retryable."""
+    if (
+        not auto_resume_enabled
+        or not interrupted_threads
+        or resume_client is None
+        or (resume_room_ids is not None and room_id in resume_room_ids)
+    ):
+        return interrupted_threads
+    scanned_room_ids.discard(room_id)
+    logger.info(
+        "Deferring auto-resume until resume identity membership is available",
+        room_id=room_id,
+        resume_user_id=resume_client.user_id,
+        membership_known=resume_room_ids is not None,
+        interrupted_count=len(interrupted_threads),
+    )
+    return []
 
 
 def _requester_resolution_message(
@@ -196,10 +215,9 @@ def _requester_resolution_message(
 
 
 async def recover_stale_streaming_messages(
-    actors: dict[str, StaleStreamCleanupActor],
+    actors: dict[str, nio.AsyncClient],
     *,
     resume_client: nio.AsyncClient | None,
-    resume_conversation_cache: ConversationCacheProtocol | None,
     config: Config,
     runtime_paths: RuntimePaths,
     startup_cutoff_ms: int | None,
@@ -208,9 +226,10 @@ async def recover_stale_streaming_messages(
     room_concurrency: int = _RECOVERY_ROOM_CONCURRENCY,
 ) -> _StaleStreamRecoveryResult:
     """Recover stale streams through one concurrent Matrix-history path."""
+    joined_room_state = await _joined_room_actors(actors, resume_client=resume_client)
     room_actors = {
         room_id: joined_actors
-        for room_id, joined_actors in (await _joined_room_actors(actors)).items()
+        for room_id, joined_actors in joined_room_state.room_actors.items()
         if room_id not in scanned_room_ids and (target_room_ids is None or room_id in target_room_ids)
     }
     scanned_room_ids.update(room_actors)
@@ -223,15 +242,15 @@ async def recover_stale_streaming_messages(
 
     async def recover_room(
         room_id: str,
-        joined_actors: dict[str, StaleStreamCleanupActor],
+        joined_actors: dict[str, nio.AsyncClient],
     ) -> tuple[int, list[_InterruptedThread]]:
-        scan_actor = joined_actors.get(resume_user_id) if isinstance(resume_user_id, str) else None
-        if scan_actor is None:
-            scan_actor = joined_actors[min(joined_actors)]
+        scan_client = joined_actors.get(resume_user_id) if isinstance(resume_user_id, str) else None
+        if scan_client is None:
+            scan_client = joined_actors[min(joined_actors)]
         async with semaphore:
             try:
-                return await _cleanup_stale_streaming_room(
-                    scan_actor.client,
+                cleaned_count, interrupted_threads = await _cleanup_stale_streaming_room(
+                    scan_client,
                     room_id=room_id,
                     actors=joined_actors,
                     bot_user_ids=all_bot_user_ids,
@@ -244,6 +263,16 @@ async def recover_stale_streaming_messages(
                 scanned_room_ids.discard(room_id)
                 logger.warning("Failed stale stream recovery for room", room_id=room_id, exc_info=True)
                 return 0, []
+            else:
+                interrupted_threads = _auto_resume_threads_for_room(
+                    room_id,
+                    interrupted_threads,
+                    auto_resume_enabled=config.defaults.auto_resume_after_restart,
+                    resume_client=resume_client,
+                    resume_room_ids=joined_room_state.resume_room_ids,
+                    scanned_room_ids=scanned_room_ids,
+                )
+                return cleaned_count, interrupted_threads
 
     tasks = [
         asyncio.create_task(recover_room(room_id, joined_actors), name=f"stale_stream_recovery:{room_id}")
@@ -262,7 +291,6 @@ async def recover_stale_streaming_messages(
                 interrupted_threads,
                 config=config,
                 runtime_paths=runtime_paths,
-                conversation_cache=resume_conversation_cache,
                 delay_before_first=resumed_count > 0,
             )
     finally:
@@ -279,16 +307,18 @@ async def recover_stale_streaming_messages(
 
 
 async def _joined_room_actors(
-    actors: dict[str, StaleStreamCleanupActor],
-) -> dict[str, dict[str, StaleStreamCleanupActor]]:
-    """Return each joined room once with every available bot account in it."""
+    actors: dict[str, nio.AsyncClient],
+    *,
+    resume_client: nio.AsyncClient | None,
+) -> _JoinedRoomState:
+    """Discover actor scan rooms and resume membership without widening scans."""
 
     async def joined_rooms_for_actor(
         bot_user_id: str,
-        actor: StaleStreamCleanupActor,
-    ) -> tuple[str, StaleStreamCleanupActor, list[str]]:
+        client: nio.AsyncClient,
+    ) -> tuple[str, nio.AsyncClient, list[str] | None]:
         try:
-            joined_rooms = await get_joined_rooms(actor.client)
+            joined_rooms = await get_joined_rooms(client)
         except Exception:
             logger.warning(
                 "Failed to list joined rooms during stale stream recovery",
@@ -296,16 +326,25 @@ async def _joined_room_actors(
                 exc_info=True,
             )
             joined_rooms = None
-        return bot_user_id, actor, joined_rooms or []
+        return bot_user_id, client, joined_rooms
 
+    membership_clients = dict(actors)
+    resume_user_id = resume_client.user_id if resume_client is not None else None
+    if isinstance(resume_user_id, str) and resume_client is not None:
+        membership_clients[resume_user_id] = resume_client
     joined_room_results = await asyncio.gather(
-        *(joined_rooms_for_actor(bot_user_id, actor) for bot_user_id, actor in actors.items()),
+        *(joined_rooms_for_actor(bot_user_id, client) for bot_user_id, client in membership_clients.items()),
     )
-    room_actors: dict[str, dict[str, StaleStreamCleanupActor]] = {}
-    for bot_user_id, actor, joined_room_ids in joined_room_results:
-        for room_id in joined_room_ids:
-            room_actors.setdefault(room_id, {})[bot_user_id] = actor
-    return room_actors
+    room_actors: dict[str, dict[str, nio.AsyncClient]] = {}
+    resume_room_ids: frozenset[str] | None = None
+    for bot_user_id, client, joined_room_ids in joined_room_results:
+        if bot_user_id == resume_user_id and joined_room_ids is not None:
+            resume_room_ids = frozenset(joined_room_ids)
+        if bot_user_id not in actors:
+            continue
+        for room_id in joined_room_ids or []:
+            room_actors.setdefault(room_id, {})[bot_user_id] = client
+    return _JoinedRoomState(room_actors=room_actors, resume_room_ids=resume_room_ids)
 
 
 async def _auto_resume_interrupted_threads(
@@ -314,7 +353,6 @@ async def _auto_resume_interrupted_threads(
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
     delay: float = 2.0,
     delay_before_first: bool = False,
 ) -> int:
@@ -334,11 +372,14 @@ async def _auto_resume_interrupted_threads(
                 target_event_id=interrupted_thread.target_event_id,
             )
             continue
+        if delay_due:
+            await asyncio.sleep(delay)
+            delay_due = False
         if not await _interrupted_target_remains_latest_human_work(
             interrupted_thread,
+            client=client,
             config=config,
             runtime_paths=runtime_paths,
-            conversation_cache=conversation_cache,
         ):
             continue
         try:
@@ -347,25 +388,9 @@ async def _auto_resume_interrupted_threads(
                 config=config,
                 runtime_paths=runtime_paths,
             )
-            if delay_due:
-                await asyncio.sleep(delay)
-                delay_due = False
-                if not await _interrupted_target_remains_latest_human_work(
-                    interrupted_thread,
-                    config=config,
-                    runtime_paths=runtime_paths,
-                    conversation_cache=conversation_cache,
-                ):
-                    continue
             delay_due = True
             delivered = await send_message_result(client, interrupted_thread.room_id, content)
             if delivered is not None:
-                if conversation_cache is not None:
-                    conversation_cache.notify_outbound_message(
-                        interrupted_thread.room_id,
-                        delivered.event_id,
-                        delivered.content_sent,
-                    )
                 logger.info(
                     "Queued auto-resume after restart",
                     room_id=interrupted_thread.room_id,
@@ -396,19 +421,25 @@ async def _auto_resume_interrupted_threads(
 async def _interrupted_target_remains_latest_human_work(
     interrupted_thread: _InterruptedThread,
     *,
+    client: nio.AsyncClient,
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None,
 ) -> bool:
-    """Return whether authoritative history has no newer effective human activity."""
-    if conversation_cache is None or interrupted_thread.thread_id is None:
+    """Return whether authoritative history has no newer effective human activity.
+
+    Reads the homeserver rather than the projection. This runs at startup to
+    decide whether a turn interrupted by the last shutdown is still the newest
+    thing in its thread, and anything written while this process was down has
+    by definition not reached its local state yet.
+    """
+    if interrupted_thread.thread_id is None:
         return False
 
     try:
-        history = await conversation_cache.get_strict_thread_history(
+        history = await fetch_thread_messages_from_source(
+            client,
             interrupted_thread.room_id,
             interrupted_thread.thread_id,
-            caller_label="startup_auto_resume_freshness",
         )
         later_messages = _authoritative_history_after_target(
             history,
@@ -436,18 +467,26 @@ async def _interrupted_target_remains_latest_human_work(
 
 
 def _authoritative_history_after_target(
-    history: ThreadReadResult,
+    history: Sequence[ResolvedVisibleMessage],
     *,
     target_event_id: str,
 ) -> Sequence[ResolvedVisibleMessage]:
-    """Return history entries after an exact target or raise when history is unusable."""
-    history_source = history.diagnostics.get(THREAD_HISTORY_SOURCE_DIAGNOSTIC)
-    if not history.is_full_history or is_thread_history_degraded(history):
-        msg = "Thread history is incomplete or degraded"
-        raise ValueError(msg)
-    if history_source not in {THREAD_HISTORY_SOURCE_CACHE, THREAD_HISTORY_SOURCE_HOMESERVER}:
-        msg = f"Non-authoritative thread history source: {history_source!r}"
-        raise ValueError(msg)
+    """Return history entries after an exact target, or raise if the target is absent.
+
+    This used to take a `ThreadReadResult` and check three things before
+    trusting it: that the read was complete, that it was not degraded, and that
+    it came from the homeserver rather than a cache. All three are now
+    discharged at the source instead of inspected here.
+
+    `fetch_thread_messages_from_source` only reads `/messages`, so there is no
+    non-authoritative source it could return. And it raises rather than
+    returning a partial answer -- `ThreadRoomScanRootNotFoundError` when the
+    scan ends without the root, `UnresolvedOpaqueRoomHistoryError` when
+    relation-bearing ciphertext it cannot read would change the result. A
+    caller that reaches this function therefore holds whole, authoritative
+    history by construction, and the remaining question is only whether the
+    target is in it.
+    """
     target_index = next(
         (index for index, message in enumerate(history) if message.event_id == target_event_id),
         None,
@@ -492,7 +531,7 @@ async def _cleanup_stale_streaming_room(
     scan_client: nio.AsyncClient,
     *,
     room_id: str,
-    actors: dict[str, StaleStreamCleanupActor],
+    actors: dict[str, nio.AsyncClient],
     bot_user_ids: set[str],
     config: Config,
     runtime_paths: RuntimePaths,
@@ -533,11 +572,11 @@ async def _cleanup_stale_streaming_room(
     for target_event_id, state in candidate_items:
         assert state.latest_body is not None  # guaranteed by filter above
         bot_user_id = state.bot_user_id
-        actor = actors.get(bot_user_id) if bot_user_id is not None else None
-        if bot_user_id is None or actor is None:
+        actor_client = actors.get(bot_user_id) if bot_user_id is not None else None
+        if bot_user_id is None or actor_client is None:
             continue
         edited, interrupted = await _process_stale_room_candidate(
-            actor,
+            actor_client,
             bot_user_id=bot_user_id,
             room_id=room_id,
             target_event_id=target_event_id,
@@ -560,7 +599,7 @@ async def _cleanup_stale_streaming_room(
 
 
 async def _process_stale_room_candidate(
-    actor: StaleStreamCleanupActor,
+    client: nio.AsyncClient,
     *,
     bot_user_id: str,
     room_id: str,
@@ -587,21 +626,20 @@ async def _process_stale_room_candidate(
         return False, None
     if _is_cleanup_candidate(state):
         return await _cleanup_candidate_message(
-            actor.client,
+            client,
             room_id=room_id,
             target_event_id=target_event_id,
             state=state,
             bot_user_ids=bot_user_ids,
             config=config,
             runtime_paths=runtime_paths,
-            conversation_cache=actor.conversation_cache,
             agent_name=agent_name,
             prior_edit_succeeded=prior_edit_succeeded,
         )
     if not (_has_restart_interrupted_note(state.latest_body) or _has_resumable_interrupted_note(state)):
         return False, None
     return await _handle_interrupted_message(
-        actor.client,
+        client,
         room_id=room_id,
         target_event_id=target_event_id,
         state=state,
@@ -610,7 +648,6 @@ async def _process_stale_room_candidate(
         bot_user_ids=bot_user_ids,
         config=config,
         runtime_paths=runtime_paths,
-        conversation_cache=actor.conversation_cache,
         agent_name=agent_name,
         prior_edit_succeeded=prior_edit_succeeded,
     )
@@ -627,7 +664,6 @@ async def _handle_interrupted_message(
     bot_user_ids: set[str],
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
     agent_name: str,
     prior_edit_succeeded: bool,
 ) -> tuple[bool, _InterruptedThread | None]:
@@ -647,7 +683,6 @@ async def _handle_interrupted_message(
         state=state,
         config=config,
         runtime_paths=runtime_paths,
-        conversation_cache=conversation_cache,
         prior_edit_succeeded=prior_edit_succeeded,
     )
     await _redact_stop_reactions(
@@ -668,7 +703,6 @@ async def _repair_restart_marked_message_metadata(
     state: _MessageState,
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
     prior_edit_succeeded: bool,
 ) -> bool:
     """Repair non-terminal stream metadata on already restart-marked messages."""
@@ -685,11 +719,8 @@ async def _repair_restart_marked_message_metadata(
             target_event_id=target_event_id,
             new_text=state.latest_body,
             preserved_content=_terminal_stream_content(state.latest_content),
-            thread_id=state.thread_id,
-            latest_thread_event_id=state.latest_thread_event_id or state.latest_event_id or target_event_id,
             config=config,
             runtime_paths=runtime_paths,
-            conversation_cache=conversation_cache,
         )
     except Exception as exc:
         logger.warning(
@@ -710,7 +741,6 @@ async def _cleanup_one_stale_message(
     bot_user_ids: set[str],
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
     agent_name: str,
 ) -> tuple[bool, _InterruptedThread | None]:
     """Edit one stale message, redact stop reactions, return interrupted thread info."""
@@ -721,11 +751,8 @@ async def _cleanup_one_stale_message(
         target_event_id=target_event_id,
         new_text=build_restart_interrupted_body(state.latest_body),
         preserved_content=_terminal_stream_content(state.latest_content),
-        thread_id=state.thread_id,
-        latest_thread_event_id=state.latest_thread_event_id or state.latest_event_id or target_event_id,
         config=config,
         runtime_paths=runtime_paths,
-        conversation_cache=conversation_cache,
     )
     if not edit_succeeded:
         return False, None
@@ -760,7 +787,6 @@ async def _cleanup_candidate_message(
     bot_user_ids: set[str],
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
     agent_name: str,
     prior_edit_succeeded: bool,
 ) -> tuple[bool, _InterruptedThread | None]:
@@ -776,7 +802,6 @@ async def _cleanup_candidate_message(
             bot_user_ids=bot_user_ids,
             config=config,
             runtime_paths=runtime_paths,
-            conversation_cache=conversation_cache,
             agent_name=agent_name,
         )
     except Exception as exc:
@@ -844,12 +869,6 @@ async def _scan_room_message_states(
         requester_ids_by_event_id=requester_ids_by_event_id,
         scanned_message_data_by_event_id=scanned_message_data_by_event_id,
     )
-    _assign_latest_thread_event_ids(
-        message_states,
-        resolved_messages,
-        scanned_message_data_by_event_id=scanned_message_data_by_event_id,
-    )
-
     return _ScannedRoomMessageStates(
         message_states=message_states,
         auto_resume_target_event_ids=auto_resume_target_event_ids,
@@ -870,29 +889,6 @@ def _auto_resume_target_event_ids(
         if reply_to_event_id is not None:
             target_event_ids.add(reply_to_event_id)
     return target_event_ids
-
-
-def _assign_latest_thread_event_ids(
-    message_states: dict[str, _MessageState],
-    resolved_messages: dict[str, ResolvedVisibleMessage],
-    *,
-    scanned_message_data_by_event_id: dict[str, ResolvedVisibleMessage],
-) -> None:
-    """Record the latest visible event ID seen for each explicit thread."""
-    all_messages: list[ResolvedVisibleMessage] = [
-        *resolved_messages.values(),
-        *scanned_message_data_by_event_id.values(),
-    ]
-    latest_event_id_by_thread = latest_visible_thread_event_id_by_thread(
-        cast("list[SupportsVisibleThreadMessage]", all_messages),
-    )
-
-    for state in message_states.values():
-        if state.thread_id is None:
-            continue
-        latest_event = latest_event_id_by_thread.get(state.thread_id)
-        if latest_event is not None:
-            state.latest_thread_event_id = latest_event
 
 
 async def _collect_room_history_events(
@@ -998,7 +994,12 @@ def _merge_resolved_message_state(
     normalized_latest_content = {key: value for key, value in message.content.items() if isinstance(key, str)}
     state = message_states.setdefault(target_event_id, _MessageState())
     state.latest_body = message.body
-    state.latest_timestamp = message.timestamp
+    # The last time this message changed, not when it was created. ``timestamp`` deliberately
+    # stays the original event's so an edit cannot reorder a thread, which means it is the
+    # wrong clock for "is this stream still active": a placeholder posted eight hours ago and
+    # edited seconds before a restart would read as older than the cleanup window and be
+    # skipped, leaving it displaying ``streaming`` forever.
+    state.latest_timestamp = message.edited_timestamp or message.timestamp
     state.latest_event_id = message.visible_event_id
     state.latest_content = normalized_latest_content
     state.thread_id = message.thread_id or fallback_thread_id
@@ -1487,13 +1488,14 @@ async def _edit_stale_message(
     target_event_id: str,
     new_text: str,
     preserved_content: dict[str, Any] | None,
-    thread_id: str | None,
-    latest_thread_event_id: str | None,
     config: Config,
     runtime_paths: RuntimePaths,
-    conversation_cache: ConversationCacheProtocol | None = None,
 ) -> bool:
-    """Edit a stale message while preserving thread context when present."""
+    """Edit a stale message.
+
+    No thread relation is built: ``build_edit_event_content`` pops ``m.relates_to`` off the
+    replacement before sending, so a relation here would never reach the wire.
+    """
     extra_content = _preserved_cleanup_content(preserved_content)
     should_preserve_visible_body = extra_content is not None and STREAM_VISIBLE_BODY_KEY in extra_content
     if should_preserve_visible_body and extra_content is not None:
@@ -1504,8 +1506,6 @@ async def _edit_stale_message(
         config,
         runtime_paths,
         new_text,
-        thread_event_id=thread_id,
-        latest_thread_event_id=latest_thread_event_id,
         extra_content=extra_content,
     )
     if should_preserve_visible_body:
@@ -1523,12 +1523,6 @@ async def _edit_stale_message(
         extra_content=extra_content,
     )
     if delivered is not None:
-        if conversation_cache is not None:
-            conversation_cache.notify_outbound_message(
-                room_id,
-                delivered.event_id,
-                delivered.content_sent,
-            )
         return True
 
     logger.warning(

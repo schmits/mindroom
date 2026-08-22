@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import stat
@@ -23,12 +24,18 @@ from agno.tools.function import Function
 from agno.tools.toolkit import Toolkit
 from pydantic import ValidationError
 
+from mindroom import agents as agents_module
+from mindroom import prompts
 from mindroom.agent_storage import get_agent_runtime_state_dbs
 from mindroom.agents import (
     _CULTURE_MANAGER_CACHE,
     _PRIVATE_CULTURE_MANAGER_CACHE,
+    _AdditionalContextChunk,
+    _apply_preload_cap,
     _load_context_files,
     _prune_toolkit_functions,
+    _render_tool_execution_environment,
+    _trim_chunk_tails,
     agent_build_can_overlap_file_memory,
     build_agent_toolkit,
     create_agent,
@@ -45,7 +52,7 @@ from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, resolve_runtime_paths
-from mindroom.credentials import CredentialsManager, load_scoped_credentials
+from mindroom.credentials import CredentialsManager, get_runtime_credentials_manager, load_scoped_credentials
 from mindroom.entity_resolution import managed_entity_power_user_ids_for_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.history.runtime import close_team_runtime_state_dbs
@@ -161,6 +168,7 @@ def _create_agent_for_test(agent_name: str, config: Config, **kwargs: object) ->
         config,
         runtime_paths_for(config),
         execution_identity=execution_identity,
+        supports_native_tool_approval=True,
         **kwargs,
     )
 
@@ -431,6 +439,264 @@ def test_get_agent_general(mock_storage: MagicMock) -> None:  # noqa: ARG001
     assert agent.learning.user_profile.mode is LearningMode.ALWAYS
     assert isinstance(agent.learning.user_memory, UserMemoryConfig)
     assert agent.learning.user_memory.mode is LearningMode.ALWAYS
+
+
+@patch("mindroom.agent_storage.SqliteDb")
+def test_agent_role_describes_local_tool_execution_environment(
+    _mock_storage: MagicMock,  # noqa: PT019
+    tmp_path: Path,
+) -> None:
+    """The prompt should identify an entirely local effective tool surface."""
+    config = _test_config()
+    config.agents["calculator"].include_default_tools = False
+    runtime_paths = _runtime_paths(tmp_path)
+
+    agent = _create_agent_for_test("calculator", config=_bind_runtime_paths(config, runtime_paths))
+
+    assert "## Tool Execution Environment" in agent.role
+    assert "All available tools run in the primary MindRoom runtime: `calculator`." in agent.role
+    assert "No tools use a worker runtime." in agent.role
+    assert "Worker backend:" not in agent.role
+
+
+@patch("mindroom.agents.get_tool_by_name")
+@patch("mindroom.agent_storage.SqliteDb")
+def test_agent_role_describes_mixed_dedicated_worker_routing(
+    _mock_storage: MagicMock,  # noqa: PT019
+    mock_get_tool_by_name: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The prompt should identify mixed local and dedicated-worker tools."""
+    mock_get_tool_by_name.return_value = MagicMock()
+    config = _test_config()
+    config.agents["general"].tools = ["shell", "calculator"]
+    config.agents["general"].include_default_tools = False
+    config.agents["general"].worker_tools = ["shell"]
+    config.agents["general"].worker_scope = "user_agent"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={
+            "MINDROOM_WORKER_BACKEND": "kubernetes",
+            "MINDROOM_SANDBOX_PROXY_TOKEN": "test-token",
+        },
+    )
+
+    agent = _create_agent_for_test("general", config=_bind_runtime_paths(config, runtime_paths))
+
+    assert "Local tools (primary MindRoom runtime): `calculator`." in agent.role
+    assert "Worker-routed tools: `shell`." in agent.role
+    assert "Worker backend: `kubernetes`." in agent.role
+    assert "Worker reuse: one runtime used only by this user-agent pair." in agent.role
+    assert "Worker state is reused across turns for that scope." in agent.role
+    assert "After the configured idle timeout, the deployment scales to zero" in agent.role
+    assert "persisted files and caches remain until an operator deletes that worker state." in agent.role
+    assert "Execution location is determined per tool; this agent is not sandboxed as a whole." in agent.role
+
+
+@pytest.mark.parametrize(
+    ("worker_scope", "expected_reuse"),
+    [
+        (None, "one runtime for this agent within the current tenant or account"),
+        ("shared", "one runtime for this agent, shared by all users"),
+        ("user", "one runtime for this user, shared across this user's agents"),
+        ("user_agent", "one runtime used only by this user-agent pair"),
+    ],
+)
+def test_tool_execution_environment_explains_dedicated_worker_scope(
+    tmp_path: Path,
+    worker_scope: WorkerScope | None,
+    expected_reuse: str,
+) -> None:
+    """Each dedicated-worker scope should be translated into its runtime boundary."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={"MINDROOM_WORKER_BACKEND": "kubernetes"},
+    )
+
+    rendered = _render_tool_execution_environment(
+        runtime_paths=runtime_paths,
+        local_tool_names=(),
+        worker_routed_tool_names=("shell",),
+        worker_scope=worker_scope,
+    )
+
+    assert f"Worker reuse: {expected_reuse}." in rendered
+    assert "Worker state is reused across turns for that scope." in rendered
+    assert "After the configured idle timeout, the deployment scales to zero" in rendered
+
+
+def test_tool_execution_environment_explains_static_runner_without_persistence_claim(tmp_path: Path) -> None:
+    """The shared static runner should not claim dedicated persisted state."""
+    runtime_paths = _runtime_paths(tmp_path)
+
+    rendered = _render_tool_execution_environment(
+        runtime_paths=runtime_paths,
+        local_tool_names=(),
+        worker_routed_tool_names=("shell",),
+        worker_scope="user_agent",
+    )
+
+    assert "Worker backend: `static_runner`." in rendered
+    assert "requests use the configured static runner" in rendered
+    assert "no per-user or per-agent worker state boundary is selected" in rendered
+    assert "persisted files and caches" not in rendered
+
+
+def test_tool_execution_environment_explains_docker_idle_lifecycle(tmp_path: Path) -> None:
+    """Docker wording should state exactly what idle cleanup retains."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={"MINDROOM_WORKER_BACKEND": "docker"},
+    )
+
+    rendered = _render_tool_execution_environment(
+        runtime_paths=runtime_paths,
+        local_tool_names=(),
+        worker_routed_tool_names=("shell",),
+        worker_scope="user_agent",
+    )
+
+    assert "After the configured idle timeout, the container stops" in rendered
+    assert "persisted files and caches remain until an operator deletes that worker state." in rendered
+
+
+@patch("mindroom.agents.get_tool_by_name", side_effect=ImportError("dependency missing"))
+@patch("mindroom.agent_storage.SqliteDb")
+def test_agent_role_omits_tool_that_failed_to_build(
+    _mock_storage: MagicMock,  # noqa: PT019
+    _mock_get_tool_by_name: MagicMock,  # noqa: PT019
+) -> None:
+    """The prompt should not advertise a toolkit that is unavailable at runtime."""
+    config = _test_config()
+    config.agents["calculator"].include_default_tools = False
+
+    agent = _create_agent_for_test("calculator", config=config)
+
+    assert agent.tools == []
+    assert "No tools are available in this runtime." in agent.role
+    assert "Worker backend:" not in agent.role
+
+
+@pytest.mark.parametrize("tool_name", ["report_publishing", "oauth_connections"])
+@patch("mindroom.agent_storage.SqliteDb")
+def test_agent_role_keeps_direct_toolkit_local_when_worker_routing_is_requested(
+    _mock_storage: MagicMock,  # noqa: PT019
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """Agent-context toolkits should stay local because they bypass registry proxy wrapping."""
+    config = _test_config()
+    config.agents["general"].tools = [tool_name]
+    config.agents["general"].include_default_tools = False
+    config.agents["general"].worker_tools = [tool_name]
+    config.agents["general"].worker_scope = "user_agent"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={
+            "MINDROOM_WORKER_BACKEND": "kubernetes",
+            "MINDROOM_SANDBOX_PROXY_TOKEN": "test-token",
+        },
+    )
+
+    agent = _create_agent_for_test("general", config=_bind_runtime_paths(config, runtime_paths))
+
+    assert [tool.name for tool in agent.tools] == [tool_name]
+    assert f"All available tools run in the primary MindRoom runtime: `{tool_name}`." in agent.role
+    assert "No tools use a worker runtime." in agent.role
+    assert "Worker backend:" not in agent.role
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "credential_service", "credential_agent_scope"),
+    [
+        pytest.param("github", "github_oauth", None, id="github"),
+        pytest.param("google_docs", "google_docs_oauth", "general", id="google-docs"),
+    ],
+)
+@pytest.mark.parametrize("unreadable_kind", ["corrupt_plaintext", "wrong_key"])
+@patch("mindroom.agent_storage.SqliteDb")
+def test_unreadable_oauth_credentials_leave_agent_reset_tool_available(
+    _mock_storage: MagicMock,  # noqa: PT019
+    tmp_path: Path,
+    tool_name: str,
+    credential_service: str,
+    credential_agent_scope: str | None,
+    unreadable_kind: str,
+) -> None:
+    """Unreadable OAuth state must not prevent an agent from exposing its recovery tool."""
+    active_key = base64.urlsafe_b64encode(b"a" * 32).decode()
+    wrong_key = base64.urlsafe_b64encode(b"b" * 32).decode()
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={
+            "MINDROOM_CREDENTIALS_ENCRYPTION_KEY": active_key,
+            "MINDROOM_PUBLIC_URL": "https://mindroom.example.test",
+        },
+    )
+    config = _test_config()
+    config.agents["general"].tools = [tool_name, "oauth_connections"]
+    config.agents["general"].include_default_tools = False
+    config.agents["general"].worker_scope = "user_agent"
+    config = _bind_runtime_paths(config, runtime_paths)
+    scoped_manager = get_runtime_credentials_manager(runtime_paths).for_primary_runtime_scope(
+        "@alice:example.org",
+        credential_agent_scope,
+    )
+    credentials_path = scoped_manager.get_credentials_path(credential_service)
+    if unreadable_kind == "wrong_key":
+        CredentialsManager(
+            scoped_manager.base_path,
+            shared_base_path=scoped_manager.shared_base_path,
+            encryption_key=wrong_key,
+        ).save_credentials(
+            credential_service,
+            {
+                "token": "unreadable-access-token",
+                "refresh_token": "unreadable-refresh-token",
+                "_source": "oauth",
+            },
+        )
+    else:
+        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        credentials_path.write_bytes(b"corrupt-plaintext-secret")
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session-alice",
+    )
+
+    agent = create_agent(
+        "general",
+        config=config,
+        runtime_paths=runtime_paths,
+        execution_identity=identity,
+        supports_native_tool_approval=True,
+    )
+
+    toolkits = {tool.name: tool for tool in agent.tools}
+    assert tool_name in toolkits
+    assert "reset_oauth_connection" in toolkits["oauth_connections"].async_functions
+
+
+@patch("mindroom.agent_storage.SqliteDb")
+def test_restricted_agent_omits_tool_execution_environment(
+    _mock_storage: MagicMock,  # noqa: PT019
+) -> None:
+    """Restricted in-process agents should not advertise unavailable capabilities."""
+    config = _test_config()
+
+    agent = _create_agent_for_test("general", config=config, disable_runtime_capabilities=True)
+
+    assert "## Tool Execution Environment" not in agent.role
 
 
 def test_get_agent_runtime_state_dbs_accepts_backend_neutral_agno_storage() -> None:
@@ -716,6 +982,7 @@ def test_create_agent_continues_when_implied_tool_import_fails(
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -729,6 +996,7 @@ def test_create_agent_continues_when_implied_tool_import_fails(
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
             worker_target,
+            authorization,
         )
         if name == "browser":
             missing_dependency_message = "No module named 'playwright'"
@@ -774,6 +1042,7 @@ def test_create_agent_continues_when_tool_lookup_reports_unknown_tool(
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -787,6 +1056,7 @@ def test_create_agent_continues_when_tool_lookup_reports_unknown_tool(
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
             worker_target,
+            authorization,
         )
         if name == "stale_tool":
             msg = "Unknown tool: stale_tool"
@@ -1094,6 +1364,49 @@ def test_resolve_agent_runtime_uses_shared_agent_roots_for_shared_agents(tmp_pat
     assert runtime.workspace is None
     assert runtime.tool_base_dir is None
     assert runtime.file_memory_root is None
+
+
+def test_resolve_agent_runtime_routes_shared_sessions_to_explicit_session_storage(tmp_path: Path) -> None:
+    """Session state may live off the canonical workspace storage root."""
+    session_storage = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage)},
+    )
+    config = _bind_runtime_paths(_test_config(), runtime_paths)
+
+    runtime = resolve_agent_runtime("general", config, runtime_paths, execution_identity=None)
+
+    assert runtime.state_root == agent_state_root_path(runtime_paths.storage_root, "general")
+    assert runtime.session_state_root == session_storage / "agents" / "general"
+
+
+def test_resolve_agent_runtime_routes_private_sessions_to_explicit_session_storage(tmp_path: Path) -> None:
+    """Private session paths preserve their stable storage-relative identity."""
+    session_storage = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage)},
+    )
+    config = _test_config()
+    config.agents["general"].private = AgentPrivateConfig(per="user")
+    config = _bind_runtime_paths(config, runtime_paths)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="s1",
+    )
+
+    runtime = resolve_agent_runtime("general", config, runtime_paths, execution_identity=identity)
+
+    relative_state_root = runtime.state_root.relative_to(runtime_paths.storage_root)
+    assert runtime.session_state_root == session_storage / relative_state_root
 
 
 def test_runtime_resolution_exports_public_resolved_agent_execution_contract(tmp_path: Path) -> None:
@@ -1891,6 +2204,29 @@ def test_get_agent_uses_storage_path_for_sessions_and_learning(mock_storage: Mag
 
 
 @patch("mindroom.agent_storage.SqliteDb")
+def test_get_agent_routes_only_sessions_to_explicit_session_storage(
+    mock_storage: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Dedicated session storage must not move learning or workspace state."""
+    storage_root = tmp_path / "storage"
+    session_storage_root = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=storage_root,
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage_root)},
+    )
+    config = _bind_runtime_paths(_test_config(), runtime_paths)
+
+    _create_agent_for_test("general", config=config)
+
+    db_files = [Path(str(call.kwargs["db_file"])) for call in mock_storage.call_args_list]
+    assert session_storage_root / "agents" / "general" / "sessions" / "general.db" in db_files
+    assert agent_state_root_path(storage_root, "general") / "learning" / "general.db" in db_files
+    assert agent_state_root_path(storage_root, "general") / "sessions" / "general.db" not in db_files
+
+
+@patch("mindroom.agent_storage.SqliteDb")
 def test_get_agent_uses_worker_storage_for_sessions_and_learning(mock_storage: MagicMock, tmp_path: Path) -> None:
     """Worker scope should not change the canonical session and learning paths."""
     config = _test_config()
@@ -2000,6 +2336,7 @@ def test_create_agent_loads_shared_worker_scoped_tool_credentials_with_explicit_
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -2011,6 +2348,7 @@ def test_create_agent_loads_shared_worker_scoped_tool_credentials_with_explicit_
             allowed_shared_services,
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
+            authorization,
         )
         credentials = load_scoped_credentials(
             tool_name,
@@ -2402,9 +2740,9 @@ def test_agent_context_files_are_loaded_into_role(mock_storage: MagicMock, tmp_p
     agent = _create_agent_for_test("general", config=_bind_runtime_paths(config, _runtime_paths(tmp_path)))
 
     assert "## Personality Context" in agent.role
-    assert "### SOUL.md" in agent.role
+    assert f"### {soul_path}" in agent.role
     assert "Core personality directive." in agent.role
-    assert "### USER.md" in agent.role
+    assert f"### {user_path}" in agent.role
     assert "User preference: concise answers." in agent.role
     soul_path.write_text("Canonical soul directive.", encoding="utf-8")
 
@@ -2413,32 +2751,116 @@ def test_agent_context_files_are_loaded_into_role(mock_storage: MagicMock, tmp_p
     assert "Canonical soul directive." in updated_agent.role
 
 
+def _preload_chunks() -> list[_AdditionalContextChunk]:
+    return [
+        _AdditionalContextChunk(title="/ws/FIRST.md", body="FIRST_START " + "A" * 600),
+        _AdditionalContextChunk(title="/ws/SECOND.md", body="SECOND_START " + "B" * 600),
+    ]
+
+
+def _apply_test_preload_cap(chunks: list[_AdditionalContextChunk], max_preload_chars: int) -> tuple[str, int]:
+    return _apply_preload_cap(
+        chunks,
+        max_preload_chars,
+        section_heading=prompts.PERSONALITY_CONTEXT_SECTION_HEADING,
+        truncation_marker_template=prompts.CONTEXT_TRUNCATION_MARKER_TEMPLATE,
+        chunk_marker_template=prompts.CONTEXT_CHUNK_OMITTED_MARKER_TEMPLATE,
+    )
+
+
+def test_trim_chunk_tails_counts_whitespace_removed_by_cleanup() -> None:
+    """Tail trimming must count whitespace removed after the requested slice."""
+    chunk = _AdditionalContextChunk(title="/ws/SOUL.md", body="alpha   beta")
+
+    omitted_chars = _trim_chunk_tails(
+        [chunk],
+        len("alpha   "),
+        render=lambda chunks: chunks[0].body,
+    )
+
+    assert chunk.body == "alpha"
+    assert chunk.omitted_chars == 7
+    assert omitted_chars == 7
+
+
+def test_preload_cap_truncates_context_files_in_order() -> None:
+    """Preload cap should drop earlier context files before later ones."""
+    chunks = _preload_chunks()
+    heading_and_markers = len(prompts.PERSONALITY_CONTEXT_SECTION_HEADING) + 400
+
+    rendered, omitted_chars = _apply_test_preload_cap(chunks, len(chunks[1].body) + heading_and_markers)
+
+    assert omitted_chars >= len(_preload_chunks()[0].body)
+    assert "FIRST_START" not in rendered
+    assert "SECOND_START" in rendered
+    assert "[Context files exceeded the preload budget - " in rendered
+
+
+def test_preload_cap_keeps_the_dropped_file_path_visible() -> None:
+    """A dropped context file must stay visible as its path plus an omission marker."""
+    chunks = _preload_chunks()
+    dropped_body_length = len(chunks[0].body)
+    heading_and_markers = len(prompts.PERSONALITY_CONTEXT_SECTION_HEADING) + 400
+
+    rendered, _ = _apply_test_preload_cap(chunks, len(chunks[1].body) + heading_and_markers)
+
+    assert "### /ws/FIRST.md" in rendered
+    assert f"[Truncated - {dropped_body_length} chars omitted. Read /ws/FIRST.md for the rest.]" in rendered
+
+
+def test_preload_cap_rejects_budget_too_small_for_required_markers() -> None:
+    """A hard cap must fail explicitly rather than slice away required file markers."""
+    chunks = [
+        _AdditionalContextChunk(
+            title=f"/workspace/context/file-{index}.md",
+            body="x" * 700,
+        )
+        for index in range(6)
+    ]
+
+    with pytest.raises(ValueError, match="cannot fit required context headings and omission markers"):
+        _apply_test_preload_cap(chunks, 400)
+
+
+def test_preload_cap_trims_last_context_body_instead_of_dropping_it() -> None:
+    """After dropping earlier files, the final file should keep as much leading content as fits."""
+    rendered, omitted_chars = _apply_test_preload_cap(_preload_chunks(), 1_000)
+
+    assert len(_preload_chunks()[0].body) < omitted_chars < sum(len(chunk.body) for chunk in _preload_chunks())
+    assert "FIRST_START" not in rendered
+    assert "SECOND_START" in rendered
+    assert "### /ws/FIRST.md" in rendered
+    assert "### /ws/SECOND.md" in rendered
+    assert len(rendered) <= 1_000
+
+
+def test_preload_cap_leaves_untruncated_context_unmarked() -> None:
+    """Context that fits the budget must carry no omission markers."""
+    rendered, omitted_chars = _apply_test_preload_cap(_preload_chunks(), 50_000)
+
+    assert omitted_chars == 0
+    assert "Truncated" not in rendered
+    assert "FIRST_START" in rendered
+    assert "SECOND_START" in rendered
+
+
 @patch("mindroom.agent_storage.SqliteDb")
-def test_agent_preload_cap_truncates_context_files_in_order(
+def test_agent_context_section_states_files_are_preloaded(
     mock_storage: MagicMock,  # noqa: ARG001
     tmp_path: Path,
 ) -> None:
-    """Preload cap should drop earlier context files before later ones."""
+    """The context section must tell the model these files are already inlined."""
     config = _test_config()
-    authored_defaults = config.defaults.model_dump(mode="python")
-    authored_defaults["max_preload_chars"] = 420
-    config.defaults = DefaultsConfig(**authored_defaults)
-
     workspace = agent_workspace_root_path(tmp_path, "general")
     workspace.mkdir(parents=True, exist_ok=True)
-    first_path = workspace / "FIRST.md"
-    second_path = workspace / "SECOND.md"
-    first_path.write_text("FIRST_START " + "A" * 220 + " FIRST_END", encoding="utf-8")
-    second_path.write_text("SECOND_START " + "B" * 220 + " SECOND_END", encoding="utf-8")
+    (workspace / "SOUL.md").write_text("Core personality directive.", encoding="utf-8")
 
-    config.agents["general"].context_files = ["FIRST.md", "SECOND.md"]
+    config.agents["general"].context_files = ["SOUL.md"]
 
     agent = _create_agent_for_test("general", config=_bind_runtime_paths(config, _runtime_paths(tmp_path)))
 
-    assert "[Content truncated - " in agent.role
-    assert "### FIRST.md" not in agent.role
-    assert "### SECOND.md" in agent.role
-    assert "SECOND_START" in agent.role
+    assert "headed by the path of the file it was read from" in agent.role
+    assert "Do not re-read a file" in agent.role
 
 
 @patch("mindroom.agent_storage.SqliteDb")
@@ -2867,6 +3289,140 @@ def test_tool_function_filter_prunes_resolved_functions() -> None:
     assert filtered is toolkit
     assert set(toolkit.functions) == {"safe"}
     assert toolkit.async_functions == {}
+
+
+def test_native_approval_capability_marks_only_potentially_gated_calls() -> None:
+    """Continuation-capable runners expose gated calls through Agno confirmation only."""
+
+    async def dangerous_async() -> None:
+        return None
+
+    config = Config.model_validate(
+        {
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [
+                    {"match": "dangerous*", "action": "require_approval"},
+                    {"match": "safe", "action": "auto_approve"},
+                ],
+            },
+        },
+    )
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="dangerous", entrypoint=lambda: None),
+            Function(name="dangerous_async", entrypoint=dangerous_async),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=True,
+    )
+
+    assert filtered is toolkit
+    assert toolkit.functions["dangerous"].requires_confirmation is True
+    assert toolkit.async_functions["dangerous_async"].requires_confirmation is True
+    assert toolkit.functions["dangerous"].approval_type == "mindroom_policy"
+    assert toolkit.async_functions["dangerous_async"].approval_type == "mindroom_policy"
+    assert toolkit.functions["safe"].requires_confirmation is not True
+
+
+def test_non_resumable_tool_surface_hides_potentially_gated_calls() -> None:
+    """An embedded agent must not receive a gated function it cannot suspend and resume."""
+
+    async def dangerous_async() -> None:
+        return None
+
+    config = Config.model_validate(
+        {
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [
+                    {"match": "dangerous*", "action": "require_approval"},
+                    {"match": "safe", "action": "auto_approve"},
+                ],
+            },
+        },
+    )
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="dangerous", entrypoint=lambda: None),
+            Function(name="dangerous_async", entrypoint=dangerous_async),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is toolkit
+    assert set(toolkit.functions) == {"safe"}
+    assert toolkit.async_functions == {}
+
+
+def test_non_resumable_tool_surface_hides_native_confirmation_calls() -> None:
+    """An authored Agno confirmation must not escape onto a surface with no resume owner."""
+    config = Config.model_validate({"tool_approval": {"default": "auto_approve"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="native_confirmation", entrypoint=lambda: None, requires_confirmation=True),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is toolkit
+    assert set(toolkit.functions) == {"safe"}
+
+
+def test_native_approval_capability_preserves_tool_authored_confirmation() -> None:
+    """MindRoom marks only policy pauses, leaving an authored confirmation distinguishable."""
+    config = Config.model_validate({"tool_approval": {"default": "require_approval"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[Function(name="native_confirmation", entrypoint=lambda: None, requires_confirmation=True)],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=True,
+    )
+
+    assert filtered is toolkit
+    assert toolkit.functions["native_confirmation"].requires_confirmation is True
+    assert toolkit.functions["native_confirmation"].approval_type is None
+
+
+def test_non_resumable_tool_surface_drops_an_empty_toolkit() -> None:
+    """A channel that hides every function must not register an unusable toolkit name."""
+    config = Config.model_validate({"tool_approval": {"default": "require_approval"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[Function(name="dangerous", entrypoint=lambda: None)],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is None
 
 
 @pytest.mark.asyncio
@@ -3335,12 +3891,18 @@ def test_agent_without_workspace_omits_skill_authoring_guidance(tmp_path: Path) 
     assert WORKSPACE_SKILL_AUTHORING_PROMPT not in agent.instructions
 
 
-def test_agent_knowledge_search_tool_description_lists_configured_sources(
+@pytest.mark.parametrize("has_memory_tool", [False, True])
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.asyncio
+async def test_agent_knowledge_search_tool_description_lists_configured_sources_by_capability(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    has_memory_tool: bool,
+    async_mode: bool,
 ) -> None:
-    """The model-facing knowledge search tool should explain what each source contains."""
+    """Sync and async knowledge tools recommend memory search only when that function exists."""
     config = _test_config()
+    config.agents["general"].tools = ["memory"] if has_memory_tool else []
     config.agents["general"].knowledge_bases = ["engineering", "product"]
     config.knowledge_bases = {
         "engineering": KnowledgeBaseConfig(
@@ -3365,6 +3927,11 @@ def test_agent_knowledge_search_tool_description_lists_configured_sources(
     knowledge = resolve_agent_knowledge_access("general", config, runtime_paths).knowledge
     assert knowledge is not None
     agent = _create_agent_for_test("general", config, knowledge=knowledge)
+    if has_memory_tool and not async_mode:
+        agent.tools = [
+            *(agent.tools or []),
+            Function(name="search_memories", entrypoint=lambda: "memory result"),
+        ]
     run_output = RunOutput(
         run_id="run-knowledge-description",
         agent_id="general",
@@ -3381,11 +3948,12 @@ def test_agent_knowledge_search_tool_description_lists_configured_sources(
         updated_at=1,
     )
 
-    search_tools = [
-        tool
-        for tool in agent.get_tools(run_output, run_context, session)
-        if isinstance(tool, Function) and tool.name == "search_knowledge_base"
-    ]
+    tools = (
+        await agent.aget_tools(run_output, run_context, session)
+        if async_mode
+        else agent.get_tools(run_output, run_context, session)
+    )
+    search_tools = [tool for tool in tools if isinstance(tool, Function) and tool.name == "search_knowledge_base"]
 
     assert len(search_tools) == 1
     description = search_tools[0].description
@@ -3396,6 +3964,79 @@ def test_agent_knowledge_search_tool_description_lists_configured_sources(
         "- product: Product requirements, feature specs, roadmap notes, and user-facing behavior decisions."
         in description
     )
+    assert "This list only describes sources available through search_knowledge_base." in description
+    recommendation = "For resilient memory search, team-visible memory, and memory IDs, use search_memories."
+    assert (recommendation in description) is has_memory_tool
+
+
+def test_memory_only_agent_gets_semantic_knowledge_search_description(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ready file-memory index should enable and describe knowledge search without authored bases."""
+    config = _test_config()
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _bind_runtime_paths(config, runtime_paths)
+    config.memory.backend = "file"
+    config.memory.search.mode = "semantic"
+    seen_base_ids: list[str] = []
+
+    def _get_published_index(base_id: str, **kwargs: object) -> object:
+        effective_config = kwargs["config"]
+        assert isinstance(effective_config, Config)
+        base_config = effective_config.knowledge_bases[base_id]
+        assert base_config.path == str(agent_workspace_root_path(runtime_paths.storage_root, "general").resolve())
+        seen_base_ids.append(base_id)
+        return SimpleNamespace(
+            key=SimpleNamespace(base_id=base_id),
+            index=SimpleNamespace(
+                knowledge=_queryable_knowledge_handle(),
+                state=SimpleNamespace(last_refresh_at=None, last_published_at=None),
+            ),
+            availability=KnowledgeAvailability.READY,
+            state=None,
+        )
+
+    monkeypatch.setattr("mindroom.knowledge.utils.get_published_index", _get_published_index)
+
+    knowledge = resolve_agent_knowledge_access("general", config, runtime_paths).knowledge
+    assert knowledge is not None
+    agent = _create_agent_for_test("general", config, knowledge=knowledge)
+    run_output = RunOutput(
+        run_id="run-memory-knowledge-description",
+        agent_id="general",
+        agent_name="GeneralAgent",
+        session_id="session-memory-knowledge-description",
+        input="hello",
+        content="ok",
+    )
+    run_context = RunContext(
+        run_id="run-memory-knowledge-description",
+        session_id="session-memory-knowledge-description",
+    )
+    session = AgentSession(
+        session_id="session-memory-knowledge-description",
+        agent_id="general",
+        created_at=1,
+        updated_at=1,
+    )
+
+    search_tools = [
+        tool
+        for tool in agent.get_tools(run_output, run_context, session)
+        if isinstance(tool, Function) and tool.name == "search_knowledge_base"
+    ]
+
+    assert len(search_tools) == 1
+    assert len(seen_base_ids) == 1
+    assert seen_base_ids[0].startswith("file_memory_agent_general_")
+    description = search_tools[0].description
+    assert description is not None
+    assert (
+        f"- {seen_base_ids[0]}: Configured file memory for this agent. "
+        "Read-only semantic search over configured Markdown paths (default: memory/**/*.md)."
+    ) in description
+    assert "use search_memories" not in description
 
 
 def test_agent_knowledge_search_tool_description_preserves_colon_space_source_ids(

@@ -34,13 +34,16 @@ if TYPE_CHECKING:
     from agno.tools.function import Function
     from structlog.stdlib import BoundLogger
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.bot_runtime_view import BotRuntimeView
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.conversation_resolver import ConversationResolver
+    from mindroom.event_journal import PrincipalStore
     from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
-    from mindroom.matrix.conversation_cache import ConversationCacheProtocol, ConversationEventCache
+    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.matrix.identity import MatrixID
+    from mindroom.matrix.relation_lookup import RelationLookup
     from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
     from mindroom.message_target import MessageTarget
     from mindroom.runtime_protocols import OrchestratorRuntime
@@ -69,8 +72,9 @@ class ToolRuntimeContext:
     client: nio.AsyncClient
     config: Config
     runtime_paths: RuntimePaths
-    event_cache: ConversationEventCache
-    conversation_cache: ConversationCacheProtocol
+    conversation_reader: ConversationReader
+    relations: RelationLookup
+    agent_reply_memberships: AgentReplyMembershipIndex | None = None
     transport_agent_name: str | None = None
     active_model_name: str | None = None
     room: nio.MatrixRoom | None = None
@@ -87,6 +91,21 @@ class ToolRuntimeContext:
     message_received_depth: int = 0
     orchestrator: OrchestratorRuntime | None = None
     tool_function_filter: Callable[[Function], bool] | None = None
+    membership: PrincipalStore | None = None
+    membership_turn_id: str | None = None
+    config_provider: Callable[[], Config] | None = None
+
+    @property
+    def current_config(self) -> Config:
+        """Return the managed runtime's current config or this detached snapshot."""
+        return self.config_provider() if self.config_provider is not None else self.config
+
+    def require_agent_reply_memberships(self) -> AgentReplyMembershipIndex:
+        """Return the injected index or reject membership-aware extension work."""
+        if self.agent_reply_memberships is None:
+            msg = "Tool runtime context requires the managed membership index for membership-aware authorization."
+            raise RuntimeError(msg)
+        return self.agent_reply_memberships
 
     @property
     def room_id(self) -> str:
@@ -211,6 +230,7 @@ class ToolRuntimeSupport:
     matrix_id: MatrixID
     resolver: ConversationResolver
     hook_context: HookContextSupport
+    membership: PrincipalStore
 
     def build_context(
         self,
@@ -227,9 +247,6 @@ class ToolRuntimeSupport:
         client = self.runtime.client
         if client is None:
             return None
-        event_cache = self.runtime.event_cache
-        if event_cache is None:
-            return None
         return ToolRuntimeContext(
             agent_name=agent_name or self.agent_name,
             target=target,
@@ -237,8 +254,8 @@ class ToolRuntimeSupport:
             client=client,
             config=self.runtime.config,
             runtime_paths=self.runtime_paths,
-            conversation_cache=self.resolver.deps.conversation_cache,
-            event_cache=event_cache,
+            conversation_reader=self.resolver.deps.conversation_reader,
+            relations=self.resolver.deps.relations,
             transport_agent_name=self.agent_name,
             active_model_name=active_model_name,
             room=self.resolver.cached_room(target.room_id),
@@ -252,6 +269,10 @@ class ToolRuntimeSupport:
             room_state_putter=self.hook_context.room_state_putter(),
             message_received_depth=(source_envelope.message_received_depth if source_envelope is not None else 0),
             orchestrator=self.runtime.orchestrator,
+            membership=self.membership,
+            membership_turn_id=source_envelope.source_event_id if source_envelope is not None else None,
+            agent_reply_memberships=self.runtime.agent_reply_memberships,
+            config_provider=lambda: self.runtime.config,
         )
 
     def build_dispatch_context(
@@ -426,14 +447,15 @@ def build_scheduling_runtime_from_tool_runtime_context(context: ToolRuntimeConte
     if context.room is None:
         msg = "Scheduling runtime requires a cached Matrix room in tool runtime context"
         raise RuntimeError(msg)
+    active_config = context.current_config
     return SchedulingRuntime(
         client=context.client,
-        config=context.config,
+        config=active_config,
         runtime_paths=context.runtime_paths,
         room=context.room,
-        conversation_cache=context.conversation_cache,
-        event_cache=context.event_cache,
+        conversation_reader=context.conversation_reader,
         matrix_admin=context.matrix_admin,
+        agent_reply_memberships=context.require_agent_reply_memberships(),
     )
 
 

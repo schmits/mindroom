@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
@@ -81,6 +82,13 @@ class _NormalizedVoiceMessage:
 
 
 _VOICE_NORMALIZATION_CACHE_MAX_ENTRIES = 128
+# Ingress lanes serialize per-sender delivery behind voice readiness, so a hung
+# normalization (download, STT, or the normalizer LLM call) wedges every later
+# message from that sender. Both timeouts exist to bound that failure mode: the
+# LLM cleanup call fails open to the raw transcription, and the shared
+# normalization task fails into the raw-audio fallback path.
+_VOICE_NORMALIZER_LLM_TIMEOUT_SECONDS = 45.0
+_VOICE_NORMALIZATION_TOTAL_TIMEOUT_SECONDS = 300.0
 _voice_normalization_cache: OrderedDict[tuple[str, str, str, str], _NormalizedVoiceMessage] = OrderedDict()
 _voice_normalization_tasks: dict[tuple[str, str, str, str], asyncio.Task[_NormalizedVoiceMessage | None]] = {}
 
@@ -143,6 +151,7 @@ async def _compute_normalized_voice_message(
     event: AudioMessageEvent,
     config: Config,
     runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
     *,
     thread_id: str | None,
 ) -> _NormalizedVoiceMessage | None:
@@ -170,6 +179,7 @@ async def _compute_normalized_voice_message(
         event,
         config,
         runtime_paths,
+        membership_index,
         audio=audio,
     )
     if not isinstance(transcribed_message, str) or not transcribed_message.strip():
@@ -188,6 +198,7 @@ async def _normalize_voice_message(
     event: AudioMessageEvent,
     config: Config,
     runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
     *,
     thread_id: str | None,
 ) -> _NormalizedVoiceMessage | None:
@@ -199,17 +210,23 @@ async def _normalize_voice_message(
 
     task = _voice_normalization_tasks.get(cache_key)
     if task is None:
-        task = asyncio.create_task(
-            _compute_normalized_voice_message(
-                client,
-                storage_path,
-                room,
-                event,
-                config,
-                runtime_paths,
-                thread_id=thread_id,
-            ),
-        )
+
+        async def _compute_bounded() -> _NormalizedVoiceMessage | None:
+            # Hard deadline so a hung download/STT/normalizer fails this shared
+            # task instead of wedging every waiter (and their ingress lanes).
+            async with asyncio.timeout(_VOICE_NORMALIZATION_TOTAL_TIMEOUT_SECONDS):
+                return await _compute_normalized_voice_message(
+                    client,
+                    storage_path,
+                    room,
+                    event,
+                    config,
+                    runtime_paths,
+                    membership_index,
+                    thread_id=thread_id,
+                )
+
+        task = asyncio.create_task(_compute_bounded())
         _voice_normalization_tasks[cache_key] = task
         task.add_done_callback(lambda done_task: _finalize_inflight_voice_normalization_task(cache_key, done_task))
 
@@ -225,6 +242,7 @@ async def prepare_voice_message(
     *,
     runtime_paths: RuntimePaths,
     thread_id: str | None,
+    membership_index: AgentReplyMembershipIndex,
 ) -> _PreparedVoiceMessage | None:
     """Download/register audio and normalize it into a synthetic text event."""
     normalized = await _normalize_voice_message(
@@ -234,6 +252,7 @@ async def prepare_voice_message(
         event,
         config,
         runtime_paths,
+        membership_index,
         thread_id=thread_id,
     )
     if normalized is None:
@@ -266,23 +285,30 @@ async def prepare_raw_voice_fallback_message(
     thread_id: str | None,
 ) -> _PreparedVoiceMessage:
     """Download/register audio and build a fallback text event without STT."""
-    audio = await _download_audio(client, event)
     attachment_id = None
-    if audio is None or audio.content is None:
-        logger.error("Failed to download audio file for raw voice fallback")
-    else:
-        attachment_record = await register_audio_attachment(
-            storage_path,
-            event_id=event.event_id,
-            audio_bytes=audio.content,
-            mime_type=audio.mime_type,
-            room_id=room.room_id,
-            thread_id=thread_id,
-            sender=event.sender,
-            event_timestamp=event.server_timestamp,
-            filename=event.body if isinstance(event.body, str) else None,
+    try:
+        async with asyncio.timeout(_VOICE_NORMALIZATION_TOTAL_TIMEOUT_SECONDS):
+            audio = await _download_audio(client, event)
+            if audio is None or audio.content is None:
+                logger.error("Failed to download audio file for raw voice fallback")
+            else:
+                attachment_record = await register_audio_attachment(
+                    storage_path,
+                    event_id=event.event_id,
+                    audio_bytes=audio.content,
+                    mime_type=audio.mime_type,
+                    room_id=room.room_id,
+                    thread_id=thread_id,
+                    sender=event.sender,
+                    event_timestamp=event.server_timestamp,
+                    filename=event.body if isinstance(event.body, str) else None,
+                )
+                attachment_id = attachment_record.attachment_id if attachment_record is not None else None
+    except TimeoutError:
+        logger.warning(
+            "voice_raw_fallback_timeout",
+            timeout_seconds=_VOICE_NORMALIZATION_TOTAL_TIMEOUT_SECONDS,
         )
-        attachment_id = attachment_record.attachment_id if attachment_record is not None else None
 
     return _build_prepared_voice_message(
         event,
@@ -351,6 +377,7 @@ async def _handle_voice_message(
     event: AudioMessageEvent,
     config: Config,
     runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
     audio: Audio | None = None,
 ) -> str | None:
     """Handle a voice message event.
@@ -361,6 +388,7 @@ async def _handle_voice_message(
         event: Voice message event
         config: Application configuration
         runtime_paths: Explicit runtime context for secrets and agent mention resolution
+        membership_index: Shared authoritative grant-room membership index
         audio: Optional pre-downloaded audio payload to reuse across fallbacks
 
     Returns:
@@ -395,9 +423,10 @@ async def _handle_voice_message(
             event.sender,
             config,
             runtime_paths,
+            membership_index,
         )
 
-        # Process transcription with AI for command/agent recognition
+        # Normalize mentions and light ASR errors without inventing commands
         formatted_message = await _process_transcription(
             transcription,
             config,
@@ -573,7 +602,7 @@ async def _process_transcription(
         # Get the AI model to process the transcription
         model = model_loading.get_model_instance(config, runtime_paths, config.voice.intelligence.model)
 
-        # Create an agent for voice command processing
+        # Create an agent for voice transcript normalization
         agent = Agent(
             name="VoiceTranscriptionNormalizer",
             role="Normalize voice transcriptions while preserving natural language and mention intent",
@@ -581,9 +610,19 @@ async def _process_transcription(
             telemetry=False,
         )
 
-        # Process the transcription with the agent
+        # Process the transcription with the agent. The transcription is already
+        # usable, so a slow or hung normalizer model fails open to it instead of
+        # blocking voice readiness (and the ingress lane serialized behind it).
         session_id = f"voice_process_{uuid.uuid4()}"
-        response = await agent.arun(prompt, session_id=session_id)
+        try:
+            async with asyncio.timeout(_VOICE_NORMALIZER_LLM_TIMEOUT_SECONDS):
+                response = await agent.arun(prompt, session_id=session_id)
+        except TimeoutError:
+            logger.warning(
+                "voice_transcription_normalizer_timeout",
+                timeout_seconds=_VOICE_NORMALIZER_LLM_TIMEOUT_SECONDS,
+            )
+            return transcription
 
         # Extract the content from the response
         if response and response.content:
@@ -611,6 +650,7 @@ async def _get_available_entities_for_sender(
     sender_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
 ) -> tuple[list[str], list[str]]:
     """Return available agent and team names in this room for a specific sender."""
     available_agent_names: list[str] = []
@@ -623,6 +663,7 @@ async def _get_available_entities_for_sender(
         sender_id,
         config,
         runtime_paths,
+        membership_index,
     ):
         name = registry.current_entity_name_for_user_id(matrix_id.full_id, include_router=False)
         if name is None:

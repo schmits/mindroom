@@ -9,17 +9,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.matrix.room_cleanup import _cleanup_orphaned_bots_in_room, cleanup_all_orphaned_bots
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.tool_system.worker_routing import agent_state_root_path
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
     bind_runtime_paths,
-    install_runtime_cache_support,
+    install_runtime_journal_support,
     orchestrator_runtime_paths,
     runtime_paths_for,
 )
@@ -61,14 +61,14 @@ class TestDMPreservationDuringCleanup:
             access_token="test_token",  # noqa: S106
         )
 
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
             rooms=["!regular:server", "!another:server"],
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
         bot.client = AsyncMock()
         bot.logger = MagicMock()
 
@@ -116,14 +116,14 @@ class TestDMPreservationDuringCleanup:
             access_token="test_token",  # noqa: S106
         )
 
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
             rooms=["!configured:server"],  # Only one configured room
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
         bot.client = AsyncMock()
         bot.logger = MagicMock()
 

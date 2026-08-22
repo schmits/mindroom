@@ -61,7 +61,7 @@ from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
 from mindroom.team_exact_members import ResolvedExactTeamMembers
 from mindroom.teams import TeamMode
-from mindroom.tool_approval import _shutdown_approval_store
+from mindroom.tool_approval import shutdown_approval_runtime
 from mindroom.tool_system.tool_calls import record_tool_success
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
@@ -71,6 +71,8 @@ from mindroom.tool_system.worker_routing import (
 from tests.identity_helpers import persist_entity_accounts
 
 _TEST_MODEL = "openai:gpt-5.4"
+_QUEUED_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
+_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY = "mindroom_queued_message_notice_response_turn_id"
 
 
 def _make_test_agent(name: str) -> AgnoAgent:
@@ -191,9 +193,9 @@ def _prepared_team_execution_context(
 @pytest.fixture(autouse=True)
 def reset_approval_store() -> Iterator[None]:
     """Keep the module-level approval store isolated per test."""
-    asyncio.run(_shutdown_approval_store())
+    asyncio.run(shutdown_approval_runtime())
     yield
-    asyncio.run(_shutdown_approval_store())
+    asyncio.run(shutdown_approval_runtime())
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -4492,7 +4494,7 @@ class TestTeamCompletion:
 
     @pytest.mark.asyncio
     async def test_prepare_openai_team_prompt_scrubs_queued_notices_and_uses_team_renderer(self) -> None:
-        """OpenAI team prep should match the main team path for cleanup and assistant-role rendering."""
+        """OpenAI team prep should recover notice facts and preserve assistant-role rendering."""
         config = Config(
             agents={"general": AgentConfig(display_name="GeneralAgent", role="General", rooms=[])},
             models={"default": ModelConfig(provider="openai", id="test-model")},
@@ -4501,6 +4503,7 @@ class TestTeamCompletion:
         runtime_paths = _runtime_paths()
         agent = _make_test_agent("GeneralAgent")
         team = _make_test_team(name="General Team", team_id="general-team")
+        prior_response_id = "prior-openai-team-response"
 
         with open_bound_scope_session_context(
             agents=[agent],
@@ -4523,7 +4526,10 @@ class TestTeamCompletion:
                         Message(
                             role="user",
                             content=QUEUED_MESSAGE_NOTICE_TEXT,
-                            provider_data={"mindroom_queued_message_notice": True},
+                            provider_data={
+                                _QUEUED_NOTICE_MARKER_KEY: True,
+                                _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                            },
                         ),
                     ],
                     member_responses=[
@@ -4534,7 +4540,10 @@ class TestTeamCompletion:
                                 Message(
                                     role="user",
                                     content=QUEUED_MESSAGE_NOTICE_TEXT,
-                                    provider_data={"mindroom_queued_message_notice": True},
+                                    provider_data={
+                                        _QUEUED_NOTICE_MARKER_KEY: True,
+                                        _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                                    },
                                 ),
                             ],
                         ),
@@ -4572,7 +4581,23 @@ class TestTeamCompletion:
                     if isinstance(run, (RunOutput, TeamRunOutput))
                     for message in collect_messages(run)
                 ]
-                assert not any(message.provider_data for message in persisted_messages)
+                persisted_notices = [
+                    message
+                    for message in persisted_messages
+                    if isinstance(message.provider_data, dict)
+                    and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) == "persisted"
+                ]
+                assert len(persisted_notices) == 1
+                assert persisted_notices[0].content == QUEUED_MESSAGE_NOTICE_TEXT
+                assert persisted_notices[0].provider_data == {
+                    _QUEUED_NOTICE_MARKER_KEY: "persisted",
+                    _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+                }
+                assert not any(
+                    isinstance(message.provider_data, dict)
+                    and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) is True
+                    for message in persisted_messages
+                )
                 return _prepared_team_execution_context(
                     final_prompt="Previous team reply\n\nAnalyze this.",
                     messages=[
@@ -4625,7 +4650,22 @@ class TestTeamCompletion:
             persisted_messages = [
                 message for run in scope_context.session.runs or [] for message in (run.messages or [])
             ]
-        assert not any(message.provider_data for message in persisted_messages)
+        persisted_notices = [
+            message
+            for message in persisted_messages
+            if isinstance(message.provider_data, dict)
+            and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) == "persisted"
+        ]
+        assert len(persisted_notices) == 1
+        assert persisted_notices[0].content == QUEUED_MESSAGE_NOTICE_TEXT
+        assert persisted_notices[0].provider_data == {
+            _QUEUED_NOTICE_MARKER_KEY: "persisted",
+            _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: prior_response_id,
+        }
+        assert not any(
+            isinstance(message.provider_data, dict) and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) is True
+            for message in persisted_messages
+        )
 
     def test_collaborate_mode_delegates_to_all(self) -> None:
         """Collaborate mode sets delegate_to_all_members=True on Team."""

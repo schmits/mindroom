@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
+from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
 from mindroom.constants import STREAM_STATUS_ERROR, STREAM_STATUS_KEY
@@ -24,11 +24,13 @@ from mindroom.orchestration.runtime import SYNC_RESTART_CANCEL_MSG
 from mindroom.response_runner import ResponseRequest, ResponseRunner
 from mindroom.streaming import _INTERRUPTED_RESPONSE_NOTE, build_restart_interrupted_body
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_ACCESS_TOKEN,
     TEST_PASSWORD,
     bind_runtime_paths,
-    install_runtime_cache_support,
+    install_runtime_journal_support,
+    make_matrix_client_mock,
     message_origin,
     patch_response_runner_module,
     runtime_paths_for,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
+    from mindroom.bot import AgentBot
     from mindroom.matrix.identity import MatrixID
 
 
@@ -74,6 +77,7 @@ def _make_bot(tmp_path: Path) -> AgentBot:
             },
             models={"default": ModelConfig(provider="ollama", id="test-model")},
             router=RouterConfig(model="default"),
+            authorization=AuthorizationConfig(default_room_access=True),
         ),
         runtime_paths,
     )
@@ -85,18 +89,16 @@ def _make_bot(tmp_path: Path) -> AgentBot:
         password=TEST_PASSWORD,
         access_token=TEST_ACCESS_TOKEN,
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
         runtime_paths=runtime_paths_for(config),
         rooms=["!team:localhost"],
     )
-    bot.client = AsyncMock()
-    bot.client.user_id = agent_user.user_id
-    bot.client.rooms = {"!team:localhost": MagicMock(room_id="!team:localhost")}
+    bot.client = make_matrix_client_mock(user_id=agent_user.user_id)
     bot.orchestrator = MagicMock(config=config)
-    return install_runtime_cache_support(bot)
+    return install_runtime_journal_support(bot)
 
 
 def _team_agents(bot: AgentBot) -> list[MatrixID]:
@@ -129,7 +131,7 @@ async def test_team_non_streaming_has_scheduler_context(tmp_path: Path) -> None:
     with (
         patch.object(
             ResponseRunner,
-            "run_cancellable_response",
+            "_run_cancellable_response",
             new=AsyncMock(side_effect=fake_run_cancellable_response),
         ),
         patch("mindroom.response_runner.typing_indicator", new=_noop_typing_indicator),
@@ -168,12 +170,12 @@ async def test_team_non_streaming_cancellation_edits_placeholder(tmp_path: Path)
     with (
         patch.object(
             ResponseRunner,
-            "run_cancellable_response",
+            "_run_cancellable_response",
             new=AsyncMock(side_effect=fake_run_cancellable_response),
         ),
         patch("mindroom.response_runner.typing_indicator", new=_noop_typing_indicator),
         patch(
-            "mindroom.delivery_gateway.edit_message_result",
+            "mindroom.delivery_gateway.edit_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$thinking",
@@ -220,12 +222,12 @@ async def test_team_non_streaming_sync_restart_edits_placeholder_with_restart_no
     with (
         patch.object(
             ResponseRunner,
-            "run_cancellable_response",
+            "_run_cancellable_response",
             new=AsyncMock(side_effect=fake_run_cancellable_response),
         ),
         patch("mindroom.response_runner.typing_indicator", new=_noop_typing_indicator),
         patch(
-            "mindroom.delivery_gateway.edit_message_result",
+            "mindroom.delivery_gateway.edit_message_outcome",
             new=AsyncMock(
                 return_value=DeliveredMatrixEvent(
                     event_id="$thinking",
@@ -290,7 +292,7 @@ async def test_team_streaming_has_scheduler_context(tmp_path: Path) -> None:
     with (
         patch.object(
             ResponseRunner,
-            "run_cancellable_response",
+            "_run_cancellable_response",
             new=AsyncMock(side_effect=fake_run_cancellable_response),
         ),
         patch("mindroom.response_runner.typing_indicator", new=_noop_typing_indicator),
@@ -336,7 +338,7 @@ async def test_team_late_cancellation_during_post_effects_propagates(tmp_path: P
     with (
         patch.object(
             ResponseRunner,
-            "run_cancellable_response",
+            "_run_cancellable_response",
             new=AsyncMock(side_effect=fake_run_cancellable_response),
         ),
         patch("mindroom.response_runner.typing_indicator", new=_noop_typing_indicator),

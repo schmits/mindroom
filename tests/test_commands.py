@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import nio
 import pytest
 
-from mindroom.commands.handler import CommandHandlerContext, generate_welcome_message_for_room, handle_command
+from mindroom.commands.handler import generate_welcome_message_for_room, handle_command
 from mindroom.commands.parsing import (
     _COMMAND_DOCS,
     Command,
@@ -23,7 +23,11 @@ from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths
 from mindroom.matrix.identity import MatrixID
 from mindroom.message_target import MessageTarget
-from tests.conftest import make_event_cache_mock
+from tests.authorization_helpers import (
+    isolated_membership_index,
+    make_test_command_handler_context,
+)
+from tests.conftest import make_conversation_reader_mock
 from tests.identity_helpers import persist_entity_accounts
 
 WELCOME_QUICK_COMMAND_LINES = [
@@ -326,6 +330,7 @@ async def test_welcome_message_uses_compact_command_docs(tmp_path: Path) -> None
         "@alice:localhost",
         config,
         runtime_paths,
+        isolated_membership_index(),
     )
 
     quick_command_block = "\u26a1 **Quick commands:**\n" + "\n".join(WELCOME_QUICK_COMMAND_LINES)
@@ -365,6 +370,7 @@ async def test_welcome_message_lists_configured_teams(tmp_path: Path) -> None:
         "@alice:localhost",
         config,
         runtime_paths,
+        isolated_membership_index(),
     )
 
     assert "\U0001f9e0 **Available agents and teams in this room:**" in welcome_message
@@ -416,6 +422,7 @@ async def test_senderless_welcome_lists_configured_room_responders(tmp_path: Pat
         None,
         config,
         runtime_paths,
+        isolated_membership_index(),
     )
 
     assert "\U0001f9e0 **Available agents and teams in this room:**" in welcome_message
@@ -452,15 +459,15 @@ async def test_hi_command_lists_ad_hoc_present_responder(tmp_path: Path) -> None
         body="!hi",
         source={"content": {"body": "!hi"}},
     )
-    context = CommandHandlerContext(
+    context = make_test_command_handler_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
         logger=MagicMock(),
-        conversation_cache=MagicMock(),
-        event_cache=make_event_cache_mock(),
+        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve("!adhoc:localhost", None, "$event"),
-        record_handled_turn=MagicMock(),
+        record_handled_turn=AsyncMock(),
+        record_command_result=AsyncMock(),
         send_response=send_response,
     )
 
@@ -506,15 +513,15 @@ async def test_hi_command_uses_live_responder_candidates_when_available(tmp_path
     room = nio.MatrixRoom(room_id="!room:localhost", own_user_id="@mindroom_router:localhost")
     send_response = AsyncMock(return_value="$welcome")
     candidate_resolver = AsyncMock(return_value=[MatrixID.parse("@mindroom_code:localhost")])
-    context = CommandHandlerContext(
+    context = make_test_command_handler_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
         logger=MagicMock(),
-        conversation_cache=MagicMock(),
-        event_cache=make_event_cache_mock(),
+        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve("!room:localhost", None, "$event"),
-        record_handled_turn=MagicMock(),
+        record_handled_turn=AsyncMock(),
+        record_command_result=AsyncMock(),
         send_response=send_response,
         responder_candidates_for_room=candidate_resolver,
     )
@@ -574,15 +581,15 @@ async def test_desktop_command_resolves_exact_agent_from_router_candidates(
     candidate_resolver = AsyncMock(return_value=[MatrixID.parse("@mindroom_code:localhost")])
     desktop_handler = MagicMock(return_value="desktop status")
     monkeypatch.setattr("mindroom.commands.handler.handle_desktop_command", desktop_handler)
-    context = CommandHandlerContext(
+    context = make_test_command_handler_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
         logger=MagicMock(),
-        conversation_cache=MagicMock(),
-        event_cache=make_event_cache_mock(),
+        conversation_reader=make_conversation_reader_mock(),
         stable_target=MessageTarget.resolve("!room:localhost", None, "$event"),
-        record_handled_turn=MagicMock(),
+        record_handled_turn=AsyncMock(),
+        record_command_result=AsyncMock(),
         send_response=send_response,
         responder_candidates_for_room=candidate_resolver,
     )

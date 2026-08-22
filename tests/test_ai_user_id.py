@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from agno.agent import Agent as AgnoAgent
+from agno.db.sqlite import SqliteDb
 from agno.media import File
 from agno.models.message import Message
 from agno.models.metrics import Metrics
@@ -27,9 +29,13 @@ from agno.run.agent import (
     ToolCallStartedEvent,
 )
 from agno.run.base import RunStatus
+from agno.run.requirement import RunRequirement
+from agno.tools.function import Function
+from structlog.testing import capture_logs
 
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import (
+    _collect_streamed_response_content,
     _compose_current_turn_prompt,
     _prepare_agent_and_prompt,
     _run_error_event_text,
@@ -71,8 +77,12 @@ from mindroom.memory import MemoryPromptParts
 from mindroom.message_target import MessageTarget
 from mindroom.prompts import INLINE_MEDIA_FALLBACK_PROMPT
 from mindroom.response_runner import (
+    _paused_with_committed_presentation,
     prepare_memory_and_model_context,
 )
+from mindroom.response_turn import PausedAttempt, ResponsePausedForApproval
+from mindroom.synthetic_model import SyntheticModel
+from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.runtime_context import (
     LiveToolDispatchContext,
     get_tool_runtime_context,
@@ -416,7 +426,7 @@ class TestUserIdPassthrough:
 
             mock_ai.side_effect = fake_ai_response
 
-            await coordinator.process_and_respond(
+            await coordinator._process_and_respond(
                 _response_request(prompt="Hello", user_id="@alice:localhost"),
             )
 
@@ -470,7 +480,7 @@ class TestUserIdPassthrough:
 
             mock_stream.side_effect = fake_stream_agent_response
 
-            await coordinator.process_and_respond_streaming(
+            await coordinator._process_and_respond_streaming(
                 _response_request(prompt="Hello", user_id="@bob:localhost"),
             )
 
@@ -680,6 +690,7 @@ class TestUserIdPassthrough:
                 prompt="test",
                 runtime_paths=runtime_paths,
                 config=config,
+                supports_native_tool_approval=True,
             )
 
         agent = prepared_run.agent
@@ -694,6 +705,61 @@ class TestUserIdPassthrough:
         assert prepared_history.replay_plan is not None
         assert prepared_history.replay_plan.mode == "configured"
         assert "runtime_paths" not in mock_create_agent.call_args.kwargs
+        assert mock_create_agent.call_args.kwargs["supports_native_tool_approval"] is True
+
+    @pytest.mark.asyncio
+    async def test_prepare_agent_and_prompt_logs_full_prompt_at_debug(self, tmp_path: Path) -> None:
+        """Routine logs stay content-safe while debug logs retain the prepared prompt."""
+        sensitive_marker = "sensitive prompt marker"
+        config = _config()
+        runtime_paths = _runtime_paths(tmp_path)
+        persist_entity_accounts(config, runtime_paths)
+        mock_agent = MagicMock()
+        prepared_execution = _PreparedExecutionContext(
+            messages=(
+                Message(role="system", content=sensitive_marker),
+                Message(role="user", content="current request"),
+            ),
+            unseen_event_ids=["event-one", "event-two"],
+            prepared_history=PreparedHistoryState(),
+        )
+
+        with (
+            patch(
+                "mindroom.ai.build_memory_prompt_parts",
+                new_callable=AsyncMock,
+                return_value=MemoryPromptParts(),
+            ),
+            patch("mindroom.ai.create_agent", return_value=mock_agent),
+            patch(
+                "mindroom.ai.prepare_agent_execution_context",
+                new=AsyncMock(return_value=prepared_execution),
+            ),
+            capture_logs() as logs,
+        ):
+            await _prepare_agent_and_prompt(
+                make_turn_context("general"),
+                prompt="current request",
+                runtime_paths=runtime_paths,
+                config=config,
+            )
+
+        safe_log = {
+            "agent": "general",
+            "event": "Preparing agent and prompt",
+            "log_level": "info",
+            "message_count": 2,
+            "unseen_event_count": 2,
+        }
+        assert logs == [
+            safe_log,
+            {
+                "agent": "general",
+                "event": "Prepared agent full prompt",
+                "full_prompt": "sensitive prompt marker\n\ncurrent request",
+                "log_level": "debug",
+            },
+        ]
 
     @pytest.mark.asyncio
     async def test_prepare_agent_and_prompt_uses_raw_prompt_for_memory_and_appends_additional_context(
@@ -1192,6 +1258,64 @@ class TestUserIdPassthrough:
         assert persisted_run.metadata["mindroom_original_status"] == "paused"
         assert persisted_run.messages is not None
         assert "turn paused before completion" in str(persisted_run.messages[-1].content)
+
+    @pytest.mark.asyncio
+    async def test_ai_response_surfaces_native_confirmation_pause_without_replay_settlement(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Converting a confirmation pause to text would keep approval inside the completed turn."""
+        storage = _SessionStorage()
+        mock_agent = MagicMock()
+        paused_tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="dangerous",
+            tool_args={"value": 1},
+            requires_confirmation=True,
+        )
+        completed_tool = ToolExecution(
+            tool_call_id="call-0",
+            tool_name="inspect",
+            tool_args={"path": "report.txt"},
+            result="ready",
+        )
+        paused_run = RunOutput(
+            run_id="run-paused",
+            agent_id="general",
+            session_id="session1",
+            content="Approval required",
+            tools=[completed_tool, paused_tool],
+            status=RunStatus.paused,
+        )
+
+        with (
+            patch(
+                "mindroom.ai.open_resolved_scope_session_context",
+                new=lambda **_: _open_agent_scope_context(storage),
+            ),
+            patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
+            patch("mindroom.ai_runtime.cached_agent_run", new_callable=AsyncMock, return_value=paused_run),
+        ):
+            mock_prepare.return_value = _prepared_prompt_result(mock_agent)
+            with pytest.raises(ResponsePausedForApproval) as raised:
+                await ai_response(
+                    make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
+                    prompt="Run the action",
+                    runtime_paths=_runtime_paths(tmp_path),
+                    config=_config(),
+                )
+
+        assert raised.value.paused.tools == (paused_tool,)
+        assert raised.value.paused.response_text.index("Approval required") < raised.value.paused.response_text.index(
+            "🔧 `inspect` [1]",
+        )
+        assert "🔧 `inspect` [1] ⏳" not in raised.value.paused.response_text
+        assert "🔧 `dangerous` [2] ⏳" in raised.value.paused.response_text
+        assert [(entry.tool_call_id, entry.type) for entry in raised.value.paused.tool_trace] == [
+            ("call-0", "tool_call_completed"),
+            ("call-1", "tool_call_started"),
+        ]
+        assert storage.session is None
 
     @pytest.mark.asyncio
     async def test_ai_response_cancelled_run_uses_only_latest_assistant_partial_text(
@@ -3580,6 +3704,213 @@ class TestUserIdPassthrough:
         payload = cast("dict[str, object]", run_metadata[AI_RUN_METADATA_KEY])
         assert payload["run_id"] == "run-paused"
         assert payload["status"] == "paused"
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_response_suspends_for_confirmation_pause(self, tmp_path: Path) -> None:
+        """A streamed confirmation pause must escape to the lifecycle suspension handler."""
+        storage = _SessionStorage()
+        mock_agent = MagicMock()
+        mock_agent.model = MagicMock()
+        mock_agent.model.__class__.__name__ = "OpenAIChat"
+        mock_agent.model.id = "test-model"
+        mock_agent.name = "GeneralAgent"
+        mock_agent.add_history_to_context = False
+        tool = ToolExecution(
+            tool_call_id="call-stream-approval",
+            tool_name="dangerous",
+            tool_args={"value": 1},
+            requires_confirmation=True,
+        )
+
+        async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+            yield RunPausedEvent(
+                run_id="run-paused",
+                session_id="session1",
+                content="Approval required",
+                tools=[tool],
+                requirements=[RunRequirement(tool)],
+            )
+
+        mock_agent.arun = MagicMock(return_value=fake_arun_stream())
+        with (
+            patch(
+                "mindroom.ai.open_resolved_scope_session_context",
+                new=lambda **_: _open_agent_scope_context(storage),
+            ),
+            patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
+        ):
+            mock_prepare.return_value = _prepared_prompt_result(mock_agent)
+            with pytest.raises(ResponsePausedForApproval) as raised:
+                await _collect_streamed_response_content(
+                    stream_agent_response(
+                        make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
+                        prompt="Run the action",
+                        runtime_paths=_runtime_paths(tmp_path),
+                        config=_config(),
+                    ),
+                    show_tool_calls=True,
+                )
+
+        assert raised.value.paused.run_id == "run-paused"
+        assert raised.value.paused.tools == (tool,)
+        assert raised.value.presentation is not None
+        assert raised.value.presentation.response_text.strip() == "🔧 `dangerous` [1] ⏳"
+        assert raised.value.presentation.tool_trace[0].tool_call_id == "call-stream-approval"
+
+    @pytest.mark.asyncio
+    async def test_hidden_streamed_confirmation_pause_preserves_internal_tool_boundary(self, tmp_path: Path) -> None:
+        """A hidden pause must retain enough internal trace state to separate its continuation."""
+        storage = _SessionStorage()
+        mock_agent = MagicMock()
+        mock_agent.model = MagicMock()
+        mock_agent.model.__class__.__name__ = "OpenAIChat"
+        mock_agent.model.id = "test-model"
+        mock_agent.name = "GeneralAgent"
+        mock_agent.add_history_to_context = False
+        tool = ToolExecution(
+            tool_call_id="call-stream-approval",
+            tool_name="dangerous",
+            tool_args={"value": 1},
+            requires_confirmation=True,
+        )
+
+        async def fake_arun_stream(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+            yield RunContentEvent(content="Before approval.")
+            yield RunPausedEvent(
+                run_id="run-paused",
+                session_id="session1",
+                tools=[tool],
+                requirements=[RunRequirement(tool)],
+            )
+
+        mock_agent.arun = MagicMock(return_value=fake_arun_stream())
+        with (
+            patch(
+                "mindroom.ai.open_resolved_scope_session_context",
+                new=lambda **_: _open_agent_scope_context(storage),
+            ),
+            patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
+        ):
+            mock_prepare.return_value = _prepared_prompt_result(mock_agent)
+            with pytest.raises(ResponsePausedForApproval) as raised:
+                await _collect_streamed_response_content(
+                    stream_agent_response(
+                        make_turn_context("general", session_id="session1", reply_to_event_id="$source"),
+                        prompt="Run the action",
+                        runtime_paths=_runtime_paths(tmp_path),
+                        config=_config(),
+                        show_tool_calls=False,
+                    ),
+                    show_tool_calls=False,
+                )
+
+        paused = _paused_with_committed_presentation(raised.value, show_tool_calls=False)
+        restored = CollectedStreamPresentation(
+            show_tool_calls=False,
+            response_text=paused.response_text,
+            tool_trace=list(paused.tool_trace),
+            track_hidden_tools=True,
+        )
+        restored.append_text("After approval.")
+
+        assert [entry.tool_call_id for entry in paused.tool_trace] == ["call-stream-approval"]
+        assert restored.final_text() == "Before approval.\n\nAfter approval."
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_response_keeps_real_agno_confirmation_run_paused(self, tmp_path: Path) -> None:
+        """Consuming Agno's pause event must not close its stream as a cancelled client."""
+        session_db = tmp_path / "streamed-pause.db"
+
+        def run_shell_command(args: list[str]) -> str:
+            return " ".join(args)
+
+        def new_agent() -> AgnoAgent:
+            return AgnoAgent(
+                id="general",
+                model=SyntheticModel(
+                    id="synthetic",
+                    seed=1,
+                    min_response_chars=20,
+                    max_response_chars=20,
+                    chars_per_second=0,
+                    tool_call_probability=1,
+                ),
+                tools=[
+                    Function(
+                        name="run_shell_command",
+                        entrypoint=run_shell_command,
+                        requires_confirmation=True,
+                    ),
+                ],
+                db=SqliteDb(db_file=str(session_db), session_table="sessions"),
+            )
+
+        agent = new_agent()
+        storage = _SessionStorage()
+        with (
+            patch(
+                "mindroom.ai.open_resolved_scope_session_context",
+                new=lambda **_: _open_agent_scope_context(storage),
+            ),
+            patch("mindroom.ai._prepare_agent_and_prompt", new_callable=AsyncMock) as mock_prepare,
+        ):
+            mock_prepare.return_value = _prepared_prompt_result(agent)
+            with pytest.raises(ResponsePausedForApproval) as raised:
+                async for _chunk in stream_agent_response(
+                    make_turn_context(
+                        "general",
+                        session_id="session1",
+                        requester_id="@user:localhost",
+                        reply_to_event_id="$source",
+                    ),
+                    prompt="Run the action",
+                    runtime_paths=_runtime_paths(tmp_path),
+                    config=_config(),
+                    supports_native_tool_approval=True,
+                ):
+                    pass
+
+        # Agno persists a GeneratorExit cancellation on a detached task, so
+        # give that write a chance to expose an incorrectly closed stream.
+        await asyncio.sleep(0.1)
+        reader = new_agent()
+        session = await reader.aget_session(session_id="session1", user_id="@user:localhost")
+        persisted = None if session is None else session.get_run(raised.value.paused.run_id)
+
+        assert persisted is not None
+        assert persisted.status == RunStatus.paused
+        assert len(persisted.requirements or []) == 1
+
+    @pytest.mark.asyncio
+    async def test_collected_agent_pause_carries_its_ordered_presentation(self) -> None:
+        """A non-Matrix stream collector must hand its body and trace to approval."""
+        tool = ToolExecution(
+            tool_call_id="call-1",
+            tool_name="inspect",
+            tool_args={"item": "report"},
+            requires_confirmation=True,
+        )
+        pause = ResponsePausedForApproval(
+            PausedAttempt(
+                session_id="session-1",
+                run_id="run-paused",
+                tools=(tool,),
+            ),
+        )
+
+        async def paused_stream() -> AsyncIterator[object]:
+            yield RunContentEvent(content="Before approval.")
+            yield ToolCallStartedEvent(tool=tool)
+            raise pause
+
+        with pytest.raises(ResponsePausedForApproval) as raised:
+            await _collect_streamed_response_content(paused_stream(), show_tool_calls=True)
+
+        assert raised.value is pause
+        assert pause.presentation is not None
+        assert pause.presentation.response_text == "Before approval.\n\n🔧 `inspect` [1] ⏳"
+        assert len(pause.presentation.tool_trace) == 1
+        assert pause.presentation.tool_trace[0].tool_call_id == "call-1"
 
     @pytest.mark.asyncio
     async def test_stream_agent_response_persists_hidden_interrupted_tool_state(self, tmp_path: Path) -> None:

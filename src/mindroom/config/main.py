@@ -37,7 +37,7 @@ from mindroom.config.entity_view import ResolvedEntityView
 from mindroom.config.external_trigger_policy import ExternalTriggerPolicyConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.matrix import (
-    CacheConfig,
+    EventJournalConfig,
     MatrixRoomAccessConfig,
     MatrixSpaceConfig,
     MatrixSyncConfig,
@@ -84,6 +84,7 @@ from mindroom.matrix_identifiers import (
 from mindroom.mcp.config import MCPServerConfig, normalize_mcp_server_id
 from mindroom.prompt_templates import render_prompt_template, validate_prompt_template_fields
 from mindroom.prompts import PROMPT_DEFAULT_NAMES, PROMPT_DEFAULTS
+from mindroom.room_model_overrides import resolve_room_model_override
 from mindroom.room_thread_modes import resolve_room_thread_mode_override
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.thread_models import resolve_thread_model_override
@@ -100,7 +101,9 @@ if TYPE_CHECKING:
 # Keep synchronized with todo_poke._SAFE_ASSIGNEE_PATTERN without importing runtime tools into config.
 _AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
 _RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user"})
-_DEFER_PROHIBITED_CONTROL_TOOLS = frozenset({"delegate", "dynamic_tools", "external_trigger_manager", "self_config"})
+_DEFER_PROHIBITED_CONTROL_TOOLS = frozenset(
+    {"delegate", "dynamic_tools", "external_trigger_manager", "invite_router", "self_config"},
+)
 _OPENCLAW_COMPAT_PRESET_TOOLS: tuple[str, ...] = (
     "shell",
     "coding",
@@ -425,7 +428,10 @@ class Config(BaseModel):
     router: RouterConfig = Field(default_factory=RouterConfig, description="Router configuration")
     voice: VoiceConfig = Field(default_factory=VoiceConfig, description="Voice configuration")
     calls: CallsConfig = Field(default_factory=CallsConfig, description="Voice call (MatrixRTC) configuration")
-    cache: CacheConfig = Field(default_factory=CacheConfig, description="Persistent Matrix event cache")
+    event_journal: EventJournalConfig = Field(
+        default_factory=EventJournalConfig,
+        description="Durable Matrix event-journal store",
+    )
     matrix_sync: MatrixSyncConfig = Field(
         default_factory=MatrixSyncConfig,
         description="Matrix event sync transport configuration",
@@ -626,12 +632,28 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def validate_agent_reply_permissions(self) -> Config:
-        """Ensure per-agent reply permissions reference known entities."""
+        """Ensure reply policies reference known entities and managed room keys."""
         known_entities = set(self.agents) | set(self.teams) | {ROUTER_AGENT_NAME}
         known_entities.add("*")
         unknown_entities = sorted(set(self.authorization.agent_reply_permissions) - known_entities)
         if unknown_entities:
             msg = f"authorization.agent_reply_permissions contains unknown entities: {', '.join(unknown_entities)}"
+            raise ValueError(msg)
+
+        configured_managed_room_keys = {
+            room_key for room_key in self.get_all_configured_rooms() if not room_key.startswith(("!", "#"))
+        }
+        invalid_room_references = sorted(
+            f"{entity_name} -> {room_key}"
+            for entity_name, policy in self.authorization.agent_reply_permissions.items()
+            for room_key in policy.joined_rooms
+            if room_key not in configured_managed_room_keys
+        )
+        if invalid_room_references:
+            msg = (
+                "authorization.agent_reply_permissions joined_rooms must reference configured managed room keys: "
+                + ", ".join(invalid_room_references)
+            )
             raise ValueError(msg)
         return self
 
@@ -1280,6 +1302,19 @@ class Config(BaseModel):
         )
         return policy.effective_execution_scope
 
+    def agent_has_tool_at_execution_scope(
+        self,
+        agent_name: str,
+        tool_name: str,
+        execution_scope: WorkerScope | None,
+    ) -> bool:
+        """Return whether one agent can still reach a tool at an exact execution scope."""
+        return (
+            agent_name in self.agents
+            and tool_name in self.resolve_entity(agent_name).available_tools
+            and self._agent_execution_scope(agent_name) == execution_scope
+        )
+
     def _agent_scope_label(self, agent_name: str) -> str:
         """Return the user-facing authored scope label for one agent.
 
@@ -1824,7 +1859,7 @@ class Config(BaseModel):
             entity_name: Name of the entity (agent, team, or router)
 
         Returns:
-            Model name (e.g., "default", "gpt-4", etc.)
+            Model alias (e.g., "default", "fast", etc.)
 
         Raises:
             ValueError: If entity_name is not found in configuration
@@ -1862,8 +1897,8 @@ class Config(BaseModel):
     ) -> ResolvedRuntimeModel:
         """Resolve the active runtime model plus its configured context window.
 
-        Precedence: explicit `active_model_name`, then a persisted per-thread
-        override, then the room override, then the entity's authored model.
+        Precedence: explicit `active_model_name`, persisted thread override,
+        persisted room override, configured room override, then authored entity model.
         """
         resolved_model_name = active_model_name
         if resolved_model_name is None and thread_id is not None:
@@ -1884,9 +1919,17 @@ class Config(BaseModel):
                 if runtime_paths is None:
                     msg = "runtime_paths are required to resolve a room-specific runtime model"
                     raise ValueError(msg)
-                from mindroom.entity_resolution import effective_entity_model_name  # noqa: PLC0415
+                room_override = resolve_room_model_override(
+                    runtime_paths,
+                    room_id,
+                    configured_models=self.models,
+                ).active
+                if room_override is not None:
+                    resolved_model_name = room_override
+                else:
+                    from mindroom.entity_resolution import effective_entity_model_name  # noqa: PLC0415
 
-                resolved_model_name = effective_entity_model_name(self, entity_name, room_id, runtime_paths)
+                    resolved_model_name = effective_entity_model_name(self, entity_name, room_id, runtime_paths)
             else:
                 resolved_model_name = self._entity_model_name(entity_name)
 

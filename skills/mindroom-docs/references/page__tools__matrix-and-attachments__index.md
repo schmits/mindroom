@@ -9,7 +9,8 @@ Use these tools when you need to send or inspect Matrix messages, manage thread 
 
 ## Tools On This Page
 
-- [`matrix_message`] - Send, reply, react, read, edit, or inspect Matrix conversation context.
+- [`matrix_message`] - Send, reply, react, read, list room threads, edit, or inspect Matrix conversation context.
+- [`matrix_room`] - Inspect Matrix room metadata, members, thread roots, and room state.
 - [`matrix_voice_message`] - Generate speech from text and send it as a Matrix voice note.
 - [`thread_tags`] - Add, remove, and inspect shared tags on a Matrix thread.
 - [`thread_resolution`] - Explicitly resolve or reopen the active Matrix thread.
@@ -21,9 +22,9 @@ Use these tools when you need to send or inspect Matrix messages, manage thread 
 ## Common Setup Notes
 
 These tools depend on the active `ToolRuntimeContext`, so they only work when an agent is running in a Matrix-connected conversation.
-`matrix_message` implies `attachments` through `Config.IMPLIED_TOOLS`, so enabling `matrix_message` makes the `attachments` toolkit available even when you do not list it separately.
+`matrix_message` implies `attachments` and `matrix_room` through `Config.IMPLIED_TOOLS`, so enabling it makes both companion toolkits available even when you do not list them separately.
 Attachment IDs are context-scoped `att_*` values, and the runtime only exposes IDs from the current conversation plus any IDs registered during the current tool run.
-Current source in this worktree exposes `matrix_message`, `matrix_voice_message`, `thread_tags`, `thread_resolution`, `thread_summary`, `thread_model`, `matrix_api`, and `attachments` in this area.
+Current source in this worktree exposes `matrix_message`, `matrix_room`, `matrix_voice_message`, `thread_tags`, `thread_resolution`, `thread_summary`, `thread_model`, `matrix_api`, and `attachments` in this area.
 
 ## [`matrix_message`]
 
@@ -31,17 +32,19 @@ Current source in this worktree exposes `matrix_message`, `matrix_voice_message`
 
 ### What It Does
 
-`matrix_message` supports `send`, `reply`, `thread-reply`, `react`, `read`, `thread-list`, `edit`, and `context`.
+`matrix_message` supports `send`, `reply`, `thread-reply`, `react`, `read`, `room-threads`, `thread-list`, `edit`, and `context`.
 `send` targets the room timeline by default, even when the current conversation is inside a thread.
 When a room-level `send` includes both text and attachments, the text is posted to the room timeline and the attachments are threaded under that new text event.
 When a room-level `send` includes multiple attachments and no text, the first attachment is posted to the room timeline and the remaining attachments are threaded under it.
 When `send` uses an explicit `thread_id`, both text and attachments stay in that existing thread instead of creating a new attachment thread.
 In `thread_mode: room`, room-level `send` stays plain room messaging and does not auto-thread attachments unless you pass an explicit `thread_id`.
 `reply` and `thread-reply` inherit the current thread when one can be resolved, and they return an error when no thread target is available.
-`read`, `edit`, and `context` also inherit the current thread when one can be resolved, while `thread_id="room"` forces room-level scope instead of thread inheritance.
+`read` and `context` also inherit the current thread when one can be resolved, while `thread_id="room"` forces room-level scope instead of thread inheritance.
+For `edit`, the required `target` alone selects the event; thread context does not select or validate that target.
 `thread-list` uses the current thread when one is active, and it requires an explicit `thread_id` when there is no active thread context.
+`room-threads` pages thread roots in the target room and returns `next_token` plus `has_more`; pass a returned `next_token` as `page_token` to fetch the next page.
 `react` requires `target` and uses `👍` when `message` is empty.
-`read` defaults to 20 messages and caps `limit` at 50.
+`read`, `thread-list`, and `room-threads` default `limit` to 20 and clamp it from 1 through 50.
 `thread-list` returns recent thread messages plus `edit_options` for messages that the current Matrix account can edit.
 Only `send`, `reply`, and `thread-reply` accept attachments, with a combined cap of five `attachment_ids` plus `attachment_file_paths` per call.
 Relative `attachment_file_paths` resolve from the agent workspace when one is available, and they must stay inside that workspace.
@@ -80,6 +83,49 @@ matrix_message(action="react", target="$event123", message="✅")
 - Successful attachment sends also return `attachment_thread_id`, which identifies the thread root used for the uploaded files.
 - If you need to send existing conversation files, pass `attachment_ids` from the current context or use the `attachments` tool to inspect them first.
 
+## [`matrix_room`]
+
+`matrix_room` provides read-only room introspection through `matrix_room(action="room-info", room_id=None, limit=None, event_type=None, state_key=None, page_token=None)`.
+
+### What It Does
+
+The supported actions are `room-info`, `members`, `threads`, and `state`.
+`room-info` returns cached room metadata including name, topic, encryption status, membership count, join rule, canonical alias, version, guest access, creator, and a power-level summary.
+`members` returns joined users with display names, avatar URLs, and power levels.
+`threads` returns paginated thread-root previews with sender, timestamp, and reply count; it defaults `limit` to 20, clamps it from 1 through 50, and returns `next_token` plus `has_more` for pagination.
+`state` returns one exact state event when `event_type` is supplied, using an empty `state_key` by default.
+Without `event_type`, `state` returns a room-state summary with at most 100 non-member event previews and elides `m.room.member` events.
+`room_id` defaults to the active Matrix room.
+An alternate room is allowed only when the requester is authorized there under the configured room-access policy.
+The tool requires an active Matrix `ToolRuntimeContext` and rate-limits each `(agent_name, requester_id, room_id)` combination to 20 actions per 30 seconds.
+
+### Configuration
+
+This tool has no tool-specific inline configuration fields.
+It can be listed explicitly, and `matrix_message` also enables it automatically through `Config.IMPLIED_TOOLS`.
+
+### Example
+
+```yaml
+agents:
+  assistant:
+    tools:
+      - matrix_room
+```
+
+```python
+matrix_room(action="room-info")
+matrix_room(action="members")
+matrix_room(action="threads", limit=10)
+matrix_room(action="threads", page_token="next-page-token")
+matrix_room(action="state", event_type="m.room.topic")
+```
+
+### Notes
+
+- `page_token` applies to `threads`, while `event_type` and `state_key` apply to `state`.
+- This tool reads room data only; use `matrix_message` or `matrix_api` for supported writes.
+
 ## [`matrix_voice_message`]
 
 `matrix_voice_message` lets agents generate speech from text and send it as a Matrix voice message in one tool call.
@@ -93,9 +139,11 @@ Use `caption` for the audio event body and `companion_message` for a separate re
 
 ### Configuration
 
-By default `matrix_voice_message` uses OpenAI text-to-speech through a stored credential or `OPENAI_API_KEY` / `OPENAI_API_KEY_FILE`.
+The optional tool configuration fields are `api_key`, `model`, `base_url`, `voice`, and `response_format`.
+By default `matrix_voice_message` uses OpenAI text-to-speech through an explicit or stored credential, or `OPENAI_API_KEY` / `OPENAI_API_KEY_FILE`.
+Provider-prefixed model IDs such as `hexgrad/kokoro-82m` route through OpenRouter and use an explicit `api_key` or `OPENROUTER_API_KEY`; OpenRouter output is always requested as MP3.
 Set the `base_url` tool config (or the `TTS_URL` secret) to target any OpenAI-compatible speech endpoint instead, such as a local Kokoro server.
-When a `base_url` is configured without an explicit `api_key`, the tool sends a dummy API key so the real OpenAI credential never leaves the machine.
+When a non-OpenRouter `base_url` is configured without an explicit `api_key`, the tool sends a dummy API key so the real OpenAI credential never leaves the machine.
 `base_url` accepts a bare host, a `/v1` URL, or a full `/audio/speech` endpoint URL, and full endpoint URLs are honored verbatim.
 Defaults: `model=gpt-4o-mini-tts`, `voice=alloy`, `response_format=opus`.
 `response_format` must be one of `aac`, `flac`, `mp3`, `opus`, or `wav`, matching what the endpoint returns.
@@ -221,11 +269,12 @@ reopen_thread()
 
 ### What It Does
 
-`thread_summary` exposes `set_thread_summary(summary, thread_id=None, room_id=None)`.
+`thread_summary` exposes `set_thread_summary(summary, thread_id=None, room_id=None, pin=True)`.
 The tool defaults to the active room and current resolved thread from `ToolRuntimeContext`.
 When there is no active resolved thread context, pass `thread_id` explicitly.
 The tool normalizes the target to the canonical thread root before sending a new `m.notice` summary event with `io.mindroom.thread_summary` metadata.
-Manual summaries are marked with `model_name="manual"` and update the cached last-summary count so later automatic summaries continue from the new baseline.
+Manual summaries are marked with `model_name="manual"` and pin the thread by default, which stops automatic summaries from overwriting the title.
+Pass `pin=False` to write a summary that later automatic summaries may replace; that also releases a thread pinned by an earlier call.
 A per-thread async lock prevents concurrent duplicate manual summaries from racing each other.
 
 ### Configuration
@@ -243,6 +292,7 @@ agents:
 
 ```python
 set_thread_summary("Decision: ship the current plan and revisit logs tomorrow.")
+set_thread_summary("Routine status update.", pin=False)
 set_thread_summary(
     "Summary for the import thread.",
     thread_id="$threadRoot",
@@ -255,6 +305,9 @@ set_thread_summary(
 - `summary` must be a non-empty string up to 300 characters after whitespace normalization.
 - The tool writes a normal Matrix notice event, so the updated summary remains visible in the thread timeline.
 - Automatic thread summaries still exist, but this tool gives an agent an explicit override path when a human asks for a manual summary refresh.
+- Pin state lives in the summary notice's `io.mindroom.thread_summary` metadata, so it survives restarts and every runtime reads the same decision.
+- Pinning stops the whole automatic pass, not just the title. A thread pinned before its automatic topic tags are inferred will not receive them; tag it explicitly with `thread_tags` instead.
+- Automatic summaries are also skipped on threads carrying the `resolved` tag.
 
 ## [`thread_model`]
 
@@ -268,7 +321,7 @@ All three functions require an active thread context and return an error outside
 The override applies to all agents and teams in the thread, persists across restarts, and takes effect from the next message; the current response keeps the model it started with.
 `get_thread_model` returns the active override and the available model names.
 When a stored override names a model that has been removed from `config.models`, runtime resolution ignores it, and `get_thread_model` reports `override: null` plus a `stale_override` field instead of an active override.
-`reset_thread_model` removes the override so agents use their configured models again.
+`reset_thread_model` removes the thread override so room-level model selection applies: an active runtime `!room_model` override, then configured `room_models`, then each entity's configured model.
 
 ### Configuration
 
@@ -293,7 +346,7 @@ reset_thread_model()
 
 - The override is stored per thread root in `mindroom_data/tracking/thread_models.json`.
 - Users can manage the same override with the `!model` chat command; see [Chat Commands](https://docs.mindroom.chat/chat-commands/).
-- An explicit `active_model_name` (for example a delegated child run) still beats the thread override, and the thread override beats `room_models` and the authored entity model.
+- An explicit `active_model_name` (for example a delegated child run) still beats the thread override, and the thread override beats the runtime `!room_model` choice, configured `room_models`, and the authored entity model.
 
 ## [`matrix_api`]
 
@@ -355,8 +408,9 @@ matrix_api(
 
 ### What It Does
 
-`attachments` exposes `list_attachments()`, `get_attachment()`, and `register_attachment()`.
+`attachments` exposes `list_attachments(target=None)`, `get_attachment()`, and `register_attachment()`.
 `list_attachments()` returns the attachment IDs currently available in tool runtime context, the resolved metadata payloads, and any `missing_attachment_ids`.
+Pass a context-available attachment ID as `target` to return only that attachment; an ID outside the current context returns an error.
 `get_attachment()` returns a single attachment record, including the runtime-local path, when called with only an attachment ID.
 `get_attachment(attachment_id, mindroom_output_path="relative/path")` saves the attachment bytes into the agent workspace and returns a `mindroom_tool_output` save receipt with the saved path, byte count, binary format, and SHA256 digest.
 Use `mindroom_output_path` before handing attachments to worker-routed workspace tools such as `file`, `coding`, `python`, or `shell`, because the runtime-local path may not exist inside the worker workspace.
@@ -382,6 +436,7 @@ agents:
 
 ```python
 list_attachments()
+list_attachments(target="att_abc123")
 get_attachment("att_abc123")
 get_attachment("att_abc123", mindroom_output_path="incoming/plan.pdf")
 register_attachment("incoming/plan.pdf")
@@ -399,7 +454,8 @@ matrix_message(action="reply", message="Sharing the plan here.", attachment_ids=
 Automatic thread summaries are still implemented in `src/mindroom/thread_summary.py` as bot runtime behavior.
 The summarizer posts one `m.notice` summary after a successful response brings a thread to the configured first threshold (one message by default), and then again every ten additional messages by default, using `defaults.thread_summary_model` or `default`.
 Set `room_thread_summary_models` to override the automatic summary model for a managed room alias or raw Matrix room ID.
-MindRoom uses `defaults.thread_summary_temperature` for automatic summaries when the provider supports runtime temperature overrides, and always omits temperature for Vertex Claude summaries.
+MindRoom uses `defaults.thread_summary_temperature` for automatic summaries when the provider supports runtime temperature overrides.
+MindRoom always uses provider temperature defaults for Vertex Claude, Claude Opus 5, Sonnet 5, Fable 5, and direct Google Gemini 3.6 Flash and Gemini 3.5 Flash-Lite summaries.
 The `thread_summary` tool complements that automatic behavior by letting an agent publish a manual summary immediately and advance the stored summary baseline.
 When no trusted prior summary exists, the first automatic summary is summary-only so a useful thread title appears early.
 The next scheduled refresh uses one structured model call to update the summary and produce up to three normalized topic tags, whether the prior summary was automatic or manual.

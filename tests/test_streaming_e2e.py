@@ -12,27 +12,27 @@ import pytest
 from agno.models.response import ToolExecution
 from agno.run.agent import ToolCallStartedEvent
 
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig, RouterConfig
 from mindroom.matrix.client import DeliveredMatrixEvent
+from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.orchestrator import _MultiAgentOrchestrator
 from mindroom.streaming import StreamingResponse, send_streaming_response
 from mindroom.tool_system.runtime_context import WorkerProgressEvent, get_worker_progress_pump
 from mindroom.workers.models import WorkerReadyProgress
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_ACCESS_TOKEN,
     TEST_PASSWORD,
     bind_runtime_paths,
     drain_coalescing,
-    install_runtime_cache_support,
+    install_runtime_journal_support,
     make_matrix_client_mock,
     orchestrator_runtime_paths,
     runtime_paths_for,
-    thread_history_result,
 )
 
 if TYPE_CHECKING:
@@ -72,6 +72,8 @@ async def test_streaming_e2e_worker_warmup_edit_sequence(tmp_path: Path) -> None
         _client: object,
         _room_id: str,
         content: dict[str, object],
+        *,
+        retry_sync_recovery: bool = False,  # noqa: ARG001
     ) -> DeliveredMatrixEvent:
         deliveries.append(("send", str(content["body"])))
         return DeliveredMatrixEvent(event_id="$stream_1", content_sent=dict(content))
@@ -82,6 +84,8 @@ async def test_streaming_e2e_worker_warmup_edit_sequence(tmp_path: Path) -> None
         _event_id: str,
         new_content: dict[str, object],
         new_text: str,
+        *,
+        retry_sync_recovery: bool = False,  # noqa: ARG001
     ) -> DeliveredMatrixEvent:
         deliveries.append(("edit", new_text))
         return DeliveredMatrixEvent(event_id="$stream_edit", content_sent=dict(new_content))
@@ -345,7 +349,7 @@ async def test_streaming_edits_e2e(  # noqa: C901, PLR0915
 
                 # Create the actual bot with config
                 runtime_config = bind_runtime_paths(config, runtime_paths)
-                return AgentBot(
+                return make_test_agent_bot(
                     agent_user,
                     storage_path,
                     runtime_config,
@@ -373,14 +377,11 @@ async def test_streaming_edits_e2e(  # noqa: C901, PLR0915
         # Access the bots
         helper_bot = orchestrator.agent_bots["helper"]
         calc_bot = orchestrator.agent_bots["calculator"]
-        empty_thread_history = thread_history_result([], is_full_history=True)
         empty_thread_snapshot = thread_history_result([], is_full_history=False)
-        helper_bot._conversation_cache.get_dispatch_thread_history = AsyncMock(return_value=empty_thread_history)
-        helper_bot._conversation_cache.get_dispatch_thread_snapshot = AsyncMock(return_value=empty_thread_snapshot)
-        helper_bot._conversation_cache.get_thread_history = AsyncMock(return_value=empty_thread_history)
-        calc_bot._conversation_cache.get_dispatch_thread_history = AsyncMock(return_value=empty_thread_history)
-        calc_bot._conversation_cache.get_dispatch_thread_snapshot = AsyncMock(return_value=empty_thread_snapshot)
-        calc_bot._conversation_cache.get_thread_history = AsyncMock(return_value=empty_thread_history)
+        helper_bot._turn_controller.deps.resolver.dispatch_thread_snapshot = AsyncMock(
+            return_value=empty_thread_snapshot,
+        )
+        calc_bot._turn_controller.deps.resolver.dispatch_thread_snapshot = AsyncMock(return_value=empty_thread_snapshot)
 
         # Ensure calculator bot has streaming disabled for this test
         calc_bot.enable_streaming = False
@@ -602,7 +603,7 @@ async def test_user_edits_with_mentions_e2e(tmp_path: Path) -> None:
             orchestrator_runtime_paths(tmp_path),
         )
 
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             calc_user,
             tmp_path,
             config,
@@ -610,7 +611,7 @@ async def test_user_edits_with_mentions_e2e(tmp_path: Path) -> None:
             rooms=["!test:localhost"],
             enable_streaming=False,
         )
-        install_runtime_cache_support(bot)
+        install_runtime_journal_support(bot)
         await bot.start()
 
         test_room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="", encrypted=False)

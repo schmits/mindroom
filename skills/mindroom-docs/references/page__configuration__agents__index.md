@@ -93,8 +93,6 @@ agents:
       bridge_telegram: room
       "!abc123:example.com": room
 
-    # Participate in room-level startup prewarm for rooms already joined at first sync (default: true)
-    startup_thread_prewarm: true
 
     # Tools to run in the sandbox proxy instead of the main process (optional, inherits from defaults)
     worker_tools: [shell, file]
@@ -123,6 +121,7 @@ agents:
       enabled: true
       threshold_percent: 0.8
       reserve_tokens: 16384
+      timeout_seconds: 600
 
 ```
 
@@ -138,7 +137,7 @@ agents:
 | `skills` | list | `[]` | Skill names the agent can use (see [Skills](https://docs.mindroom.chat/skills/)) |
 | `instructions` | list | `[]` | Extra lines appended to the system prompt after the role |
 | `rooms` | list | `[]` | Room aliases to auto-join; rooms are created if they don't exist |
-| `accept_invites` | bool | `true` | Accept authorized inbound Matrix room invites for this agent. Invited room IDs are persisted so ad-hoc memberships survive restarts and room cleanup. Set to `false` to ignore new invites for this agent. Approval-gated tools still require the router to be joined to the room, so ad-hoc invited rooms only support approval if the router is already joined there |
+| `accept_invites` | bool | `true` | Accept authorized inbound Matrix room invites for this agent. Invited room IDs are persisted so ad-hoc memberships survive restarts and room cleanup. Set to `false` to ignore new invites for this agent. Approval-gated tools require the router in the room; agents can recover a missing router with their built-in zero-argument `invite_router` tool when `router.accept_invites` is enabled |
 | `markdown` | bool | `null` | When enabled, the agent is instructed to format responses as Markdown. Inherits from `defaults.markdown` (default: `true`) |
 | `learning` | bool | `null` | Enable [Agno Learning](https://docs.agno.com/agents/learning) — the agent builds a persistent profile of user preferences and adapts over time. Inherits from `defaults.learning` (default: `true`) |
 | `learning_mode` | string | `null` | `always`: agent automatically learns from every interaction. `agentic`: agent decides when to learn via a tool call. Inherits from `defaults.learning_mode` (default: `"always"`) |
@@ -149,7 +148,6 @@ agents:
 | `context_files` | list | `[]` | File paths (relative to the agent's workspace) loaded into each agent instance and prepended to role context (under `Personality Context`) |
 | `thread_mode` | string | `"thread"` | `thread`: responses are sent in Matrix threads (default). `room`: responses are sent as plain room messages with a single persistent session per room — ideal for bridges (Telegram, Signal, WhatsApp) and mobile |
 | `room_thread_modes` | map | `{}` | Per-room thread mode overrides keyed by room alias/name or Matrix room ID. Values are `thread` or `room`. Overrides apply before `thread_mode` fallback |
-| `startup_thread_prewarm` | bool | `true` | When enabled, this bot may prewarm recent thread snapshots for rooms already joined when first sync completes, which can reduce cold-cache latency for early thread replies after startup |
 | `num_history_runs` | int | `null` | Number of prior Agno runs to include as history context (`null` = all). Mutually exclusive with `num_history_messages` |
 | `num_history_messages` | int | `null` | Max messages from history. Mutually exclusive with `num_history_runs` |
 | `compress_tool_results` | bool | `null` | Compress tool results in history to save context. Inherits from `defaults.compress_tool_results` (default: `false`). On Anthropic and Vertex Claude models, setting this to `true` can mutate replayed tool messages and invalidate prompt-cache prefixes |
@@ -172,16 +170,16 @@ Use `memory_backend: none` for stateless agents that should skip prompt memory l
 Unset `memory_search` fields inherit from top-level `memory.search`.
 `show_stop_button` and `enable_streaming` are global-only settings in `defaults` and cannot be overridden per-agent.
 The dashboard Agents tab exposes this as the **Memory Backend** selector for each agent.
-
-Startup thread prewarm is a background, best-effort cache warmup for rooms already joined when first sync completes.
 Agents use `agents.<name>.accept_invites`, while the router uses its own `router.accept_invites` option with the same durable invite semantics.
 Teams do not currently expose a separate `accept_invites` option, but accepted team invites are still persisted as durable desired membership.
 Invite acceptance still respects your normal authorization rules, so unauthorized senders cannot force an entity to join and persist a room.
 Approval-gated tools are stricter than plain ad-hoc chat access.
-Approval-gated tools only work there while the router is already joined.
+When approval needs a missing router, the agent can call `invite_router` to invite it into the current room and then retry.
+The tool waits briefly for joined membership and, if the invite remains pending, tells the agent to retry only after the router joins.
+The router accepts and persists that authorized internal invite when `router.accept_invites` is enabled.
 
 MindRoom compacts in one visible lifecycle.
-Per-agent compaction supports `enabled`, `threshold_tokens`, `threshold_percent`, `replay_window_tokens`, `reserve_tokens`, `model`, and `fallback_model`.
+Per-agent compaction supports `enabled`, `threshold_tokens`, `threshold_percent`, `replay_window_tokens`, `reserve_tokens`, `model`, `fallback_model`, and `timeout_seconds`.
 When the active runtime model has a known `context_window`, MindRoom always computes a per-run replay plan that reduces or disables persisted replay before the model call if needed.
 Automatic destructive compaction is enabled by default through `defaults.compaction`, but it runs only when raw history exceeds the hard replay budget for the next reply.
 `threshold_tokens` and `threshold_percent` set a soft trigger budget for planning metadata and compaction notices.
@@ -189,15 +187,16 @@ Crossing that soft trigger while still within the hard budget leaves the stored 
 
 You can tune compaction behavior with these settings:
 
-- Use `replay_window_tokens` to cap persisted replay, required-compaction planning, and summary input chunks below the model's real context window without lowering the provider request limit.
+- Use `replay_window_tokens` to cap persisted replay and required-compaction planning below the model's real context window without lowering the provider request limit.
 - Use `reserve_tokens` to leave hard-budget headroom.
 - Use `model` to choose the summary model.
-- Use `fallback_model` to name a different model config that resends the unchanged summary prompt and input once (only the target model differs) when the summary model refuses for safeguards; after a successful fallback, that model serves the remaining compaction chunks and is reported as the summary model.
+- Use `fallback_model` to name a different model config retried once when the summary model refuses for safeguards; the same input is reused when it fits, otherwise it is rebuilt under the fallback model's own context budget, and after success that model serves the remaining chunks.
+- Use `timeout_seconds` to bound each primary, retry, or fallback summary request; it defaults to 600 seconds, while an explicitly shorter provider timeout remains the stricter cap.
 - Set `enabled: false` to disable automatic pre-reply compaction for this agent.
 
 When the active runtime model window is known, replay safety uses the smaller of it and `replay_window_tokens`.
 When that model window is unknown, an explicit `replay_window_tokens` still supplies the replay-planning window.
-The effective replay window also caps each compaction summary input chunk.
+Each compaction summary input chunk is sized independently from the selected compaction model's real `context_window`, after reserve, prompt overhead, and a safety margin.
 Destructive compaction requires the resolved summary input budget to exceed 2,000 tokens.
 With the default `reserve_tokens`, this makes destructive compaction unavailable when the compaction model's context window is roughly 10,000 tokens or smaller; lowering `reserve_tokens` restores availability for such small windows.
 If you set `compaction.model`, that summary model must also define its own `context_window`, but only for the durable summary-generation pass.
@@ -215,6 +214,11 @@ Learning data is persisted under `agents/<name>/learning/<agent>.db`, so it surv
 `context_files` are resolved relative to the agent's workspace directory (`agents/<name>/workspace/`).
 When the effective memory backend is `file`, the agent's canonical file memory root is that same workspace directory.
 Absolute paths and `..` traversal are rejected.
+
+Each part of the `Personality Context` section is headed by the resolved path of the file it was read from, and the section states that those files are already inlined so the agent does not spend a turn re-reading them.
+When the rendered section exceeds `defaults.max_preload_chars`, MindRoom drops earlier file bodies first, trims the final surviving body from its end, and leaves a per-file marker giving each affected path and omitted-character count, followed by a summary marker for the section.
+A dropped file therefore still appears with its path, so the agent can open it when it needs the omitted part.
+If the configured cap cannot contain the section heading plus all required per-file and summary markers, agent materialization fails explicitly instead of silently removing source paths.
 
 ## Per-Agent Tool Configuration
 
@@ -359,7 +363,7 @@ Adding or removing tools via chat does not discard existing per-agent overrides 
 `worker_tools` decides which tools run in the sandbox proxy instead of the main MindRoom process.
 When omitted, MindRoom routes `coding`, `docker`, `file`, `python`, and `shell` through the proxy by default.
 Registry-backed tools can be listed in `worker_tools`, and MindRoom will attempt to route them through the worker runtime.
-Some local-only tools stay in the primary runtime even when listed: `attachments`, `desktop`, `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, and `homeassistant`.
+Some local-only tools stay in the primary runtime even when listed: `approved_egress`, `attachments`, `callback_manager`, `desktop`, `external_trigger_manager`, `github`, `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, `homeassistant`, `invite_router`, `oauth_connections`, and `todo`.
 Dedicated Docker workers also receive a projected read-only config snapshot so config-relative plugins, knowledge bases, and other worker-safe assets remain available without exposing unrelated primary-runtime state.
 Agent-scoped workers snapshot only that agent's projected context files and assigned knowledge bases, while scopes that intentionally share one worker across multiple agents keep the broader shared projection for that worker.
 Writable file-memory paths are rewritten into worker-owned state instead of being mounted from the host config tree.
@@ -367,10 +371,11 @@ Config-adjacent `.env` files are intentionally masked as files inside those Dock
 A filtered public startup-runtime env payload can still propagate from exported env vars and allowed `.env` values.
 `worker_scope` controls how those sandbox runtimes are reused between calls.
 Some integrations require `worker_scope` unset or `shared` because their credentials or sessions are shared at runtime.
-That list includes `spotify`, `homeassistant`, and non-OAuth configured `mcp_<server_id>` tools.
-OAuth-backed remote MCP tools use requester-scoped OAuth credentials and can be used with `worker_scope: user` or `worker_scope: user_agent`.
+That list includes `spotify` and `homeassistant`.
+Configured `mcp_<server_id>` tools work on every worker scope: generated OAuth providers follow the selected agent's effective credential scope, while non-OAuth servers use the shared MCP session without requester credentials.
+For OAuth-backed MCP, `shared` uses one agent-owned connection, `user` reuses one requester-owned connection across agents, `user_agent` isolates each requester-agent pair, and unscoped uses one installation-level connection.
 Among those shared-scope integrations, `homeassistant` always stays local regardless of `worker_tools` and is never proxied to the sandbox.
-`gmail`, `google_calendar`, `google_docs`, `google_drive`, and `google_sheets` also always stay local.
+`github`, `gmail`, `google_calendar`, `google_docs`, `google_drive`, `google_sheets`, and `oauth_connections` also always stay local.
 `spotify` can still be proxied through the sandbox.
 The built-in `memory`, `delegate`, and `self_config` tools are also created directly in the primary runtime today and are not routed through `worker_tools`.
 
@@ -418,8 +423,8 @@ Workers mount those canonical private-instance roots.
 They do not own them.
 
 The dashboard's generic credential forms only work for unscoped agents and agents with `worker_scope=shared`.
-OAuth providers that support scoped dashboard flows, such as the Google Drive, Docs, Gmail, Calendar, and Sheets providers, are the exception.
-For those providers, the dashboard can connect scoped `user` and `user_agent` credentials, but the Google tools still execute in the primary MindRoom runtime.
+The Google Drive, Docs, Gmail, Calendar, and Sheets OAuth providers are an exception: the dashboard can connect scoped `user` and `user_agent` credentials, while the tools still execute in the primary MindRoom runtime.
+GitHub managed OAuth credentials always use the requester's `user` scope, independently of the agent's `worker_scope`.
 Tools without a scoped OAuth provider still manage `user` and `user_agent` credentials through their worker runtime instead.
 
 For more details on storage layout and isolation, see [Sandbox Proxy Isolation](https://docs.mindroom.chat/deployment/sandbox-proxy/).
@@ -621,8 +626,8 @@ Agent and team names must be distinct — the same key cannot appear in both `ag
 
 ## Defaults
 
-The `defaults` section sets fallback values for all agents.
-Any agent that omits a setting inherits the value from here.
+The `defaults` section sets fallback values for supported per-agent override fields and global-only agent behavior.
+Supported override fields inherit when omitted, `defaults.tools` is merged only when `include_default_tools` is true, and global-only defaults apply to every agent.
 
 ```yaml
 defaults:
@@ -650,6 +655,7 @@ defaults:
     enabled: true
     threshold_percent: 0.8
     reserve_tokens: 16384
+    timeout_seconds: 600
   max_tool_calls_from_history: null     # Limit tool call messages replayed from history (null = no limit)
   show_tool_calls: true                 # Show tool-call markers and trace metadata; hidden mode still allows generic worker warmup copy
   worker_tools: null                     # Tool names to route through workers (null = use MindRoom's default routing policy, [] = disable)

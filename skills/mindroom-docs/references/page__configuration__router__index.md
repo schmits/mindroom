@@ -13,19 +13,14 @@ router:
   # Accept authorized room invites and preserve them across restarts (default: true)
   accept_invites: true
 
-  # Participate in room-level startup prewarm for rooms already joined at first sync (default: true)
-  startup_thread_prewarm: true
 ```
 
-The router has three configuration options:
+The router has two configuration options:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `model` | string | `"default"` | Model to use for routing decisions |
-| `accept_invites` | bool | `true` | When enabled, the router accepts authorized room invites, persists accepted room IDs, rejoins them after restart, and preserves them during room cleanup |
-| `startup_thread_prewarm` | bool | `true` | When enabled, the router may prewarm recent thread snapshots for rooms already joined when first sync completes, which can reduce cold-cache latency for early thread replies after startup |
-
-Startup thread prewarm is a background, best-effort cache warmup for rooms already joined when first sync completes.
+| `accept_invites` | bool | `true` | When enabled, the router accepts authorized human and internal-agent room invites, persists accepted room IDs, rejoins them after restart, and preserves them during room cleanup |
 
 ## How Routing Works
 
@@ -49,7 +44,8 @@ The router is a special system agent that handles several important tasks beyond
 
 ### Command Handling
 
-The router exclusively handles all commands:
+The router owns commands by default.
+A requester-scoped `!desktop` command may instead be owned by an eligible private agent when the room contains exactly that requester and agent.
 
 - `!help [topic]` - Get help on commands or specific topics
 - `!hi` - Show the welcome message again
@@ -57,13 +53,20 @@ The router exclusively handles all commands:
 - `!list_schedules` - List scheduled tasks
 - `!cancel_schedule <id>` - Cancel a scheduled task
 - `!edit_schedule <id> <task>` - Edit an existing scheduled task
+- `!reload-plugins` - Reload configured plugins (admin only)
 - `!config <operation>` - Manage configuration when explicitly enabled for global admins
+- `!desktop [setup|status|confirm|rotate|disconnect]` - Manage the requester's Desktop target
+- `!model [name|list|reset]` - Show or switch the current thread model
+- `!room_model [name|list|reset]` - Show the current room model default or switch it (set/reset require a room admin)
+- `!thread_mode [room|thread|reset|show]` - Manage room thread mode (room admin only)
+- `!encrypt [confirm]` - Enable room encryption (irreversible, room admin only)
+- `!e2ee` - Show room encryption diagnostics
 
-Even in single-responder rooms, commands are always processed by the router.
+Except for the requester-scoped `!desktop` case above, commands are processed by the router even in single-responder rooms.
 
 ### Welcome Messages
 
-When the router joins a room after an invite, it sends a requester-scoped welcome message.
+After accepting an invite, the router sends a requester-scoped welcome message only when the room has no existing message history.
 
 That welcome message lists:
 
@@ -72,7 +75,8 @@ That welcome message lists:
 - Quick command reference
 
 Startup welcomes with no requester list configured room responders when the room is statically configured.
-Startup welcomes for ad-hoc rooms send the general interaction guidance and quick command reference without an available-responder list.
+Startup does not send requester-less welcomes in persisted ad-hoc invite rooms because the original inviter cannot be re-authorized safely after restart.
+The live invite callback sends the requester-scoped welcome when the inviter currently has router reply access.
 
 Use `!hi` in any room to see the welcome message again.
 
@@ -90,6 +94,12 @@ The router creates and manages rooms:
 - Has admin privileges to manage room membership
 - Cleans up orphaned bots on startup
 
+Every concrete Matrix agent operating in a room also receives a built-in zero-argument `invite_router` recovery tool.
+The tool can invite only the persisted router identity and only into the agent's current room.
+The router treats the configured agent identity as an authorized internal sender, auto-accepts the invite, and persists the room when `router.accept_invites` is enabled.
+The recovery tool waits briefly for joined membership and reports a pending state when the router has not joined yet.
+This lets an agent recover router-backed approvals without adding persistent prompt instructions or exposing arbitrary invite targets.
+
 By default (`matrix_room_access.mode: single_user_private`), rooms remain invite-only and private in the room directory.
 In `multi_user` mode, the router can set join rules (`public`/`knock`) and optionally publish rooms to the server directory.
 That same reconciliation path also updates `m.room.power_levels` for managed rooms, so the router must be joined and able to edit room power levels when thread tags are enabled.
@@ -99,7 +109,8 @@ That same reconciliation path also updates `m.room.power_levels` for managed roo
 Audio events are handled through the shared media pipeline on all bots.
 The router only posts a visible handoff when it must disambiguate between multiple eligible responders in a room.
 When the responder is already clear, normalized audio follows the normal direct agent or team dispatch rules without an extra router message.
-By default, `voice.visible_router_echo: true` also lets the router post the normalized voice text as a display-only message when it is allowed to reply.
+By default, `voice.visible_router_echo: true` also lets the router post an immediate display-only transcription placeholder and replace it with the normalized transcript or fallback text when voice STT is enabled and it is allowed to reply.
+With STT disabled, the router posts the display-only fallback directly.
 Set `voice.visible_router_echo: false` to suppress that display-only echo.
 
 See [Voice Messages](https://docs.mindroom.chat/voice/) for the detailed dispatch behavior.

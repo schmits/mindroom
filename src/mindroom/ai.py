@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 from agno.db.base import SessionType
@@ -81,16 +82,24 @@ from mindroom.response_turn import (
     DynamicContinuationRunState,
     ExcludedAttempt,
     HandledAttempt,
+    ResponsePausedForApproval,
     ResponseTurnContext,
     StreamingTurnAdapter,
     TurnPartialSnapshot,
     TurnSinks,
     build_matrix_run_metadata,
+    paused_attempt_from_event,
+    paused_attempt_from_response,
     run_blocking_response_turn,
     stream_response_turn,
 )
 from mindroom.timing import DispatchPipelineTiming, emit_timing_event, timed, timed_block, timing_scope
-from mindroom.tool_system.events import StreamingToolTracker, complete_pending_tool_block, format_tool_combined
+from mindroom.tool_system.events import (
+    CollectedStreamPresentation,
+    StreamingToolTracker,
+    complete_pending_tool_block,
+    format_tool_combined,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
@@ -109,7 +118,7 @@ if TYPE_CHECKING:
     from mindroom.history.types import CompactionLifecycle
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-    from mindroom.response_turn import EmptyRunDiscard, StandaloneReplaySnapshot, TurnRunState
+    from mindroom.response_turn import EmptyRunDiscard, PausedAttempt, StandaloneReplaySnapshot, TurnRunState
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
@@ -492,101 +501,41 @@ class _NonStreamingAttemptResult:
     user_error: Exception | None = None
 
 
-@dataclass
-class _CollectedStreamResponseState:
-    """State for collecting stream-shaped output into one final body."""
-
-    full_response: str = ""
-    canonical_final_body_candidate: str | None = None
-    tool_tracker: StreamingToolTracker = field(default_factory=StreamingToolTracker)
-    tool_trace: list[ToolTraceEntry] = field(default_factory=list)
-
-
-def _collect_stream_content_chunk(
-    state: _CollectedStreamResponseState,
-    chunk: str | RunContentEvent | RunCompletedEvent,
-) -> None:
-    """Append regular stream content or remember the final canonical body."""
-    if isinstance(chunk, str):
-        state.full_response += chunk
-    elif isinstance(chunk, RunContentEvent):
-        if chunk.content:
-            state.full_response += str(chunk.content)
-    elif chunk.content is not None:
-        state.canonical_final_body_candidate = str(chunk.content)
-
-
-def _collect_stream_tool_started(
-    state: _CollectedStreamResponseState,
-    event: ToolCallStartedEvent,
-    *,
-    show_tool_calls: bool,
-) -> None:
-    """Track a tool start while collecting a silent stream."""
-    if not show_tool_calls or event.tool is None:
-        return
-
-    tool_index = len(state.tool_trace) + 1
-    text_chunk, trace_entry = state.tool_tracker.start(event.tool, tool_index=tool_index)
-    if trace_entry is not None:
-        state.tool_trace.append(trace_entry)
-    state.full_response += text_chunk
-
-
-def _collect_stream_tool_completed(
-    state: _CollectedStreamResponseState,
-    event: ToolCallCompletedEvent,
-    *,
-    show_tool_calls: bool,
-) -> None:
-    """Track a tool completion while collecting a silent stream."""
-    if not show_tool_calls:
-        return
-
-    completion = state.tool_tracker.complete(event.tool)
-    if completion is None:
-        return
-
-    tool_name, result, pending_tool, completed_trace = completion
-    if pending_tool is None or pending_tool.visible_tool_index is None:
-        logger.warning(
-            "Missing pending tool start in collected streaming response; skipping completion marker",
-            tool_name=tool_name,
-        )
-        return
-
-    state.full_response, _ = complete_pending_tool_block(
-        state.full_response,
-        tool_name,
-        result,
-        tool_index=pending_tool.visible_tool_index,
-    )
-    if not state.tool_tracker.update_visible_trace_entry(state.tool_trace, pending_tool, completed_trace):
-        logger.warning(
-            "Missing tool trace slot in collected streaming response for completion",
-            tool_name=tool_name,
-            tool_index=pending_tool.visible_tool_index,
-            trace_len=len(state.tool_trace),
-        )
-
-
 async def _collect_streamed_response_content(
     response_stream: AsyncIterator[AIStreamChunk],
     *,
     show_tool_calls: bool,
+    initial_response_text: str = "",
+    initial_tool_trace: Sequence[ToolTraceEntry] = (),
 ) -> tuple[str, list[ToolTraceEntry]]:
     """Collect a streaming response into one final body without Matrix edits."""
-    state = _CollectedStreamResponseState()
+    state = CollectedStreamPresentation(
+        show_tool_calls=show_tool_calls,
+        response_text=initial_response_text,
+        tool_trace=deepcopy(list(initial_tool_trace)),
+    )
 
-    async for chunk in response_stream:
-        if isinstance(chunk, str | RunContentEvent | RunCompletedEvent):
-            _collect_stream_content_chunk(state, chunk)
-        elif isinstance(chunk, ToolCallStartedEvent):
-            _collect_stream_tool_started(state, chunk, show_tool_calls=show_tool_calls)
-        elif isinstance(chunk, ToolCallCompletedEvent):
-            _collect_stream_tool_completed(state, chunk, show_tool_calls=show_tool_calls)
+    try:
+        async for chunk in response_stream:
+            if isinstance(chunk, str):
+                state.append_text(chunk)
+            elif isinstance(chunk, RunContentEvent):
+                state.append_text(chunk.content)
+            elif isinstance(chunk, RunCompletedEvent):
+                if chunk.content is not None:
+                    state.canonical_final_body_candidate = str(chunk.content)
+            elif isinstance(chunk, ToolCallStartedEvent):
+                state.start_tool(chunk.tool)
+            elif isinstance(chunk, ToolCallCompletedEvent):
+                state.complete_tool(chunk.tool)
+    except ResponsePausedForApproval as error:
+        error.capture_collected_presentation(
+            response_text=state.final_text().rstrip(),
+            tool_trace=state.tool_trace,
+        )
+        raise
 
-    return state.full_response or state.canonical_final_body_candidate or "", state.tool_trace
+    return state.final_text(), state.tool_trace
 
 
 async def _collect_response_body_with_trace(
@@ -678,6 +627,46 @@ def _extract_tool_trace(response: RunOutput) -> list[ToolTraceEntry]:
     return trace
 
 
+def _attach_blocking_pause_presentation(
+    paused: PausedAttempt,
+    response: RunOutput,
+    *,
+    show_tool_calls: bool,
+) -> PausedAttempt:
+    """Render a blocking pause once, before it crosses the approval boundary."""
+    presentation = CollectedStreamPresentation(
+        show_tool_calls=show_tool_calls,
+        track_hidden_tools=True,
+    )
+    presentation.append_text(_extract_replayable_response_text(response))
+    pending_by_id: dict[str, ToolExecution] = {}
+    for tool in paused.tools:
+        call_id = tool_execution_call_id(tool)
+        if call_id is None or call_id in pending_by_id:
+            msg = "Paused approval tool is missing its exact identity"
+            raise RuntimeError(msg)
+        pending_by_id[call_id] = tool
+
+    seen_ids: set[str] = set()
+    for tool in (*tuple(response.tools or ()), *paused.tools):
+        call_id = tool_execution_call_id(tool)
+        if call_id is None:
+            msg = "Blocking approval output has a tool without stable identity"
+            raise RuntimeError(msg)
+        if call_id in seen_ids:
+            continue
+        seen_ids.add(call_id)
+        presentation.start_tool(tool)
+        if call_id not in pending_by_id:
+            presentation.complete_tool(tool)
+
+    return replace(
+        paused,
+        response_text=presentation.final_text(),
+        tool_trace=tuple(presentation.tool_trace),
+    )
+
+
 def _extract_cancelled_tool_trace(response: RunOutput) -> tuple[list[ToolTraceEntry], list[ToolTraceEntry]]:
     """Extract completed and unfinished tool traces from an interrupted RunOutput."""
     return split_interrupted_tool_trace(response.tools)
@@ -765,17 +754,35 @@ def _track_stream_tool_started(
     event: ToolCallStartedEvent,
     *,
     show_tool_calls: bool,
-) -> None:
+) -> bool:
     """Track started tool-call metadata for streaming output."""
-    state.observed_tool_calls += 1
     display_tool_index = state.tool_count + 1 if show_tool_calls else None
-    tool_msg, _ = state.tool_tracker.start(event.tool, tool_index=display_tool_index)
+    tool_msg, trace_entry = state.tool_tracker.start(event.tool, tool_index=display_tool_index)
+    if trace_entry is None:
+        return False
+    state.observed_tool_calls += 1
     if not show_tool_calls or display_tool_index is None:
-        return
+        return True
 
     state.tool_count = display_tool_index
     if tool_msg:
         state.full_response += tool_msg
+    return True
+
+
+def _materialize_paused_agent_tool_events(
+    state: _StreamingAttemptState,
+    tools: Sequence[ToolExecution],
+    *,
+    show_tool_calls: bool,
+) -> tuple[ToolCallStartedEvent, ...]:
+    """Return exact missing tool-start events for one native approval pause."""
+    materialized: list[ToolCallStartedEvent] = []
+    for tool in tools:
+        event = ToolCallStartedEvent(tool=tool)
+        if _track_stream_tool_started(state, event, show_tool_calls=show_tool_calls):
+            materialized.append(event)
+    return tuple(materialized)
 
 
 def _track_stream_tool_completed(
@@ -1049,8 +1056,7 @@ async def _run_non_streaming_agent_attempts(
             pending_retry_decision.record_retry_success()
         return _NonStreamingAttemptResult(response=response, attempt=attempt)
     finally:
-        await ai_runtime.cleanup_queued_notice_state_async(
-            run_output=response,
+        ai_runtime.register_queued_notice_storage(
             storage_factory=scope_context.storage_factory if scope_context is not None else None,
             session_id=run_context.session_id,
             session_type=SessionType.AGENT,
@@ -1106,6 +1112,7 @@ async def _prepare_agent_and_prompt(
     current_prompt_is_structured: bool = False,
     pipeline_timing: DispatchPipelineTiming | None = None,
     eager_deferred_tools: bool = False,
+    supports_native_tool_approval: bool = False,
     reusable_agent: Agent | None = None,
 ) -> _PreparedAgentRun:
     """Prepare agent and full prompt for AI processing.
@@ -1146,6 +1153,7 @@ async def _prepare_agent_and_prompt(
                 delegation_depth=delegation_depth,
                 refresh_scheduler=refresh_scheduler,
                 dynamic_tool_continuation=True,
+                supports_native_tool_approval=supports_native_tool_approval,
                 eager_deferred_tools=eager_deferred_tools,
             )
         return runtime_model, agent
@@ -1263,8 +1271,15 @@ async def _prepare_agent_and_prompt(
     unseen_event_ids = prepared_execution.unseen_event_ids
     run_messages = prepared_execution.messages
 
+    # Routine logs stay content-safe; detailed prompt text is emitted separately only at DEBUG.
     logger.info(
         "Preparing agent and prompt",
+        agent=agent_name,
+        message_count=len(run_messages),
+        unseen_event_count=len(unseen_event_ids),
+    )
+    logger.debug(
+        "Prepared agent full prompt",
         agent=agent_name,
         full_prompt=render_prepared_messages_text(run_messages),
     )
@@ -1301,6 +1316,7 @@ async def _prepare_agent_run_context(
     turn_recorder: TurnRecorder | None,
     pipeline_timing: DispatchPipelineTiming | None,
     eager_deferred_tools: bool = False,
+    supports_native_tool_approval: bool = False,
     reusable_agent: Agent | None = None,
 ) -> _AgentRunContext:
     """Prepare one agent response lifecycle through metadata assembly."""
@@ -1327,6 +1343,7 @@ async def _prepare_agent_run_context(
         current_prompt_is_structured=current_prompt_is_structured,
         pipeline_timing=pipeline_timing,
         eager_deferred_tools=eager_deferred_tools,
+        supports_native_tool_approval=supports_native_tool_approval,
         reusable_agent=reusable_agent,
     )
     if pipeline_timing is not None:
@@ -1393,6 +1410,7 @@ async def ai_response(  # noqa: C901
     turn_recorder: TurnRecorder | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
     eager_deferred_tools: bool = False,
+    supports_native_tool_approval: bool = False,
     reusable_agent: Agent | None = None,
 ) -> str:
     """Generates a response using the specified agno Agent with memory integration.
@@ -1435,6 +1453,7 @@ async def ai_response(  # noqa: C901
         turn_recorder: Optional lifecycle-owned recorder updated with trusted turn state.
         pipeline_timing: Optional dispatch timing collector updated with AI-stage milestones.
         eager_deferred_tools: Whether to materialize every deferred toolkit without the dynamic loader.
+        supports_native_tool_approval: Whether this caller can resume Agno confirmation pauses.
         reusable_agent: Optional caller-owned agent materialized for repeated sequential turns.
             The caller must serialize uses and close its runtime database handles.
 
@@ -1470,6 +1489,7 @@ async def ai_response(  # noqa: C901
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
                 eager_deferred_tools=eager_deferred_tools,
+                supports_native_tool_approval=supports_native_tool_approval,
                 reusable_agent=reusable_agent,
             ),
             show_tool_calls=show_tool_calls,
@@ -1536,6 +1556,7 @@ async def ai_response(  # noqa: C901
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
                 eager_deferred_tools=eager_deferred_tools,
+                supports_native_tool_approval=supports_native_tool_approval,
                 reusable_agent=_reset_reusable_agent_context(reusable_agent, reusable_agent_base_context),
             )
         except Exception as e:
@@ -1587,6 +1608,20 @@ async def ai_response(  # noqa: C901
             )
 
         if response.status in (RunStatus.cancelled, RunStatus.error, RunStatus.paused):
+            paused_attempt = paused_attempt_from_response(
+                response,
+                fallback_session_id=session_id,
+                fallback_run_id=attempt.attempt_run_id,
+            )
+            if paused_attempt is not None:
+                return replace(
+                    _attach_blocking_pause_presentation(
+                        paused_attempt,
+                        response,
+                        show_tool_calls=show_tool_calls,
+                    ),
+                    runtime_model_name=prepared_run.runtime_model_name,
+                )
             partial_text = _extract_interrupted_partial_text(
                 response.content,
                 messages=response.messages,
@@ -1750,7 +1785,11 @@ async def _process_stream_events(  # noqa: C901, PLR0912, PLR0915
                 state.paused_run_event = event
                 if state_updated is not None:
                     state_updated()
-                return
+                # Agno persists the pause before yielding this event, then
+                # finishes its generator on the next iteration. Draining that
+                # final step is load-bearing: closing the generator here sends
+                # it GeneratorExit, which Agno persists as a cancelled run.
+                continue
 
             if isinstance(event, RunErrorEvent):
                 error_text = _run_error_event_text(event)
@@ -1882,6 +1921,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
     turn_recorder: TurnRecorder | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
     eager_deferred_tools: bool = False,
+    supports_native_tool_approval: bool = False,
     reusable_agent: Agent | None = None,
 ) -> AsyncIterator[AIStreamChunk]:
     """Generate streaming AI response using Agno's streaming API.
@@ -1920,6 +1960,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
         turn_recorder: Optional lifecycle-owned recorder updated with trusted turn state.
         pipeline_timing: Optional dispatch timing collector updated with AI-stage milestones.
         eager_deferred_tools: Whether to materialize every deferred toolkit without the dynamic loader.
+        supports_native_tool_approval: Whether this caller can resume Agno confirmation pauses.
         reusable_agent: Optional caller-owned agent materialized for repeated sequential turns.
             The caller must serialize uses and close its runtime database handles.
 
@@ -1965,15 +2006,14 @@ async def stream_agent_response(  # noqa: C901, PLR0915
         if not holder.attempt_started:
             return
         holder.attempt_started = False
-        await ai_runtime.cleanup_queued_notice_state_async(
-            run_output=None,
+        ai_runtime.register_queued_notice_storage(
             storage_factory=scope_context.storage_factory if scope_context is not None else None,
             session_id=session_id,
             session_type=SessionType.AGENT,
             entity_name=agent_name,
         )
 
-    async def _run_streaming_attempt(  # noqa: C901
+    async def _run_streaming_attempt(  # noqa: C901, PLR0915
         run: TurnRunState,
         continuation_state: DynamicContinuationRunState,
     ) -> AsyncGenerator[AIStreamChunk | AttemptResolved, None]:
@@ -2002,6 +2042,7 @@ async def stream_agent_response(  # noqa: C901, PLR0915
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
                 eager_deferred_tools=eager_deferred_tools,
+                supports_native_tool_approval=supports_native_tool_approval,
                 reusable_agent=_reset_reusable_agent_context(reusable_agent, reusable_agent_base_context),
             )
         except Exception as e:
@@ -2126,6 +2167,31 @@ async def stream_agent_response(  # noqa: C901, PLR0915
                 return
 
             if state.paused_run_event is not None:
+                paused_attempt = paused_attempt_from_event(
+                    state.paused_run_event,
+                    fallback_session_id=session_id,
+                    fallback_run_id=attempt.attempt_run_id,
+                )
+                if paused_attempt is not None:
+                    for tool_event in _materialize_paused_agent_tool_events(
+                        state,
+                        paused_attempt.tools,
+                        show_tool_calls=show_tool_calls,
+                    ):
+                        _sync_live_turn_recorder()
+                        yield tool_event
+                    yield AttemptResolved(
+                        replace(
+                            paused_attempt,
+                            runtime_model_name=prepared_run.runtime_model_name,
+                            tool_trace=(
+                                paused_attempt.tool_trace
+                                if show_tool_calls
+                                else tuple(pending.trace_entry for pending in state.pending_tools)
+                            ),
+                        ),
+                    )
+                    return
                 paused_metadata = _build_interrupted_metadata(
                     state,
                     RunStatus.paused,

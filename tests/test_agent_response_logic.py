@@ -20,16 +20,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
+from mindroom.config.auth import AgentReplyPermission
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.conversation_resolver import MessageContext
-from mindroom.matrix.cache.thread_history_result import thread_history_result
 from mindroom.matrix.client import ResolvedVisibleMessage
-from mindroom.matrix.thread_diagnostics import THREAD_HISTORY_DEGRADED_DIAGNOSTIC, THREAD_HISTORY_ERROR_DIAGNOSTIC
+from mindroom.matrix.thread_diagnostics import THREAD_HISTORY_DEGRADED_DIAGNOSTIC
+from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.message_target import MessageTarget
 from mindroom.teams import TeamIntent, TeamMode, TeamOutcome, TeamResolution
 from mindroom.thread_utils import check_agent_mentioned, get_agents_in_thread, is_router_only_agent_mention
-from mindroom.turn_policy import PreparedDispatch, ResponseAction, TurnPolicy, TurnPolicyDeps, _ResponderAvailability
+from mindroom.turn_policy import PreparedDispatch, ResponseAction, TurnPolicy, _ResponderAvailability
+from tests.authorization_helpers import (
+    make_test_turn_policy_deps,
+)
 from tests.conftest import (
     agent_response_should_respond,
     bind_runtime_paths,
@@ -107,7 +111,7 @@ class TestAgentResponseLogic:
     def test_mentioned_agent_blocked_by_reply_permissions(self) -> None:
         """Per-agent reply allowlist should block disallowed senders even when mentioned."""
         self.config.authorization.agent_reply_permissions = {
-            "calculator": [f"@alice:{self.domain}"],
+            "calculator": AgentReplyPermission(users=[f"@alice:{self.domain}"]),
         }
         should_respond = agent_response_should_respond(
             agent_name="calculator",
@@ -126,7 +130,7 @@ class TestAgentResponseLogic:
         canonical_user = f"@alice:{self.domain}"
         alias_user = f"@telegram_111:{self.domain}"
         self.config.authorization.agent_reply_permissions = {
-            "calculator": [canonical_user],
+            "calculator": AgentReplyPermission(users=[canonical_user]),
         }
         self.config.authorization.aliases = {canonical_user: [alias_user]}
         should_respond = agent_response_should_respond(
@@ -162,7 +166,7 @@ class TestAgentResponseLogic:
         runtime.config = config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=runtime_paths,
@@ -171,11 +175,11 @@ class TestAgentResponseLogic:
             ),
         )
 
-        responder_pool = policy.filter_materializable_responders(
+        responder_pool = policy._filter_materializable_responders(
             [team_id],
             _ResponderAvailability(materializable_agent_names={"alpha", "beta"}, live_entity_names=None),
         )
-        action = policy.team_response_action(
+        action = policy._team_response_action(
             TeamResolution(
                 intent=TeamIntent.EXPLICIT_MEMBERS,
                 requested_members=[team_id],
@@ -216,7 +220,7 @@ class TestAgentResponseLogic:
         runtime.config = config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=runtime_paths,
@@ -234,8 +238,8 @@ class TestAgentResponseLogic:
             reason="Team request includes unsupported members.",
         )
         responder_pool = [ids["private_worker"], ids["shared"]]
-        owner = policy.response_owner_for_team_resolution(team_resolution, responder_pool)
-        action = policy.team_response_action(team_resolution, responder_pool)
+        owner = policy._response_owner_for_team_resolution(team_resolution, responder_pool)
+        action = policy._team_response_action(team_resolution, responder_pool)
 
         assert owner == ids["shared"]
         assert action is not None
@@ -273,7 +277,7 @@ class TestAgentResponseLogic:
         runtime.config = config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=runtime_paths,
@@ -290,11 +294,11 @@ class TestAgentResponseLogic:
             outcome=TeamOutcome.TEAM,
             mode=TeamMode.COORDINATE,
         )
-        owner = policy.response_owner_for_team_resolution(
+        owner = policy._response_owner_for_team_resolution(
             team_resolution,
             responder_pool=[ids["private_one"], ids["ops"], ids["shared"]],
         )
-        action = policy.team_response_action(
+        action = policy._team_response_action(
             team_resolution,
             responder_pool=[ids["private_one"], ids["ops"], ids["shared"]],
         )
@@ -312,7 +316,7 @@ class TestAgentResponseLogic:
         runtime.config = self.config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=self.runtime_paths,
@@ -329,7 +333,6 @@ class TestAgentResponseLogic:
                 is_full_history=False,
                 diagnostics={
                     THREAD_HISTORY_DEGRADED_DIAGNOSTIC: True,
-                    THREAD_HISTORY_ERROR_DIAGNOSTIC: "dispatch_read_timeout",
                 },
             ),
             mentioned_agents=[],
@@ -358,7 +361,7 @@ class TestAgentResponseLogic:
             "mindroom.turn_policy.responder_candidate_entities_for_room",
             new=AsyncMock(return_value=[candidate_ids["calculator"], candidate_ids["general"]]),
         ):
-            multiple_visible_action = await policy.resolve_response_action(
+            multiple_visible_action = await policy._resolve_response_action(
                 dispatch,
                 room,
                 False,
@@ -371,7 +374,7 @@ class TestAgentResponseLogic:
             "mindroom.turn_policy.responder_candidate_entities_for_room",
             new=AsyncMock(return_value=[candidate_ids["calculator"]]),
         ):
-            single_visible_action = await policy.resolve_response_action(
+            single_visible_action = await policy._resolve_response_action(
                 dispatch,
                 room,
                 False,
@@ -390,7 +393,7 @@ class TestAgentResponseLogic:
         runtime.orchestrator = None
         logger = MagicMock()
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=logger,
                 runtime_paths=self.runtime_paths,
@@ -441,7 +444,7 @@ class TestAgentResponseLogic:
                 new=MagicMock(return_value=TeamResolution.none()),
             ),
         ):
-            action = await policy.resolve_response_action(
+            action = await policy._resolve_response_action(
                 dispatch,
                 room,
                 False,
@@ -472,7 +475,7 @@ class TestAgentResponseLogic:
         runtime.orchestrator = None
         logger = MagicMock()
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=logger,
                 runtime_paths=self.runtime_paths,
@@ -518,7 +521,7 @@ class TestAgentResponseLogic:
             "mindroom.turn_policy.responder_candidate_entities_for_room",
             new=AsyncMock(return_value=[candidate_ids["calculator"], candidate_ids["general"]]),
         ):
-            action = await policy.resolve_response_action(
+            action = await policy._resolve_response_action(
                 dispatch,
                 room,
                 False,
@@ -542,7 +545,7 @@ class TestAgentResponseLogic:
         runtime.config = self.config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=self.runtime_paths,
@@ -602,7 +605,7 @@ class TestAgentResponseLogic:
                 new=MagicMock(return_value=TeamResolution.none()),
             ),
         ):
-            action = await policy.resolve_response_action(
+            action = await policy._resolve_response_action(
                 dispatch,
                 room,
                 False,
@@ -632,7 +635,7 @@ class TestAgentResponseLogic:
         runtime.config = config
         runtime.orchestrator = None
         policy = TurnPolicy(
-            TurnPolicyDeps(
+            make_test_turn_policy_deps(
                 runtime=runtime,
                 logger=MagicMock(),
                 runtime_paths=runtime_paths,
@@ -662,7 +665,7 @@ class TestAgentResponseLogic:
     def test_mentioned_agent_reply_permissions_support_domain_pattern(self) -> None:
         """Per-agent reply patterns should allow domain-scoped sender matching."""
         self.config.authorization.agent_reply_permissions = {
-            "calculator": [f"*:{self.domain}"],
+            "calculator": AgentReplyPermission(users=[f"*:{self.domain}"]),
         }
         should_respond = agent_response_should_respond(
             agent_name="calculator",
@@ -679,10 +682,10 @@ class TestAgentResponseLogic:
     def test_single_visible_agent_can_respond_without_mentions(self) -> None:
         """When permissions hide other agents, the only visible agent should respond."""
         self.config.authorization.agent_reply_permissions = {
-            "calculator": [f"@alice:{self.domain}"],
-            "general": [f"@bob:{self.domain}"],
-            "agent1": [f"@bob:{self.domain}"],
-            "research": [f"@bob:{self.domain}"],
+            "calculator": AgentReplyPermission(users=[f"@alice:{self.domain}"]),
+            "general": AgentReplyPermission(users=[f"@bob:{self.domain}"]),
+            "agent1": AgentReplyPermission(users=[f"@bob:{self.domain}"]),
+            "research": AgentReplyPermission(users=[f"@bob:{self.domain}"]),
         }
         room = create_mock_room("!room:localhost", ["calculator", "general"], self.config)
 
@@ -1023,8 +1026,8 @@ class TestAgentResponseLogic:
     def test_only_permitted_agent_in_thread_continues(self) -> None:
         """A permitted agent should continue when other thread participants are disallowed."""
         self.config.authorization.agent_reply_permissions = {
-            "calculator": [f"@alice:{self.domain}"],
-            "general": [f"@bob:{self.domain}"],
+            "calculator": AgentReplyPermission(users=[f"@alice:{self.domain}"]),
+            "general": AgentReplyPermission(users=[f"@bob:{self.domain}"]),
         }
         thread_history = [
             _message(sender=self.agent_id("calculator"), body="2+2=4"),

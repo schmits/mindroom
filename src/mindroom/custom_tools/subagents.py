@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
@@ -290,6 +291,7 @@ def _cached_target_room(context: ToolRuntimeContext, room_id: str) -> nio.Matrix
 
 
 async def _available_subagent_names(context: ToolRuntimeContext, *, room_id: str | None = None) -> list[str]:
+    context = replace(context, config=context.current_config, config_provider=None)
     target_room_id = room_id or context.room_id
     target_room = _cached_target_room(context, target_room_id)
     if target_room is not None:
@@ -299,6 +301,7 @@ async def _available_subagent_names(context: ToolRuntimeContext, *, room_id: str
             context.requester_id,
             context.config,
             context.runtime_paths,
+            context.require_agent_reply_memberships(),
         )
     elif target_room_id == context.room_id:
         candidates = await responder_candidate_entities_for_room(
@@ -307,6 +310,7 @@ async def _available_subagent_names(context: ToolRuntimeContext, *, room_id: str
             context.requester_id,
             context.config,
             context.runtime_paths,
+            context.require_agent_reply_memberships(),
         )
     else:
         candidates = responder_candidate_entities_from_cached_room(
@@ -314,6 +318,7 @@ async def _available_subagent_names(context: ToolRuntimeContext, *, room_id: str
             context.requester_id,
             context.config,
             context.runtime_paths,
+            context.require_agent_reply_memberships(),
         )
     materializable_agent_names = materializable_agent_names_for_orchestrator(
         context.orchestrator,
@@ -342,6 +347,7 @@ def _agent_id_error(
     agent_id: str | None,
     available_agents: list[str],
 ) -> str | None:
+    context = replace(context, config=context.current_config, config_provider=None)
     if not agent_id:
         return None
     available = ", ".join(available_agents) or "(none)"
@@ -371,10 +377,9 @@ async def _send_matrix_text(
     """Send a formatted text message to a Matrix room, optionally in a thread."""
     latest_thread_event_id = None
     if thread_id is not None:
-        latest_thread_event_id = await context.conversation_cache.get_latest_thread_event_id_if_needed(
-            room_id,
-            thread_id,
-            caller_label="subagent_tool_send",
+        latest_thread_event_id = await context.conversation_reader.latest_thread_event_id(
+            room_id=room_id,
+            thread_id=thread_id,
         )
     content = format_message_with_mentions(
         context.config,
@@ -387,8 +392,6 @@ async def _send_matrix_text(
         content[ORIGINAL_SENDER_KEY] = original_sender
         content[SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
     delivered = await send_message_result(context.client, room_id, content)
-    if delivered is not None:
-        context.conversation_cache.notify_outbound_message(room_id, delivered.event_id, delivered.content_sent)
     if delivered is not None:
         return delivered.event_id
     return None
@@ -414,6 +417,7 @@ async def _spawn_followup_warnings(
     tag: str,
     summary_message_count: int = 1,
     last_summary_count: int | None = 1,
+    known_latest_thread_event_id: str | None = None,
 ) -> list[str]:
     warnings: list[str] = []
     try:
@@ -424,7 +428,8 @@ async def _spawn_followup_warnings(
             summary,
             summary_message_count,
             "manual",
-            context.conversation_cache,
+            context.conversation_reader,
+            known_latest_thread_event_id=known_latest_thread_event_id,
         )
     except Exception as exc:
         warnings.append(f"Failed to set thread summary: {exc}")
@@ -486,6 +491,10 @@ async def _spawn_session_payload(
         event_id=event_id,
         summary=summary,
         tag=tag,
+        # The spawn message is this thread's only event, so the newest event is
+        # the root we just sent. Reading history here would scan the homeserver
+        # for a thread that has no cache snapshot yet.
+        known_latest_thread_event_id=event_id,
     )
     payload_kwargs: dict[str, object] = {
         "session_key": spawned_session_key,
@@ -668,6 +677,7 @@ class SubAgentsTools(Toolkit):
         context = _get_context()
         if context is None:
             return _context_error("agents_list")
+        context = replace(context, config=context.current_config, config_provider=None)
 
         caller_name = context.agent_name
         # Missing callers mirror describe_agent's router special case in agent_descriptions.py:19.

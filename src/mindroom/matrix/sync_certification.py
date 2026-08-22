@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-from mindroom.matrix.sync_token_values import normalize_sync_token
+from mindroom.matrix.sync_token_values import SyncCheckpoint, normalize_sync_token
+
+if TYPE_CHECKING:
+    import nio
 
 
 class SyncTrustState(Enum):
@@ -19,28 +22,47 @@ class SyncTrustState(Enum):
 
 
 @dataclass(frozen=True)
-class SyncCheckpoint:
-    """A sync token saved after its sync response was durably cached."""
+class SyncRecoveryOutcome:
+    """What one sync response settled about durable ownership of its events.
 
-    token: str
-    cache_generation: str | None = None
+    Both facts are reported rather than measured after the fact. nio names the
+    rooms whose gap it closed and the rooms it could not, and admission either
+    accepted every event in the response or refused one -- refusing inside the
+    callback nio awaits, which is what keeps the event for redelivery and the
+    watermark where it was.
 
+    This replaced a tally of background cache writes. That tally existed only
+    because those writes happened outside nio's acceptance protocol, so
+    something had to go back afterwards and ask whether they had landed.
+    """
 
-@dataclass(frozen=True)
-class SyncCacheWriteResult:
-    """Durable sync-timeline cache write outcome for one sync response."""
+    recovered_room_ids: frozenset[str] = frozenset()
+    unrecovered_room_ids: frozenset[str] = frozenset()
+    admission_refused: bool = False
 
-    complete: bool
-    limited_room_ids: tuple[str, ...] = ()
-    errors: tuple[BaseException, ...] = ()
-    runtime_available: bool | None = None
-    task_count: int | None = None
-    runtime_diagnostics: dict[str, object] | None = None
+    @classmethod
+    def from_sync_response(
+        cls,
+        response: nio.SyncResponse | nio.SlidingSyncResponse,
+        *,
+        admission_refused: bool,
+    ) -> SyncRecoveryOutcome:
+        """Build the outcome carrying nio's authoritative recovery verdict."""
+        return cls(
+            recovered_room_ids=response.recovered_room_ids,
+            unrecovered_room_ids=response.unrecovered_room_ids,
+            admission_refused=admission_refused,
+        )
 
     @property
-    def certified(self) -> bool:
-        """Return whether this result proves the sync delta reached durable cache."""
-        return self.complete and not self.limited_room_ids and not self.errors
+    def recovery_conclusive(self) -> bool:
+        """Return whether this response settles whether nio closed every gap.
+
+        A response that refused an event never reached its recovery verdict, so
+        it may neither prove nor disprove that a room's rebuild has stopped
+        converging.
+        """
+        return not self.admission_refused
 
 
 @dataclass(frozen=True)
@@ -52,58 +74,80 @@ class SyncCertificationDecision:
     clear_saved_token: bool = False
     reset_client_token: bool = False
     reason: str | None = None
+    # Rooms this checkpoint is about to move past without their history. The
+    # decision carries them from planning to application because the durable
+    # record of what was skipped has to be written before the checkpoint that
+    # skips it, and only the applying side is allowed to write anything.
+    skipped_recovery_room_ids: frozenset[str] = frozenset()
 
 
 def _uncertain_decision(
     *,
     reason: str,
-    reset_client_token: bool = False,
+    reset_client_token: bool,
+    clear_saved_token: bool = False,
 ) -> SyncCertificationDecision:
     """Return a fail-closed uncertainty decision."""
     return SyncCertificationDecision(
         state=SyncTrustState.UNCERTAIN,
-        clear_saved_token=True,
+        clear_saved_token=clear_saved_token,
         reset_client_token=reset_client_token,
         reason=reason,
     )
 
 
-def _uncertain_reason(cache_result: SyncCacheWriteResult, *, next_batch: str | None) -> str | None:
+def _uncertain_reason(
+    recovery: SyncRecoveryOutcome,
+    *,
+    token: str | None,
+    skipped_recovery_room_ids: frozenset[str],
+) -> str | None:
     """Return why one sync response cannot certify a checkpoint."""
-    if normalize_sync_token(next_batch) is None:
-        return "missing_next_batch"
-    if cache_result.errors:
-        return "cache_write_failed"
-    if cache_result.limited_room_ids:
-        return "limited_sync_timeline"
-    if not cache_result.complete:
-        return "cache_write_incomplete"
-    return None
+    if token is None:
+        reason = "missing_next_batch"
+    elif recovery.admission_refused:
+        reason = "admission_refused"
+    elif recovery.unrecovered_room_ids - skipped_recovery_room_ids:
+        reason = "sync_recovery_incomplete"
+    else:
+        reason = None
+    return reason
 
 
 def certify_sync_response(
-    state: SyncTrustState,
     *,
     next_batch: str | None,
-    cache_result: SyncCacheWriteResult,
-    first_sync: bool,
+    recovery: SyncRecoveryOutcome,
+    skipped_recovery_room_ids: frozenset[str] = frozenset(),
 ) -> SyncCertificationDecision:
-    """Return the certifier decision for one sync response."""
-    reason = _uncertain_reason(cache_result, next_batch=next_batch)
+    """Return the certifier decision for one sync response.
+
+    ``skipped_recovery_room_ids`` names rooms whose unrecovered gap the caller
+    has decided to give up on, trading that room's missed history for the
+    forward progress a permanently rewinding cursor can never make.
+    """
+    token = normalize_sync_token(next_batch)
+    reason = _uncertain_reason(
+        recovery,
+        token=token,
+        skipped_recovery_room_ids=skipped_recovery_room_ids,
+    )
     if reason is not None:
         return _uncertain_decision(
             reason=reason,
-            reset_client_token=state is SyncTrustState.PENDING and first_sync,
+            reset_client_token=True,
         )
 
-    token = normalize_sync_token(next_batch)
-    if token is None:
-        return _uncertain_decision(reason="missing_next_batch")
-
-    checkpoint = SyncCheckpoint(token=token)
+    checkpoint = SyncCheckpoint(token=cast("str", token))
     return SyncCertificationDecision(
         state=SyncTrustState.CERTIFIED,
         checkpoint_to_save=checkpoint,
+        # Skipping a gap leaves nio holding recovery state for a room this
+        # checkpoint has already moved past, and that state can block the
+        # response from ever being acknowledged. Restart the client from the
+        # newly certified position instead of acknowledging in place.
+        reset_client_token=bool(skipped_recovery_room_ids),
+        skipped_recovery_room_ids=skipped_recovery_room_ids,
     )
 
 
@@ -111,27 +155,21 @@ def handle_unknown_pos() -> SyncCertificationDecision:
     """Return the fail-closed decision for Matrix ``M_UNKNOWN_POS``."""
     return _uncertain_decision(
         reason="unknown_pos",
+        clear_saved_token=True,
         reset_client_token=True,
     )
 
 
-def sync_cache_write_diagnostics(cache_result: SyncCacheWriteResult) -> dict[str, Any]:
-    """Return structured log fields explaining one sync cache-write result."""
+def sync_recovery_diagnostics(recovery: SyncRecoveryOutcome) -> dict[str, Any]:
+    """Return structured log fields explaining one response's recovery outcome."""
     diagnostics: dict[str, Any] = {
-        "cache_write_complete": cache_result.complete,
-        "cache_write_certified": cache_result.certified,
-        "cache_limited_room_count": len(cache_result.limited_room_ids),
-        "cache_error_count": len(cache_result.errors),
+        "sync_admission_refused": recovery.admission_refused,
+        "sync_recovery_certified": not recovery.admission_refused and not recovery.unrecovered_room_ids,
+        "sync_recovered_room_count": len(recovery.recovered_room_ids),
+        "sync_unrecovered_room_count": len(recovery.unrecovered_room_ids),
     }
-    if cache_result.runtime_available is not None:
-        diagnostics["cache_runtime_available"] = cache_result.runtime_available
-    if cache_result.task_count is not None:
-        diagnostics["cache_task_count"] = cache_result.task_count
-    if cache_result.runtime_diagnostics:
-        diagnostics.update(cache_result.runtime_diagnostics)
-    if cache_result.limited_room_ids:
-        diagnostics["cache_limited_room_ids"] = cache_result.limited_room_ids[:5]
-    if cache_result.errors:
-        diagnostics["cache_error_types"] = tuple(type(error).__name__ for error in cache_result.errors[:5])
-        diagnostics["cache_error_messages"] = tuple(str(error)[:200] for error in cache_result.errors[:5])
+    if recovery.recovered_room_ids:
+        diagnostics["sync_recovered_room_ids"] = tuple(sorted(recovery.recovered_room_ids))[:5]
+    if recovery.unrecovered_room_ids:
+        diagnostics["sync_unrecovered_room_ids"] = tuple(sorted(recovery.unrecovered_room_ids))[:5]
     return diagnostics

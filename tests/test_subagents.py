@@ -6,7 +6,7 @@ import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock
 
 import nio
 import pytest
@@ -14,6 +14,7 @@ import pytest
 import mindroom.tools  # noqa: F401
 from mindroom.agent_descriptions import describe_agent
 from mindroom.config.agent import AgentConfig
+from mindroom.config.auth import AgentReplyPermission, AuthorizationConfig
 from mindroom.constants import (
     ORIGINAL_SENDER_KEY,
     ROUTER_AGENT_NAME,
@@ -31,7 +32,15 @@ from mindroom.session_ids import create_session_id, parse_session_id
 from mindroom.thread_summary import THREAD_SUMMARY_MAX_LENGTH
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from tests.conftest import delivered_matrix_side_effect, make_event_cache_mock
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    delivered_matrix_side_effect,
+    make_conversation_reader_mock,
+    make_matrix_client_mock,
+    make_relation_lookup,
+)
 from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
 
 if TYPE_CHECKING:
@@ -86,8 +95,7 @@ def _make_config(
     config.get_entity_thread_mode = MagicMock(return_value=thread_mode)
     config.get_agent_tools = MagicMock(side_effect=lambda agent_name: config.agents[agent_name].tool_names)
     config.render_prompt = MagicMock(return_value="Delegate only to listed agents.")
-    config.authorization.agent_reply_permissions = {}
-    config.authorization.resolve_alias.side_effect = lambda sender_id: sender_id
+    config.authorization = AuthorizationConfig()
     return config
 
 
@@ -102,9 +110,8 @@ def _make_context(
     room_agent_names: list[str] | None = None,
 ) -> ToolRuntimeContext:
     async def _latest_thread_event_id(
-        _room_id: str,
-        thread_id: str | None,
         *_args: object,
+        thread_id: str | None = None,
         **_kwargs: object,
     ) -> str | None:
         return thread_id
@@ -113,11 +120,7 @@ def _make_context(
     effective_config = config or _make_config()
     _persist_subagent_accounts(effective_config, runtime_paths)
     room = _make_room(effective_config, runtime_paths, room_id, agent_name, room_agent_names)
-    conversation_cache = AsyncMock()
-    conversation_cache.get_latest_thread_event_id_if_needed.side_effect = _latest_thread_event_id
-    conversation_cache.notify_outbound_message = Mock()
-    conversation_cache.notify_outbound_redaction = Mock()
-    return ToolRuntimeContext(
+    return make_test_tool_runtime_context(
         agent_name=agent_name,
         target=MessageTarget.resolve(
             room_id=room_id,
@@ -125,11 +128,11 @@ def _make_context(
             reply_to_event_id=None,
         ),
         requester_id=requester_id,
-        client=MagicMock(),
+        client=make_matrix_client_mock(),
         config=effective_config,
         runtime_paths=runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=conversation_cache,
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
         room=room,
         storage_path=tmp_path,
     )
@@ -217,6 +220,27 @@ async def test_agents_list_payload_structure(tmp_path: Path) -> None:
     assert all(set(row) == {"name", "can_delegate", "can_spawn", "description"} for row in payload["agents"])
     assert all(isinstance(row, dict) for row in payload["agents"])
     assert all(row["can_spawn"] is True for row in payload["agents"])
+
+
+@pytest.mark.asyncio
+async def test_agents_list_uses_current_authorization_after_reload(tmp_path: Path) -> None:
+    """A long-lived tool context must not expose agents revoked by a config reload."""
+    original_config = _make_config()
+    current_config = _make_config()
+    current_config.authorization = AuthorizationConfig(
+        agent_reply_permissions={
+            "research": AgentReplyPermission(users=[]),
+        },
+    )
+    ctx = replace(
+        _make_context(tmp_path, config=original_config),
+        config_provider=lambda: current_config,
+    )
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await SubAgentsTools().agents_list())
+
+    assert [row["name"] for row in payload["agents"]] == ["code"]
 
 
 @pytest.mark.asyncio
@@ -672,9 +696,8 @@ async def test_send_matrix_text_uses_latest_thread_event_id_for_fallback(
     """Threaded subagent sends should include the latest thread event for fallback replies."""
     send_mock = AsyncMock(side_effect=delivered_matrix_side_effect("$evt"))
     monkeypatch.setattr(subagents_module, "send_message_result", send_mock)
-    event_cache = MagicMock()
-    ctx = replace(_make_context(tmp_path, requester_id="@user:localhost"), event_cache=event_cache)
-    ctx.conversation_cache.get_latest_thread_event_id_if_needed = AsyncMock(return_value="$latest:localhost")
+    ctx = _make_context(tmp_path, requester_id="@user:localhost")
+    ctx.conversation_reader.latest_thread_event_id = AsyncMock(return_value="$latest:localhost")
 
     await subagents_module._send_matrix_text(
         ctx,
@@ -684,10 +707,9 @@ async def test_send_matrix_text_uses_latest_thread_event_id_for_fallback(
         original_sender=ctx.requester_id,
     )
 
-    ctx.conversation_cache.get_latest_thread_event_id_if_needed.assert_awaited_once_with(
-        ctx.room_id,
-        ctx.thread_id,
-        caller_label="subagent_tool_send",
+    ctx.conversation_reader.latest_thread_event_id.assert_awaited_once_with(
+        room_id=ctx.room_id,
+        thread_id=ctx.thread_id,
     )
     content = send_mock.await_args.args[2]
     assert content["m.relates_to"]["event_id"] == ctx.thread_id
@@ -1156,9 +1178,74 @@ async def test_sessions_spawn_sets_summary_after_spawn(
         TEST_SUMMARY,
         1,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id="$event",
     )
     update_mock.assert_called_once_with(ctx.room_id, "$event", 1)
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_summary_does_not_read_the_new_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The initial spawn summary should relate to the new root without reading thread history.
+
+    A freshly created thread has no cache snapshot, so a latest-event lookup here
+    starts a homeserver scan that races the spawned agent's first outbound event.
+    """
+    monkeypatch.setattr(subagents_module, "_send_matrix_text", AsyncMock(return_value="$spawn-root:localhost"))
+    monkeypatch.setattr(subagents_module, "set_thread_tag", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(subagents_module, "update_last_summary_count", MagicMock())
+    ctx = _make_context(tmp_path)
+    ctx.client.room_send = AsyncMock(
+        return_value=nio.RoomSendResponse(event_id="$summary:localhost", room_id=ctx.room_id),
+    )
+    ctx.conversation_reader.latest_thread_event_id = AsyncMock(return_value="$never-read:localhost")
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_spawn(task="do thing", summary=TEST_SUMMARY, tag=TEST_TAG),
+        )
+
+    assert payload["status"] == "ok"
+    ctx.conversation_reader.latest_thread_event_id.assert_not_awaited()
+    relates_to = ctx.client.room_send.call_args.kwargs["content"]["m.relates_to"]
+    assert relates_to["rel_type"] == "m.thread"
+    assert relates_to["event_id"] == "$spawn-root:localhost"
+    assert relates_to["m.in_reply_to"] == {"event_id": "$spawn-root:localhost"}
+
+
+@pytest.mark.asyncio
+async def test_sessions_spawn_reuse_still_resolves_the_latest_thread_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a labelled session targets an existing thread, so its tail must still be resolved."""
+    summary_mock, _, _ = _stub_spawn_followups(monkeypatch)
+    ctx = _make_context(tmp_path)
+    monkeypatch.setattr(
+        subagents_module,
+        "_resolve_by_label",
+        lambda *_args, **_kwargs: (
+            create_session_id(ctx.room_id, "$existing-root:localhost"),
+            {"target_agent": "code"},
+        ),
+    )
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(
+            await SubAgentsTools().sessions_spawn(
+                task="do thing",
+                summary=TEST_SUMMARY,
+                tag=TEST_TAG,
+                label="worklog",
+            ),
+        )
+
+    assert payload["status"] == "ok"
+    assert payload["reused"] is True
+    assert summary_mock.await_args.kwargs["known_latest_thread_event_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1416,7 +1503,8 @@ async def test_sessions_spawn_dedup_returns_existing_for_duplicate_label(
         TEST_SUMMARY,
         1,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id="$event",
     )
     tag_mock.assert_awaited_once_with(
         ctx.client,
@@ -1457,7 +1545,8 @@ async def test_sessions_spawn_dedup_returns_existing_for_duplicate_label(
         TEST_SUMMARY,
         0,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id=None,
     )
     tag_mock.assert_awaited_once_with(
         ctx.client,
@@ -1508,7 +1597,8 @@ async def test_sessions_spawn_skips_reuse_when_registry_entry_lacks_thread_id(
         TEST_SUMMARY,
         1,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id="$new-event",
     )
     tag_mock.assert_awaited_once_with(
         ctx.client,
@@ -1559,7 +1649,8 @@ async def test_sessions_spawn_reuse_derives_thread_id_from_session_key(
         TEST_SUMMARY,
         0,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id=None,
     )
     tag_mock.assert_awaited_once_with(
         ctx.client,
@@ -1604,7 +1695,8 @@ async def test_sessions_spawn_skips_room_level_reuse_candidates(
         TEST_SUMMARY,
         1,
         "manual",
-        ctx.conversation_cache,
+        ctx.conversation_reader,
+        known_latest_thread_event_id="$event",
     )
     tag_mock.assert_awaited_once_with(
         ctx.client,

@@ -6,11 +6,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import nio
 import pytest
 
 import mindroom.tools  # noqa: F401
+from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.agents import create_agent, describe_agent
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+from mindroom.config.auth import AgentReplyPermission, AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import resolve_runtime_paths
@@ -18,12 +21,22 @@ from mindroom.custom_tools.delegate import MAX_DELEGATION_DEPTH, DelegateTools
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.indexing_config import IndexingSettings
 from mindroom.knowledge.utils import _KnowledgeResolution
+from mindroom.matrix.state import MatrixState
 from mindroom.message_target import MessageTarget
+from mindroom.thread_models import set_thread_model_override
 from mindroom.tool_schema_cache import cached_processed_schema
 from mindroom.tool_system.metadata import TOOL_METADATA
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context, tool_runtime_context
+from mindroom.tool_system.runtime_context import get_tool_runtime_context, tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
-from tests.conftest import bind_runtime_paths, make_conversation_cache_mock, make_event_cache_mock, runtime_paths_for
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    bind_runtime_paths,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    runtime_paths_for,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -180,6 +193,84 @@ class TestDelegateTools:
         assert "Cannot delegate an empty task" in result
 
     @pytest.mark.asyncio
+    async def test_restricted_delegation_fails_closed_without_runtime_context(
+        self,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """A restricted target cannot be delegated without requester authorization state."""
+        config.authorization = AuthorizationConfig(
+            agent_reply_permissions={
+                "code": AgentReplyPermission(users=["@alice:example.org"]),
+            },
+        )
+        tools = DelegateTools(
+            agent_name="leader",
+            delegate_to=["code"],
+            runtime_paths=resolve_runtime_paths(
+                config_path=storage_path / "config.yaml",
+                storage_path=storage_path,
+            ),
+            config=config,
+            delegation_depth=0,
+        )
+
+        with patch("mindroom.custom_tools.delegate.ai_response", new_callable=AsyncMock) as mock_ai_response:
+            result = await tools.delegate_task("code", "Write a hello world program")
+
+        assert "requester authorization is unavailable" in result
+        mock_ai_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delegation_uses_live_runtime_authorization_after_config_reload(
+        self,
+        storage_path: Path,
+        config: Config,
+    ) -> None:
+        """A long-lived delegate toolkit must enforce the current runtime policy."""
+        runtime_paths = resolve_runtime_paths(
+            config_path=storage_path / "config.yaml",
+            storage_path=storage_path,
+        )
+        tools = DelegateTools(
+            agent_name="leader",
+            delegate_to=["code"],
+            runtime_paths=runtime_paths,
+            config=config,
+            delegation_depth=0,
+        )
+        replacement_config = config.model_copy(deep=True)
+        replacement_config.authorization = AuthorizationConfig(
+            agent_reply_permissions={"code": AgentReplyPermission(users=[])},
+        )
+        runtime_context = make_test_tool_runtime_context(
+            agent_name="leader",
+            target=MessageTarget(
+                room_id="!room:example.org",
+                source_thread_id=None,
+                resolved_thread_id=None,
+                reply_to_event_id=None,
+                session_id="!room:example.org",
+            ),
+            requester_id="@alice:example.org",
+            client=MagicMock(),
+            config=config,
+            config_provider=lambda: replacement_config,
+            runtime_paths=runtime_paths,
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
+        )
+
+        with (
+            tool_runtime_context(runtime_context),
+            patch("mindroom.custom_tools.delegate.ai_response", new_callable=AsyncMock) as mock_ai_response,
+        ):
+            result = await tools.delegate_task("code", "Write a hello world program")
+
+        assert "not allowed to reply" in result
+        mock_ai_response.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_successful_delegation(self, tools: DelegateTools) -> None:
         """Test that a successful delegation returns the agent's response content."""
         with patch(
@@ -203,6 +294,82 @@ class TestDelegateTools:
             assert call_kwargs["delegation_depth"] == 1
             assert call_ctx.session_id.startswith("delegate:leader:code:")
             assert result == "Here is the generated code: print('hello')"
+
+    @pytest.mark.asyncio
+    async def test_delegation_accepts_requester_authorized_by_grant_room(self, tmp_path: Path) -> None:
+        """Direct delegated runs should consume the same shared room-membership reply policy."""
+        config = Config(
+            agents={
+                "leader": AgentConfig(
+                    display_name="Leader",
+                    role="Lead",
+                    rooms=["grant"],
+                    delegate_to=["worker"],
+                ),
+                "worker": AgentConfig(
+                    display_name="Worker",
+                    role="Work",
+                    rooms=["grant"],
+                ),
+            },
+            authorization=AuthorizationConfig(
+                agent_reply_permissions={
+                    "worker": AgentReplyPermission(joined_rooms=["grant"]),
+                },
+            ),
+            models={"default": ModelConfig(provider="openai", id="gpt-5.6")},
+        )
+        config = _bind_runtime_paths(config, tmp_path)
+        runtime_paths = runtime_paths_for(config)
+        grant_room_id = "!grant:example.org"
+        state = MatrixState.load(runtime_paths=runtime_paths)
+        state.add_room("grant", grant_room_id, "#grant:example.org", "Grant")
+        state.save(runtime_paths=runtime_paths)
+        client = AsyncMock(spec=nio.AsyncClient)
+        client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[grant_room_id])
+        client.joined_members.return_value = nio.JoinedMembersResponse(
+            members=[nio.RoomMember("@alice:example.org", None, None)],
+            room_id=grant_room_id,
+        )
+        memberships = AgentReplyMembershipIndex()
+        await memberships.refresh(config, runtime_paths, client)
+        tools = DelegateTools(
+            agent_name="leader",
+            delegate_to=["worker"],
+            runtime_paths=runtime_paths,
+            config=config,
+            delegation_depth=0,
+        )
+        runtime_context = make_test_tool_runtime_context(
+            agent_name="leader",
+            target=MessageTarget(
+                room_id="!dm:example.org",
+                source_thread_id=None,
+                resolved_thread_id=None,
+                reply_to_event_id=None,
+                session_id="!dm:example.org",
+            ),
+            requester_id="@alice:example.org",
+            client=client,
+            config=config,
+            runtime_paths=runtime_paths,
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
+            agent_reply_memberships=memberships,
+        )
+
+        with (
+            tool_runtime_context(runtime_context),
+            patch(
+                "mindroom.custom_tools.delegate.ai_response",
+                new_callable=AsyncMock,
+                return_value="done",
+            ) as mock_ai_response,
+        ):
+            result = await tools.delegate_task("worker", "do work")
+
+        assert result == "done"
+        mock_ai_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_delegation_with_no_content(self, tools: DelegateTools) -> None:
@@ -545,7 +712,7 @@ class TestDelegateKnowledge:
             delegation_depth=0,
         )
         tool_function_filter = MagicMock(return_value=True)
-        runtime_context = ToolRuntimeContext(
+        runtime_context = make_test_tool_runtime_context(
             agent_name="leader",
             target=MessageTarget(
                 room_id="!room:example.org",
@@ -558,8 +725,8 @@ class TestDelegateKnowledge:
             client=MagicMock(),
             config=config,
             runtime_paths=runtime_paths,
-            event_cache=make_event_cache_mock(),
-            conversation_cache=make_conversation_cache_mock(),
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
             correlation_id="corr-parent",
             tool_function_filter=tool_function_filter,
         )
@@ -587,12 +754,18 @@ class TestDelegateKnowledge:
         assert result == "done"
 
     @pytest.mark.asyncio
-    async def test_delegation_rebinds_room_resolved_model_for_child_agent(
+    @pytest.mark.parametrize(
+        ("thread_model_name", "expected_model_name"),
+        [(None, "large"), ("default", "default")],
+    )
+    async def test_delegation_rebinds_resolved_model_for_child_agent(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        thread_model_name: str | None,
+        expected_model_name: str,
     ) -> None:
-        """Delegated child tools should see the child's room-resolved runtime model."""
+        """Delegated child and its tools must share thread-over-room model precedence."""
         config = Config(
             agents={
                 "leader": AgentConfig(
@@ -617,6 +790,14 @@ class TestDelegateKnowledge:
         config = _bind_runtime_paths(config, tmp_path)
         runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
         monkeypatch.setattr("mindroom.matrix.state.get_room_alias_from_id", lambda *_args: "lobby")
+        if thread_model_name is not None:
+            set_thread_model_override(
+                runtime_paths,
+                thread_id="$thread",
+                model_name=thread_model_name,
+                room_id="!room:example.org",
+                set_by="@alice:example.org",
+            )
         execution_identity = ToolExecutionIdentity(
             channel="matrix",
             agent_name="leader",
@@ -634,7 +815,7 @@ class TestDelegateKnowledge:
             execution_identity=execution_identity,
             delegation_depth=0,
         )
-        runtime_context = ToolRuntimeContext(
+        runtime_context = make_test_tool_runtime_context(
             agent_name="leader",
             target=MessageTarget(
                 room_id="!room:example.org",
@@ -647,8 +828,8 @@ class TestDelegateKnowledge:
             client=MagicMock(),
             config=config,
             runtime_paths=runtime_paths,
-            event_cache=make_event_cache_mock(),
-            conversation_cache=make_conversation_cache_mock(),
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
             active_model_name="default",
         )
 
@@ -657,8 +838,10 @@ class TestDelegateKnowledge:
             assert context is not None
             assert context.agent_name == "worker"
             assert context.room_id == "!room:example.org"
-            assert context.active_model_name == "large"
+            assert context.active_model_name == expected_model_name
             assert ctx.room_id == "!room:example.org"
+            assert ctx.thread_id == "$thread"
+            assert ctx.active_model_name == expected_model_name
             return "done"
 
         with (

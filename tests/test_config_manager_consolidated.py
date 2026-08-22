@@ -31,7 +31,15 @@ from mindroom.oauth.service import lookup_oauth_connect_token
 from mindroom.tool_system.metadata import _AUTHORED_OVERRIDE_INHERIT
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope, resolve_worker_key
-from tests.conftest import load_config_yaml, make_conversation_cache_mock, make_event_cache_mock, write_config_yaml
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
+from tests.conftest import (
+    load_config_yaml,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    write_config_yaml,
+)
 from tests.identity_helpers import persist_entity_accounts
 
 
@@ -59,7 +67,7 @@ def _caller_context(
     requester_id: str = "@alice:example.org",
 ) -> ToolRuntimeContext:
     """Build a live config-manager caller context with a stable human requester."""
-    return ToolRuntimeContext(
+    return make_test_tool_runtime_context(
         agent_name=agent_name,
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -70,8 +78,8 @@ def _caller_context(
         client=MagicMock(),
         config=config,
         runtime_paths=config_manager.runtime_paths,
-        event_cache=make_event_cache_mock(),
-        conversation_cache=make_conversation_cache_mock(),
+        relations=make_relation_lookup(),
+        conversation_reader=make_conversation_reader_mock(),
     )
 
 
@@ -519,7 +527,7 @@ class TestConsolidatedConfigManager:
         room.add_member("@mindroom_unconfigured_present_oldns:localhost", "Unconfigured Present", None)
         room.add_member("@user:localhost", "User", None)
         room.members_synced = True
-        runtime_context = ToolRuntimeContext(
+        runtime_context = make_test_tool_runtime_context(
             agent_name="present",
             target=MessageTarget.resolve(
                 room_id=room.room_id,
@@ -530,8 +538,8 @@ class TestConsolidatedConfigManager:
             client=MagicMock(),
             config=config,
             runtime_paths=cm.runtime_paths,
-            event_cache=make_event_cache_mock(),
-            conversation_cache=make_conversation_cache_mock(),
+            relations=make_relation_lookup(),
+            conversation_reader=make_conversation_reader_mock(),
             room=room,
         )
 
@@ -730,10 +738,10 @@ class TestConsolidatedConfigManager:
             resolved_thread_id="$thread",
             session_id="!room:example.org:$thread",
         )
-        assert connect_target.agent_name == "research"
+        assert connect_target.binding.requested_agent_name == "research"
         assert connect_target.requester_id == "@alice:example.org"
-        assert connect_target.worker_scope == worker_scope
-        assert connect_target.worker_key == resolve_worker_key(
+        assert connect_target.binding.worker_scope == worker_scope
+        assert connect_target.binding.worker_key == resolve_worker_key(
             worker_scope,
             expected_identity,
             agent_name="research",
@@ -779,9 +787,9 @@ class TestConsolidatedConfigManager:
             cm.runtime_paths,
             query["connect_token"][0],
         )
-        assert connect_target.agent_name == "research"
+        assert connect_target.binding.requested_agent_name == "research"
         assert connect_target.requester_id == "@alice:example.org"
-        assert connect_target.worker_scope == private_scope
+        assert connect_target.binding.worker_scope == private_scope
 
     def test_manage_agent_update_does_not_mint_caller_link_when_requester_cannot_manage_target(
         self,
@@ -908,8 +916,8 @@ class TestConsolidatedConfigManager:
         assert "connect_url" not in result
         assert "MindRoom-managed OAuth" not in result
 
-    def test_manage_agent_returns_target_link_for_oauth_mcp_tool(self, tmp_path: Path) -> None:
-        """Generic OAuth MCP metadata should use the same updated-agent target flow."""
+    def test_manage_agent_returns_agent_scope_link_for_oauth_mcp_tool(self, tmp_path: Path) -> None:
+        """MCP OAuth links must target the created agent's effective credential scope."""
         mcp_server = MCPServerConfig(
             transport="streamable-http",
             url="https://mcp.example.test/mcp",

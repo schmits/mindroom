@@ -89,20 +89,35 @@ Each agent bot runs its own sync loop with a 30-second long-polling timeout.
 The default `matrix_sync.mode: classic` streams events through classic `/v3/sync` and backfills limited-timeline gaps from `/messages`.
 Set `matrix_sync.mode: sliding` to opt into MSC4186 Simplified Sliding Sync on homeservers that advertise `org.matrix.simplified_msc3575`.
 `matrix_sync.sliding_timeline_limit` (default 100) bounds the per-room timeline window of each sliding request.
-Sliding positions are connection-scoped, so a restarted backend replays at most that window per room and older undelivered events are not recovered.
+Sliding positions remain connection-scoped, while callback admission uses mindroom-nio's persisted per-event provenance.
+Sliding Sync classifies its validated `num_live` tail as live, ordinary continuations without `num_live` as live, and initial or expanded timelines without `num_live` as history.
+Classic Sync classifies initial timelines and `/messages` recovery as history, while `since` continuations are live.
+This provenance remains attached across recovery, restart, and decryption independently of journal checkpoint persistence.
+`matrix/journal_ingress.py` commits every inbound event to the event journal before nio treats it as delivered, and a refused write raises `nio.CallbackNotAcceptedError` so nio redelivers the event rather than advancing the checkpoint past it.
+Admission is fail-closed at every provenance, not only for recovery, because an event the journal never accepted is one no later process would see again.
+Conversation history is hydrated on demand rather than pre-warmed at join: a bounded backward walk fills one room or thread and records the membership epoch it filled under, so a rejoin rebuilds from what the new membership can see instead of merging two memberships into one conversation.
+Every derived conversation row, pending turn, and delivery outbox entry is tied to that membership epoch.
+A departure advances the epoch, removes old projected history, retires unsent old-membership delivery work, and prevents an in-flight response admitted before departure from being sent after rejoin.
+Attempted but unacknowledged deliveries retain their frozen transaction identity for exact reconciliation instead of being blindly resent.
 Changing `matrix_sync` restarts running entities on config hot reload.
 Sync loops are wrapped with `sync_forever_with_restart()` for automatic restart on connection failures.
 
-Events are processed in background tasks:
-1. Sync receives event via long-polling
-2. Event callback triggered (`_on_message`, `_on_invite`, etc.)
-3. Background task created for async processing
-4. Agent responds in thread
+An event reaches an agent through durable admission, never straight from the sync callback:
+
+1. Sync receives the event via long-polling, and nio states its provenance once.
+2. `JournalIngress._admit` runs first, as nio's event-admission callback, and commits the event and its projection row in one transaction before nio treats the event as delivered.
+3. Only after every admission callback succeeds do the ordinary event callbacks run, and they load already-persisted work rather than the parsed event they were handed.
+4. `PendingEventWorker` drains what is still pending, so an event whose turn was interrupted is re-dispatched instead of lost.
+5. `TurnController` owns the turn and the agent responds in thread.
+
+Invites are the deliberate exception: an invite has no Matrix event ID to key a durable row on, and an unacted-on invite reappears in every sync response, so `_on_invite` is a plain background task relying on homeserver redelivery.
+See [Bot Runtime](bot-runtime.md) for the full durable dispatch boundary.
 
 ### Streaming Responses
 
 Agents stream responses by progressively editing messages.
-Streaming is enabled only when the requesting user is online (checked via `should_use_streaming()`), saving API calls for offline users.
+When requester identity is available, `should_use_streaming()` enables streaming only while that requester is online, avoiding progressive Matrix edits for offline users.
+When requester identity is unavailable, the presence check cannot run and `should_use_streaming()` defaults to streaming.
 See [Streaming Responses](../streaming.md) for the full feature documentation.
 
 Tool call telemetry is emitted as plain inline markers and mirrored in `io.mindroom.tool_trace` metadata on the same message content.
@@ -153,9 +168,20 @@ Messages exceeding the 64KB Matrix event limit are automatically handled by `pre
 
 ## Response Tracking
 
-MindRoom prevents duplicate responses using a `ResponseTracker` that records which events have already been processed.
-When a sync reconnection or retry delivers the same event twice, the tracker suppresses the duplicate so only one agent response is sent per triggering message.
-Tracking state is persisted under `mindroom_data/tracking/` and survives restarts.
+Duplicate responses are prevented at two durable layers, both in `tracking/event_journal.db` under `mindroom_data/`.
+
+`journal_events` is keyed `(principal_id, event_id)`, so a Matrix event redelivered by a sync reconnection or a `/messages` walk is recognised as already admitted rather than admitted twice.
+A settled row is retained for exactly that reason, with only its replay payload cleared.
+
+`TurnStore` owns the answer to "has this turn finished?", through the handled-turn ledger in `handled_turns.py`.
+It shares the journal's database, so a terminal turn record and the settlement of the journal sources it answers commit in one transaction instead of two substrates approximately agreeing.
+Its scope is the agent rather than the sync principal, because the proof that a message was already answered stays true across a re-login.
+
+Delivery itself is owned by the `matrix_delivery_outbox` table, keyed `(principal_id, delivery_id, stage)` over `INITIAL` and `FINAL` delivery stages.
+A `FINAL` stage edits an existing event when it has an edit target and otherwise publishes a standalone terminal event.
+Each row freezes its explicit Matrix event type, payload, and deterministic transaction ID before the first send attempt, so ordinary responses and tool-approval cards recover through the same worker after a crash between sending and recording.
+The claim also stores the sending device, because a transaction ID is only idempotent for the device that used it and a re-login would otherwise let a resend post a duplicate.
+After a device change, standalone deliveries that reply outside a journal turn reconcile by exact frozen content and retain their debt when history cannot prove which event won.
 
 ## Room Cleanup
 
@@ -204,6 +230,11 @@ Outgoing encrypted Matrix sends always deliver to unverified devices.
 MindRoom bots have no interactive device-verification flow, so enforcing nio's device-trust checks would fail every send to an encrypted room with an `OlmUnverifiedDeviceError` and the agent would appear to silently ignore messages.
 A configurable trust policy only becomes meaningful once a device-verification mechanism exists (for example trust-on-first-use, a verification command, or cross-signing support).
 
+While a room's timeline is still recovering from a limited sync, nio rejects sends to that room with `SendRetryError` until the gap closes, so MindRoom retries the affected delivery in place instead of dropping it.
+Streaming progress updates and completed terminal deliveries reuse the identical prepared payload and retry for up to 30 seconds — one recovery pump — backing off from 50ms to 500ms between attempts.
+Cancelled and errored terminal updates never wait on recovery, so a stopped or failed turn still settles immediately.
+If the window expires the delivery is reported as failed, the placeholder settles as a delivery failure, and the failure update itself is sent without waiting on recovery again.
+
 ## End-to-End Encryption
 
 Agents fully participate in encrypted rooms: they decrypt inbound text and media, reply encrypted, and re-fetch and decrypt thread history from the homeserver.
@@ -213,7 +244,12 @@ Enabling encryption on a Matrix room is irreversible; MindRoom never disables it
 
 When an agent receives an event it cannot decrypt from an authorized sender, it logs a `matrix_event_decryption_failed` warning, sends a best-effort room-key request once per session (delivered to the bot account's own devices, so recovery normally needs the sender to post a new message), and posts one notice per (room, session) so the user knows to resend.
 All bots share a disk-backed notice ledger, so the first bot that fails on a session posts the only notice and multi-agent rooms never storm.
-Notices are suppressed for events that predate a bot's room join or a start without sync continuity, since pre-join and already-replayed history is expected to be undecryptable.
+After a live room join, decryption-failure callbacks for that exact unfinished join stay fenced across restarts until a trusted sync response confirms joined membership.
+A rejected sync certification keeps that join fence closed; once admission succeeds again, the next trusted response atomically advances continuity and clears the fence.
+The fence suppresses only the user-visible notice, so a fenced failure still logs diagnostics, updates E2EE statistics, and requests missing keys without claiming the visible-notice ledger.
+Cold history is admitted rather than rejected: nio's `HISTORY` provenance classes an event context-only, so it joins the conversation the projection serves but can never start a turn.
+`LIVE` and recovered events are admitted as actionable independently of response-level sync positions, recovery gaps, and sync-certification state.
+The join fence does not compare federated event timestamps with the local wall clock.
 Decryption-failure counters are exposed on `/api/health` under `e2ee`.
 
 Each agent bootstraps a self-managed cross-signing identity at login (master and self-signing keys persisted next to its encryption store) and signs its own device, so clients that exclude non-cross-signed devices (MSC4153) keep sharing room keys with agents.
@@ -221,7 +257,7 @@ Each agent bootstraps a self-managed cross-signing identity at login (master and
 When the homeserver no longer has the uploaded identity (for example after a dev-server reset that kept `encryption_keys/`), the bootstrap detects the divergence and re-uploads the persisted keys instead of wedging.
 
 If a bot's encryption store under `mindroom_data/encryption_keys/` is lost while its device identity persists, startup logs in as a fresh device instead of restoring a wedged crypto identity, and re-signs the new device with the persisted cross-signing keys; `mindroom doctor` reports missing stores.
-Messages encrypted only to the lost device stay undecryptable, but the durable event cache preserves the agent's conversational context.
+Messages encrypted only to the lost device stay undecryptable, but the durable visible-message projection preserves the agent's conversational context.
 
 ## Configuration
 

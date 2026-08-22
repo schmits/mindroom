@@ -7,33 +7,47 @@ import inspect
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from agno.agent import Agent as AgnoAgent
+from agno.db.base import SessionType
+from agno.db.sqlite import SqliteDb
 from agno.models.message import Message
 from agno.models.response import ToolExecution
 from agno.run.agent import RunContentEvent as AgentRunContentEvent
 from agno.run.agent import RunOutput
 from agno.run.agent import ToolCallCompletedEvent as AgentToolCallCompletedEvent
 from agno.run.agent import ToolCallStartedEvent as AgentToolCallStartedEvent
-from agno.run.base import RunStatus
+from agno.run.base import RunContext, RunStatus
+from agno.run.requirement import RunRequirement
 from agno.run.team import RunCancelledEvent as TeamRunCancelledEvent
+from agno.run.team import RunCompletedEvent as TeamRunCompletedEvent
 from agno.run.team import RunContentEvent as TeamRunContentEvent
 from agno.run.team import RunErrorEvent as TeamRunErrorEvent
+from agno.run.team import RunPausedEvent as TeamRunPausedEvent
 from agno.run.team import TeamRunOutput
 from agno.run.team import ToolCallCompletedEvent as TeamToolCallCompletedEvent
 from agno.run.team import ToolCallStartedEvent as TeamToolCallStartedEvent
 from agno.team import Team as AgnoTeam
 from agno.team._run import _cleanup_and_store
+from agno.tools.function import Function
 from agno.utils.message import get_text_from_message
 
 from mindroom.agents import create_agent
+from mindroom.ai_runtime import (
+    finalize_queued_notice_response_turn_async,
+    install_queued_message_notice_hook,
+    queued_message_signal_context,
+)
+from mindroom.approval_receipt import approval_receipt_context
+from mindroom.approval_response import require_ordered_pause_presentation
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME
+from mindroom.constants import AI_RUN_METADATA_KEY, ROUTER_AGENT_NAME, RuntimePaths
 from mindroom.error_handling import MODEL_SAFEGUARD_REFUSAL_MESSAGE
 from mindroom.execution_preparation import (
     ThreadHistoryRenderLimits,
@@ -41,11 +55,12 @@ from mindroom.execution_preparation import (
     _PreparedExecutionContext,
     prepare_bound_team_run_context,
 )
+from mindroom.history.compaction import _compaction_replay_messages
 from mindroom.history.interrupted_replay import _render_interrupted_replay_content
 from mindroom.history.runtime import open_bound_scope_session_context
 from mindroom.history.storage import read_scope_seen_event_ids, update_scope_seen_event_ids
 from mindroom.history.turn_recorder import TurnRecorder
-from mindroom.history.types import CompactionDecision, CompactionReplyOutcome, PreparedHistoryState
+from mindroom.history.types import CompactionDecision, CompactionReplyOutcome, HistoryScope, PreparedHistoryState
 from mindroom.hooks import EnrichmentItem
 from mindroom.knowledge.utils import _KnowledgeResolution
 from mindroom.media_fallback import (
@@ -56,6 +71,8 @@ from mindroom.media_fallback import (
 from mindroom.media_inputs import MediaInputs
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
+from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, ResponsePausedForApproval
+from mindroom.synthetic_model import SyntheticModel
 from mindroom.team_exact_members import (
     ResolvedExactTeamMembers,
     materialize_exact_requested_team_members,
@@ -63,10 +80,14 @@ from mindroom.team_exact_members import (
 )
 from mindroom.teams import (
     TeamMode,
+    _attach_team_pause_presentation,
+    _collect_team_continuation,
     _materialize_team_members,
     _PreparedMaterializedTeamExecution,
     _team_response_stream_raw,
+    _TeamStreamPresentation,
     build_materialized_team_instance,
+    continue_paused_team_run,
     materialize_exact_team_members,
     prepare_materialized_team_execution,
     team_response,
@@ -88,6 +109,476 @@ if TYPE_CHECKING:
 
 
 _TEST_MODEL = "openai:gpt-5.4"
+_QUEUED_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
+_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY = "mindroom_queued_message_notice_response_turn_id"
+
+
+def test_team_stream_presentation_keeps_duplicate_labels_in_distinct_member_slots() -> None:
+    """Stable member IDs keep equal rendering labels from sharing content or tools."""
+    presentation = _TeamStreamPresentation.new(
+        config_names=["member-a", "member-b"],
+        display_names=["Same", "Same"],
+        show_tool_calls=True,
+    )
+
+    presentation.append_member("member-a", "First answer.")
+    presentation.append_member("member-b", "Second answer.")
+    presentation.start_member_tool(
+        "member-b",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}),
+    )
+
+    assert presentation.per_member == {
+        "member-a": "First answer.",
+        "member-b": "Second answer.\n\n🔧 `inspect` [1] ⏳\n\n",
+    }
+    assert presentation.tool_trace[0].scope_key == "agent:member-b"
+    assert presentation.render_body().count("**Same**:") == 2
+
+
+def test_team_pause_reindexes_interleaved_member_tools_to_document_order() -> None:
+    """Trace slots and completion indices must follow rendered member-slot order."""
+    presentation = _TeamStreamPresentation.new(
+        config_names=["first", "second"],
+        display_names=["First", "Second"],
+        show_tool_calls=True,
+    )
+    first = ToolExecution(
+        tool_call_id="call-first",
+        tool_name="inspect_first",
+        requires_confirmation=True,
+    )
+    second = ToolExecution(
+        tool_call_id="call-second",
+        tool_name="inspect_second",
+        requires_confirmation=True,
+    )
+    presentation.start_member_tool("second", second)
+    presentation.start_member_tool("first", first)
+    first_requirement = RunRequirement(first)
+    first_requirement.member_agent_id = "first"
+    second_requirement = RunRequirement(second)
+    second_requirement.member_agent_id = "second"
+    paused = PausedAttempt(
+        session_id="session-1",
+        run_id="run-1",
+        tools=(first, second),
+        requirements=(first_requirement, second_requirement),
+        response_text=presentation.render_body(),
+        tool_trace=tuple(presentation.tool_trace),
+        response_presentation_state=presentation.to_state(),
+    )
+
+    require_ordered_pause_presentation(paused, show_tool_calls=True)
+
+    assert [entry.tool_call_id for entry in presentation.tool_trace] == ["call-first", "call-second"]
+    assert "🔧 `inspect_first` [1] ⏳" in presentation.per_member["first"]
+    assert "🔧 `inspect_second` [2] ⏳" in presentation.per_member["second"]
+    presentation.complete_member_tool(
+        "second",
+        ToolExecution(tool_call_id="call-second", tool_name="inspect_second", result="done"),
+    )
+    assert [entry.type for entry in presentation.tool_trace] == ["tool_call_started", "tool_call_completed"]
+    assert "🔧 `inspect_second` [2]\n\n" in presentation.per_member["second"]
+
+
+def test_hidden_team_stream_presentation_retains_only_internal_tool_identity() -> None:
+    """Frozen hidden rendering keeps restart identity without adding markers to the body."""
+    presentation = _TeamStreamPresentation.new(["general"], ["GeneralAgent"], show_tool_calls=False)
+    presentation.append_member("general", "Before.")
+    presentation.start_member_tool(
+        "general",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"query": "value"}),
+    )
+
+    restored = _TeamStreamPresentation.restore(
+        config_names=["general"],
+        show_tool_calls=False,
+        state=presentation.to_state(),
+        tool_trace=presentation.tool_trace,
+        prior_response_text=presentation.render_body(),
+    )
+    restored.complete_member_tool(
+        "general",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done"),
+    )
+    restored.append_member("general", " After.")
+
+    assert "🔧" not in restored.render_body()
+    assert restored.tool_trace[0].tool_call_id == "call-1"
+    assert restored.tool_trace[0].type == "tool_call_completed"
+
+
+def test_team_stream_presentation_scopes_reused_call_ids_to_members() -> None:
+    """Two member model runs can reuse a provider call ID without suppressing either tool."""
+    presentation = _TeamStreamPresentation.new(
+        ["first", "second"],
+        ["First", "Second"],
+        show_tool_calls=True,
+    )
+    presentation.start_member_tool(
+        "first",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "first"}),
+    )
+    presentation.start_member_tool(
+        "second",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "second"}),
+    )
+    presentation.complete_member_tool(
+        "first",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="first done"),
+    )
+
+    assert [(entry.scope_key, entry.type) for entry in presentation.tool_trace] == [
+        ("agent:first", "tool_call_completed"),
+        ("agent:second", "tool_call_started"),
+    ]
+    assert "🔧 `inspect` [1]" in presentation.per_member["first"]
+    assert "🔧 `inspect` [2] ⏳" in presentation.per_member["second"]
+
+
+@pytest.mark.asyncio
+async def test_team_continuation_appends_terminal_only_consensus() -> None:
+    """Terminal team content remains visible when the provider emitted no content deltas."""
+    presentation = _TeamStreamPresentation.new([], [], show_tool_calls=True)
+    presentation.append_consensus("Before approval. ")
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        content="After approval.",
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield terminal
+
+    response = await _collect_team_continuation(events(), presentation)
+
+    assert response is terminal
+    assert "Before approval. After approval." in presentation.render_body()
+
+
+@pytest.mark.asyncio
+async def test_hidden_team_continuation_separates_text_across_the_tool_boundary() -> None:
+    """Hidden team approval tools must not concatenate prose across continuation."""
+    prior = _TeamStreamPresentation.new([], [], show_tool_calls=False)
+    prior.append_consensus("Before approval.")
+    prior.start_tool(
+        "team",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}),
+    )
+    presentation = _TeamStreamPresentation.restore(
+        config_names=[],
+        show_tool_calls=False,
+        state=prior.to_state(),
+        tool_trace=prior.tool_trace,
+        prior_response_text=prior.render_body(),
+    )
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        content="After approval.",
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield terminal
+
+    await _collect_team_continuation(events(), presentation)
+
+    assert "Before approval.\n\nAfter approval." in presentation.render_body()
+
+
+@pytest.mark.asyncio
+async def test_hidden_team_continuation_separates_text_across_a_new_tool_boundary() -> None:
+    """A hidden team tool started after restoration must separate later prose."""
+    presentation = _TeamStreamPresentation.new([], [], show_tool_calls=False)
+    presentation.append_consensus("Before tool.")
+    tool = ToolExecution(tool_call_id="call-2", tool_name="inspect", result="done")
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        content="After tool.",
+        tools=[tool],
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield TeamToolCallStartedEvent(
+            tool=ToolExecution(tool_call_id="call-2", tool_name="inspect", tool_args={}),
+        )
+        yield TeamToolCallCompletedEvent(tool=tool)
+        yield terminal
+
+    await _collect_team_continuation(events(), presentation)
+
+    assert "Before tool.\n\nAfter tool." in presentation.render_body()
+
+
+def test_hidden_team_separator_state_survives_a_chained_pause_in_another_scope() -> None:
+    """A chained pause must preserve hidden boundaries for every member slot."""
+    prior = _TeamStreamPresentation.new(
+        ["first", "second"],
+        ["First", "Second"],
+        show_tool_calls=False,
+    )
+    prior.append_member("first", "Before tool.")
+    prior.start_member_tool(
+        "first",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}),
+    )
+    prior.complete_member_tool(
+        "first",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done"),
+    )
+    prior.append_member("second", "Waiting.")
+    prior.start_member_tool(
+        "second",
+        ToolExecution(tool_call_id="call-2", tool_name="approve", tool_args={}),
+    )
+
+    restored = _TeamStreamPresentation.restore(
+        config_names=["first", "second"],
+        show_tool_calls=False,
+        state=prior.to_state(),
+        tool_trace=prior.tool_trace,
+        prior_response_text=prior.render_body(),
+    )
+    restored.append_member("first", "After tool.")
+
+    assert "Before tool.\n\nAfter tool." in restored.render_body()
+
+
+@pytest.mark.asyncio
+async def test_team_continuation_reuses_an_existing_visible_tool_separator() -> None:
+    """A restored team marker suffix must not become two blank paragraphs."""
+    prior = _TeamStreamPresentation.new([], [], show_tool_calls=True)
+    prior.append_consensus("Before approval.")
+    prior.start_tool(
+        "team",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}),
+    )
+    presentation = _TeamStreamPresentation.restore(
+        config_names=[],
+        show_tool_calls=True,
+        state=prior.to_state(),
+        tool_trace=prior.tool_trace,
+        prior_response_text=prior.render_body(),
+    )
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        content="After approval.",
+        tools=[ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done")],
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield terminal
+
+    await _collect_team_continuation(events(), presentation)
+
+    assert "Before approval.\n\n🔧 `inspect` [1]\n\nAfter approval." in presentation.render_body()
+
+
+@pytest.mark.asyncio
+async def test_team_continuation_falls_back_per_unstreamed_slot() -> None:
+    """A streamed member delta must not suppress terminal-only team consensus."""
+    presentation = _TeamStreamPresentation.new(["general"], ["GeneralAgent"], show_tool_calls=True)
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        content="Consensus delta.",
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="Member delta.")
+        yield terminal
+
+    await _collect_team_continuation(events(), presentation)
+
+    body = presentation.render_body()
+    assert "**GeneralAgent**: Member delta." in body
+    assert "**Team Consensus**:\n\nConsensus delta." in body
+
+
+@pytest.mark.asyncio
+async def test_team_continuation_completes_terminal_only_member_tool_in_its_slot() -> None:
+    """A terminal member result must complete the pending marker owned by that member."""
+    presentation = _TeamStreamPresentation.new(["general"], ["GeneralAgent"], show_tool_calls=True)
+    presentation.start_member_tool(
+        "general",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={}),
+    )
+    terminal = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.completed,
+        member_responses=[
+            RunOutput(
+                agent_id="general",
+                agent_name="GeneralAgent",
+                tools=[ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done")],
+            ),
+        ],
+    )
+
+    async def events() -> AsyncIterator[object]:
+        yield terminal
+
+    await _collect_team_continuation(events(), presentation)
+
+    assert presentation.tool_trace[0].type == "tool_call_completed"
+    assert presentation.tool_trace[0].scope_key == "agent:general"
+    assert "🔧 `inspect` [1] ⏳" not in presentation.per_member["general"]
+    assert "🔧 `inspect` [1]" in presentation.per_member["general"]
+
+
+def test_blocking_team_pause_uses_the_structured_member_slot() -> None:
+    """A blocking pause must reach approval with its pending marker already anchored."""
+    tool = ToolExecution(tool_call_id="call-1", tool_name="inspect", requires_confirmation=True)
+    requirement = RunRequirement(tool_execution=tool)
+    requirement.member_agent_id = "general"
+    requirement.member_agent_name = "GeneralAgent"
+    response = TeamRunOutput(
+        content="Consensus before approval.",
+        tools=[tool],
+        member_responses=[RunOutput(agent_id="general", agent_name="GeneralAgent", content="Member answer.")],
+        status=RunStatus.paused,
+    )
+
+    paused = _attach_team_pause_presentation(
+        PausedAttempt(
+            session_id="session-1",
+            run_id="run-1",
+            tools=(tool,),
+            requirements=(requirement,),
+        ),
+        response=response,
+        config_names=["general"],
+        display_names=["GeneralAgent"],
+        show_tool_calls=True,
+    )
+
+    restored = _TeamStreamPresentation.restore(
+        config_names=["general"],
+        show_tool_calls=True,
+        state=paused.response_presentation_state,
+        tool_trace=paused.tool_trace,
+        prior_response_text=paused.response_text,
+    )
+    assert "Member answer." in restored.per_member["general"]
+    assert "🔧 `inspect` [1] ⏳" in restored.per_member["general"]
+    assert restored.consensus == "Consensus before approval."
+    assert restored.tool_trace[0].tool_call_id == "call-1"
+
+
+def test_blocking_team_pause_renders_a_marker_only_member_tool_on_its_own_line() -> None:
+    """A member label must not consume the standalone marker line used for ordering."""
+    tool = ToolExecution(tool_call_id="call-1", tool_name="inspect", requires_confirmation=True)
+    requirement = RunRequirement(tool_execution=tool)
+    requirement.member_agent_id = "general"
+    requirement.member_agent_name = "GeneralAgent"
+
+    paused = _attach_team_pause_presentation(
+        PausedAttempt(
+            session_id="session-1",
+            run_id="run-1",
+            tools=(tool,),
+            requirements=(requirement,),
+        ),
+        response=TeamRunOutput(tools=[tool], status=RunStatus.paused),
+        config_names=["general"],
+        display_names=["GeneralAgent"],
+        show_tool_calls=True,
+    )
+
+    assert "**GeneralAgent**:\n\n🔧 `inspect` [1] ⏳" in paused.response_text
+    require_ordered_pause_presentation(paused, show_tool_calls=True)
+
+
+def test_blocking_team_pause_maps_provider_member_id_to_raw_config_name() -> None:
+    """Agno's URL-safe requirement identity must retain the authored approval owner."""
+    tool = ToolExecution(tool_call_id="call-1", tool_name="inspect", requires_confirmation=True)
+    requirement = RunRequirement(tool_execution=tool)
+    requirement.member_agent_id = "code-review"
+    requirement.member_agent_name = "Code Review"
+
+    paused = _attach_team_pause_presentation(
+        PausedAttempt(
+            session_id="session-1",
+            run_id="run-1",
+            tools=(tool,),
+            requirements=(requirement,),
+        ),
+        response=TeamRunOutput(
+            tools=[tool],
+            member_responses=[RunOutput(agent_id="Code_Review", agent_name="Code Review")],
+            status=RunStatus.paused,
+        ),
+        config_names=["Code_Review"],
+        display_names=["Code Review"],
+        show_tool_calls=True,
+    )
+
+    assert paused.tool_trace[0].scope_key == "agent:code-review"
+    assert paused.response_presentation_state["members"] == [
+        {
+            "id": "code-review",
+            "config_name": "Code_Review",
+            "display_name": "Code Review",
+            "content": "\n\n🔧 `inspect` [1] ⏳\n\n",
+        },
+    ]
+
+
+def test_blocking_team_pause_scopes_reused_call_ids_to_distinct_members() -> None:
+    """A completed member tool must not collide with another member's pending call ID."""
+    completed = ToolExecution(tool_call_id="call-1", tool_name="inspect", result="done")
+    pending = ToolExecution(
+        tool_call_id="call-1",
+        tool_name="inspect",
+        requires_confirmation=True,
+    )
+    requirement = RunRequirement(tool_execution=pending)
+    requirement.member_agent_id = "second"
+    requirement.member_agent_name = "SecondAgent"
+    response = TeamRunOutput(
+        tools=[pending],
+        member_responses=[
+            RunOutput(agent_id="first", agent_name="FirstAgent", tools=[completed]),
+            RunOutput(agent_id="second", agent_name="SecondAgent", content="Waiting."),
+        ],
+        status=RunStatus.paused,
+    )
+
+    paused = _attach_team_pause_presentation(
+        PausedAttempt(
+            session_id="session-1",
+            run_id="run-1",
+            tools=(pending,),
+            requirements=(requirement,),
+        ),
+        response=response,
+        config_names=["first", "second"],
+        display_names=["FirstAgent", "SecondAgent"],
+        show_tool_calls=True,
+    )
+
+    restored = _TeamStreamPresentation.restore(
+        config_names=["first", "second"],
+        show_tool_calls=True,
+        state=paused.response_presentation_state,
+        tool_trace=paused.tool_trace,
+        prior_response_text=paused.response_text,
+    )
+    assert [(entry.scope_key, entry.type) for entry in restored.tool_trace] == [
+        ("agent:first", "tool_call_completed"),
+        ("agent:second", "tool_call_started"),
+    ]
+    assert "🔧 `inspect` [1]" in restored.per_member["first"]
+    assert "🔧 `inspect` [2] ⏳" in restored.per_member["second"]
 
 
 def _make_test_agent(name: str) -> AgnoAgent:
@@ -139,23 +630,87 @@ def _prepared_team_execution_context(
     )
 
 
-def _queued_notice_message() -> Message:
+def _queued_notice_message(response_turn_id: str) -> Message:
     return Message(
         role="user",
         content=QUEUED_MESSAGE_NOTICE_TEXT,
-        provider_data={"mindroom_queued_message_notice": True},
+        provider_data={
+            _QUEUED_NOTICE_MARKER_KEY: True,
+            _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: response_turn_id,
+        },
     )
 
 
-def _has_queued_notice(messages: list[Message] | None) -> bool:
+def _has_live_queued_notice(messages: list[Message] | None, *, response_turn_id: str | None = None) -> bool:
     return any(
-        (
-            isinstance(message.provider_data, dict)
-            and message.provider_data.get("mindroom_queued_message_notice") is True
+        isinstance(message.provider_data, dict)
+        and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) is True
+        and (
+            response_turn_id is None
+            or message.provider_data.get(_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY) == response_turn_id
         )
-        or message.content == QUEUED_MESSAGE_NOTICE_TEXT
         for message in messages or []
     )
+
+
+def _has_persisted_queued_notice(
+    messages: list[Message] | None,
+    *,
+    response_turn_id: str | None = None,
+    notice_text: str = QUEUED_MESSAGE_NOTICE_TEXT,
+) -> bool:
+    return any(
+        isinstance(message.provider_data, dict)
+        and message.provider_data.get(_QUEUED_NOTICE_MARKER_KEY) == "persisted"
+        and (
+            response_turn_id is None
+            or message.provider_data.get(_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY) == response_turn_id
+        )
+        and message.content == notice_text
+        for message in messages or []
+    )
+
+
+class _PendingQueuedMessageState:
+    def has_pending_human_messages(self) -> bool:
+        return True
+
+
+def _assert_retry_notice_not_relocated(
+    *,
+    agent: AgnoAgent,
+    session_id: str,
+    runtime_paths: RuntimePaths,
+    config: Config,
+    response_turn_id: str,
+    team_name: str | None = None,
+    check_compaction: bool = False,
+) -> None:
+    with open_bound_scope_session_context(
+        agents=[agent],
+        session_id=session_id,
+        runtime_paths=runtime_paths,
+        config=config,
+        execution_identity=None,
+        team_name=team_name,
+    ) as scope_context:
+        assert scope_context is not None
+        assert scope_context.session is not None
+        errored_run, completed_run = scope_context.session.runs or []
+        assert not _has_live_queued_notice(errored_run.messages)
+        assert not _has_persisted_queued_notice(errored_run.messages)
+        assert not _has_persisted_queued_notice(
+            completed_run.messages,
+            response_turn_id=response_turn_id,
+        )
+        if check_compaction:
+            assert QUEUED_MESSAGE_NOTICE_TEXT not in {
+                message.content
+                for message in _compaction_replay_messages(
+                    errored_run,
+                    config.resolve_entity(None).history_settings,
+                )
+            }
 
 
 def _team_turn_recorder(message: str) -> TurnRecorder:
@@ -225,6 +780,305 @@ def test_materialize_exact_requested_team_members_short_circuits_missing_live_me
     assert team_members.materialized_agent_names == set()
     assert team_members.failed_agent_names == ["research"]
     build_member.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_paused_team_scope_open_failure_closes_materialized_member_databases() -> None:
+    """A scope __enter__ failure must still release every newly materialized member DB."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    agent = _make_test_agent("GeneralAgent")
+    members = ResolvedExactTeamMembers(
+        requested_agent_names=["general"],
+        agents=[agent],
+        display_names=["GeneralAgent"],
+        materialized_agent_names={"general"},
+        failed_agent_names=[],
+    )
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@user:localhost",
+        room_id="!room:localhost",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-1",
+    )
+
+    class ThrowingScope:
+        def __enter__(self) -> None:
+            msg = "scope open failed"
+            raise RuntimeError(msg)
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    with (
+        patch("mindroom.teams.materialize_exact_team_members", return_value=members),
+        patch("mindroom.teams.install_approval_receipt_hooks") as install_receipt,
+        patch("mindroom.teams.open_bound_scope_session_context", return_value=ThrowingScope()),
+        patch("mindroom.teams.close_team_runtime_state_dbs") as close_dbs,
+        pytest.raises(RuntimeError, match="scope open failed"),
+    ):
+        await continue_paused_team_run(
+            member_names=("general",),
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=identity,
+            session_id="session-1",
+            run_id="run-1",
+            user_id="@user:localhost",
+            configured_team_name="research",
+            model_name="default",
+            decisions={"call-1": True},
+            denial_reasons={"call-1": None},
+            refresh_scheduler=None,
+        )
+
+    close_dbs.assert_called_once_with(
+        agents=[agent],
+        team_db=None,
+        shared_scope_storage=None,
+    )
+    install_receipt.assert_called_once_with(agent.model, agent.fallback_config)
+
+
+@pytest.mark.parametrize(("approved", "reason"), [(True, None), (False, "too dangerous")])
+@pytest.mark.asyncio
+async def test_team_continuation_executes_real_agno_confirmation(
+    tmp_path: Path,
+    approved: bool,
+    reason: str | None,
+) -> None:
+    """Exercise the real persisted Agno team pause and continuation spine."""
+    executed: list[list[str]] = []
+    observed_metadata: list[dict[str, object] | None] = []
+    original_metadata = {
+        "room_id": "!room:localhost",
+        "thread_id": "$thread",
+        "correlation_id": "team-approval-metadata",
+    }
+
+    def run_shell_command(args: list[str], run_context: RunContext) -> str:
+        executed.append(args)
+        observed_metadata.append(run_context.metadata)
+        return "ok"
+
+    team = AgnoTeam(
+        id="research",
+        name="Research",
+        members=[],
+        model=SyntheticModel(
+            id="synthetic",
+            seed=1,
+            min_response_chars=20,
+            max_response_chars=20,
+            chars_per_second=0,
+            tool_call_probability=1,
+        ),
+        tools=[
+            Function(
+                name="run_shell_command",
+                entrypoint=run_shell_command,
+                requires_confirmation=True,
+            ),
+        ],
+        db=SqliteDb(db_file=str(tmp_path / "team-continuation.db"), session_table="sessions"),
+    )
+    paused = await team.arun(
+        "exercise the tool",
+        session_id="session-1",
+        user_id="@user:localhost",
+        metadata=original_metadata,
+        stream=False,
+    )
+    continue_run = MagicMock(wraps=team.acontinue_run)
+    requirement = (paused.requirements or [])[0]
+    assert requirement.tool_execution is not None
+    tool_call_id = requirement.tool_execution.tool_call_id
+    assert tool_call_id is not None
+    prior = _TeamStreamPresentation.new([], [], show_tool_calls=True)
+    prior.append_consensus("Before approval.")
+    prior.start_tool(
+        "team",
+        ToolExecution(
+            tool_call_id=tool_call_id,
+            tool_name=requirement.tool_execution.tool_name,
+            tool_args=requirement.tool_execution.tool_args,
+        ),
+    )
+    collected_trace = []
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    members = ResolvedExactTeamMembers(
+        requested_agent_names=[],
+        agents=[],
+        display_names=[],
+        materialized_agent_names=set(),
+        failed_agent_names=[],
+    )
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="research",
+        requester_id="@user:localhost",
+        room_id="!room:localhost",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-1",
+    )
+    persisted_scope = HistoryScope(kind="team", scope_id="ad_hoc_original_scope")
+    storage_factory = MagicMock()
+    scope_context = SimpleNamespace(storage=None, storage_factory=storage_factory)
+
+    with (
+        patch("mindroom.teams.materialize_exact_team_members", return_value=members),
+        patch(
+            "mindroom.teams.open_bound_scope_session_context",
+            return_value=nullcontext(scope_context),
+        ) as open_scope,
+        patch("mindroom.teams.build_materialized_team_instance", return_value=team),
+        patch.object(team, "acontinue_run", new=continue_run),
+        patch("mindroom.teams.close_team_runtime_state_dbs"),
+        patch("mindroom.teams.ai_runtime.register_queued_notice_storage") as register_notice,
+        approval_receipt_context("trusted approval receipt"),
+    ):
+        result = await continue_paused_team_run(
+            member_names=(),
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=identity,
+            session_id="session-1",
+            run_id=paused.run_id,
+            user_id="@user:localhost",
+            configured_team_name="research",
+            model_name="default",
+            decisions={tool_call_id: approved},
+            denial_reasons={tool_call_id: reason},
+            refresh_scheduler=None,
+            history_scope=persisted_scope,
+            prior_response_text=prior.render_body(),
+            prior_tool_trace=prior.tool_trace,
+            prior_presentation_state=prior.to_state(),
+            show_tool_calls=True,
+            tool_trace_collector=collected_trace,
+        )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert AI_RUN_METADATA_KEY in result.metadata_content
+    assert bool(executed) is approved
+    assert observed_metadata == ([original_metadata] if approved else [])
+    continued_requirement = continue_run.call_args.kwargs["requirements"][0]
+    assert continue_run.call_args.kwargs["metadata"] == original_metadata
+    assert continue_run.call_args.kwargs["metadata"] is not paused.metadata
+    assert continue_run.call_args.kwargs["stream"] is True
+    assert continue_run.call_args.kwargs["stream_events"] is True
+    assert continue_run.call_args.kwargs["yield_run_output"] is True
+    assert continued_requirement.tool_execution is not None
+    assert continued_requirement.tool_execution.confirmed is approved
+    assert continued_requirement.tool_execution.confirmation_note == (None if approved else reason)
+    assert open_scope.call_args.kwargs["scope"] == persisted_scope
+    assert result.response_text.index("Before approval.") < result.response_text.index("🔧 `run_shell_command` [1]")
+    assert collected_trace[0].tool_call_id == tool_call_id
+    assert collected_trace[0].type == "tool_call_completed"
+    register_notice.assert_called_once_with(
+        storage_factory=storage_factory,
+        session_id="session-1",
+        session_type=SessionType.TEAM,
+        entity_name="research",
+    )
+
+
+@pytest.mark.parametrize(
+    ("persisted_call_ids", "decision_call_ids"),
+    [
+        pytest.param((None,), ("call-1",), id="missing"),
+        pytest.param(("call-1", "call-1"), ("call-1",), id="duplicate"),
+        pytest.param(("call-1",), ("call-1", "call-extra"), id="extra"),
+        pytest.param(("call-new",), ("call-stale",), id="stale"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_team_continuation_rejects_non_exact_persisted_call_ids(
+    persisted_call_ids: tuple[str | None, ...],
+    decision_call_ids: tuple[str, ...],
+) -> None:
+    """A malformed persisted team pause must never reach Agno continuation execution."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    requirements = [
+        RunRequirement(
+            ToolExecution(
+                tool_call_id=call_id,
+                tool_name="dangerous",
+                requires_confirmation=True,
+            ),
+        )
+        for call_id in persisted_call_ids
+    ]
+    persisted = TeamRunOutput(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.paused,
+        requirements=requirements,
+    )
+    team = MagicMock()
+    team.db = None
+    team.aget_session = AsyncMock(return_value=SimpleNamespace(get_run=lambda _run_id: persisted))
+    team.acontinue_run = AsyncMock(
+        return_value=TeamRunOutput(
+            run_id="run-1",
+            session_id="session-1",
+            status=RunStatus.completed,
+        ),
+    )
+    members = ResolvedExactTeamMembers(
+        requested_agent_names=[],
+        agents=[],
+        display_names=[],
+        materialized_agent_names=set(),
+        failed_agent_names=[],
+    )
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="research",
+        requester_id="@user:localhost",
+        room_id="!room:localhost",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="session-1",
+    )
+    decisions = dict.fromkeys(decision_call_ids, True)
+    denial_reasons = dict.fromkeys(decision_call_ids)
+
+    with (
+        patch("mindroom.teams.materialize_exact_team_members", return_value=members),
+        patch(
+            "mindroom.teams.open_bound_scope_session_context",
+            return_value=nullcontext(SimpleNamespace(storage=None, storage_factory=None)),
+        ),
+        patch("mindroom.teams.build_materialized_team_instance", return_value=team),
+        patch("mindroom.teams.close_team_runtime_state_dbs"),
+        pytest.raises(RuntimeError, match="no longer match the approval continuation"),
+    ):
+        await continue_paused_team_run(
+            member_names=(),
+            mode=TeamMode.COORDINATE,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=identity,
+            session_id="session-1",
+            run_id="run-1",
+            user_id="@user:localhost",
+            configured_team_name="research",
+            model_name="default",
+            decisions=decisions,
+            denial_reasons=denial_reasons,
+            refresh_scheduler=None,
+        )
+
+    team.acontinue_run.assert_not_awaited()
 
 
 def test_materialize_exact_team_members_closes_partial_agents_on_failure() -> None:
@@ -546,8 +1400,8 @@ async def test_team_generic_invalid_request_retry_failure_does_not_teach() -> No
 
 
 @pytest.mark.asyncio
-async def test_team_response_retry_scrubs_queued_notice_before_second_attempt() -> None:
-    """Non-stream retries should scrub queued notices from the loaded team session before retrying."""
+async def test_team_response_retry_does_not_relocate_failed_attempt_notice() -> None:
+    """Non-stream retries should not copy a failed attempt's notice into the successful run."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
     orchestrator = MagicMock()
@@ -598,13 +1452,20 @@ async def test_team_response_retry_scrubs_queued_notice_before_second_attempt() 
                 team_name="General Team",
                 session_id="session-retry-clean",
                 content="Error code: 500 - audio input is not supported",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(notice_context.response_turn_id)],
                 status=RunStatus.error,
             )
             _cleanup_and_store(mock_team, errored_output, prepared_scope_context.session)
             return errored_output
-        assert not any(_has_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
-        return TeamRunOutput(
+        assert any(
+            _has_live_queued_notice(
+                run.messages,
+                response_turn_id=notice_context.response_turn_id,
+            )
+            for run in prepared_scope_context.session.runs or []
+        )
+        assert not any(_has_persisted_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
+        completed_output = TeamRunOutput(
             run_id="run-2",
             team_id=team_id,
             team_name="General Team",
@@ -612,31 +1473,44 @@ async def test_team_response_retry_scrubs_queued_notice_before_second_attempt() 
             content="Recovered team response",
             status=RunStatus.completed,
         )
+        _cleanup_and_store(mock_team, completed_output, prepared_scope_context.session)
+        return completed_output
 
     mock_team.arun = AsyncMock(side_effect=fake_arun)
 
-    with (
-        patch("mindroom.teams.create_agent", return_value=fake_agent),
-        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
-        patch("mindroom.teams._create_team_instance", return_value=mock_team),
-        patch(
-            "mindroom.execution_preparation._prepare_bound_team_execution_context",
-            new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
-        ),
-    ):
-        response = await team_response(
-            agent_names=["general"],
-            mode=TeamMode.COORDINATE,
-            message="Analyze this.",
-            turn_recorder=_team_turn_recorder("Analyze this."),
-            orchestrator=orchestrator,
-            execution_identity=None,
-            ctx=make_turn_context(session_id="session-retry-clean"),
-            media=MediaInputs(audio=[MagicMock(name="audio_input")]),
-        )
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        notice_context.notice_fired = True
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.execution_preparation._prepare_bound_team_execution_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+        ):
+            response = await team_response(
+                agent_names=["general"],
+                mode=TeamMode.COORDINATE,
+                message="Analyze this.",
+                turn_recorder=_team_turn_recorder("Analyze this."),
+                orchestrator=orchestrator,
+                execution_identity=None,
+                ctx=make_turn_context(session_id="session-retry-clean"),
+                media=MediaInputs(audio=[MagicMock(name="audio_input")]),
+            )
+        await finalize_queued_notice_response_turn_async(notice_context)
 
     assert attempts == 2
     assert "Recovered team response" in response
+    _assert_retry_notice_not_relocated(
+        agent=fake_agent,
+        session_id="session-retry-clean",
+        runtime_paths=runtime_paths,
+        config=config,
+        response_turn_id=notice_context.response_turn_id,
+        check_compaction=True,
+    )
 
 
 @pytest.mark.asyncio
@@ -657,7 +1531,7 @@ async def test_team_response_fallback_run_output_cleans_queued_notice_before_for
         content=None,
         messages=[
             Message(role="assistant", content="Recovered team response"),
-            _queued_notice_message(),
+            _queued_notice_message("fallback-response"),
         ],
         status=RunStatus.completed,
     )
@@ -873,8 +1747,8 @@ async def test_team_response_preserves_unseen_matrix_thread_context_with_persist
 
 
 @pytest.mark.asyncio
-async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run() -> None:
-    """Team runs should not replay or persist hidden queued-message notices."""
+async def test_team_response_recovers_prior_notice_and_finalizes_current_notice() -> None:
+    """Team runs should recover prior facts and finalize current notice state at the response boundary."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
     orchestrator = MagicMock()
@@ -882,6 +1756,7 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
     orchestrator.runtime_paths = runtime_paths
     orchestrator.knowledge_managers = {}
     orchestrator.agent_bots = {"general": MagicMock()}
+    prior_response_id = "prior-response"
 
     fake_agent = _make_test_agent("GeneralAgent")
     with open_bound_scope_session_context(
@@ -906,7 +1781,7 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
                 team_id=scope_context.session.team_id,
                 team_name="General Team",
                 session_id="session-queued",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(prior_response_id)],
                 status=RunStatus.completed,
             ),
             scope_context.session,
@@ -928,7 +1803,7 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
                 team_name="General Team",
                 session_id="session-queued",
                 content="Recovered team response",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(notice_context.response_turn_id)],
                 status=RunStatus.completed,
             ),
             prepared_scope_context.session,
@@ -939,7 +1814,7 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
             team_name="General Team",
             session_id="session-queued",
             content="Recovered team response",
-            messages=[_queued_notice_message()],
+            messages=[_queued_notice_message(notice_context.response_turn_id)],
             status=RunStatus.completed,
         )
 
@@ -954,27 +1829,40 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
         assert scope_context is not None
         assert scope_context.session is not None
         prepared_scope_context = scope_context
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert (
+            sum(
+                _has_persisted_queued_notice(
+                    run.messages,
+                    response_turn_id=prior_response_id,
+                )
+                for run in scope_context.session.runs or []
+            )
+            == 1
+        )
         return _prepared_team_execution_context(final_prompt="Analyze this.")
 
-    with (
-        patch("mindroom.teams.create_agent", return_value=fake_agent),
-        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
-        patch("mindroom.teams._create_team_instance", return_value=mock_team),
-        patch(
-            "mindroom.execution_preparation._prepare_bound_team_execution_context",
-            new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
-        ),
-    ):
-        response = await team_response(
-            agent_names=["general"],
-            mode=TeamMode.COORDINATE,
-            message="Analyze this.",
-            turn_recorder=_team_turn_recorder("Analyze this."),
-            orchestrator=orchestrator,
-            execution_identity=None,
-            ctx=make_turn_context(session_id="session-queued"),
-        )
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        notice_context.notice_fired = True
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.execution_preparation._prepare_bound_team_execution_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+        ):
+            response = await team_response(
+                agent_names=["general"],
+                mode=TeamMode.COORDINATE,
+                message="Analyze this.",
+                turn_recorder=_team_turn_recorder("Analyze this."),
+                orchestrator=orchestrator,
+                execution_identity=None,
+                ctx=make_turn_context(session_id="session-queued"),
+            )
+        await finalize_queued_notice_response_turn_async(notice_context)
 
     assert "Recovered team response" in response
     with open_bound_scope_session_context(
@@ -986,15 +1874,33 @@ async def test_team_response_scrubs_queued_notices_before_prepare_and_after_run(
     ) as scope_context:
         assert scope_context is not None
         assert scope_context.session is not None
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert (
+            sum(
+                _has_persisted_queued_notice(run.messages, response_turn_id=prior_response_id)
+                for run in scope_context.session.runs or []
+            )
+            == 1
+        )
+        assert (
+            sum(
+                _has_persisted_queued_notice(
+                    run.messages,
+                    response_turn_id=notice_context.response_turn_id,
+                )
+                for run in scope_context.session.runs or []
+            )
+            == 1
+        )
 
 
 @pytest.mark.asyncio
-async def test_prepare_materialized_team_execution_scrubs_queued_notices_when_called_directly() -> None:
-    """Shared team preparation should scrub loaded queued notices even outside team_response helpers."""
+async def test_prepare_materialized_team_execution_recovers_queued_notice_when_called_directly() -> None:
+    """Shared team preparation should persist prior live notices outside response helpers."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
     fake_agent = _make_test_agent("GeneralAgent")
+    prior_response_id = "prior-direct-response"
 
     with open_bound_scope_session_context(
         agents=[fake_agent],
@@ -1015,7 +1921,7 @@ async def test_prepare_materialized_team_execution_scrubs_queued_notices_when_ca
                 team_id=scope_context.session.team_id,
                 team_name="General Team",
                 session_id="session-helper-scrub",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(prior_response_id)],
                 status=RunStatus.completed,
             ),
             scope_context.session,
@@ -1039,7 +1945,17 @@ async def test_prepare_materialized_team_execution_scrubs_queued_notices_when_ca
             prepared_scope_context = kwargs["scope_context"]
             assert prepared_scope_context is not None
             assert prepared_scope_context.session is not None
-            assert not any(_has_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
+            assert not any(_has_live_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
+            assert (
+                sum(
+                    _has_persisted_queued_notice(
+                        run.messages,
+                        response_turn_id=prior_response_id,
+                    )
+                    for run in prepared_scope_context.session.runs or []
+                )
+                == 1
+            )
             return _prepared_team_execution_context(final_prompt="Analyze this.")
 
         with patch(
@@ -1256,14 +2172,14 @@ async def test_prepare_bound_team_execution_context_uses_team_renderer_for_trimm
     assert tuple((message.role, message.content) for message in prepared.messages) == (
         (
             "assistant",
-            "Previous team reply",
+            "\n\nPrevious team reply",
         ),
         ("user", "Analyze this."),
     )
     assert captured_prompts == [
         ("Analyze this.", None),
         ("Analyze this.", None),
-        ("assistant: Previous team reply\n\nAnalyze this.", None),
+        ("assistant: \n\nPrevious team reply\n\nAnalyze this.", None),
     ]
 
 
@@ -1314,8 +2230,8 @@ async def test_prepare_bound_team_execution_context_truncates_long_fallback_mess
 
 
 @pytest.mark.asyncio
-async def test_team_response_scrubs_queued_notices_after_run_exception() -> None:
-    """Failed team runs should still remove hidden queued-message notices from history."""
+async def test_team_response_finalizes_notice_from_completed_run_before_exception() -> None:
+    """A completed stored run should retain the delivered notice when later handling fails."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
     orchestrator = MagicMock()
@@ -1354,7 +2270,7 @@ async def test_team_response_scrubs_queued_notices_after_run_exception() -> None
                 team_name="General Team",
                 session_id="session-queued-error",
                 content="intermediate response",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(notice_context.response_turn_id)],
                 status=RunStatus.completed,
             ),
             prepared_scope_context.session,
@@ -1372,27 +2288,31 @@ async def test_team_response_scrubs_queued_notices_after_run_exception() -> None
         assert scope_context is not None
         assert scope_context.session is not None
         prepared_scope_context = scope_context
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_persisted_queued_notice(run.messages) for run in scope_context.session.runs or [])
         return _prepared_team_execution_context(final_prompt="Analyze this.")
 
-    with (
-        patch("mindroom.teams.create_agent", return_value=fake_agent),
-        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
-        patch("mindroom.teams._create_team_instance", return_value=mock_team),
-        patch(
-            "mindroom.teams.prepare_bound_team_run_context",
-            new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
-        ),
-    ):
-        response = await team_response(
-            agent_names=["general"],
-            mode=TeamMode.COORDINATE,
-            message="Analyze this.",
-            orchestrator=orchestrator,
-            execution_identity=None,
-            ctx=make_turn_context(session_id="session-queued-error"),
-            turn_recorder=_team_turn_recorder("Analyze this."),
-        )
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        notice_context.notice_fired = True
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.teams.prepare_bound_team_run_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+        ):
+            response = await team_response(
+                agent_names=["general"],
+                mode=TeamMode.COORDINATE,
+                message="Analyze this.",
+                orchestrator=orchestrator,
+                execution_identity=None,
+                ctx=make_turn_context(session_id="session-queued-error"),
+                turn_recorder=_team_turn_recorder("Analyze this."),
+            )
+        await finalize_queued_notice_response_turn_async(notice_context)
 
     assert "boom" in response
     with open_bound_scope_session_context(
@@ -1404,12 +2324,19 @@ async def test_team_response_scrubs_queued_notices_after_run_exception() -> None
     ) as scope_context:
         assert scope_context is not None
         assert scope_context.session is not None
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert any(
+            _has_persisted_queued_notice(
+                run.messages,
+                response_turn_id=notice_context.response_turn_id,
+            )
+            for run in scope_context.session.runs or []
+        )
 
 
 @pytest.mark.asyncio
-async def test_team_response_stream_scrubs_queued_notices_after_stream_exception() -> None:
-    """Streaming team failures should still scrub hidden queued-message notices."""
+async def test_team_response_stream_finalizes_notice_from_completed_run_before_exception() -> None:
+    """A completed streamed run should retain the delivered notice when later handling fails."""
     config = _build_test_config()
     runtime_paths = runtime_paths_for(config)
     orchestrator = MagicMock()
@@ -1436,7 +2363,7 @@ async def test_team_response_stream_scrubs_queued_notices_after_stream_exception
     mock_team = _make_test_team(name="General Team", team_id=team_id)
     boom_error = "boom"
 
-    async def failing_raw_stream() -> AsyncIterator[object]:
+    async def failing_raw_stream(run_id: str) -> AsyncIterator[object]:
         if False:
             yield None
         assert prepared_scope_context is not None
@@ -1445,12 +2372,12 @@ async def test_team_response_stream_scrubs_queued_notices_after_stream_exception
         _cleanup_and_store(
             mock_team,
             TeamRunOutput(
-                run_id="run-stream-error",
+                run_id=run_id,
                 team_id=team_id,
                 team_name="General Team",
                 session_id="session-stream-queued-error",
                 content="intermediate response",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(notice_context.response_turn_id)],
                 status=RunStatus.completed,
             ),
             prepared_scope_context.session,
@@ -1466,37 +2393,46 @@ async def test_team_response_stream_scrubs_queued_notices_after_stream_exception
         assert scope_context is not None
         assert scope_context.session is not None
         prepared_scope_context = scope_context
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_persisted_queued_notice(run.messages) for run in scope_context.session.runs or [])
         return _prepared_team_execution_context(final_prompt="Analyze this.")
 
-    async def fake_team_response_stream_raw(**_kwargs: object) -> AsyncIterator[object]:
-        return failing_raw_stream()
+    async def fake_team_response_stream_raw(**kwargs: object) -> AsyncIterator[object]:
+        run_id = kwargs["run_id"]
+        assert isinstance(run_id, str)
+        return failing_raw_stream(run_id)
 
-    with (
-        patch("mindroom.teams.create_agent", return_value=fake_agent),
-        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
-        patch("mindroom.teams._create_team_instance", return_value=mock_team),
-        patch(
-            "mindroom.teams.prepare_bound_team_run_context",
-            new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
-        ),
-        patch(
-            "mindroom.teams._team_response_stream_raw",
-            new=AsyncMock(side_effect=fake_team_response_stream_raw),
-        ),
-    ):
-        chunks = [
-            chunk
-            async for chunk in team_response_stream(
-                agent_ids=[entity_ids(config, runtime_paths)["general"]],
-                mode=TeamMode.COORDINATE,
-                message="Analyze this.",
-                orchestrator=orchestrator,
-                execution_identity=None,
-                ctx=make_turn_context(session_id="session-stream-queued-error"),
-                turn_recorder=_team_turn_recorder("Analyze this."),
-            )
-        ]
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        notice_context.notice_fired = True
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.teams.prepare_bound_team_run_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+            patch(
+                "mindroom.teams._team_response_stream_raw",
+                new=AsyncMock(side_effect=fake_team_response_stream_raw),
+            ),
+        ):
+            chunks = [
+                chunk
+                async for chunk in team_response_stream(
+                    agent_ids=[entity_ids(config, runtime_paths)["general"]],
+                    mode=TeamMode.COORDINATE,
+                    message="Analyze this.",
+                    orchestrator=orchestrator,
+                    execution_identity=None,
+                    ctx=make_turn_context(
+                        session_id="session-stream-queued-error",
+                        run_id="run-stream-error",
+                    ),
+                    turn_recorder=_team_turn_recorder("Analyze this."),
+                )
+            ]
+        await finalize_queued_notice_response_turn_async(notice_context)
 
     assert "boom" in "".join(chunk.content if hasattr(chunk, "content") else str(chunk) for chunk in chunks)
     with open_bound_scope_session_context(
@@ -1508,7 +2444,180 @@ async def test_team_response_stream_scrubs_queued_notices_after_stream_exception
     ) as scope_context:
         assert scope_context is not None
         assert scope_context.session is not None
-        assert not any(_has_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert not any(_has_live_queued_notice(run.messages) for run in scope_context.session.runs or [])
+        assert any(
+            _has_persisted_queued_notice(
+                run.messages,
+                response_turn_id=notice_context.response_turn_id,
+            )
+            for run in scope_context.session.runs or []
+        )
+
+
+@pytest.mark.asyncio
+async def test_team_response_stream_event_only_stop_after_finalizes_delivered_notice() -> None:  # noqa: PLR0915
+    """An event-only stop-after stream should retain the exact delivered notice."""
+    config = _build_test_config()
+    config.teams["super_team"] = TeamConfig(
+        display_name="Super Team",
+        role="Configured test team",
+        agents=["general"],
+    )
+    runtime_paths = runtime_paths_for(config)
+    orchestrator = MagicMock()
+    orchestrator.config = config
+    orchestrator.runtime_paths = runtime_paths
+    orchestrator.knowledge_managers = {}
+    orchestrator.agent_bots = {"general": MagicMock(running=True)}
+    session_id = "session-event-only-stop-after"
+    run_id = "run-event-only-stop-after"
+
+    fake_agent = _make_test_agent("GeneralAgent")
+    with open_bound_scope_session_context(
+        agents=[fake_agent],
+        session_id=session_id,
+        runtime_paths=runtime_paths,
+        config=config,
+        execution_identity=None,
+        team_name="super_team",
+        create_session_if_missing=True,
+    ) as scope_context:
+        assert scope_context is not None
+        assert scope_context.session is not None
+        scope_context.storage.upsert_session(scope_context.session)
+
+    mock_team = _make_test_team(name="General Team", team_id="super_team")
+    model = mock_team.model
+    assert model is not None
+    assert not isinstance(model, str)
+    notice_text = "Custom team queued notice."
+    install_queued_message_notice_hook(
+        model,
+        notice_text=notice_text,
+    )
+    prepared_scope_context = None
+
+    async def fake_prepare_bound_team_execution_context(
+        _ctx: object,
+        **kwargs: object,
+    ) -> _PreparedExecutionContext:
+        nonlocal prepared_scope_context
+        scope_context = kwargs["scope_context"]
+        assert scope_context is not None
+        assert scope_context.session is not None
+        prepared_scope_context = scope_context
+        return _prepared_team_execution_context(final_prompt="Analyze this.")
+
+    async def fake_stream_raw(**kwargs: object) -> AsyncIterator[object]:
+        current_run_id = kwargs["run_id"]
+        assert current_run_id == run_id
+        assert prepared_scope_context is not None
+        assert prepared_scope_context.session is not None
+        messages: list[Message] = []
+        model.format_function_call_results(
+            messages=messages,
+            function_call_results=[Message(role="tool", content="first result")],
+        )
+        assert _has_live_queued_notice(
+            messages,
+            response_turn_id=notice_context.response_turn_id,
+        )
+        stop_after_result = Message(
+            role="tool",
+            content="stop here",
+            stop_after_tool_call=True,
+        )
+        model.format_function_call_results(
+            messages=messages,
+            function_call_results=[stop_after_result],
+        )
+        assert [(message.role, message.content) for message in messages] == [
+            ("tool", "first result"),
+            ("user", notice_text),
+            ("tool", "stop here"),
+        ]
+
+        mock_team.db = prepared_scope_context.storage
+        _cleanup_and_store(
+            mock_team,
+            TeamRunOutput(
+                run_id=run_id,
+                team_id="super_team",
+                team_name="General Team",
+                session_id=session_id,
+                messages=messages,
+                status=RunStatus.completed,
+            ),
+            prepared_scope_context.session,
+        )
+        yield TeamToolCallCompletedEvent(
+            team_id="super_team",
+            run_id=run_id,
+            session_id=session_id,
+            tool=ToolExecution(
+                tool_call_id="stop-call",
+                tool_name="finish",
+                result="stop here",
+                stop_after_tool_call=True,
+            ),
+        )
+        yield TeamRunCompletedEvent(
+            team_id="super_team",
+            run_id=run_id,
+            session_id=session_id,
+        )
+
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.teams.prepare_bound_team_run_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+            patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+        ):
+            chunks = [
+                chunk
+                async for chunk in team_response_stream(
+                    agent_ids=[entity_ids(config, runtime_paths)["general"]],
+                    mode=TeamMode.COORDINATE,
+                    message="Analyze this.",
+                    orchestrator=orchestrator,
+                    execution_identity=None,
+                    ctx=make_turn_context(session_id=session_id, run_id=run_id),
+                    turn_recorder=_team_turn_recorder("Analyze this."),
+                    configured_team_name="super_team",
+                    show_tool_calls=False,
+                )
+            ]
+        await finalize_queued_notice_response_turn_async(notice_context)
+
+    assert notice_context.notice_fired
+    assert chunks == []
+    with open_bound_scope_session_context(
+        agents=[fake_agent],
+        session_id=session_id,
+        runtime_paths=runtime_paths,
+        config=config,
+        execution_identity=None,
+        team_name="super_team",
+    ) as scope_context:
+        assert scope_context is not None
+        assert scope_context.session is not None
+        run = (scope_context.session.runs or [])[0]
+        assert not _has_live_queued_notice(run.messages)
+        assert _has_persisted_queued_notice(
+            run.messages,
+            response_turn_id=notice_context.response_turn_id,
+            notice_text=notice_text,
+        )
+        assert [(message.role, message.content) for message in run.messages or []] == [
+            ("tool", "first result"),
+            ("user", notice_text),
+            ("tool", "stop here"),
+        ]
 
 
 @pytest.mark.asyncio
@@ -2134,6 +3243,78 @@ async def test_team_response_stream_raises_cancelled_error_for_team_run_cancelle
 
 
 @pytest.mark.asyncio
+async def test_team_response_stream_suspends_for_confirmation_pause_event() -> None:
+    """A streamed team confirmation pause must escape to the lifecycle suspension handler."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    orchestrator = MagicMock()
+    orchestrator.config = config
+    orchestrator.runtime_paths = runtime_paths
+    orchestrator.knowledge_managers = {}
+    orchestrator.agent_bots = {"general": MagicMock(running=True)}
+    team_members = ResolvedExactTeamMembers(
+        requested_agent_names=["general"],
+        agents=[],
+        display_names=["GeneralAgent"],
+        materialized_agent_names={"general"},
+        failed_agent_names=[],
+        model_names={"general": "large"},
+    )
+    tool = ToolExecution(
+        tool_call_id="call-team-stream-approval",
+        tool_name="dangerous",
+        tool_args={"value": 1},
+        requires_confirmation=True,
+    )
+
+    async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        yield TeamRunContentEvent(content="Before approval.")
+        yield TeamRunPausedEvent(
+            run_id="run-paused",
+            session_id="session-team",
+            content="Approval required",
+            tools=[tool],
+            requirements=[RunRequirement(tool)],
+        )
+
+    team_agent_ids = [
+        fixture_entity_matrix_id(
+            "general",
+            config.get_domain(runtime_paths),
+            runtime_paths,
+        ),
+    ]
+    with (
+        patch(
+            "mindroom.teams.resolve_agent_knowledge_access",
+            new=MagicMock(return_value=_KnowledgeResolution(knowledge=None)),
+        ),
+        patch("mindroom.teams._materialize_team_members", return_value=team_members),
+        patch("mindroom.teams._create_team_instance", return_value=_make_test_team()),
+        patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+        pytest.raises(ResponsePausedForApproval) as raised,
+    ):
+        async for _chunk in team_response_stream(
+            agent_ids=team_agent_ids,
+            message="Analyze this.",
+            turn_recorder=TurnRecorder(user_message="Analyze this."),
+            orchestrator=orchestrator,
+            execution_identity=None,
+            ctx=make_turn_context(run_id="run-paused", session_id="session-team"),
+            mode=TeamMode.COORDINATE,
+        ):
+            pass
+
+    assert raised.value.paused.run_id == "run-paused"
+    assert raised.value.paused.tools == (tool,)
+    assert raised.value.paused.team_member_model_names == (("general", "large"),)
+    assert "Before approval." in raised.value.paused.response_text
+    assert "🔧 `dangerous` [1] ⏳" in raised.value.paused.response_text
+    assert raised.value.paused.tool_trace[0].tool_call_id == "call-team-stream-approval"
+    assert raised.value.paused.response_presentation_state["kind"] == "team_stream"
+
+
+@pytest.mark.asyncio
 async def test_team_response_stream_records_hidden_interrupted_tool_state() -> None:
     """Streaming team cancellation should capture hidden completed tools in the lifecycle recorder."""
     config = _build_test_config()
@@ -2154,12 +3335,14 @@ async def test_team_response_stream_records_hidden_interrupted_tool_state() -> N
     )
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        yield AgentRunContentEvent(agent_name="GeneralAgent", content="Half done")
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="Half done")
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_name="run_shell_command", tool_args={"cmd": "pwd"}),
         )
         yield AgentToolCallCompletedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(
                 tool_name="run_shell_command",
@@ -2239,6 +3422,7 @@ async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_to
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(
                 tool_name="run_shell_command",
@@ -2247,6 +3431,7 @@ async def test_team_response_stream_marks_tool_call_timing_for_agent_and_team_to
             ),
         )
         yield AgentToolCallCompletedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(
                 tool_name="run_shell_command",
@@ -2401,7 +3586,7 @@ async def test_team_response_stream_records_interrupted_snapshot_after_external_
     recorder = TurnRecorder(user_message="Analyze this.")
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        yield AgentRunContentEvent(agent_name="GeneralAgent", content="Half done")
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="Half done")
         await asyncio.sleep(60)
 
     async def consume_stream() -> None:
@@ -2485,17 +3670,20 @@ async def test_team_response_stream_preserves_pending_tool_scope_for_same_named_
     )
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        yield AgentRunContentEvent(agent_name="GeneralAgent", content="General started")
-        yield AgentRunContentEvent(agent_name="ResearchAgent", content="Research started")
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="General started")
+        yield AgentRunContentEvent(agent_id="research", agent_name="ResearchAgent", content="Research started")
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_name="run_shell_command", tool_args={"cmd": "pwd"}),
         )
         yield AgentToolCallStartedEvent(
+            agent_id="research",
             agent_name="ResearchAgent",
             tool=ToolExecution(tool_name="run_shell_command", tool_args={"cmd": "ls"}),
         )
         yield AgentToolCallCompletedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(
                 tool_name="run_shell_command",
@@ -2576,16 +3764,19 @@ async def test_team_response_stream_preserves_pending_tool_identity_within_membe
     )
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        yield AgentRunContentEvent(agent_name="GeneralAgent", content="General started")
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="General started")
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_call_id="call-1", tool_name="run_shell_command", tool_args={"cmd": "pwd"}),
         )
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_call_id="call-2", tool_name="run_shell_command", tool_args={"cmd": "ls"}),
         )
         yield AgentToolCallCompletedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(
                 tool_call_id="call-1",
@@ -2673,6 +3864,7 @@ async def test_team_response_stream_does_not_retry_after_hidden_tool_progress_on
         nonlocal attempts
         attempts += 1
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_name="run_shell_command", tool_args={"cmd": "pwd"}),
         )
@@ -2741,6 +3933,7 @@ async def test_team_response_stream_does_not_retry_after_hidden_tool_progress_on
         nonlocal attempts
         attempts += 1
         yield AgentToolCallStartedEvent(
+            agent_id="general",
             agent_name="GeneralAgent",
             tool=ToolExecution(tool_name="run_shell_command", tool_args={"cmd": "pwd"}),
         )
@@ -2863,7 +4056,7 @@ async def test_team_response_stream_marks_successful_event_stream_completed() ->
     )
 
     async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
-        yield AgentRunContentEvent(agent_name="GeneralAgent", content="Member answer.")
+        yield AgentRunContentEvent(agent_id="general", agent_name="GeneralAgent", content="Member answer.")
         yield TeamRunContentEvent(content="Consensus answer.")
 
     team_agent_ids = [
@@ -2909,6 +4102,83 @@ async def test_team_response_stream_marks_successful_event_stream_completed() ->
 
 
 @pytest.mark.asyncio
+async def test_team_response_stream_keys_canonical_text_by_provider_member_id() -> None:
+    """A raw config name must not diverge from Agno's URL-safe stream identity."""
+    config = _build_test_config()
+    runtime_paths = runtime_paths_for(config)
+    orchestrator = MagicMock()
+    orchestrator.config = config
+    orchestrator.runtime_paths = runtime_paths
+    orchestrator.knowledge_managers = {}
+    orchestrator.agent_bots = {"Code_Review": MagicMock(running=True)}
+    team_members = ResolvedExactTeamMembers(
+        requested_agent_names=["Code_Review"],
+        agents=[],
+        display_names=["Code Review"],
+        materialized_agent_names={"Code_Review"},
+        failed_agent_names=[],
+    )
+    tool = ToolExecution(
+        tool_call_id="call-normalized",
+        tool_name="inspect",
+        requires_confirmation=True,
+    )
+    requirement = RunRequirement(tool)
+    requirement.member_agent_id = "code-review"
+    requirement.member_agent_name = "Code Review"
+
+    async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        yield AgentRunContentEvent(agent_id="code-review", agent_name="Code Review", content="Member answer.")
+        yield TeamRunPausedEvent(
+            run_id="run-normalized",
+            session_id="session-team-stream",
+            tools=[tool],
+            requirements=[requirement],
+        )
+
+    team_agent_ids = [
+        fixture_entity_matrix_id(
+            "general",
+            config.get_domain(runtime_paths),
+            runtime_paths,
+        ),
+    ]
+    recorder = TurnRecorder(user_message="Review this.")
+
+    with (
+        patch("mindroom.teams._materialize_team_members", return_value=team_members),
+        patch("mindroom.teams._create_team_instance", return_value=_make_test_team()),
+        patch(
+            "mindroom.teams.prepare_bound_team_run_context",
+            new=AsyncMock(return_value=_prepared_team_execution_context(final_prompt="Review this.")),
+        ),
+        patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+        pytest.raises(ResponsePausedForApproval) as raised,
+    ):
+        async for _chunk in team_response_stream(
+            agent_ids=team_agent_ids,
+            message="Review this.",
+            turn_recorder=recorder,
+            orchestrator=orchestrator,
+            execution_identity=None,
+            ctx=make_turn_context(session_id="session-team-stream", run_id="run-normalized"),
+            mode=TeamMode.COORDINATE,
+            show_tool_calls=False,
+        ):
+            pass
+
+    assert "**Code Review**: Member answer." in raised.value.paused.response_text
+    assert raised.value.paused.response_presentation_state["members"] == [
+        {
+            "id": "code-review",
+            "config_name": "Code_Review",
+            "display_name": "Code Review",
+            "content": "Member answer.",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_team_response_stream_emits_plain_run_output_fallback_with_team_formatting() -> None:
     """A completed plain RunOutput fallback should still use the normal team response shape."""
     config = _build_test_config()
@@ -2932,7 +4202,7 @@ async def test_team_response_stream_emits_plain_run_output_fallback_with_team_fo
             content=None,
             messages=[
                 Message(role="assistant", content="Recovered team response"),
-                _queued_notice_message(),
+                _queued_notice_message("fallback-stream-response"),
             ],
             status=RunStatus.completed,
         )
@@ -3301,8 +4571,8 @@ async def test_team_response_stream_tracks_retry_run_id_after_hard_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_team_response_stream_retry_scrubs_queued_notice_before_second_attempt() -> None:
-    """Streaming retries should scrub queued notices from the loaded team session before retrying."""
+async def test_team_response_stream_retry_does_not_relocate_failed_attempt_notice() -> None:  # noqa: PLR0915
+    """Streaming retries should not copy a failed attempt's notice into the successful run."""
     config = _build_test_config()
     config.teams["super_team"] = TeamConfig(
         display_name="Super Team",
@@ -3343,7 +4613,7 @@ async def test_team_response_stream_retry_scrubs_queued_notice_before_second_att
         prepared_scope_context = scope_context
         return _prepared_team_execution_context(final_prompt="Analyze this.")
 
-    async def fake_stream_raw(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+    async def fake_stream_raw(*_args: object, **kwargs: object) -> AsyncIterator[object]:
         nonlocal attempts
         attempts += 1
         assert prepared_scope_context is not None
@@ -3352,56 +4622,92 @@ async def test_team_response_stream_retry_scrubs_queued_notice_before_second_att
         team_id = prepared_scope_context.session.team_id
         assert team_id is not None
         assert team_id == "super_team"
+        current_run_id = kwargs["run_id"]
+        assert isinstance(current_run_id, str)
         if attempts == 1:
             errored_output = TeamRunOutput(
-                run_id="run-1",
+                run_id=current_run_id,
                 team_id=team_id,
                 team_name="General Team",
                 session_id="session-stream-retry-clean",
                 content="Error code: 500 - audio input is not supported",
-                messages=[_queued_notice_message()],
+                messages=[_queued_notice_message(notice_context.response_turn_id)],
                 status=RunStatus.error,
             )
             _cleanup_and_store(mock_team, errored_output, prepared_scope_context.session)
             yield errored_output
             return
-        assert not any(_has_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
-        yield TeamRunOutput(
-            run_id="run-2",
+        assert any(
+            _has_live_queued_notice(
+                run.messages,
+                response_turn_id=notice_context.response_turn_id,
+            )
+            for run in prepared_scope_context.session.runs or []
+        )
+        assert not any(_has_persisted_queued_notice(run.messages) for run in prepared_scope_context.session.runs or [])
+        completed_output = TeamRunOutput(
+            run_id=current_run_id,
             team_id=team_id,
             team_name="General Team",
             session_id="session-stream-retry-clean",
             content="Recovered streamed response",
             status=RunStatus.completed,
         )
+        _cleanup_and_store(mock_team, completed_output, prepared_scope_context.session)
+        yield TeamRunContentEvent(
+            team_id=team_id,
+            run_id=current_run_id,
+            session_id="session-stream-retry-clean",
+            content="Recovered streamed response",
+        )
+        yield TeamRunCompletedEvent(
+            team_id=team_id,
+            run_id=current_run_id,
+            session_id="session-stream-retry-clean",
+            content="Recovered streamed response",
+        )
 
-    with (
-        patch("mindroom.teams.create_agent", return_value=fake_agent),
-        patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
-        patch("mindroom.teams._create_team_instance", return_value=mock_team),
-        patch(
-            "mindroom.teams.prepare_bound_team_run_context",
-            new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
-        ),
-        patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
-    ):
-        chunks = [
-            chunk
-            async for chunk in team_response_stream(
-                agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
-                message="Analyze this.",
-                turn_recorder=_team_turn_recorder("Analyze this."),
-                orchestrator=orchestrator,
-                execution_identity=None,
-                ctx=make_turn_context(session_id="session-stream-retry-clean"),
-                media=MediaInputs(audio=[MagicMock(name="audio_input")]),
-                configured_team_name="super_team",
-            )
-        ]
+    with queued_message_signal_context(_PendingQueuedMessageState()) as notice_context:
+        notice_context.notice_fired = True
+        with (
+            patch("mindroom.teams.create_agent", return_value=fake_agent),
+            patch("mindroom.teams.resolve_agent_knowledge_access", return_value=_KnowledgeResolution(knowledge=None)),
+            patch("mindroom.teams._create_team_instance", return_value=mock_team),
+            patch(
+                "mindroom.teams.prepare_bound_team_run_context",
+                new=AsyncMock(side_effect=fake_prepare_bound_team_execution_context),
+            ),
+            patch("mindroom.teams._team_response_stream_raw", new=AsyncMock(side_effect=fake_stream_raw)),
+        ):
+            chunks = [
+                chunk
+                async for chunk in team_response_stream(
+                    agent_ids=[entity_ids(config, runtime_paths_for(config))["general"]],
+                    message="Analyze this.",
+                    turn_recorder=_team_turn_recorder("Analyze this."),
+                    orchestrator=orchestrator,
+                    execution_identity=None,
+                    ctx=make_turn_context(
+                        session_id="session-stream-retry-clean",
+                        run_id="run-1",
+                    ),
+                    media=MediaInputs(audio=[MagicMock(name="audio_input")]),
+                    configured_team_name="super_team",
+                )
+            ]
+        await finalize_queued_notice_response_turn_async(notice_context)
 
     assert attempts == 2
     assert len(chunks) == 1
     assert "Recovered streamed response" in str(chunks[0])
+    _assert_retry_notice_not_relocated(
+        agent=fake_agent,
+        session_id="session-stream-retry-clean",
+        runtime_paths=runtime_paths,
+        config=config,
+        team_name="super_team",
+        response_turn_id=notice_context.response_turn_id,
+    )
 
 
 @pytest.mark.asyncio

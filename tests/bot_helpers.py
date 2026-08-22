@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -12,12 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 
-from mindroom.approval_manager import (
-    PendingApproval,
-    SentApprovalEvent,
-    _ApprovalManager,
-    initialize_approval_store,
-)
 from mindroom.attachments import AttachmentRecord, register_local_attachment
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.auth import AuthorizationConfig
@@ -29,10 +23,16 @@ from mindroom.constants import (
     RuntimePaths,
     resolve_runtime_paths,
 )
-from mindroom.dispatch_handoff import PreparedTextEvent
+from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import (
     MESSAGE_SOURCE_KIND,
     VOICE_SOURCE_KIND,
+)
+from mindroom.event_journal import EventClass, EventKind
+from mindroom.event_journal.models import (
+    DepartureObservation,
+    DepartureOutcome,
+    DepartureSource,
 )
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.handled_turns import TurnRecord
@@ -43,23 +43,18 @@ from mindroom.hooks import (
 )
 from mindroom.knowledge.indexing_config import IndexingSettings
 from mindroom.knowledge.utils import _KnowledgeResolution
-from mindroom.matrix.cache import ThreadHistoryResult
 from mindroom.matrix.client import ResolvedVisibleMessage
+from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
-from mindroom.orchestration.config_updates import ConfigUpdatePlan
 from mindroom.response_runner import (
     ResponseRequest,
 )
-from mindroom.runtime_support import StartupThreadPrewarmRegistry
-from mindroom.tool_approval import _shutdown_approval_store
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
 from tests.conftest import (
     TEST_PASSWORD,
     bind_runtime_paths,
     drain_coalescing,
-    make_event_cache_mock,
-    make_event_cache_write_coordinator_mock,
     make_matrix_client_mock,
     message_origin,
     replace_turn_controller_deps,
@@ -86,6 +81,28 @@ if TYPE_CHECKING:
         _MultiAgentOrchestrator,
     )
     from mindroom.turn_store import TurnStore
+
+
+def make_test_agent_bot(*args: Any, **kwargs: Any) -> AgentBot:  # noqa: ANN401
+    """Build a standalone test bot with an explicit real membership index."""
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex  # noqa: PLC0415
+    from mindroom.bot import AgentBot as RuntimeAgentBot  # noqa: PLC0415
+
+    if "agent_reply_memberships" not in kwargs:
+        membership_sync = kwargs.get("agent_reply_membership_sync")
+        kwargs["agent_reply_memberships"] = (
+            membership_sync.memberships if membership_sync is not None else AgentReplyMembershipIndex()
+        )
+    return RuntimeAgentBot(*args, **kwargs)
+
+
+def make_test_team_bot(*args: Any, **kwargs: Any) -> TeamBot:  # noqa: ANN401
+    """Build a standalone test team bot with an explicit real membership index."""
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex  # noqa: PLC0415
+    from mindroom.bot import TeamBot as RuntimeTeamBot  # noqa: PLC0415
+
+    kwargs.setdefault("agent_reply_memberships", AgentReplyMembershipIndex())
+    return RuntimeTeamBot(*args, **kwargs)
 
 
 def _stream_outcome(
@@ -153,6 +170,23 @@ def _visible_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> st
     return outcome.final_visible_event_id
 
 
+async def dispatch_reaction_durably(
+    bot: AgentBot,
+    room: nio.MatrixRoom,
+    event: nio.ReactionEvent,
+) -> None:
+    """Exercise one reaction through its durable production entrypoint."""
+    source = dict(event.source)
+    source.setdefault("event_id", event.event_id)
+    source.setdefault("sender", event.sender)
+    source.setdefault("origin_server_ts", 1)
+    source.setdefault("type", "m.reaction")
+    event.source = source
+    event.decrypted = False
+    await bot._journal_dispatcher.admit_out_of_band(room, event, EventKind.REACTION, EventClass.ACTIONABLE)
+    await bot._journal_dispatcher.drain_once()
+
+
 def _handled_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> str | None:
     if isinstance(outcome, str) or outcome is None:
         return outcome
@@ -161,8 +195,8 @@ def _handled_response_event_id(outcome: FinalDeliveryOutcome | str | None) -> st
 
 def _assert_ready_voice_text_fallback(ready_event: ReadyPendingEvent | None) -> None:
     assert ready_event is not None
-    assert ready_event.pending_event.source_kind == VOICE_SOURCE_KIND
-    assert isinstance(ready_event.pending_event.event, PreparedTextEvent)
+    assert ready_event.pending_event.event.source_kind == VOICE_SOURCE_KIND
+    assert isinstance(ready_event.pending_event.event, PreparedIngress)
     assert ready_event.pending_event.event.body == "🎤 [Attached voice message]"
     assert ready_event.pending_event.event.source["content"][VOICE_RAW_AUDIO_FALLBACK_KEY] is True
 
@@ -215,13 +249,6 @@ def _wrap_extracted_collaborators(bot: AgentBot) -> AgentBot:
     return wrapped_bot
 
 
-def _install_runtime_cache_support(bot: AgentBot | TeamBot) -> None:
-    """Attach the full injected runtime-support bundle to a bot test instance."""
-    bot.event_cache = make_event_cache_mock()
-    bot.event_cache_write_coordinator = make_event_cache_write_coordinator_mock()
-    bot.startup_thread_prewarm_registry = StartupThreadPrewarmRegistry()
-
-
 def _empty_full_thread_history() -> ThreadHistoryResult:
     """Return a fully hydrated empty thread history for tests that bypass Matrix fetches."""
     return ThreadHistoryResult([], is_full_history=True)
@@ -240,14 +267,13 @@ def _turn_store(bot: AgentBot | TeamBot) -> TurnStore:
 def _set_turn_store_tracker(bot: AgentBot | TeamBot, tracker: MagicMock) -> MagicMock:
     """Swap the private handled-turn ledger behind one turn store for test assertions."""
     stored_records: dict[str, TurnRecord] = {}
+    tracker.get_turn_record.return_value = None
+    tracker.has_responded.return_value = False
 
-    def update_handled_turn(
+    async def update_handled_turn(
         lookup_event_ids: Sequence[str],
         update: Callable[[Mapping[str, TurnRecord]], TurnRecord],
-        *,
-        wait_for_persist: bool = False,
     ) -> TurnRecord:
-        del wait_for_persist  # The fake applies updates synchronously.
         existing_records = {
             source_event_id: turn_record
             for source_event_id in lookup_event_ids
@@ -489,9 +515,8 @@ def _mock_managed_bot(config: Config) -> MagicMock:
     bot = MagicMock()
     bot.config = config
     bot.enable_streaming = config.defaults.enable_streaming
-    bot.event_cache = None
-    bot.event_cache_write_coordinator = None
     bot._set_presence_with_model_info = AsyncMock()
+    bot.recover_pending_turn_journal_events = AsyncMock()
     return bot
 
 
@@ -518,115 +543,6 @@ def _approval_reload_config(tmp_path: Path, *, include_code: bool) -> Config:
             models={"default": {"provider": "test", "id": "test-model"}},
         ),
         tmp_path,
-    )
-
-
-def _mock_approval_reload_bot(
-    config: Config,
-    *,
-    agent_name: str,
-    user_id: str,
-    room_send: AsyncMock,
-) -> MagicMock:
-    """Return one managed-bot double with a live Matrix client for approval reload tests."""
-    bot = _mock_managed_bot(config)
-    bot.agent_name = agent_name
-    bot.running = True
-    bot.client = make_matrix_client_mock(user_id=user_id)
-    bot.client.room_send = room_send
-    bot.client.rooms["!room:localhost"].add_member(user_id, agent_name.capitalize(), None)
-    latest_thread_event_id = "$latest-thread-event" if agent_name == "code" else None
-    bot.latest_thread_event_id_if_needed = AsyncMock(return_value=latest_thread_event_id)
-    bot.cleanup = AsyncMock()
-    return bot
-
-
-async def _wait_for_live_pending(
-    store: _ApprovalManager,
-    sender: AsyncMock,
-    *,
-    room_id: str = "!test:localhost",
-) -> PendingApproval:
-    async with asyncio.timeout(15):
-        while True:
-            if sender.await_args is not None:
-                approval_id = sender.await_args.args[2]["approval_id"]
-                card_event_id = store._live_card_event_id_for_approval(approval_id)
-                if card_event_id is not None:
-                    pending = await store._pending_approval_for_card(room_id=room_id, card_event_id=card_event_id)
-                    if pending is not None:
-                        return pending
-            await asyncio.sleep(0)
-
-
-async def _live_pending_approval(
-    store: _ApprovalManager,
-    *,
-    room_id: str,
-    approval_id: str,
-) -> PendingApproval | None:
-    card_event_id = store._live_card_event_id_for_approval(approval_id)
-    if card_event_id is None:
-        return None
-    return await store._pending_approval_for_card(room_id=room_id, card_event_id=card_event_id)
-
-
-async def _wait_for_pending_approval_id(store: _ApprovalManager, approval_ids: list[str]) -> str:
-    async with asyncio.timeout(1):
-        while True:
-            if (
-                approval_ids
-                and await _live_pending_approval(store, room_id="!room:localhost", approval_id=approval_ids[0])
-                is not None
-            ):
-                return approval_ids[0]
-            await asyncio.sleep(0)
-
-
-async def _start_live_approval(
-    runtime_paths: RuntimePaths,
-    *,
-    approver_user_id: str = "@user:localhost",
-    editor: AsyncMock | None = None,
-    arguments: dict[str, Any] | None = None,
-) -> tuple[_ApprovalManager, PendingApproval, asyncio.Task[Any], AsyncMock]:
-    sender = AsyncMock(return_value=SentApprovalEvent("$approval"))
-    approval_editor = editor or AsyncMock(return_value=True)
-    store = initialize_approval_store(runtime_paths, sender=sender, editor=approval_editor)
-    task = asyncio.create_task(
-        store.request_approval(
-            tool_name="read_file",
-            arguments=arguments or {"path": "notes.txt"},
-            room_id="!test:localhost",
-            requester_id="@user:localhost",
-            approver_user_id=approver_user_id,
-            timeout_seconds=30,
-        ),
-    )
-    try:
-        pending = await _wait_for_live_pending(store, sender)
-    except Exception:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-        await _shutdown_approval_store()
-        raise
-    return store, pending, task, approval_editor
-
-
-def _approval_removal_plan(new_config: Config) -> ConfigUpdatePlan:
-    """Return one config-update plan that removes the code bot without restarting others."""
-    return ConfigUpdatePlan(
-        new_config=new_config,
-        changed_mcp_servers=set(),
-        configured_entities=set(),
-        entities_to_restart=set(),
-        new_entities=set(),
-        removed_entities={"code"},
-        mindroom_user_changed=False,
-        matrix_room_access_changed=False,
-        matrix_space_changed=False,
-        authorization_changed=False,
     )
 
 
@@ -992,6 +908,7 @@ class AgentBotTestBase:
             event = MagicMock(spec=nio.ReactionEvent)
             event.key = "👍"
             event.reacts_to = "$question"
+            event.server_timestamp = 1234567890
             event.source = {"content": {}}
         else:  # pragma: no cover - defensive guard for test helper misuse
             msg = f"Unsupported handler: {handler_name}"
@@ -1016,7 +933,7 @@ class AgentBotTestBase:
             await bot._on_media_message(room, event)
             await drain_coalescing(bot)
         elif handler_name == "reaction":
-            await bot._on_reaction(room, event)
+            await dispatch_reaction_durably(bot, room, event)
         else:  # pragma: no cover - defensive guard for test helper misuse
             msg = f"Unsupported handler: {handler_name}"
             raise ValueError(msg)
@@ -1042,3 +959,68 @@ class AgentBotTestBase:
             ),
             runtime_root,
         )
+
+
+@dataclass
+class FencedRoomRecorder:
+    """A `MembershipView` that records which rooms a fence invalidated.
+
+    The three bot-level tests that use this care about *which* rooms the fence
+    touched and in what order relative to their neighbours, not about the
+    durable departure bookkeeping underneath. Reporting every observation as
+    `FENCED` with no report owed keeps `MembershipFence` on its simplest path,
+    so a test that spies on room identity never has to model debt it is not
+    asserting on. `test_journal_membership_fence.py` owns the real thing.
+    """
+
+    fenced_room_ids: list[str] = field(default_factory=list)
+
+    async def fence_departure(
+        self,
+        room_id: str,
+        *,
+        source: DepartureSource,
+        report_observation_id: str | None = None,
+    ) -> DepartureOutcome:
+        """Record one invalidation and hand back the room's new epoch."""
+        del report_observation_id
+        self.fenced_room_ids.append(room_id)
+        epoch = len(self.fenced_room_ids)
+        return DepartureOutcome(
+            DepartureObservation.FENCED,
+            epoch,
+            0,
+            reported_run_epoch=(epoch if source is DepartureSource.REPORTED else None),
+        )
+
+    async def note_membership_restarted(
+        self,
+        room_id: str,
+        *,
+        expected_membership_epoch: int | None = None,
+    ) -> None:
+        """Accept a confirmed join without recording it."""
+        del room_id, expected_membership_epoch
+
+    async def close_preceding_reported_departure(
+        self,
+        room_id: str,
+        join_event_id: str,
+    ) -> None:
+        """Accept a join after one reported departure."""
+        del room_id, join_event_id
+
+    async def close_reported_departure_run(
+        self,
+        room_id: str,
+        run_epoch: int,
+    ) -> None:
+        """Accept closure of one reported departure run."""
+        del room_id, run_epoch
+
+    async def retire_owed_departure_reports(self, room_id: str) -> None:
+        """Accept a retirement that can never happen here: nothing is ever owed."""
+
+    async def rooms_owing_departure_reports(self) -> frozenset[str]:
+        """Return no debt, so the fence never opens a report window."""
+        return frozenset()

@@ -15,21 +15,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom.bot import AgentBot, TeamBot
 from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
 from mindroom.constants import STREAM_STATUS_KEY
-from mindroom.matrix.cache.thread_history_result import thread_history_result
 from mindroom.matrix.client import DeliveredMatrixEvent
+from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.response_runner import ResponseRequest
 from mindroom.tool_system.worker_routing import get_tool_execution_identity
+from tests.bot_helpers import make_test_agent_bot, make_test_team_bot
 from tests.conftest import (
     bind_runtime_paths,
     drain_coalescing,
-    install_runtime_cache_support,
-    install_send_response_mock,
+    install_runtime_journal_support,
     make_matrix_client_mock,
     make_visible_message,
     patch_response_runner_module,
@@ -84,6 +84,7 @@ def config_with_team() -> Config:
             ),
         },
         router=RouterConfig(model="default"),
+        authorization=AuthorizationConfig(default_room_access=True),
     )
 
 
@@ -127,9 +128,9 @@ async def test_router_does_not_route_when_preformed_team_is_mentioned(config_wit
         display_name="Router",
         password="p",  # noqa: S106
     )
-    router = AgentBot(router_user, tmp_path, config_with_team, runtime_paths)
+    router = make_test_agent_bot(router_user, tmp_path, config_with_team, runtime_paths)
     router.client = _make_matrix_client_mock()
-    install_runtime_cache_support(router)
+    install_runtime_journal_support(router)
 
     # Room has router + team + two agents and the human user
     team_user_id = ids["t1"].full_id
@@ -141,7 +142,7 @@ async def test_router_does_not_route_when_preformed_team_is_mentioned(config_wit
     event = _mock_event_with_team_mention(team_user_id)
 
     # Also patch suggest_responder_for_message to detect accidental routing
-    with patch("mindroom.turn_controller.suggest_responder_for_message", new=AsyncMock(return_value="a1")):
+    with patch("mindroom.router_relay.suggest_responder_for_message", new=AsyncMock(return_value="a1")):
         await router._on_message(room, event)
 
     # Router must not send any message (i.e., must not route)
@@ -160,7 +161,7 @@ async def test_preformed_team_bot_responds_when_mentioned(config_with_team: Conf
         display_name="Team One",
         password="p",  # noqa: S106
     )
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
@@ -170,7 +171,7 @@ async def test_preformed_team_bot_responds_when_mentioned(config_with_team: Conf
         enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
 
     async def fake_team_response(*_args: Any, **_kwargs: Any) -> str:  # noqa: ANN401
         return "🤝 Team Response (a1, a2):\n\n**a1**: ok\n\n**a2**: ok"
@@ -223,7 +224,7 @@ async def test_preformed_team_bot_schedules_memory_save_for_all_file_members(
         display_name="Team One",
         password="p",  # noqa: S106
     )
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
@@ -233,7 +234,7 @@ async def test_preformed_team_bot_schedules_memory_save_for_all_file_members(
         enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
 
     store_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -307,7 +308,7 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
         display_name="Team One",
         password="p",  # noqa: S106
     )
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
@@ -317,14 +318,12 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
         enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
     bot.orchestrator.agent_bots = {"a1": MagicMock()}
-    send_response = AsyncMock(return_value="$new_response")
-    install_send_response_mock(bot, send_response)
 
     with patch(
-        "mindroom.delivery_gateway.edit_message_result",
+        "mindroom.delivery_gateway.send_message_outcome",
         new=AsyncMock(
             return_value=DeliveredMatrixEvent(
                 event_id="$existing_response",
@@ -349,11 +348,14 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
         )
 
     assert resolution == "$existing_response"
-    assert mock_edit.await_args.args[2] == "$existing_response"
+    # The outbox sends the finished replace event, so the edit target and its
+    # text are read out of the envelope rather than off the call.
+    envelope = mock_edit.await_args.args[2]
+    assert envelope["m.relates_to"] == {"rel_type": "m.replace", "event_id": "$existing_response"}
     assert (
-        mock_edit.await_args.args[4] == "Team 't1' includes agent 'a2' that could not be materialized for this request."
+        envelope["m.new_content"]["body"]
+        == "Team 't1' includes agent 'a2' that could not be materialized for this request."
     )
-    send_response.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -371,7 +373,7 @@ async def test_preformed_team_plain_reply_does_not_continue_existing_thread_root
         display_name="Team One",
         password="p",  # noqa: S106
     )
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
@@ -381,7 +383,7 @@ async def test_preformed_team_plain_reply_does_not_continue_existing_thread_root
         enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
 
     team_user_id = ids["t1"].full_id
@@ -442,7 +444,7 @@ async def test_team_does_not_respond_to_different_domain_mention(config_with_tea
         display_name="Team One",
         password="p",  # noqa: S106
     )
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
@@ -452,7 +454,7 @@ async def test_team_does_not_respond_to_different_domain_mention(config_with_tea
         enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
-    install_runtime_cache_support(bot)
+    install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
 
     async def fake_team_response(*_args: Any, **_kwargs: Any) -> str:  # noqa: ANN401

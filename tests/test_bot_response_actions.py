@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom.bot import AgentBot, TeamBot
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
@@ -25,10 +24,9 @@ from mindroom.dispatch_source import (
 from mindroom.hooks import (
     MessageEnvelope,
 )
-from mindroom.matrix.cache import ThreadHistoryResult
-from mindroom.matrix.cache.thread_history_result import thread_history_result
 from mindroom.matrix.client import ResolvedVisibleMessage
 from mindroom.matrix.thread_diagnostics import THREAD_HISTORY_DEGRADED_DIAGNOSTIC
+from mindroom.matrix.thread_history_result import ThreadHistoryResult, thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.teams import TeamIntent, TeamMemberStatus, TeamOutcome, TeamResolution, TeamResolutionMember
@@ -37,11 +35,12 @@ from mindroom.turn_policy import PreparedDispatch, _DispatchPlan
 from tests.bot_helpers import (
     AgentBotTestBase,
     _hook_envelope,
-    _install_runtime_cache_support,
     _matrix_room,
     _policy_dispatch,
     _runtime_bound_config,
     make_mock_agent_user,
+    make_test_agent_bot,
+    make_test_team_bot,
 )
 from tests.conftest import (
     TEST_PASSWORD,
@@ -107,11 +106,11 @@ class TestAgentBot(AgentBotTestBase):
 
         with patch("mindroom.turn_policy.decide_team_formation", new_callable=MagicMock) as mock_decide:
             mock_decide.return_value = TeamResolution.none()
-            bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+            bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
             bot.orchestrator = MagicMock()
             bot.orchestrator.agent_bots = {"calculator": MagicMock()}
 
-            await bot._turn_policy.decide_team_for_sender(
+            await bot._turn_policy._decide_team_for_sender(
                 agents_in_thread=[],
                 context=context,
                 room=room,
@@ -141,7 +140,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(own_user_id=bot.matrix_id.full_id, user_ids=[bot.matrix_id.full_id])
         context = MessageContext(
             am_i_mentioned=True,
@@ -154,7 +153,7 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch(
-                "mindroom.bot.TurnPolicy.decide_team_for_sender",
+                "mindroom.bot.TurnPolicy._decide_team_for_sender",
                 new=AsyncMock(
                     return_value=TeamResolution(
                         intent=TeamIntent.EXPLICIT_MEMBERS,
@@ -177,7 +176,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=AgentResponseDecision(True),
             ) as mock_decide_agent_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "help me"),
                 room,
                 False,
@@ -214,7 +213,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -238,7 +237,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@alice:localhost", "calculator and general, help"),
                 room,
                 False,
@@ -269,7 +268,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.orchestrator = MagicMock()
         bot.orchestrator.agent_bots = {"calculator": MagicMock()}
         room = _matrix_room(
@@ -296,7 +295,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "general and research, help"),
                 room,
                 False,
@@ -326,7 +325,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.orchestrator = MagicMock()
         bot.orchestrator.agent_bots = {
             "alpha": MagicMock(running=False),
@@ -355,7 +354,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "alpha and calculator, help"),
                 room,
                 False,
@@ -391,7 +390,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -415,7 +414,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@alice:localhost", "calculator and general, help"),
                 room,
                 False,
@@ -448,7 +447,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -466,7 +465,7 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         with patch("mindroom.turn_policy.decide_team_formation", new=MagicMock(return_value=TeamResolution.none())):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@bob:localhost", "can someone help?"),
                 room,
                 False,
@@ -493,7 +492,7 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -510,7 +509,7 @@ class TestAgentBot(AgentBotTestBase):
             has_non_agent_mentions=False,
         )
 
-        action = await bot._turn_policy.resolve_response_action(
+        action = await bot._turn_policy._resolve_response_action(
             _policy_dispatch(bot, room, context, "@bob:localhost", "calculator, help"),
             room,
             False,
@@ -540,7 +539,7 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[entity_ids(config, runtime_paths)["calculator"].full_id],
@@ -554,7 +553,7 @@ class TestAgentBot(AgentBotTestBase):
             has_non_agent_mentions=False,
         )
 
-        action = await bot._turn_policy.resolve_response_action(
+        action = await bot._turn_policy._resolve_response_action(
             _policy_dispatch(
                 bot,
                 room,
@@ -600,7 +599,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Ops Team",
             password=TEST_PASSWORD,
         )
-        bot = TeamBot(
+        bot = make_test_team_bot(
             team_user,
             tmp_path,
             config=config,
@@ -623,7 +622,7 @@ class TestAgentBot(AgentBotTestBase):
             has_non_agent_mentions=False,
         )
 
-        action = await bot._turn_policy.resolve_response_action(
+        action = await bot._turn_policy._resolve_response_action(
             _policy_dispatch(bot, room, context, "@bob:localhost", "ops, help"),
             room,
             False,
@@ -648,7 +647,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -670,7 +669,7 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch(
-                "mindroom.bot.TurnPolicy.decide_team_for_sender",
+                "mindroom.bot.TurnPolicy._decide_team_for_sender",
                 new=AsyncMock(
                     return_value=TeamResolution(
                         intent=TeamIntent.EXPLICIT_MEMBERS,
@@ -701,7 +700,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=AgentResponseDecision(True),
             ) as mock_decide_agent_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "alpha and calculator, help"),
                 room,
                 False,
@@ -728,7 +727,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -750,7 +749,7 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch(
-                "mindroom.bot.TurnPolicy.decide_team_for_sender",
+                "mindroom.bot.TurnPolicy._decide_team_for_sender",
                 new=AsyncMock(
                     return_value=TeamResolution(
                         intent=TeamIntent.EXPLICIT_MEMBERS,
@@ -781,7 +780,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=AgentResponseDecision(True),
             ) as mock_decide_agent_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "alpha and calculator, help"),
                 room,
                 False,
@@ -815,7 +814,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         bot.orchestrator = MagicMock()
         bot.orchestrator.agent_bots = {"calculator": MagicMock(running=True)}
         room = _matrix_room(
@@ -841,7 +840,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "alpha and calculator, help"),
                 room,
                 False,
@@ -869,7 +868,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         room = _matrix_room(own_user_id=bot.matrix_id.full_id, user_ids=[bot.matrix_id.full_id])
         context = MessageContext(
             am_i_mentioned=False,
@@ -882,7 +881,7 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch(
-                "mindroom.bot.TurnPolicy.decide_team_for_sender",
+                "mindroom.bot.TurnPolicy._decide_team_for_sender",
                 new=AsyncMock(
                     return_value=TeamResolution.individual(
                         intent=TeamIntent.IMPLICIT_THREAD_TEAM,
@@ -897,7 +896,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=AgentResponseDecision(False),
             ) as mock_decide_agent_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@user:localhost", "help me"),
                 room,
                 True,
@@ -924,7 +923,7 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         ids = entity_ids(config, runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -990,7 +989,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=True,
             ) as mock_has_active_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 PreparedDispatch(
                     requester_user_id="@user:localhost",
                     context=context,
@@ -1026,7 +1025,7 @@ class TestAgentBot(AgentBotTestBase):
         )
         runtime_paths = runtime_paths_for(config)
         ids = entity_ids(config, runtime_paths)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1070,7 +1069,7 @@ class TestAgentBot(AgentBotTestBase):
             patch("mindroom.turn_policy.decide_team_formation", new=MagicMock(return_value=TeamResolution.none())),
             patch.object(bot._response_runner, "has_active_response_for_target", return_value=True),
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 PreparedDispatch(
                     requester_user_id="@user:localhost",
                     context=context,
@@ -1104,7 +1103,7 @@ class TestAgentBot(AgentBotTestBase):
         )
         runtime_paths = runtime_paths_for(config)
         ids = entity_ids(config, runtime_paths)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1132,7 +1131,7 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         with patch.object(bot._response_runner, "has_active_response_for_target", return_value=True):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 PreparedDispatch(
                     requester_user_id="@user:localhost",
                     context=context,
@@ -1164,7 +1163,7 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         ids = entity_ids(config, runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1213,7 +1212,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=False,
             ) as mock_has_active_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 PreparedDispatch(
                     requester_user_id="@user:localhost",
                     context=context,
@@ -1247,7 +1246,7 @@ class TestAgentBot(AgentBotTestBase):
             tmp_path,
         )
         runtime_paths = runtime_paths_for(config)
-        bot = AgentBot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths)
         ids = entity_ids(config, runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1296,7 +1295,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=False,
             ) as mock_has_active_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 PreparedDispatch(
                     requester_user_id="@user:localhost",
                     context=context,
@@ -1336,7 +1335,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Router",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
         bot.client = AsyncMock()
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1389,7 +1388,7 @@ class TestAgentBot(AgentBotTestBase):
             envelope=envelope,
         )
 
-        plan = await bot._turn_policy.plan_router_dispatch(room, event, dispatch)
+        plan = await bot._turn_policy._plan_router_dispatch(room, event, dispatch)
 
         assert plan is not None
         assert plan.kind == "route"
@@ -1419,8 +1418,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Router",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
-        _install_runtime_cache_support(bot)
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths)
         bot.client = AsyncMock()
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1435,7 +1433,7 @@ class TestAgentBot(AgentBotTestBase):
         event = self._make_handler_event("message", sender="@user:localhost", event_id="$event")
         event.body = "continue"
         event.source = {"content": {"body": "continue"}}
-        bot._conversation_cache.get_dispatch_thread_snapshot = AsyncMock(
+        bot._turn_controller.deps.resolver.dispatch_thread_snapshot = AsyncMock(
             return_value=ThreadHistoryResult(
                 [
                     ResolvedVisibleMessage(
@@ -1494,7 +1492,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Synthesis",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1555,7 +1553,7 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=AgentResponseDecision(False),
             ) as mock_decide_agent_response,
         ):
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@bas:localhost", "I fixed two issues"),
                 room,
                 False,
@@ -1588,7 +1586,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Synthesis",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1620,7 +1618,7 @@ class TestAgentBot(AgentBotTestBase):
             requires_model_history_refresh=True,
         )
 
-        action = await bot._turn_policy.resolve_response_action(
+        action = await bot._turn_policy._resolve_response_action(
             _policy_dispatch(bot, room, context, "@bas:localhost", "Follow-up"),
             room,
             False,
@@ -1652,7 +1650,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Synthesis",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1688,7 +1686,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@bas:localhost", "Follow-up"),
                 room,
                 False,
@@ -1720,7 +1718,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Synthesis",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
+        bot = make_test_agent_bot(bot_user, tmp_path, config=config, runtime_paths=runtime_paths)
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
             user_ids=[
@@ -1755,7 +1753,7 @@ class TestAgentBot(AgentBotTestBase):
             "mindroom.turn_policy.decide_agent_response",
             return_value=AgentResponseDecision(True),
         ) as mock_decide_agent_response:
-            action = await bot._turn_policy.resolve_response_action(
+            action = await bot._turn_policy._resolve_response_action(
                 _policy_dispatch(bot, room, context, "@bas:localhost", "Follow-up"),
                 room,
                 False,
@@ -1787,7 +1785,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Router",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(router_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         ids = entity_ids(config, runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1831,7 +1829,7 @@ class TestAgentBot(AgentBotTestBase):
             envelope=_hook_envelope(body="Follow-up", source_event_id=event.event_id, target=dispatch_target),
         )
 
-        plan = await bot._turn_policy.plan_router_dispatch(room, event, dispatch)
+        plan = await bot._turn_policy._plan_router_dispatch(room, event, dispatch)
 
         assert plan == _DispatchPlan(kind="ignore", ignore_reason="router")
 
@@ -1857,7 +1855,7 @@ class TestAgentBot(AgentBotTestBase):
             display_name="Router",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(router_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(router_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
         ids = entity_ids(config, runtime_paths_for(config))
         room = _matrix_room(
             own_user_id=bot.matrix_id.full_id,
@@ -1901,6 +1899,6 @@ class TestAgentBot(AgentBotTestBase):
             envelope=_hook_envelope(body="Follow-up", source_event_id=event.event_id, target=dispatch_target),
         )
 
-        plan = await bot._turn_policy.plan_router_dispatch(room, event, dispatch)
+        plan = await bot._turn_policy._plan_router_dispatch(room, event, dispatch)
 
         assert plan == _DispatchPlan(kind="ignore", ignore_reason="router")

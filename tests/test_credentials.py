@@ -410,6 +410,59 @@ class TestCredentialsManager:
             mode = stat.S_IMODE(directory_path.stat().st_mode)
             assert mode == 0o700
 
+    def test_fresh_scoped_credentials_use_durable_directory_creation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every newly introduced scoped-directory entry must use the durable creator."""
+        manager = CredentialsManager(tmp_path / "credentials")
+        created: list[Path] = []
+        real_create = credentials_module.create_directory_durable
+
+        def record_create(path: Path, *, mode: int) -> None:
+            created.append(path)
+            real_create(path, mode=mode)
+
+        monkeypatch.setattr(credentials_module, "create_directory_durable", record_create)
+
+        scoped_manager = manager.for_primary_runtime_scope("@user:example.test", "agent")
+
+        assert created == [
+            scoped_manager.base_path.parent.parent,
+            scoped_manager.base_path.parent,
+            scoped_manager.base_path,
+        ]
+
+    def test_existing_scoped_directory_retries_interrupted_durable_creation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Manager retry must republish an existing scope directory after creator failure."""
+        manager = CredentialsManager(tmp_path / "credentials")
+        scoped_root = tmp_path / "private_oauth"
+        attempted: list[Path] = []
+        real_create = credentials_module.create_directory_durable
+        failed_once = False
+
+        def fail_after_create(path: Path, *, mode: int) -> None:
+            nonlocal failed_once
+            attempted.append(path)
+            real_create(path, mode=mode)
+            if path == scoped_root and not failed_once:
+                failed_once = True
+                msg = "scope publication interrupted"
+                raise OSError(msg)
+
+        monkeypatch.setattr(credentials_module, "create_directory_durable", fail_after_create)
+
+        with pytest.raises(OSError, match="scope publication interrupted"):
+            manager.for_primary_runtime_scope("@user:example.test", "agent")
+        manager.for_primary_runtime_scope("@user:example.test", "agent")
+
+        assert attempted.count(scoped_root) == 2
+
     def test_encrypted_scoped_credentials_harden_existing_parent_directories(
         self,
         tmp_path: Path,
@@ -968,12 +1021,22 @@ class TestCredentialsManager:
     def test_sync_shared_credentials_to_worker_empty_allowlist_mirrors_nothing(
         self,
         temp_credentials_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An explicit empty worker allowlist should deny all shared credential mirroring."""
+        """An empty allowlist should skip the shared store while cleaning stale mirrors."""
         manager = CredentialsManager(temp_credentials_dir)
         manager.save_credentials("google", {"api_key": "env-key", "_source": "env"})
         worker_shared_manager = manager.for_worker("worker-a").shared_manager()
         worker_shared_manager.save_credentials("google", {"api_key": "stale-key", "_source": "env"})
+
+        def fail_shared_store_lookup(_manager: CredentialsManager) -> CredentialsManager:
+            pytest.fail("empty allowlist must not open the shared credential store")
+
+        monkeypatch.setattr(
+            credentials_module,
+            "_shared_credentials_manager",
+            fail_shared_store_lookup,
+        )
 
         sync_shared_credentials_to_worker(
             "worker-a",

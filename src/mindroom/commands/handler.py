@@ -16,6 +16,7 @@ from mindroom.commands.desktop_commands import (
 from mindroom.commands.encryption_commands import handle_e2ee_command, handle_encrypt_command
 from mindroom.commands.model_commands import handle_model_command
 from mindroom.commands.parsing import Command, CommandType, get_command_help, get_compact_command_entries
+from mindroom.commands.room_model_commands import handle_room_model_command
 from mindroom.commands.thread_mode_commands import handle_thread_mode_command
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.entity_resolution import configured_routable_entity_ids_for_room, entity_identity_registry
@@ -37,15 +38,30 @@ if TYPE_CHECKING:
     import nio
     import structlog
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.hooks import HookMatrixAdmin
-    from mindroom.matrix.conversation_cache import ConversationCacheProtocol, ConversationEventCache
+    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.matrix.identity import MatrixID
     from mindroom.message_target import MessageTarget
     from mindroom.tool_system.plugins import PluginReloadResult
 
 logger = get_logger(__name__)
+
+COMMAND_TYPES_WITH_SIDE_EFFECTS = frozenset(
+    {
+        CommandType.RELOAD_PLUGINS,
+        CommandType.SCHEDULE,
+        CommandType.CANCEL_SCHEDULE,
+        CommandType.EDIT_SCHEDULE,
+        CommandType.DESKTOP,
+        CommandType.MODEL,
+        CommandType.ROOM_MODEL,
+        CommandType.THREAD_MODE,
+        CommandType.ENCRYPT,
+    },
+)
 
 
 def _scheduling_runtime(context: CommandHandlerContext, room: nio.MatrixRoom) -> SchedulingRuntime:
@@ -55,9 +71,9 @@ def _scheduling_runtime(context: CommandHandlerContext, room: nio.MatrixRoom) ->
         config=context.config,
         runtime_paths=context.runtime_paths,
         room=room,
-        conversation_cache=context.conversation_cache,
-        event_cache=context.event_cache,
+        conversation_reader=context.conversation_reader,
         matrix_admin=context.matrix_admin,
+        agent_reply_memberships=context.agent_reply_memberships,
     )
 
 
@@ -90,11 +106,12 @@ class CommandHandlerContext:
     config: Config
     runtime_paths: RuntimePaths
     logger: structlog.stdlib.BoundLogger
-    conversation_cache: ConversationCacheProtocol
-    event_cache: ConversationEventCache
+    conversation_reader: ConversationReader
     stable_target: MessageTarget
-    record_handled_turn: Callable[[TurnRecord], None]
+    record_handled_turn: Callable[[TurnRecord], Awaitable[None]]
+    record_command_result: Callable[[str], Awaitable[None]]
     send_response: _CommandResponseSender
+    agent_reply_memberships: AgentReplyMembershipIndex
     reload_plugins: Callable[[], Awaitable[PluginReloadResult]] | None = None
     matrix_admin: HookMatrixAdmin | None = None
     responder_candidates_for_room: Callable[[nio.MatrixRoom, str], Awaitable[list[MatrixID]]] | None = None
@@ -186,18 +203,29 @@ async def generate_welcome_message_for_room(
     sender_id: str | None,
     config: Config,
     runtime_paths: RuntimePaths,
+    agent_reply_memberships: AgentReplyMembershipIndex,
 ) -> str:
     """Generate a welcome message for callers without a live turn-policy candidate source."""
     if sender_id is None:
         candidate_entities = configured_routable_entity_ids_for_room(config, room.room_id, runtime_paths)
     else:
-        candidate_entities = await responder_candidate_entities_for_room(client, room, sender_id, config, runtime_paths)
+        candidate_entities = await responder_candidate_entities_for_room(
+            client,
+            room,
+            sender_id,
+            config,
+            runtime_paths,
+            agent_reply_memberships,
+        )
     return _format_welcome_message(candidate_entities, config, runtime_paths)
 
 
-def _normalized_response_event_id(raw_response_event_id: str | None) -> str | None:
-    """Normalize Matrix send helpers that may return empty strings or None."""
-    return raw_response_event_id if isinstance(raw_response_event_id, str) and raw_response_event_id else None
+def _require_response_event_id(raw_response_event_id: str | None) -> str:
+    """Return one visible Matrix response ID or keep the command retryable."""
+    if isinstance(raw_response_event_id, str) and raw_response_event_id:
+        return raw_response_event_id
+    msg = "Command response delivery did not return a Matrix event ID"
+    raise RuntimeError(msg)
 
 
 def _format_plugin_reload_summary(result: PluginReloadResult) -> str:
@@ -241,6 +269,7 @@ async def _desktop_agent_for_room(
             requester_user_id,
             context.config,
             context.runtime_paths,
+            context.agent_reply_memberships,
         )
     else:
         candidates = await context.responder_candidates_for_room(room, requester_user_id)
@@ -301,6 +330,7 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                 requester_user_id,
                 context.config,
                 context.runtime_paths,
+                context.agent_reply_memberships,
             )
         else:
             candidate_entities = await context.responder_candidates_for_room(room, requester_user_id)
@@ -400,45 +430,24 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                     response_text,
                     skip_mentions=True,
                 )
-                response_event_id = _normalized_response_event_id(raw_response_event_id)
+                response_event_id = _require_response_event_id(raw_response_event_id)
                 handled_turn = TurnRecord.create(
                     [event.event_id],
                     response_event_id=response_event_id,
                 )
 
-                if response_event_id:
-                    context.record_handled_turn(handled_turn)
-                    # Register the pending change
-                    config_confirmation.register_pending_change(
-                        event_id=response_event_id,
-                        room_id=room.room_id,
-                        thread_id=effective_thread_id,
-                        config_path=change_info["config_path"],
-                        old_value=change_info["old_value"],
-                        new_value=change_info["new_value"],
-                        requester=resolved_requester_user_id,
-                    )
+                await config_confirmation.ensure_pending_change(
+                    context.client,
+                    event_id=response_event_id,
+                    room_id=room.room_id,
+                    thread_id=effective_thread_id,
+                    config_path=change_info["config_path"],
+                    old_value=change_info["old_value"],
+                    new_value=change_info["new_value"],
+                    requester=resolved_requester_user_id,
+                )
 
-                    # Get the pending change we just registered
-                    pending_change = config_confirmation.get_pending_change(response_event_id)
-
-                    # Store in Matrix state for persistence
-                    if pending_change:
-                        await config_confirmation.store_pending_change_in_matrix(
-                            context.client,
-                            response_event_id,
-                            pending_change,
-                        )
-
-                    # Add reaction buttons
-                    await config_confirmation.add_confirmation_reactions(
-                        context.client,
-                        room.room_id,
-                        response_event_id,
-                    )
-
-                if response_event_id is None:
-                    context.record_handled_turn(handled_turn)
+                await context.record_handled_turn(handled_turn)
                 return  # Exit early since we've handled the response
 
     elif command.type == CommandType.MODEL:
@@ -449,6 +458,17 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
             room_id=room.room_id,
             thread_id=effective_thread_id,
             requester_user_id=requester_user_id,
+        )
+
+    elif command.type == CommandType.ROOM_MODEL:
+        response_text = await handle_room_model_command(
+            command.args.get("args_text", ""),
+            client=context.client,
+            config=context.config,
+            runtime_paths=context.runtime_paths,
+            room_id=room.room_id,
+            requester_user_id=requester_user_id,
+            sender_user_id=event.sender,
         )
 
     elif command.type == CommandType.THREAD_MODE:
@@ -481,13 +501,16 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
         response_text = "❌ Unknown command. Try !help for available commands."
 
     if response_text:
+        if command.type in COMMAND_TYPES_WITH_SIDE_EFFECTS:
+            await context.record_command_result(response_text)
         raw_response_event_id = await context.send_response(
             response_text,
             skip_mentions=True,
         )
-        context.record_handled_turn(
+        response_event_id = _require_response_event_id(raw_response_event_id)
+        await context.record_handled_turn(
             TurnRecord.create(
                 [event.event_id],
-                response_event_id=_normalized_response_event_id(raw_response_event_id),
+                response_event_id=response_event_id,
             ),
         )

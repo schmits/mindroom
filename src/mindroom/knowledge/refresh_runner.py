@@ -4,29 +4,41 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
+import math
 import os
 import signal
 import sys
-import tempfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
-from mindroom.constants import RuntimePaths, resolve_runtime_paths, runtime_env_values
-from mindroom.file_locks import async_exclusive_file_lock
+from mindroom.constants import (
+    DEFAULT_KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_SECONDS,
+    KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV,
+    RuntimePaths,
+    resolve_runtime_paths,
+    runtime_env_values,
+)
+from mindroom.credentials import get_runtime_shared_credentials_manager
 from mindroom.knowledge.availability import KnowledgeAvailability
-from mindroom.knowledge.manager import KnowledgeManager, knowledge_source_signature
+from mindroom.knowledge.github_app_auth import (
+    GitHubAppTokenBinding,
+    get_runtime_github_app_token_provider,
+)
+from mindroom.knowledge.index_metadata import state_for_publication
+from mindroom.knowledge.manager import KnowledgeManager
 from mindroom.knowledge.redaction import redact_credentials_in_text
+from mindroom.knowledge.refresh_locks import (
+    mark_refresh_active,
+    mark_refresh_inactive,
+    refresh_source_root_lock,
+)
 from mindroom.knowledge.registry import (
-    KnowledgeRefreshTarget,
-    KnowledgeSourceRoot,
     PublishedIndexKey,
     PublishedIndexState,
     load_published_index_state,
@@ -76,6 +88,13 @@ class KnowledgeRefreshResult:
 
 
 @dataclass(frozen=True)
+class _SubprocessGitHubAppToken:
+    token: str = field(repr=False)
+    expires_at_epoch: int
+    binding: GitHubAppTokenBinding
+
+
+@dataclass(frozen=True)
 class _SubprocessRefreshRequest:
     base_id: str
     config_data: dict[str, object]
@@ -83,6 +102,7 @@ class _SubprocessRefreshRequest:
     storage_root: str
     runtime_knowledge_base: dict[str, object] | None = None
     execution_identity: SerializedToolExecutionIdentity | None = None
+    github_app_token: _SubprocessGitHubAppToken | None = None
     force_reindex: bool = False
 
 
@@ -90,11 +110,22 @@ class _SubprocessSessionKwargs(TypedDict, total=False):
     start_new_session: bool
 
 
-_refresh_locks_guard = Lock()
-_active_refresh_counts: dict[KnowledgeRefreshTarget, int] = {}
-_active_refresh_counts_guard = Lock()
-_MAX_REFRESH_LOCKS = 512
-_REFRESH_FILE_LOCK_POLL_SECONDS = 0.1
+def _refresh_subprocess_timeout_seconds(runtime_paths: RuntimePaths) -> float:
+    """Return how long one refresh child may run before it is killed."""
+    raw_value = runtime_paths.env_value(KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV)
+    if raw_value is None:
+        return DEFAULT_KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_SECONDS
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        msg = f"{KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV} must be a number, got {raw_value!r}"
+        raise ValueError(msg) from exc
+    if not math.isfinite(value) or value <= 0:
+        msg = f"{KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV} must be a finite number greater than 0, got {value}"
+        raise ValueError(msg)
+    return value
+
+
 _REFRESH_SUBPROCESS_THREAD_ENV = {
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
@@ -103,106 +134,58 @@ _REFRESH_SUBPROCESS_THREAD_ENV = {
     "VECLIB_MAXIMUM_THREADS": "1",
     "TOKENIZERS_PARALLELISM": "false",
 }
+_REFRESH_SUBPROCESS_INTERMEDIATE_PENDING_REASONS = frozenset(
+    {
+        "git_source_updated",
+        "manual_reindex",
+        "source_changed",
+    },
+)
 
 
-@dataclass
-class _RefreshLockEntry:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    borrowers: int = 0
-
-
-_refresh_locks: dict[KnowledgeSourceRoot, _RefreshLockEntry] = {}
-
-
-def _borrow_refresh_lock_for_key(key: KnowledgeSourceRoot) -> _RefreshLockEntry:
-    with _refresh_locks_guard:
-        entry = _refresh_locks.get(key)
-        if entry is None:
-            _prune_refresh_locks_locked(reserve_slots=1)
-            entry = _RefreshLockEntry()
-            _refresh_locks[key] = entry
-        entry.borrowers += 1
-        return entry
-
-
-def _release_refresh_lock_for_key(key: KnowledgeSourceRoot, entry: _RefreshLockEntry) -> None:
-    with _refresh_locks_guard:
-        if entry.borrowers <= 0:
-            return
-        entry.borrowers -= 1
-        if _refresh_locks.get(key) is entry:
-            _prune_refresh_locks_locked()
-
-
-def _prune_refresh_locks_locked(*, reserve_slots: int = 0) -> None:
-    target_size = max(_MAX_REFRESH_LOCKS - reserve_slots, 0)
-    if len(_refresh_locks) <= target_size:
-        return
-    excess = len(_refresh_locks) - target_size
-    for key, entry in tuple(_refresh_locks.items()):
-        if excess <= 0:
-            break
-        if entry.borrowers > 0 or entry.lock.locked():
-            continue
-        _refresh_locks.pop(key, None)
-        excess -= 1
-
-
-@asynccontextmanager
-async def _acquire_refresh_lock(key: KnowledgeSourceRoot) -> AsyncIterator[None]:
-    entry = _borrow_refresh_lock_for_key(key)
-    acquired = False
-    try:
-        await entry.lock.acquire()
-        acquired = True
-        yield
-    finally:
-        if acquired:
-            entry.lock.release()
-        _release_refresh_lock_for_key(key, entry)
-
-
-def mark_refresh_active(key: KnowledgeRefreshTarget) -> None:
-    """Record scheduler-level refresh activity before a task reaches the runner."""
-    with _active_refresh_counts_guard:
-        _active_refresh_counts[key] = _active_refresh_counts.get(key, 0) + 1
-
-
-def mark_refresh_inactive(key: KnowledgeRefreshTarget) -> None:
-    """Clear scheduler-level refresh activity after a scheduled task finishes."""
-    with _active_refresh_counts_guard:
-        count = _active_refresh_counts.get(key, 0)
-        if count <= 1:
-            _active_refresh_counts.pop(key, None)
-        else:
-            _active_refresh_counts[key] = count - 1
-
-
-def is_refresh_active(key: KnowledgeRefreshTarget) -> bool:
-    """Return whether a refresh is active for one resolved physical binding."""
-    with _active_refresh_counts_guard:
-        return _active_refresh_counts.get(key, 0) > 0
-
-
-def is_refresh_active_for_binding(
+async def _github_app_refresh_binding(
     base_id: str,
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-    execution_identity: ToolExecutionIdentity | None = None,
-) -> bool:
-    """Resolve a binding and return whether it has an active refresh."""
-    try:
-        key = resolve_refresh_target(
-            base_id,
-            config=config,
-            runtime_paths=runtime_paths,
-            execution_identity=execution_identity,
-            create=False,
+) -> tuple[str, dict[str, Any]] | None:
+    git_config = config.get_knowledge_base_config(base_id).git
+    if git_config is None or git_config.credentials_service is None:
+        return None
+    credentials_manager = get_runtime_shared_credentials_manager(runtime_paths)
+    credentials = (
+        await asyncio.to_thread(
+            credentials_manager.load_credentials,
+            git_config.credentials_service,
         )
-    except ValueError:
-        return False
-    return is_refresh_active(key)
+        or {}
+    )
+    if credentials.get("auth_type") != "github_app":
+        return None
+    return git_config.repo_url, credentials
+
+
+async def _resolve_subprocess_github_app_token(
+    base_id: str,
+    *,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> _SubprocessGitHubAppToken | None:
+    binding = await _github_app_refresh_binding(
+        base_id,
+        config=config,
+        runtime_paths=runtime_paths,
+    )
+    if binding is None:
+        return None
+    repo_url, credentials = binding
+    provider = get_runtime_github_app_token_provider()
+    resolved = await provider.resolve_token(repo_url, credentials)
+    return _SubprocessGitHubAppToken(
+        token=resolved.token,
+        expires_at_epoch=int(resolved.expires_at.timestamp()),
+        binding=provider.binding_for(repo_url, credentials),
+    )
 
 
 async def refresh_knowledge_binding_in_subprocess(
@@ -228,14 +211,32 @@ async def refresh_knowledge_binding_in_subprocess(
         create=True,
     )
     initial_state = await asyncio.to_thread(load_published_index_state, published_index_metadata_path(key))
-    request_payload = _serialize_subprocess_refresh_request(
-        base_id,
-        config=config,
-        runtime_paths=runtime_paths,
-        execution_identity=execution_identity,
-        force_reindex=force_reindex,
-    )
+    try:
+        github_app_token = await _resolve_subprocess_github_app_token(
+            base_id,
+            config=config,
+            runtime_paths=runtime_paths,
+        )
+        request_payload = _serialize_subprocess_refresh_request(
+            base_id,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=execution_identity,
+            github_app_token=github_app_token,
+            force_reindex=force_reindex,
+        )
+        # Resolved before the spawn so a malformed window rejects the refresh
+        # instead of leaving a child nobody is waiting on.
+        timeout = _refresh_subprocess_timeout_seconds(runtime_paths)
+    except Exception as exc:
+        await _reconcile_failed_refresh_subprocess(
+            key,
+            initial_state=initial_state,
+            error=redact_credentials_in_text(str(exc)),
+        )
+        raise
     env = dict(runtime_env_values(runtime_paths))
+    env.setdefault("PATH", os.environ.get("PATH") or os.defpath)
     env.update(_REFRESH_SUBPROCESS_THREAD_ENV)
     env["MINDROOM_KNOWLEDGE_REFRESH_SUBPROCESS"] = "1"
     process = await asyncio.create_subprocess_exec(
@@ -247,9 +248,29 @@ async def refresh_knowledge_binding_in_subprocess(
         **_subprocess_session_kwargs(),
     )
     try:
-        with suppress(BrokenPipeError, ConnectionResetError):
-            await _send_subprocess_refresh_request(process, request_payload)
-        return_code = await process.wait()
+        async with asyncio.timeout(timeout):
+            with suppress(BrokenPipeError, ConnectionResetError):
+                await _send_subprocess_refresh_request(process, request_payload)
+            return_code = await process.wait()
+    except TimeoutError:
+        # A refresh child can wedge below Python: torch's Metal shader-library
+        # caches are unlocked, and a corrupted lookup spins forever. The child
+        # gets its own session, so nothing else would ever reap it.
+        msg = f"Knowledge refresh subprocess for {base_id!r} timed out after {timeout}s and was terminated"
+        logger.warning(msg, base_id=base_id)
+        cleanup_task = asyncio.create_task(
+            _cleanup_timed_out_refresh_subprocess(
+                process,
+                key,
+                initial_state=initial_state,
+                error=msg,
+            ),
+        )
+        cancellation = await _drain_owned_cleanup_task(cleanup_task)
+        cleanup_task.result()
+        if cancellation is not None:
+            raise cancellation from None
+        raise RuntimeError(msg) from None
     except asyncio.CancelledError:
         cleanup_task = asyncio.create_task(
             _cleanup_cancelled_refresh_subprocess(
@@ -260,12 +281,16 @@ async def refresh_knowledge_binding_in_subprocess(
                 runtime_paths=runtime_paths,
             ),
         )
-        while not cleanup_task.done():
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(cleanup_task)
+        await _drain_owned_cleanup_task(cleanup_task)
         with suppress(Exception):
             cleanup_task.result()
         raise
+
+    cleanup_task = asyncio.create_task(_terminate_refresh_subprocess(process))
+    cancellation = await _drain_owned_cleanup_task(cleanup_task)
+    cleanup_task.result()
+    if cancellation is not None:
+        raise cancellation from None
 
     if return_code != 0:
         msg = f"Knowledge refresh subprocess failed for {base_id!r} with exit code {return_code}"
@@ -279,6 +304,7 @@ def _serialize_subprocess_refresh_request(
     config: Config,
     runtime_paths: RuntimePaths,
     execution_identity: ToolExecutionIdentity | None,
+    github_app_token: _SubprocessGitHubAppToken | None = None,
     force_reindex: bool,
 ) -> bytes:
     runtime_knowledge_base = config.runtime_knowledge_base_overlay(base_id)
@@ -295,9 +321,13 @@ def _serialize_subprocess_refresh_request(
         execution_identity=None
         if execution_identity is None
         else serialize_tool_execution_identity(execution_identity),
+        github_app_token=github_app_token,
         force_reindex=force_reindex,
     )
-    return json.dumps(asdict(payload), sort_keys=True).encode()
+    serialized_payload = asdict(payload)
+    if github_app_token is None:
+        del serialized_payload["github_app_token"]
+    return json.dumps(serialized_payload, sort_keys=True).encode()
 
 
 async def _send_subprocess_refresh_request(
@@ -314,41 +344,76 @@ async def _send_subprocess_refresh_request(
         await process.stdin.wait_closed()
 
 
-def _refresh_file_lock_path(key: KnowledgeSourceRoot) -> Path:
-    digest = hashlib.sha256(f"{key.storage_root}\0{key.knowledge_path}".encode()).hexdigest()
-    return Path(tempfile.gettempdir()) / "mindroom" / "knowledge_refresh_locks" / f"{digest}.lock"
-
-
-@asynccontextmanager
-async def _acquire_refresh_file_lock(key: KnowledgeSourceRoot) -> AsyncIterator[None]:
-    """Serialize source-root refresh and mutation work across processes."""
-    async with async_exclusive_file_lock(_refresh_file_lock_path(key), poll_seconds=_REFRESH_FILE_LOCK_POLL_SECONDS):
-        yield
-
-
 def _subprocess_session_kwargs() -> _SubprocessSessionKwargs:
     if os.name == "nt":
         return {}
     return {"start_new_session": True}
 
 
-async def _terminate_refresh_subprocess(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
-    if os.name == "nt":
-        process.terminate()
-    else:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        await asyncio.wait_for(process.wait(), timeout=10)
-    except TimeoutError:
-        if os.name == "nt":
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_process_group_exit(process_group_id: int, *, wait_seconds: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_seconds
+    # There is no asyncio readiness primitive for POSIX process-group exit.
+    while _process_group_exists(process_group_id) and loop.time() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+    if _process_group_exists(process_group_id):
+        logger.warning(
+            "Knowledge refresh process group survived termination wait",
+            process_group_id=process_group_id,
+            wait_seconds=wait_seconds,
+        )
+
+
+async def _terminate_refresh_subprocess(process: asyncio.subprocess.Process) -> None:
+    if os.name == "nt":
+        if process.returncode is not None:
+            return
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError:
             process.kill()
-        else:
+            await process.wait()
+        return
+
+    process_group_id = process.pid
+    with suppress(ProcessLookupError):
+        os.killpg(process_group_id, signal.SIGTERM)
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError:
             with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-        await process.wait()
+                os.killpg(process_group_id, signal.SIGKILL)
+            await process.wait()
+            await _wait_for_process_group_exit(process_group_id)
+            return
+    if _process_group_exists(process_group_id):
+        with suppress(ProcessLookupError):
+            os.killpg(process_group_id, signal.SIGKILL)
+        await _wait_for_process_group_exit(process_group_id)
+
+
+async def _drain_owned_cleanup_task(cleanup_task: asyncio.Task[None]) -> asyncio.CancelledError | None:
+    """Wait through repeated caller cancellation until an owned cleanup task settles."""
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+    return cancellation
 
 
 async def _cleanup_cancelled_refresh_subprocess(
@@ -362,7 +427,7 @@ async def _cleanup_cancelled_refresh_subprocess(
     try:
         await _terminate_refresh_subprocess(process)
         source_root = source_root_for_published_index_key(key)
-        async with _acquire_refresh_lock(source_root), _acquire_refresh_file_lock(source_root):
+        async with refresh_source_root_lock(source_root):
             await _reconcile_cancelled_refresh(
                 key,
                 initial_state=initial_state,
@@ -373,6 +438,18 @@ async def _cleanup_cancelled_refresh_subprocess(
         logger.warning("Failed to reconcile cancelled knowledge refresh subprocess", base_id=key.base_id, exc_info=True)
 
 
+async def _cleanup_timed_out_refresh_subprocess(
+    process: asyncio.subprocess.Process,
+    key: PublishedIndexKey,
+    *,
+    initial_state: PublishedIndexState | None,
+    error: str,
+) -> None:
+    """Terminate one timed-out child and persist its failure before returning."""
+    await _terminate_refresh_subprocess(process)
+    await _reconcile_failed_refresh_subprocess(key, initial_state=initial_state, error=error)
+
+
 async def _reconcile_failed_refresh_subprocess(
     key: PublishedIndexKey,
     *,
@@ -381,7 +458,7 @@ async def _reconcile_failed_refresh_subprocess(
 ) -> None:
     try:
         source_root = source_root_for_published_index_key(key)
-        async with _acquire_refresh_lock(source_root), _acquire_refresh_file_lock(source_root):
+        async with refresh_source_root_lock(source_root):
             state = await asyncio.to_thread(load_published_index_state, published_index_metadata_path(key))
             if not _failed_subprocess_state_can_be_reconciled(key, state, initial_state):
                 return
@@ -408,7 +485,7 @@ async def knowledge_binding_mutation_lock(
         create=create,
     )
     source_root = source_root_for_refresh_target(key)
-    async with _acquire_refresh_lock(source_root), _acquire_refresh_file_lock(source_root):
+    async with refresh_source_root_lock(source_root):
         yield
 
 
@@ -449,7 +526,7 @@ async def _refresh_resolved_knowledge_binding(
     source_root = source_root_for_published_index_key(key)
     mark_refresh_active(refresh_target)
     try:
-        async with _acquire_refresh_lock(source_root), _acquire_refresh_file_lock(source_root):
+        async with refresh_source_root_lock(source_root):
             initial_state = await asyncio.to_thread(
                 load_published_index_state,
                 published_index_metadata_path(key),
@@ -500,7 +577,6 @@ async def _refresh_knowledge_binding_locked(
     force_reindex: bool = False,
 ) -> KnowledgeRefreshResult:
     base_id = key.base_id
-    manager: KnowledgeManager | None = None
     try:
         if config.get_knowledge_base_config(base_id).mode == "files":
             return await _refresh_file_mode_binding_locked(
@@ -525,6 +601,20 @@ async def _refresh_knowledge_binding_locked(
             storage_path=binding.storage_root,
             knowledge_path=binding.knowledge_path,
         )
+        if await _should_defer_cold_empty_publication(manager, key):
+            await asyncio.to_thread(
+                mark_published_index_stale,
+                key,
+                reason="source_empty",
+                refresh_job="idle",
+            )
+            return KnowledgeRefreshResult(
+                key=key,
+                indexed_count=0,
+                index_published=False,
+                availability=KnowledgeAvailability.INITIALIZING,
+                last_error=None,
+            )
         unchanged_result = await _maybe_publish_unchanged_index(
             manager,
             key,
@@ -533,16 +623,19 @@ async def _refresh_knowledge_binding_locked(
         )
         if unchanged_result is not None:
             return unchanged_result
-        indexed_count = await manager.reindex_all()
-        if manager._last_refresh_error is not None:
-            error = redact_credentials_in_text(manager._last_refresh_error)
-            await asyncio.to_thread(mark_published_index_refresh_failed_preserving_last_good, key, error=error)
+        outcome = await manager.reindex_all(force_reindex=force_reindex)
+        if outcome.error is not None:
+            await asyncio.to_thread(
+                mark_published_index_refresh_failed_preserving_last_good,
+                key,
+                error=outcome.error,
+            )
             return KnowledgeRefreshResult(
                 key=key,
-                indexed_count=indexed_count,
+                indexed_count=outcome.indexed_count,
                 index_published=False,
                 availability=KnowledgeAvailability.REFRESH_FAILED,
-                last_error=error,
+                last_error=outcome.error,
             )
     except Exception as exc:
         error = redact_credentials_in_text(str(exc))
@@ -550,41 +643,43 @@ async def _refresh_knowledge_binding_locked(
         raise
     return await _refresh_result_from_persisted_state(
         key,
-        indexed_count=indexed_count,
+        indexed_count=outcome.indexed_count,
         config=config,
         runtime_paths=runtime_paths,
     )
 
 
+async def _should_defer_cold_empty_publication(
+    manager: KnowledgeManager,
+    key: PublishedIndexKey,
+) -> bool:
+    """Return whether a content-gated cold index has no corpus to publish yet."""
+    if not manager.config.get_knowledge_base_config(manager.base_id).require_content_before_publish:
+        return False
+    files = await asyncio.to_thread(manager.list_files)
+    if files:
+        return False
+    state = await asyncio.to_thread(load_published_index_state, published_index_metadata_path(key))
+    return state is None or state.status != "complete" or not state.indexed_count
+
+
 async def _publish_file_mode_source_metadata(
     key: PublishedIndexKey,
     manager: KnowledgeManager,
+    *,
+    published_revision: str | None = None,
 ) -> KnowledgeRefreshResult:
     """Publish current source metadata for a file-only base without building vectors."""
-    source_signature = await asyncio.to_thread(
-        knowledge_source_signature,
-        manager.config,
-        manager.base_id,
-        manager._knowledge_source_path(),
-        tracked_relative_paths=manager._git_tracked_relative_paths,
-    )
-    now = datetime.now(tz=UTC).isoformat()
+    source_signature = await manager.source_signature()
     await asyncio.to_thread(
         save_published_index_state,
         published_index_metadata_path(key),
-        PublishedIndexState(
+        state_for_publication(
             settings=key.indexing_settings,
-            status="complete",
             collection=None,
-            last_published_at=now,
-            published_revision=manager._git_last_successful_commit,
             indexed_count=0,
             source_signature=source_signature,
-            refresh_job="idle",
-            reason=None,
-            last_error=None,
-            updated_at=now,
-            last_refresh_at=now,
+            published_revision=published_revision,
         ),
     )
     return KnowledgeRefreshResult(
@@ -668,9 +763,11 @@ async def _refresh_file_mode_binding_locked(
         storage_path=binding.storage_root,
         knowledge_path=binding.knowledge_path,
     )
-    if manager._git_config() is not None:
-        git_sync_result = await manager.sync_git_source()
-        if git_sync_result.get("updated", False):
+    published_revision: str | None = None
+    if manager.git_source.is_configured():
+        git_sync_result = await manager.git_source.sync()
+        published_revision = git_sync_result.head
+        if git_sync_result.updated:
             await mark_knowledge_source_changed_async(
                 key.base_id,
                 config=manager.config,
@@ -679,7 +776,7 @@ async def _refresh_file_mode_binding_locked(
                 reason="git_source_updated",
             )
 
-    return await _publish_file_mode_source_metadata(key, manager)
+    return await _publish_file_mode_source_metadata(key, manager, published_revision=published_revision)
 
 
 async def _maybe_publish_unchanged_index(
@@ -689,11 +786,11 @@ async def _maybe_publish_unchanged_index(
     execution_identity: ToolExecutionIdentity | None,
     force_reindex: bool,
 ) -> KnowledgeRefreshResult | None:
-    force_reindex = force_reindex or manager._needs_full_reindex_on_create()
-    if manager._git_config() is not None:
-        git_sync_result = await manager.sync_git_source()
-        if force_reindex or git_sync_result.get("updated", False):
-            if git_sync_result.get("updated", False):
+    force_reindex = force_reindex or manager.needs_full_reindex_on_create()
+    if manager.git_source.is_configured():
+        git_sync_result = await manager.git_source.sync()
+        if force_reindex or git_sync_result.updated:
+            if git_sync_result.updated:
                 await mark_knowledge_source_changed_async(
                     key.base_id,
                     config=manager.config,
@@ -705,7 +802,7 @@ async def _maybe_publish_unchanged_index(
         return await _publish_unchanged_index(
             manager,
             key,
-            published_revision=manager._git_last_successful_commit,
+            published_revision=git_sync_result.head,
         )
     if force_reindex:
         await mark_knowledge_source_changed_async(
@@ -794,6 +891,19 @@ async def _refresh_result_from_persisted_state(
     )
 
 
+def _revision_proves_source_unchanged(state: PublishedIndexState, published_revision: str | None) -> bool:
+    """Return whether a matching Git revision already proves the indexed corpus is unchanged.
+
+    MindRoom owns the checkout and realigns it with ``git reset --hard``, so a tracked
+    file's content is fully determined by HEAD. Every corpus filter (branch, LFS, hidden
+    paths, include/exclude patterns and extensions) lives in ``IndexingSettings``, which
+    the caller has already compared. An unmoved revision therefore means byte-identical
+    indexed content, and hashing the corpus to learn the same thing costs a full read of
+    every file — the dominant cost on a large or network-mounted source.
+    """
+    return published_revision is not None and state.published_revision == published_revision
+
+
 async def _publish_unchanged_index(
     manager: KnowledgeManager,
     key: PublishedIndexKey,
@@ -812,13 +922,10 @@ async def _publish_unchanged_index(
     ):
         return None
 
-    current_source_signature = await asyncio.to_thread(
-        knowledge_source_signature,
-        manager.config,
-        manager.base_id,
-        manager._knowledge_source_path(),
-        tracked_relative_paths=manager._git_tracked_relative_paths,
-    )
+    if _revision_proves_source_unchanged(state, published_revision):
+        current_source_signature = state.source_signature
+    else:
+        current_source_signature = await manager.source_signature()
     if current_source_signature != state.source_signature:
         if mark_stale_on_source_change:
             await mark_knowledge_source_changed_async(
@@ -830,9 +937,9 @@ async def _publish_unchanged_index(
             )
         return None
 
+    # Settings already matched at the top of this function, so only the revision
+    # and publish stamp can still move.
     updated_state = state
-    if state.settings != key.indexing_settings:
-        updated_state = replace(updated_state, settings=key.indexing_settings)
     if published_revision is not None:
         updated_state = replace(
             updated_state,
@@ -859,6 +966,17 @@ async def _publish_unchanged_index(
             last_error=error,
         )
     await asyncio.to_thread(mark_published_index_refresh_succeeded, key)
+    # This path returns before any candidate is opened, so it is the only place
+    # that can retire candidate state left by an interrupted forced rebuild.
+    try:
+        await manager.discard_superseded_candidate(published_collection=updated_state.collection)
+    except Exception:
+        logger.warning(
+            "Failed to retire candidate after unchanged knowledge index publish",
+            base_id=manager.base_id,
+            collection=updated_state.collection,
+            exc_info=True,
+        )
     return KnowledgeRefreshResult(
         key=key,
         indexed_count=updated_state.indexed_count or 0,
@@ -909,6 +1027,32 @@ def _refresh_running_fingerprint(
     )
 
 
+def _published_state_publication_fingerprint(state: PublishedIndexState) -> tuple[object, ...]:
+    return (
+        state.settings,
+        state.status,
+        state.collection,
+        state.last_published_at,
+        state.published_revision,
+        state.indexed_count,
+        state.source_signature,
+    )
+
+
+def _refresh_start_publication_fingerprint(
+    key: PublishedIndexKey,
+    initial_state: PublishedIndexState | None,
+) -> tuple[object, ...]:
+    if initial_state is not None:
+        return _published_state_publication_fingerprint(initial_state)
+    return _published_state_publication_fingerprint(
+        PublishedIndexState(
+            settings=key.indexing_settings,
+            status="indexing",
+        ),
+    )
+
+
 def _failed_subprocess_state_can_be_reconciled(
     key: PublishedIndexKey,
     state: PublishedIndexState | None,
@@ -919,7 +1063,16 @@ def _failed_subprocess_state_can_be_reconciled(
         _refresh_running_fingerprint(key, initial_state),
     }:
         return True
-    return state is not None and state.refresh_job == "running" and state.reason == "refreshing"
+    if state is None:
+        return False
+    if state.refresh_job == "running" and state.reason == "refreshing":
+        return True
+    return (
+        state.refresh_job == "pending"
+        and state.reason in _REFRESH_SUBPROCESS_INTERMEDIATE_PENDING_REASONS
+        and _published_state_publication_fingerprint(state)
+        == _refresh_start_publication_fingerprint(key, initial_state)
+    )
 
 
 async def _reconcile_cancelled_refresh(
@@ -956,6 +1109,62 @@ async def _reconcile_cancelled_refresh(
             await asyncio.to_thread(mark_published_index_refresh_succeeded, key)
             return
     await asyncio.to_thread(mark_published_index_stale, key, reason="refresh_cancelled", refresh_job="idle")
+
+
+def _load_subprocess_github_app_binding(raw_binding_payload: object) -> GitHubAppTokenBinding:
+    if not isinstance(raw_binding_payload, dict):
+        msg = "Knowledge refresh subprocess request github_app_token.binding must be an object"
+        raise TypeError(msg)
+    binding_payload = cast("dict[str, object]", raw_binding_payload)
+    raw_app_id = binding_payload.get("app_id")
+    raw_installation_id = binding_payload.get("installation_id")
+    raw_owner = binding_payload.get("owner")
+    raw_repository = binding_payload.get("repository")
+    raw_private_key_file = binding_payload.get("private_key_file")
+    if not isinstance(raw_app_id, int) or isinstance(raw_app_id, bool) or raw_app_id <= 0:
+        msg = "Knowledge refresh subprocess request github_app_token.binding.app_id must be positive"
+        raise TypeError(msg)
+    if not isinstance(raw_installation_id, int) or isinstance(raw_installation_id, bool) or raw_installation_id <= 0:
+        msg = "Knowledge refresh subprocess request github_app_token.binding.installation_id must be positive"
+        raise TypeError(msg)
+    if not isinstance(raw_owner, str) or not raw_owner:
+        msg = "Knowledge refresh subprocess request github_app_token.binding.owner must be non-empty"
+        raise TypeError(msg)
+    if not isinstance(raw_repository, str) or not raw_repository:
+        msg = "Knowledge refresh subprocess request github_app_token.binding.repository must be non-empty"
+        raise TypeError(msg)
+    if not isinstance(raw_private_key_file, str) or not raw_private_key_file:
+        msg = "Knowledge refresh subprocess request github_app_token.binding.private_key_file must be non-empty"
+        raise TypeError(msg)
+    return GitHubAppTokenBinding(
+        app_id=raw_app_id,
+        installation_id=raw_installation_id,
+        owner=raw_owner,
+        repository=raw_repository,
+        private_key_file=raw_private_key_file,
+    )
+
+
+def _load_subprocess_github_app_token(raw_token_payload: object) -> _SubprocessGitHubAppToken | None:
+    if raw_token_payload is None:
+        return None
+    if not isinstance(raw_token_payload, dict):
+        msg = "Knowledge refresh subprocess request github_app_token must be an object when present"
+        raise TypeError(msg)
+    token_payload = cast("dict[str, object]", raw_token_payload)
+    raw_token = token_payload.get("token")
+    raw_expires_at_epoch = token_payload.get("expires_at_epoch")
+    if not isinstance(raw_token, str) or not raw_token:
+        msg = "Knowledge refresh subprocess request github_app_token.token must be non-empty"
+        raise TypeError(msg)
+    if not isinstance(raw_expires_at_epoch, int) or isinstance(raw_expires_at_epoch, bool) or raw_expires_at_epoch <= 0:
+        msg = "Knowledge refresh subprocess request github_app_token.expires_at_epoch must be positive"
+        raise TypeError(msg)
+    return _SubprocessGitHubAppToken(
+        token=raw_token,
+        expires_at_epoch=raw_expires_at_epoch,
+        binding=_load_subprocess_github_app_binding(token_payload.get("binding")),
+    )
 
 
 def _load_subprocess_refresh_request(payload: bytes) -> _SubprocessRefreshRequest:
@@ -995,7 +1204,40 @@ def _load_subprocess_refresh_request(payload: bytes) -> _SubprocessRefreshReques
         storage_root=raw_storage_root,
         runtime_knowledge_base=cast("dict[str, object] | None", raw_runtime_knowledge_base),
         execution_identity=raw_execution_identity,
+        github_app_token=_load_subprocess_github_app_token(raw_payload.get("github_app_token")),
         force_reindex=bool(raw_force_reindex),
+    )
+
+
+async def _prime_subprocess_github_app_token(
+    request: _SubprocessRefreshRequest,
+    *,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> None:
+    if request.github_app_token is None:
+        return
+    binding = await _github_app_refresh_binding(
+        request.base_id,
+        config=config,
+        runtime_paths=runtime_paths,
+    )
+    if binding is None:
+        return
+    try:
+        expires_at = datetime.fromtimestamp(request.github_app_token.expires_at_epoch, tz=UTC)
+    except (OSError, OverflowError, ValueError) as exc:
+        msg = "Knowledge refresh subprocess GitHub App token expiry is invalid"
+        raise TypeError(msg) from exc
+    repo_url, credentials = binding
+    provider = get_runtime_github_app_token_provider()
+    if provider.binding_for(repo_url, credentials) != request.github_app_token.binding:
+        return
+    provider.prime(
+        repo_url,
+        credentials,
+        token=request.github_app_token.token,
+        expires_at=expires_at,
     )
 
 
@@ -1010,6 +1252,11 @@ async def _run_subprocess_refresh_request(payload: bytes) -> KnowledgeRefreshRes
     if request.runtime_knowledge_base is not None:
         base_config = KnowledgeBaseConfig.model_validate(request.runtime_knowledge_base)
         config = config.with_runtime_knowledge_base_overlay(request.base_id, base_config)
+    await _prime_subprocess_github_app_token(
+        request,
+        config=config,
+        runtime_paths=runtime_paths,
+    )
     execution_identity = (
         None
         if request.execution_identity is None
