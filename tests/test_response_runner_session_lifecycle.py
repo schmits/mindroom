@@ -2321,3 +2321,89 @@ async def test_generate_response_preserves_retry_model_prompt(tmp_path: Path) ->
     assert persisted_run.messages is not None
     assert "Describe this image" in cast("str", persisted_run.messages[0].content)
     assert "Available attachment IDs: att_1" in cast("str", persisted_run.messages[0].content)
+
+@pytest.mark.asyncio
+async def test_generate_response_emits_session_completion_callback_once_after_terminal_outcome(
+    tmp_path: Path,
+) -> None:
+    """A completed agent run should notify the parent/coordinator seam once with terminal facts."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = bind_runtime_paths(_config(), runtime_paths)
+    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths)
+    callbacks = AsyncMock()
+
+    with (
+        patch("mindroom.response_runner.ai_response", new=AsyncMock(return_value="Hello!")),
+        patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
+    ):
+        coordinator = _build_response_runner(
+            bot,
+            config=config,
+            runtime_paths=runtime_paths,
+            storage_path=tmp_path,
+            requester_id="@alice:localhost",
+            enable_streaming=False,
+        )
+        response_event_id = await coordinator.generate_response(
+            replace(
+                _response_request(
+                    prompt="Hello",
+                    user_id="@alice:localhost",
+                    correlation_id="corr-1",
+                ),
+                on_session_completed=callbacks,
+            ),
+        )
+
+    assert response_event_id == _visible_response_event_id()
+    callbacks.assert_awaited_once()
+    event = callbacks.await_args.args[0]
+    assert event.session_id == MessageTarget.resolve("!test:localhost", None, "$user_msg", room_mode=True).session_id
+    assert event.response_event_id == _visible_response_event_id()
+    assert event.terminal_status == "completed"
+    assert event.run_succeeded is True
+    assert event.source_handled is True
+    assert event.room_id == "!test:localhost"
+    assert event.thread_id is None
+    assert event.reply_to_event_id == "$user_msg"
+    assert event.source_event_id == "$user_msg"
+    assert event.correlation_id == "corr-1"
+    assert event.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_session_completion_callback_is_idempotent_and_fail_open(
+    tmp_path: Path,
+) -> None:
+    """Callback failures should be logged and must not make a settled response retry."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = bind_runtime_paths(_config(), runtime_paths)
+    bot = _make_bot(tmp_path, config=config, runtime_paths=runtime_paths)
+    callbacks = AsyncMock(side_effect=RuntimeError("callback down"))
+
+    with (
+        patch("mindroom.response_runner.ai_response", new=AsyncMock(return_value="Hello!")),
+        patch("mindroom.response_lifecycle.apply_post_response_effects", new=AsyncMock(return_value=None)),
+    ):
+        coordinator = _build_response_runner(
+            bot,
+            config=config,
+            runtime_paths=runtime_paths,
+            storage_path=tmp_path,
+            requester_id="@alice:localhost",
+            enable_streaming=False,
+        )
+        response_event_id = await coordinator.generate_response(
+            replace(
+                _response_request(prompt="Hello", user_id="@alice:localhost"),
+                on_session_completed=callbacks,
+            ),
+        )
+
+    assert response_event_id == _visible_response_event_id()
+    callbacks.assert_awaited_once()
+    assert [
+        call.args[0]
+        for call in bot.logger.warning.call_args_list
+        if call.args and call.args[0] == "session_completion_callback_failed"
+    ] == ["session_completion_callback_failed"]

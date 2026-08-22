@@ -19,6 +19,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from agno.tools import Toolkit
 
@@ -125,11 +126,13 @@ class RepoWorkspaceTools(Toolkit):
             return f"Error: workspace already exists: {workspace_id}"
         repo_dir = workspace_dir / "repo"
         artifacts_dir = workspace_dir / "artifacts"
+        source_provenance = _empty_workspace_provenance()
         try:
             repo_dir.mkdir(parents=True, exist_ok=False)
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             if source_path:
-                source = self._validate_source_path(source_path)
+                source = self._validate_source_path(source_path, expected_repo=repo_name)
+                source_provenance = _source_provenance(source, expected_repo=repo_name, source_ref=ref)
                 _copy_source_tree(source, repo_dir)
         except ValueError as exc:
             shutil.rmtree(workspace_dir, ignore_errors=True)
@@ -159,9 +162,15 @@ class RepoWorkspaceTools(Toolkit):
                 "execution_performed": False,
                 "handoff_required": "coding_sandbox",
             },
-            "provenance": {
-                "source_path": str(Path(source_path).resolve()) if source_path else None,
-                "source_type": "local_copy" if source_path else "empty_workspace",
+            "provenance": source_provenance,
+            "audit": {
+                "created_by_tool": "repo_workspace",
+                "materialization_method": "local_source_path_copy" if source_path else "empty_workspace",
+                "source_path_boundary_enforced": bool(source_path),
+                "allowed_source_roots": [str(root) for root in self.allowed_source_roots],
+                "writes_require_confirmation": True,
+                "network_performed": False,
+                "execution_performed": False,
             },
         }
         self._write_metadata(workspace_dir, metadata)
@@ -439,7 +448,7 @@ class RepoWorkspaceTools(Toolkit):
             raise ValueError(f"ttl_minutes exceeds max_ttl_minutes ({self.max_ttl_minutes}).")
         return ttl
 
-    def _validate_source_path(self, source_path: str) -> Path:
+    def _validate_source_path(self, source_path: str, *, expected_repo: str) -> Path:
         if not self.allowed_source_roots:
             raise ValueError("source_path requires allowed_source_roots to be configured.")
         source = Path(source_path).resolve()
@@ -447,6 +456,8 @@ class RepoWorkspaceTools(Toolkit):
             raise ValueError("source_path must be an existing directory.")
         if not any(_is_relative_to(source, root) for root in self.allowed_source_roots):
             raise ValueError("source_path is outside allowed_source_roots.")
+        if not _source_path_matches_repo_layout(source, expected_repo, allowed_source_roots=self.allowed_source_roots):
+            raise ValueError("source_path must identify the requested repo root at <allowed_source_root>/<owner>/<repo>, not an owner or parent directory.")
         return source
 
     def _new_workspace_id(self, repo: str, workspace_id: str | None) -> str:
@@ -474,10 +485,9 @@ class RepoWorkspaceTools(Toolkit):
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             return f"Error reading workspace metadata: {exc}"
-        repo_dir = Path(str(metadata.get("repo_dir", ""))).resolve()
-        expected_repo_dir = (workspace_dir / "repo").resolve()
-        if repo_dir != expected_repo_dir:
-            return "Error: workspace metadata repo_dir does not match expected confined path."
+        validation_error = self._validate_workspace_metadata(metadata, workspace_dir)
+        if validation_error:
+            return validation_error
         return metadata, workspace_dir
 
     def _repo_dir_for_workspace(self, workspace_id: str) -> Path | str:
@@ -507,6 +517,9 @@ class RepoWorkspaceTools(Toolkit):
     def _write_metadata(self, workspace_dir: Path, metadata: dict[str, Any]) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         (workspace_dir / "workspace.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _validate_workspace_metadata(self, metadata: dict[str, Any], workspace_dir: Path) -> str | None:
+        return _validate_workspace_metadata(metadata, workspace_dir, configured_source_roots=self.allowed_source_roots)
 
 
 def _normalize_string_list(value: list[str] | str | None) -> list[str]:
@@ -560,6 +573,121 @@ def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
         timeout=30,
         check=False,
     )
+
+
+def _empty_workspace_provenance() -> dict[str, Any]:
+    return {
+        "source_path": None,
+        "source_type": "empty_workspace",
+        "repo_identity": None,
+        "source_ref": None,
+        "source_head_sha": None,
+        "origin_url": None,
+    }
+
+
+def _source_provenance(source: Path, *, expected_repo: str, source_ref: str | None) -> dict[str, Any]:
+    provenance: dict[str, Any] = {
+        "source_path": str(source),
+        "source_type": "local_copy",
+        "repo_identity": expected_repo,
+        "source_ref": source_ref,
+        "source_head_sha": None,
+        "origin_url": None,
+    }
+    if not (source / ".git").is_dir():
+        return provenance
+
+    _verify_git_checkout(source)
+    head_result = _run_git(["rev-parse", "--verify", "HEAD"], cwd=source)
+    if head_result.returncode != 0:
+        raise ValueError("source_path .git checkout has no verifiable HEAD commit.")
+    origin_result = _run_git(["config", "--get", "remote.origin.url"], cwd=source)
+    origin_url = origin_result.stdout.strip() if origin_result.returncode == 0 else ""
+    redacted_origin = _redact_origin_url(origin_url) if origin_url else None
+    repo_identity = _repo_identity_from_origin(redacted_origin) if redacted_origin else None
+    if repo_identity and repo_identity != expected_repo:
+        raise ValueError(f"source_path git origin does not match requested repo: {repo_identity}")
+    if not repo_identity:
+        # The exact allowed-root/owner/repo layout was already verified before
+        # provenance collection. A missing origin is acceptable only because the
+        # deterministic path identity boundary still identifies the requested repo.
+        repo_identity = expected_repo
+    ref_result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=source)
+    detected_ref = ref_result.stdout.strip() if ref_result.returncode == 0 else ""
+    if not detected_ref or detected_ref == "HEAD":
+        detected_ref = source_ref or None
+
+    provenance.update(
+        {
+            "source_type": "local_git_checkout",
+            "repo_identity": repo_identity,
+            "source_ref": source_ref or detected_ref,
+            "source_head_sha": head_result.stdout.strip(),
+            "origin_url": redacted_origin,
+        }
+    )
+    return provenance
+
+
+def _verify_git_checkout(source: Path) -> None:
+    result = _run_git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir"], cwd=source)
+    if result.returncode != 0:
+        raise ValueError("source_path .git directory is not a valid git checkout.")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ValueError("source_path .git checkout could not be verified.")
+    toplevel = Path(lines[0]).resolve()
+    git_dir = Path(lines[1]).resolve()
+    if toplevel != source.resolve() or git_dir != (source / ".git").resolve():
+        raise ValueError("source_path must be the root of a non-linked local git checkout.")
+
+
+def _redact_origin_url(origin_url: str) -> str:
+    if not origin_url:
+        return origin_url
+    if "@" in origin_url and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", origin_url):
+        parsed = urlsplit(origin_url)
+        hostname = parsed.hostname or ""
+        netloc = hostname
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", origin_url):
+        parsed = urlsplit(origin_url)
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return origin_url.split("?", 1)[0].split("#", 1)[0]
+
+
+def _repo_identity_from_origin(origin_url: str | None) -> str | None:
+    if not origin_url:
+        return None
+    candidate = origin_url.rstrip("/")
+    if candidate.startswith("git@github.com:"):
+        path = candidate.split(":", 1)[1]
+    else:
+        parsed = urlsplit(candidate)
+        if parsed.hostname not in {"github.com", "www.github.com"}:
+            return None
+        path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path if _GITHUB_REPO_RE.fullmatch(path) else None
+
+
+def _source_path_matches_repo_layout(
+    source: Path,
+    expected_repo: str,
+    *,
+    allowed_source_roots: list[Path] | None = None,
+) -> bool:
+    owner, repo = expected_repo.split("/", 1)
+    source = source.resolve()
+    if source.name != repo or source.parent.name != owner:
+        return False
+    if allowed_source_roots is None:
+        return True
+    return any(source == (root.resolve() / owner / repo).resolve() for root in allowed_source_roots)
 
 
 def _copy_source_tree(source: Path, destination: Path) -> None:
@@ -630,11 +758,92 @@ def _public_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "network_policy",
         "execution_policy",
         "provenance",
+        "audit",
         "exists",
         "expired",
         "dirty",
     }
     return {key: metadata[key] for key in allowed_keys if key in metadata}
+
+
+def _validate_workspace_metadata(
+    metadata: dict[str, Any],
+    workspace_dir: Path,
+    *,
+    configured_source_roots: list[Path] | None = None,
+) -> str | None:
+    repo_name = metadata.get("repo")
+    if not isinstance(repo_name, str) or not _GITHUB_REPO_RE.fullmatch(repo_name):
+        return "Error: workspace metadata has invalid repo identity."
+    repo_dir = Path(str(metadata.get("repo_dir", ""))).resolve()
+    expected_repo_dir = (workspace_dir / "repo").resolve()
+    if repo_dir != expected_repo_dir:
+        return "Error: workspace metadata repo_dir does not match expected confined path."
+
+    audit = metadata.get("audit")
+    if not isinstance(audit, dict):
+        return "Error: workspace metadata is missing required audit fields."
+    if audit.get("created_by_tool") != "repo_workspace":
+        return "Error: workspace metadata audit has invalid created_by_tool."
+    if audit.get("network_performed") is not False or audit.get("execution_performed") is not False:
+        return "Error: workspace metadata audit violates repo_workspace non-execution policy."
+    if audit.get("writes_require_confirmation") is not True:
+        return "Error: workspace metadata audit is missing write confirmation policy."
+
+    provenance = metadata.get("provenance")
+    if not isinstance(provenance, dict):
+        return "Error: workspace metadata is missing required provenance."
+    source_type = provenance.get("source_type")
+    if source_type not in {"empty_workspace", "local_copy", "local_git_checkout"}:
+        return "Error: workspace metadata provenance has invalid source_type."
+    if source_type == "empty_workspace":
+        source_path = provenance.get("source_path")
+        if source_path not in {None, ""}:
+            return "Error: workspace metadata empty_workspace provenance must not include source_path."
+    else:
+        if audit.get("source_path_boundary_enforced") is not True:
+            return "Error: workspace metadata audit must enforce source_path boundary for local sources."
+        source_path = provenance.get("source_path")
+        if not isinstance(source_path, str) or not source_path:
+            return "Error: workspace metadata provenance is missing source_path."
+        try:
+            resolved_source = Path(source_path).resolve()
+        except OSError:
+            return "Error: workspace metadata provenance has invalid source_path."
+        recorded_roots = _recorded_allowed_source_roots(audit)
+        if not recorded_roots:
+            return "Error: workspace metadata audit is missing allowed_source_roots for local source_path."
+        if not any(_is_relative_to(resolved_source, root) for root in recorded_roots):
+            return "Error: workspace metadata provenance source_path is outside allowed_source_roots."
+        if not _source_path_matches_repo_layout(resolved_source, repo_name, allowed_source_roots=recorded_roots):
+            return "Error: workspace metadata provenance source_path does not match repo identity boundary."
+        configured_roots = [root.resolve() for root in (configured_source_roots or [])]
+        if configured_roots and not any(_is_relative_to(resolved_source, root) for root in configured_roots):
+            return "Error: workspace metadata provenance source_path is outside configured allowed_source_roots."
+        if configured_roots and not _source_path_matches_repo_layout(resolved_source, repo_name, allowed_source_roots=configured_roots):
+            return "Error: workspace metadata provenance source_path does not match configured repo identity boundary."
+        repo_identity = provenance.get("repo_identity")
+        if source_type == "local_git_checkout" and repo_identity != repo_name:
+            return "Error: workspace metadata provenance repo_identity does not match workspace repo."
+        if source_type == "local_copy" and repo_identity not in {repo_name, None, ""}:
+            return "Error: workspace metadata provenance repo_identity does not match workspace repo."
+    return None
+
+
+def _recorded_allowed_source_roots(audit: dict[str, Any]) -> list[Path]:
+    roots: list[Path] = []
+    recorded_roots = audit.get("allowed_source_roots")
+    if isinstance(recorded_roots, list):
+        for item in recorded_roots:
+            if not isinstance(item, str) or not item:
+                continue
+            try:
+                root = Path(item).resolve()
+            except OSError:
+                continue
+            if root not in roots:
+                roots.append(root)
+    return roots
 
 
 def _write_confirmation_error(action: str) -> str:

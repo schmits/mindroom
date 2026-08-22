@@ -10,14 +10,16 @@ from mindroom.custom_tools.repo_workspace import RepoWorkspaceTools
 from mindroom.tool_system.registry_state import BUILTIN_TOOL_METADATA
 
 
-def _init_repo(path: Path) -> None:
-    path.mkdir()
+def _init_repo(path: Path, origin_repo: str = "schmits/repo-sandbox-fixture") -> str:
+    path.mkdir(parents=True)
     subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", f"https://token@example.invalid@github.com/{origin_repo}.git"], cwd=path, check=True)
     (path / "README.md").write_text("hello\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-m", "initial"], cwd=path, check=True, capture_output=True, text=True)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def _create_workspace(tools: RepoWorkspaceTools, workspace_id: str = "ws-test", source_path: Path | None = None) -> dict[str, object]:
@@ -58,6 +60,37 @@ def test_rejects_unallowlisted_and_denied_repositories(tmp_path: Path) -> None:
     assert "explicitly denied" in tools.create_workspace(repo="schmits/prod", workspace_id="ws-b", confirm_write=True)
 
 
+def test_rejects_source_checkout_with_mismatched_git_origin(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    subprocess.run(["git", "remote", "set-url", "origin", "https://github.com/octocat/Hello-World.git"], cwd=source, check=True)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
+    )
+
+    result = tools.create_workspace(source_path=str(source), workspace_id="ws-test", confirm_write=True)
+
+    assert "git origin does not match requested repo" in result
+
+
+def test_accepts_git_checkout_without_origin_when_exact_path_matches_requested_repo(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    subprocess.run(["git", "remote", "remove", "origin"], cwd=source, check=True)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
+    )
+
+    payload = _create_workspace(tools, source_path=source)
+
+    assert payload["workspace"]["provenance"]["repo_identity"] == "schmits/repo-sandbox-fixture"
+    assert payload["workspace"]["provenance"]["origin_url"] is None
+
+
 def test_rejects_dangerously_broad_repo_patterns(tmp_path: Path) -> None:
     for pattern in ["*", "*/*", "*/repo", "owner/repo*"]:
         try:
@@ -82,6 +115,56 @@ def test_source_path_requires_allowlisted_source_root(tmp_path: Path) -> None:
     assert "outside allowed_source_roots" in result
 
 
+def test_rejects_owner_directory_as_source_path_for_specific_repo(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    owner_dir = source_root / "schmits"
+    repo_dir = owner_dir / "repo-sandbox-fixture"
+    repo_dir.mkdir(parents=True)
+    (repo_dir / "README.md").write_text("fixture\n", encoding="utf-8")
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+
+    result = tools.create_workspace(source_path=str(owner_dir), workspace_id="ws-test", confirm_write=True)
+
+    assert "source_path must identify the requested repo root" in result
+
+
+def test_rejects_owner_named_repo_under_wrong_allowed_root_depth(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    wrong_depth = source_root / "nested" / "schmits" / "repo-sandbox-fixture"
+    wrong_depth.mkdir(parents=True)
+    (wrong_depth / "README.md").write_text("fixture\n", encoding="utf-8")
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+
+    result = tools.create_workspace(source_path=str(wrong_depth), workspace_id="ws-test", confirm_write=True)
+
+    assert "<allowed_source_root>/<owner>/<repo>" in result
+
+
+def test_accepts_nongit_source_path_matching_requested_repo_layout(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source = source_root / "schmits" / "repo-sandbox-fixture"
+    source.mkdir(parents=True)
+    (source / "README.md").write_text("fixture\n", encoding="utf-8")
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+
+    payload = _create_workspace(tools, source_path=source)
+
+    assert payload["workspace"]["provenance"]["source_type"] == "local_copy"
+    assert "fixture" in tools.read_file("ws-test", "README.md")
+
+
 def test_create_workspace_rejects_network_request(tmp_path: Path) -> None:
     tools = RepoWorkspaceTools(workspace_root=str(tmp_path), allowed_repos=["schmits/repo-sandbox-fixture"])
 
@@ -91,7 +174,7 @@ def test_create_workspace_rejects_network_request(tmp_path: Path) -> None:
 
 
 def test_create_workspace_rejects_nested_symlinks(tmp_path: Path) -> None:
-    source = tmp_path / "source"
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
     _init_repo(source)
     nested = source / "nested"
     nested.mkdir()
@@ -99,7 +182,7 @@ def test_create_workspace_rejects_nested_symlinks(tmp_path: Path) -> None:
     tools = RepoWorkspaceTools(
         workspace_root=str(tmp_path / "workspaces"),
         allowed_repos=["schmits/repo-sandbox-fixture"],
-        allowed_source_roots=[str(tmp_path)],
+        allowed_source_roots=[str(tmp_path / "sources")],
     )
 
     result = tools.create_workspace(source_path=str(source), workspace_id="ws-test", confirm_write=True)
@@ -107,13 +190,28 @@ def test_create_workspace_rejects_nested_symlinks(tmp_path: Path) -> None:
     assert "contains symlinks" in result
 
 
-def test_create_workspace_copies_source_and_records_policy_metadata(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    _init_repo(source)
+def test_rejects_git_checkout_matching_path_but_wrong_owner_origin(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source = source_root / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source, origin_repo="evil-owner/repo-sandbox-fixture")
     tools = RepoWorkspaceTools(
         workspace_root=str(tmp_path / "workspaces"),
         allowed_repos=["schmits/repo-sandbox-fixture"],
-        allowed_source_roots=[str(tmp_path)],
+        allowed_source_roots=[str(source_root)],
+    )
+
+    result = tools.create_workspace(source_path=str(source), workspace_id="ws-test", confirm_write=True)
+
+    assert "git origin does not match requested repo" in result
+
+
+def test_create_workspace_copies_source_and_records_policy_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    head_sha = _init_repo(source)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
     )
 
     payload = _create_workspace(tools, source_path=source)
@@ -122,6 +220,12 @@ def test_create_workspace_copies_source_and_records_policy_metadata(tmp_path: Pa
     assert payload["workspace"]["network_policy"]["network_performed"] is False
     assert info["execution_policy"]["allow_arbitrary_execution"] is False
     assert info["repo"] == "schmits/repo-sandbox-fixture"
+    assert info["provenance"]["source_type"] == "local_git_checkout"
+    assert info["provenance"]["repo_identity"] == "schmits/repo-sandbox-fixture"
+    assert info["provenance"]["source_ref"] == "main"
+    assert info["provenance"]["source_head_sha"] == head_sha
+    assert info["provenance"]["origin_url"] == "https://github.com/schmits/repo-sandbox-fixture.git"
+    assert "token" not in info["provenance"]["origin_url"]
     assert "README.md" in tools.list_files("ws-test", pattern="*")
     assert "hello" in tools.read_file("ws-test", "README.md")
 
@@ -137,12 +241,12 @@ def test_file_operations_are_confined_to_workspace(tmp_path: Path) -> None:
 
 
 def test_status_diff_apply_patch_and_export_patch(tmp_path: Path) -> None:
-    source = tmp_path / "source"
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
     _init_repo(source)
     tools = RepoWorkspaceTools(
         workspace_root=str(tmp_path / "workspaces"),
         allowed_repos=["schmits/repo-sandbox-fixture"],
-        allowed_source_roots=[str(tmp_path)],
+        allowed_source_roots=[str(tmp_path / "sources")],
     )
     _create_workspace(tools, source_path=source)
 
@@ -165,7 +269,7 @@ def test_status_diff_apply_patch_and_export_patch(tmp_path: Path) -> None:
 
 
 def test_git_diff_disables_external_diff_execution(tmp_path: Path) -> None:
-    source = tmp_path / "source"
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
     _init_repo(source)
     marker = tmp_path / "external-diff-ran"
     script = tmp_path / "external_diff.py"
@@ -175,7 +279,7 @@ def test_git_diff_disables_external_diff_execution(tmp_path: Path) -> None:
     tools = RepoWorkspaceTools(
         workspace_root=str(tmp_path / "workspaces"),
         allowed_repos=["schmits/repo-sandbox-fixture"],
-        allowed_source_roots=[str(tmp_path)],
+        allowed_source_roots=[str(tmp_path / "sources")],
     )
     _create_workspace(tools, source_path=source)
 
@@ -183,6 +287,155 @@ def test_git_diff_disables_external_diff_execution(tmp_path: Path) -> None:
 
     assert "changed" in diff
     assert not marker.exists()
+
+
+def test_workspace_info_requires_provenance_and_audit_metadata(tmp_path: Path) -> None:
+    tools = RepoWorkspaceTools(workspace_root=str(tmp_path), allowed_repos=["schmits/repo-sandbox-fixture"])
+    _create_workspace(tools)
+    metadata_path = tmp_path / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    for key, expected in [
+        ("provenance", "missing required provenance"),
+        ("audit", "missing required audit fields"),
+    ]:
+        broken = dict(metadata)
+        broken.pop(key)
+        metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+        assert expected in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_invalid_audit_and_repo_dir_boundary(tmp_path: Path) -> None:
+    tools = RepoWorkspaceTools(workspace_root=str(tmp_path), allowed_repos=["schmits/repo-sandbox-fixture"])
+    _create_workspace(tools)
+    metadata_path = tmp_path / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken_repo_dir = dict(metadata)
+    broken_repo_dir["repo_dir"] = str(tmp_path / "outside")
+    metadata_path.write_text(json.dumps(broken_repo_dir), encoding="utf-8")
+    assert "repo_dir does not match expected confined path" in tools.get_workspace_info("ws-test")
+
+    broken_audit = dict(metadata)
+    broken_audit["audit"] = dict(metadata["audit"], execution_performed=True)
+    metadata_path.write_text(json.dumps(broken_audit), encoding="utf-8")
+    assert "non-execution policy" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_local_source_without_boundary_enforcement(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
+    )
+    _create_workspace(tools, source_path=source)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken = dict(metadata)
+    broken["audit"] = dict(metadata["audit"], source_path_boundary_enforced=False)
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "must enforce source_path boundary" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_empty_workspace_with_tampered_source_path(tmp_path: Path) -> None:
+    tools = RepoWorkspaceTools(workspace_root=str(tmp_path / "workspaces"), allowed_repos=["schmits/repo-sandbox-fixture"])
+    _create_workspace(tools)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken = dict(metadata)
+    broken["provenance"] = dict(metadata["provenance"], source_path=str(tmp_path.parent / "outside"))
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "empty_workspace provenance must not include source_path" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_source_path_outside_recorded_allowed_roots(tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
+    )
+    _create_workspace(tools, source_path=source)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken = dict(metadata)
+    broken["provenance"] = dict(metadata["provenance"], source_path=str(outside))
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "source_path is outside allowed_source_roots" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_source_path_outside_configured_allowed_roots(tmp_path: Path) -> None:
+    source_root = tmp_path / "source-root"
+    source = source_root / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    original_tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+    _create_workspace(original_tools, source_path=source)
+
+    reconfigured_tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "different-source-root")],
+    )
+
+    assert "source_path is outside configured allowed_source_roots" in reconfigured_tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_tampered_source_path_identity_boundary(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source = source_root / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+    _create_workspace(tools, source_path=source)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    wrong_repo_path = source_root / "schmits" / "other-repo"
+    wrong_repo_path.mkdir()
+
+    broken = dict(metadata)
+    broken["provenance"] = dict(metadata["provenance"], source_path=str(wrong_repo_path))
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "source_path does not match repo identity boundary" in tools.get_workspace_info("ws-test")
+
+
+def test_workspace_info_rejects_tampered_git_repo_identity(tmp_path: Path) -> None:
+    source_root = tmp_path / "sources"
+    source = source_root / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(source_root)],
+    )
+    _create_workspace(tools, source_path=source)
+    metadata_path = tmp_path / "workspaces" / "ws-test" / "workspace.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    broken = dict(metadata)
+    broken["provenance"] = dict(metadata["provenance"], repo_identity="octocat/Hello-World")
+    metadata_path.write_text(json.dumps(broken), encoding="utf-8")
+
+    assert "repo_identity does not match workspace repo" in tools.get_workspace_info("ws-test")
 
 
 def test_handoff_to_coding_sandbox_does_not_execute(tmp_path: Path) -> None:
@@ -210,3 +463,24 @@ def test_safe_subprocess_env_filters_tokens(monkeypatch, tmp_path: Path) -> None
     assert "GH_TOKEN" not in env
     assert "GIT_ASKPASS" not in env
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_subprocesses_do_not_receive_token_environment(monkeypatch, tmp_path: Path) -> None:
+    source = tmp_path / "sources" / "schmits" / "repo-sandbox-fixture"
+    _init_repo(source)
+    marker = tmp_path / "token-bleed"
+    askpass = tmp_path / "askpass.py"
+    askpass.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("GH_TOKEN", "secret")
+    monkeypatch.setenv("GIT_ASKPASS", str(askpass))
+    tools = RepoWorkspaceTools(
+        workspace_root=str(tmp_path / "workspaces"),
+        allowed_repos=["schmits/repo-sandbox-fixture"],
+        allowed_source_roots=[str(tmp_path / "sources")],
+    )
+
+    _create_workspace(tools, source_path=source)
+    assert "# git status" in tools.get_status("ws-test")
+
+    assert not marker.exists()
