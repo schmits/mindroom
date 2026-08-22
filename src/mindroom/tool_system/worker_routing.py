@@ -34,19 +34,23 @@ _SHARED_ONLY_INTEGRATION_NAMES = frozenset(
         "homeassistant",
     },
 )
-_LOCAL_ONLY_SHARED_INTEGRATION_TOOL_NAMES = frozenset(
+_LOCAL_ONLY_TOOL_NAMES = frozenset(
     {
         "approved_egress",
         "attachments",
         "callback_manager",
         "desktop",
         "external_trigger_manager",
+        "github",
         "gmail",
         "google_calendar",
         "google_docs",
         "google_drive",
         "google_sheets",
         "homeassistant",
+        "invite_router",
+        "oauth_connections",
+        "script",
         "todo",
     },
 )
@@ -464,9 +468,9 @@ def worker_scope_allows_shared_only_integrations(worker_scope: WorkerScope | Non
 def _requires_shared_only_integration_scope(name: str) -> bool:
     """Return whether a tool or dashboard integration is restricted to shared scope.
 
-    MCP registry tools are supported on every scope: OAuth-backed servers use
-    requester-scoped sessions, and non-OAuth servers always execute through the
-    shared server session without requester credentials.
+    MCP registry tools are supported on every scope: OAuth-backed servers follow
+    the configured worker scope, and non-OAuth servers always execute through
+    the shared server session without requester credentials.
     """
     return name in _SHARED_ONLY_INTEGRATION_NAMES
 
@@ -489,8 +493,8 @@ def unsupported_shared_only_integration_names(
 
 
 def tool_stays_local(name: str) -> bool:
-    """Return whether one integration tool always stays in the primary runtime."""
-    return name in _LOCAL_ONLY_SHARED_INTEGRATION_TOOL_NAMES
+    """Return whether one tool always stays in the primary runtime."""
+    return name in _LOCAL_ONLY_TOOL_NAMES
 
 
 def unsupported_shared_only_integration_message(

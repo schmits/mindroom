@@ -17,16 +17,23 @@ import asyncio
 import base64
 import os
 import re
+import signal
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import urlparse
 
 from mindroom.credentials import get_runtime_shared_credentials_manager
+from mindroom.file_locks import current_inherited_file_lock
 from mindroom.knowledge.file_listing import (
     git_checkout_present,
     git_tracked_relative_paths_from_checkout,
     include_knowledge_relative_path,
+)
+from mindroom.knowledge.github_app_auth import (
+    GitHubAppTokenProvider,
+    get_runtime_github_app_token_provider,
 )
 from mindroom.knowledge.redaction import (
     MAX_REDACTABLE_TOKEN_LENGTH,
@@ -39,7 +46,7 @@ from mindroom.knowledge.redaction import (
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Mapping
 
     from mindroom.config.knowledge import KnowledgeGitConfig
     from mindroom.config.main import Config
@@ -49,10 +56,78 @@ logger = get_logger(__name__)
 
 __all__ = ["GitKnowledgeSource", "GitSyncResult"]
 
+_REFRESH_SUBPROCESS_ENV = "MINDROOM_KNOWLEDGE_REFRESH_SUBPROCESS"
+_OwnedTaskResult = TypeVar("_OwnedTaskResult")
+
+
+def _git_process_group_is_owned_here() -> bool:
+    """Return whether this process, rather than an outer refresh, must reap Git."""
+    return os.name != "nt" and os.environ.get(_REFRESH_SUBPROCESS_ENV) != "1"
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_process_group_exit(process_group_id: int, *, wait_seconds: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_seconds
+    while _process_group_exists(process_group_id) and loop.time() < deadline:  # noqa: ASYNC110
+        await asyncio.sleep(0.01)
+    if _process_group_exists(process_group_id):
+        logger.warning(
+            "Knowledge Git process group survived termination wait",
+            process_group_id=process_group_id,
+            wait_seconds=wait_seconds,
+        )
+
+
+async def _drain_owned_task(task: asyncio.Task[_OwnedTaskResult]) -> asyncio.CancelledError | None:
+    """Wait through repeated caller cancellation until owned work settles."""
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+    return cancellation
+
+
+async def _terminate_git_process(
+    process: asyncio.subprocess.Process,
+    *,
+    owned_process_group_id: int | None,
+) -> None:
+    group_signalled = False
+    if owned_process_group_id is None:
+        if process.returncode is not None:
+            return
+        with suppress(ProcessLookupError):
+            process.kill()
+    else:
+        try:
+            os.killpg(owned_process_group_id, signal.SIGKILL)
+            group_signalled = True
+        except ProcessLookupError:
+            pass
+    with suppress(ProcessLookupError):
+        await process.wait()
+    if group_signalled and owned_process_group_id is not None:
+        await _wait_for_process_group_exit(owned_process_group_id)
+
 
 def _http_credentials(
     credentials_service: str | None,
     runtime_paths: RuntimePaths,
+    *,
+    credentials: Mapping[str, object] | None = None,
 ) -> tuple[str, str] | None:
     """Return HTTP basic-auth userinfo for one credentials service, if any.
 
@@ -64,7 +139,8 @@ def _http_credentials(
     if not credentials_service:
         return None
 
-    credentials = get_runtime_shared_credentials_manager(runtime_paths).load_credentials(credentials_service) or {}
+    if credentials is None:
+        credentials = get_runtime_shared_credentials_manager(runtime_paths).load_credentials(credentials_service) or {}
     username = credentials.get("username")
     token = credentials.get("token") or credentials.get("api_key")
     password = credentials.get("password")
@@ -95,6 +171,8 @@ def _git_auth_env(
     repo_url: str,
     credentials_service: str | None,
     runtime_paths: RuntimePaths,
+    *,
+    credentials: Mapping[str, object] | None = None,
 ) -> dict[str, str] | None:
     """Return process-local Git config that injects credentials without persisting them.
 
@@ -123,7 +201,9 @@ def _git_auth_env(
         return _git_http_basic_auth_env(clean_url, *embedded_userinfo)
 
     credentials_userinfo = (
-        _http_credentials(credentials_service, runtime_paths) if parsed_clean_url.scheme in {"http", "https"} else None
+        _http_credentials(credentials_service, runtime_paths, credentials=credentials)
+        if parsed_clean_url.scheme in {"http", "https"}
+        else None
     )
     if credentials_userinfo is not None:
         return _git_http_basic_auth_env(clean_url, *credentials_userinfo)
@@ -142,6 +222,28 @@ def _git_auth_env(
         "GIT_CONFIG_KEY_0": f"url.{repo_url}.insteadOf",
         "GIT_CONFIG_VALUE_0": clean_url,
     }
+
+
+async def _resolved_git_auth_env(
+    repo_url: str,
+    credentials_service: str | None,
+    runtime_paths: RuntimePaths,
+    github_app_token_provider: GitHubAppTokenProvider,
+) -> dict[str, str] | None:
+    """Resolve refreshable App credentials or retain existing static Git auth."""
+    credentials: Mapping[str, object] = {}
+    if credentials_service:
+        credentials = get_runtime_shared_credentials_manager(runtime_paths).load_credentials(credentials_service) or {}
+    if credentials.get("auth_type") == "github_app":
+        username, token = await github_app_token_provider.resolve(repo_url, credentials)
+        return _git_http_basic_auth_env(credential_free_repo_url(repo_url), username, token)
+
+    return _git_auth_env(
+        repo_url,
+        credentials_service,
+        runtime_paths,
+        credentials=credentials if credentials_service else None,
+    )
 
 
 #: scp-style SSH syntax (``git@github.com:org/repo.git``), which ``urlparse``
@@ -310,6 +412,11 @@ class GitKnowledgeSource:
     #: restart does not re-pull every object for an unchanged checkout.
     lfs_hydrated_head_path: Path
     _sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _github_app_token_provider: GitHubAppTokenProvider = field(
+        default_factory=get_runtime_github_app_token_provider,
+        init=False,
+        repr=False,
+    )
     _last_synced_head: str | None = field(default=None, init=False)
     _lfs_checked: bool = field(default=False, init=False)
     _lfs_repository_ready: bool = field(default=False, init=False)
@@ -353,12 +460,19 @@ class GitKnowledgeSource:
         return await self._rev_parse("HEAD")
 
     async def sync(self) -> GitSyncResult:
-        """Fetch and force-align one configured Git repository checkout."""
+        """Fetch and force-align one configured Git repository checkout.
+
+        An existing index lock is recoverable only while this task holds the
+        source-root file lock whose descriptor every Git child inherits. A Git
+        descendant that outlives its Python parent therefore keeps later
+        refreshes outside this transaction boundary until it exits.
+        """
         git_config = self._git_config()
         if git_config is None:
             return GitSyncResult(head=None, updated=False)
 
         async with self._sync_lock:
+            self._clear_orphaned_index_lock()
             changed_files, removed_files, updated = await self._sync_once(git_config)
             current_head = await self._rev_parse("HEAD")
             self._last_synced_head = current_head
@@ -404,6 +518,49 @@ class GitKnowledgeSource:
     def _clear_lfs_hydrated_head(self) -> None:
         self.lfs_hydrated_head_path.unlink(missing_ok=True)
 
+    def _git_index_lock_path(self) -> Path | None:
+        """Resolve the index lock for a repository or linked worktree."""
+        dot_git = self.source_path / ".git"
+        if dot_git.is_dir():
+            return dot_git / "index.lock"
+        try:
+            git_file = dot_git.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        prefix, separator, raw_git_dir = git_file.partition(":")
+        if prefix.lower() != "gitdir" or not separator or not raw_git_dir.strip():
+            return None
+        git_dir = Path(raw_git_dir.strip())
+        if not git_dir.is_absolute():
+            git_dir = dot_git.parent / git_dir
+        return git_dir.resolve() / "index.lock"
+
+    def _clear_orphaned_index_lock(self) -> None:
+        """Remove a Git index lock left behind before this owned sync began."""
+        capability = current_inherited_file_lock()
+        if capability is None or capability.fileno_for(self.source_path) is None:
+            return
+        lock_path = self._git_index_lock_path()
+        if lock_path is None:
+            return
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning(
+                "Could not remove orphaned knowledge Git index lock",
+                base_id=self.base_id,
+                lock_path=str(lock_path),
+                error=str(exc),
+            )
+            return
+        logger.warning(
+            "Removed orphaned knowledge Git index lock",
+            base_id=self.base_id,
+            lock_path=str(lock_path),
+        )
+
     async def _checkout_present(self) -> bool:
         return await asyncio.to_thread(
             git_checkout_present,
@@ -419,34 +576,67 @@ class GitKnowledgeSource:
         env: dict[str, str] | None = None,
     ) -> str:
         repo_root = cwd or self.source_path
-        process = await asyncio.create_subprocess_exec(
-            "git",
-            *args,
-            cwd=str(repo_root),
-            env=None if env is None else {**os.environ, **env},
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        capability = current_inherited_file_lock()
+        inherited_lock_fd = None if capability is None else capability.fileno_for(self.source_path)
+        owns_process_group = _git_process_group_is_owned_here()
+        spawn_task = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                "git",
+                *args,
+                cwd=str(repo_root),
+                env=None if env is None else {**os.environ, **env},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                pass_fds=(() if inherited_lock_fd is None else (inherited_lock_fd,)),
+                start_new_session=owns_process_group,
+            ),
         )
+        spawn_cancellation = await _drain_owned_task(spawn_task)
+        process = spawn_task.result()
+        owned_process_group_id = process.pid if owns_process_group else None
+        if spawn_cancellation is not None:
+            cleanup_task = asyncio.create_task(
+                _terminate_git_process(process, owned_process_group_id=owned_process_group_id),
+            )
+            await _drain_owned_task(cleanup_task)
+            cleanup_task.result()
+            raise spawn_cancellation from None
         try:
             timeout_seconds = self._sync_timeout_seconds()
             if timeout_seconds is None:
                 stdout, stderr = await process.communicate()
             else:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
-        except asyncio.CancelledError:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(ProcessLookupError):
-                await process.wait()
-            raise
+        except asyncio.CancelledError as exc:
+            cleanup_task = asyncio.create_task(
+                _terminate_git_process(process, owned_process_group_id=owned_process_group_id),
+            )
+            await _drain_owned_task(cleanup_task)
+            cleanup_task.result()
+            raise exc from None
         except TimeoutError as exc:
-            with suppress(ProcessLookupError):
-                process.kill()
-            with suppress(ProcessLookupError):
-                await process.wait()
+            cleanup_task = asyncio.create_task(
+                _terminate_git_process(process, owned_process_group_id=owned_process_group_id),
+            )
+            cancellation = await _drain_owned_task(cleanup_task)
+            cleanup_task.result()
+            if cancellation is not None:
+                raise cancellation from None
             command = " ".join(["git", *(redact_url_credentials(arg) for arg in args)])
             msg = f"Git command timed out after {timeout_seconds:.0f}s: {command}"
             raise RuntimeError(msg) from exc
+
+        # A completed Git leader may still leave a filter/helper behind. Direct
+        # refreshes own a private group and must drain it before releasing the
+        # inherited source lock. A refresh subprocess leaves this to its outer
+        # process-group supervisor instead.
+        cleanup_task = asyncio.create_task(
+            _terminate_git_process(process, owned_process_group_id=owned_process_group_id),
+        )
+        cancellation = await _drain_owned_task(cleanup_task)
+        cleanup_task.result()
+        if cancellation is not None:
+            raise cancellation from None
 
         if process.returncode == 0:
             return stdout.decode("utf-8", errors="replace")
@@ -477,9 +667,8 @@ class GitKnowledgeSource:
         await self._run_git(["lfs", "install", "--local"], cwd=repo_root)
         self._lfs_repository_ready = True
 
-    def _lfs_skip_smudge_env(self, git_config: KnowledgeGitConfig) -> dict[str, str] | None:
-        if not git_config.lfs:
-            return None
+    def _lfs_skip_smudge_env(self) -> dict[str, str]:
+        """Prevent implicit LFS downloads; enabled repositories hydrate explicitly."""
         return {"GIT_LFS_SKIP_SMUDGE": "1"}
 
     def _lfs_pull_args(self, git_config: KnowledgeGitConfig) -> list[str]:
@@ -502,7 +691,12 @@ class GitKnowledgeSource:
         await self._run_git(
             self._lfs_pull_args(git_config),
             cwd=repo_root or self.source_path,
-            env=_git_auth_env(git_config.repo_url, git_config.credentials_service, self.runtime_paths),
+            env=await _resolved_git_auth_env(
+                git_config.repo_url,
+                git_config.credentials_service,
+                self.runtime_paths,
+                self._github_app_token_provider,
+            ),
         )
         if resolved_head is None:
             resolved_head = await self._rev_parse("HEAD")
@@ -556,8 +750,13 @@ class GitKnowledgeSource:
             ],
             cwd=knowledge_root.parent,
             env=_merge_git_env(
-                _git_auth_env(git_config.repo_url, git_config.credentials_service, runtime_paths),
-                self._lfs_skip_smudge_env(git_config),
+                await _resolved_git_auth_env(
+                    git_config.repo_url,
+                    git_config.credentials_service,
+                    runtime_paths,
+                    self._github_app_token_provider,
+                ),
+                self._lfs_skip_smudge_env(),
             ),
         )
         await self._run_git(["remote", "set-url", "origin", clone_url], cwd=knowledge_root)
@@ -576,7 +775,12 @@ class GitKnowledgeSource:
         remote_ref = f"origin/{git_config.branch}"
         await self._run_git(
             ["fetch", "origin", f"+refs/heads/{git_config.branch}:refs/remotes/{remote_ref}"],
-            env=_git_auth_env(git_config.repo_url, git_config.credentials_service, self.runtime_paths),
+            env=await _resolved_git_auth_env(
+                git_config.repo_url,
+                git_config.credentials_service,
+                self.runtime_paths,
+                self._github_app_token_provider,
+            ),
         )
         remote_head = await self._rev_parse(remote_ref)
         if remote_head is None:
@@ -591,11 +795,11 @@ class GitKnowledgeSource:
 
         await self._run_git(
             ["checkout", "--force", "-B", git_config.branch, remote_ref],
-            env=self._lfs_skip_smudge_env(git_config),
+            env=self._lfs_skip_smudge_env(),
         )
         # Reviewed with Bas (2026-04-17): program-owned checkout, hard reset is the
         # intentional way to realign it with the configured remote state.
-        await self._run_git(["reset", "--hard", remote_ref], env=self._lfs_skip_smudge_env(git_config))
+        await self._run_git(["reset", "--hard", remote_ref], env=self._lfs_skip_smudge_env())
         await self._hydrate_lfs_worktree(git_config, current_head=remote_head)
 
         after_files = await self._list_tracked_files()

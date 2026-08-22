@@ -10,6 +10,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+MATRIX_ROOM_RUNTIME_APPROVAL_TYPE = "mindroom_matrix_room_runtime"
+MATRIX_ROOM_RUNTIME_TOOL_NAMES = ("invite_router",)
+
+
 class ToolAuthoredOverrideValidator(str, Enum):
     """Explicit authored-override validation modes for a tool."""
 
@@ -61,6 +65,7 @@ class ToolManagedInitArg(str, Enum):
     RUNTIME_PATHS = "runtime_paths"
     CREDENTIALS_MANAGER = "credentials_manager"
     WORKER_TARGET = "worker_target"
+    AUTHORIZATION = "authorization"
     TOOL_OUTPUT_WORKSPACE_ROOT = "tool_output_workspace_root"
     WORKER_TOOLS_OVERRIDE = "worker_tools_override"
     CURRENT_ROOM_ID = "current_room_id"
@@ -116,6 +121,7 @@ class ToolMetadata:
     authored_override_validator: ToolAuthoredOverrideValidator = ToolAuthoredOverrideValidator.DEFAULT
     dependencies: list[str] | None = None
     auth_provider: str | None = None
+    oauth_fallback_fields: tuple[str, ...] = ()
     docs_url: str | None = None
     helper_text: str | None = None
     function_names: tuple[str, ...] = ()

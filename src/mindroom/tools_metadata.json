@@ -126,6 +126,30 @@
       "dependencies": [
         "agno"
       ],
+      "description": "Invite the MindRoom router to the current Matrix room",
+      "display_name": "Invite Router",
+      "docs_url": null,
+      "function_names": [
+        "invite_router"
+      ],
+      "helper_text": null,
+      "icon": null,
+      "icon_color": null,
+      "name": "invite_router",
+      "requires_room_context": true,
+      "setup_type": "none",
+      "status": "available"
+    },
+    {
+      "agent_override_fields": null,
+      "auth_provider": null,
+      "category": "communication",
+      "config_fields": null,
+      "consumes_workspace_paths": false,
+      "default_execution_target": "primary",
+      "dependencies": [
+        "agno"
+      ],
       "description": "Low-level Matrix event, state, and room search operations (send_event, get_state, put_state, redact, get_event, search)",
       "display_name": "Matrix API",
       "docs_url": "https://github.com/mindroom-ai/mindroom",
@@ -517,7 +541,6 @@
       "docs_url": "https://docs.agno.com/tools/toolkits/social/slack",
       "function_names": [
         "download_file",
-        "download_file_bytes",
         "get_channel_history",
         "get_channel_info",
         "get_thread",
@@ -835,8 +858,7 @@
       "function_names": [
         "get_call_details",
         "list_messages",
-        "send_sms",
-        "validate_phone_number"
+        "send_sms"
       ],
       "helper_text": null,
       "icon": "SiTwilio",
@@ -2376,12 +2398,12 @@
         },
         {
           "authored_override": true,
-          "default": "PYTHON",
-          "description": "Primary language for the sandbox (PYTHON, JAVASCRIPT, TYPESCRIPT)",
+          "default": "python",
+          "description": "Primary language for the sandbox (python, javascript, typescript)",
           "label": "Sandbox Language",
           "name": "sandbox_language",
           "options": null,
-          "placeholder": "PYTHON",
+          "placeholder": "python",
           "required": false,
           "type": "text",
           "validation": null
@@ -2485,7 +2507,7 @@
         {
           "authored_override": true,
           "default": true,
-          "description": "Automatically create sandbox if none exists",
+          "description": "Create a fallback sandbox after a sandbox-management error",
           "label": "Auto Create Sandbox",
           "name": "auto_create_sandbox",
           "options": null,
@@ -2509,7 +2531,7 @@
         {
           "authored_override": true,
           "default": true,
-          "description": "Whether to reuse the same sandbox across agent sessions",
+          "description": "Whether to reuse the same sandbox within the current agent session",
           "label": "Persistent",
           "name": "persistent",
           "options": null,
@@ -3663,7 +3685,7 @@
     },
     {
       "agent_override_fields": null,
-      "auth_provider": null,
+      "auth_provider": "github",
       "category": "development",
       "config_fields": [
         {
@@ -3744,8 +3766,11 @@
       "icon": "SiGithub",
       "icon_color": "text-gray-800",
       "name": "github",
+      "oauth_fallback_fields": [
+        "access_token"
+      ],
       "requires_room_context": false,
-      "setup_type": "api_key",
+      "setup_type": "oauth",
       "status": "requires_config"
     },
     {
@@ -4559,7 +4584,7 @@
         {
           "authored_override": true,
           "default": "mp4",
-          "description": "The type of file to generate (mp4, gif, or mp3)",
+          "description": "The type of file to generate (png, jpg, mp4, gif, mp3, or wav)",
           "label": "File Type",
           "name": "file_type",
           "options": null,
@@ -4646,7 +4671,7 @@
       "dependencies": [
         "requests"
       ],
-      "description": "AI model marketplace for generating videos, audio, and GIFs from text prompts",
+      "description": "AI model marketplace for generating images, videos, audio, and GIFs from text prompts",
       "display_name": "ModelsLabs",
       "docs_url": "https://docs.agno.com/tools/toolkits/others/models_labs",
       "function_names": [
@@ -7061,19 +7086,7 @@
           "options": null,
           "placeholder": null,
           "required": false,
-          "type": "text",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": null,
-          "description": null,
-          "label": "Proxies",
-          "name": "proxies",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
+          "type": "string[]",
           "validation": null
         }
       ],
@@ -7088,8 +7101,7 @@
       "function_names": [
         "get_video_timestamps",
         "get_youtube_video_captions",
-        "get_youtube_video_data",
-        "get_youtube_video_id"
+        "get_youtube_video_data"
       ],
       "helper_text": null,
       "icon": "SiYoutube",
@@ -7499,6 +7511,30 @@
       "requires_room_context": false,
       "setup_type": "api_key",
       "status": "requires_config"
+    },
+    {
+      "agent_override_fields": null,
+      "auth_provider": null,
+      "category": "integrations",
+      "config_fields": [],
+      "consumes_workspace_paths": false,
+      "default_execution_target": "primary",
+      "dependencies": [
+        "agno"
+      ],
+      "description": "Reset the current requester's OAuth connections for the current agent",
+      "display_name": "OAuth Connections",
+      "docs_url": null,
+      "function_names": [
+        "reset_oauth_connection"
+      ],
+      "helper_text": null,
+      "icon": "Unplug",
+      "icon_color": "text-amber-500",
+      "name": "oauth_connections",
+      "requires_room_context": true,
+      "setup_type": "none",
+      "status": "available"
     },
     {
       "agent_override_fields": null,
@@ -8264,18 +8300,6 @@
       "auth_provider": null,
       "category": "productivity",
       "config_fields": [
-        {
-          "authored_override": true,
-          "default": null,
-          "description": null,
-          "label": "Config",
-          "name": "config",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
-          "validation": null
-        },
         {
           "authored_override": true,
           "default": null,
@@ -9364,7 +9388,6 @@
       "function_names": [
         "add_zep_message",
         "get_zep_memory",
-        "initialize",
         "search_zep_memory"
       ],
       "helper_text": null,
@@ -11556,9 +11579,6 @@
       "display_name": "PubMed",
       "docs_url": "https://docs.agno.com/tools/toolkits/search/pubmed",
       "function_names": [
-        "fetch_details",
-        "fetch_pubmed_ids",
-        "parse_details",
         "search_pubmed"
       ],
       "helper_text": null,
@@ -11656,18 +11676,6 @@
           "placeholder": null,
           "required": false,
           "type": "boolean",
-          "validation": null
-        },
-        {
-          "authored_override": true,
-          "default": null,
-          "description": null,
-          "label": "Headers",
-          "name": "headers",
-          "options": null,
-          "placeholder": null,
-          "required": false,
-          "type": "text",
           "validation": null
         },
         {
@@ -13080,7 +13088,6 @@
       "function_names": [
         "create_post",
         "get_home_timeline",
-        "get_my_info",
         "get_user_info",
         "reply_to_post",
         "search_posts",

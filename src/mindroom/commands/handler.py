@@ -16,6 +16,7 @@ from mindroom.commands.desktop_commands import (
 from mindroom.commands.encryption_commands import handle_e2ee_command, handle_encrypt_command
 from mindroom.commands.model_commands import handle_model_command
 from mindroom.commands.parsing import Command, CommandType, get_command_help, get_compact_command_entries
+from mindroom.commands.room_model_commands import handle_room_model_command
 from mindroom.commands.thread_mode_commands import handle_thread_mode_command
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.entity_resolution import configured_routable_entity_ids_for_room, entity_identity_registry
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     import nio
     import structlog
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.hooks import HookMatrixAdmin
@@ -55,6 +57,7 @@ COMMAND_TYPES_WITH_SIDE_EFFECTS = frozenset(
         CommandType.EDIT_SCHEDULE,
         CommandType.DESKTOP,
         CommandType.MODEL,
+        CommandType.ROOM_MODEL,
         CommandType.THREAD_MODE,
         CommandType.ENCRYPT,
     },
@@ -70,6 +73,7 @@ def _scheduling_runtime(context: CommandHandlerContext, room: nio.MatrixRoom) ->
         room=room,
         conversation_reader=context.conversation_reader,
         matrix_admin=context.matrix_admin,
+        agent_reply_memberships=context.agent_reply_memberships,
     )
 
 
@@ -107,6 +111,7 @@ class CommandHandlerContext:
     record_handled_turn: Callable[[TurnRecord], Awaitable[None]]
     record_command_result: Callable[[str], Awaitable[None]]
     send_response: _CommandResponseSender
+    agent_reply_memberships: AgentReplyMembershipIndex
     reload_plugins: Callable[[], Awaitable[PluginReloadResult]] | None = None
     matrix_admin: HookMatrixAdmin | None = None
     responder_candidates_for_room: Callable[[nio.MatrixRoom, str], Awaitable[list[MatrixID]]] | None = None
@@ -198,12 +203,20 @@ async def generate_welcome_message_for_room(
     sender_id: str | None,
     config: Config,
     runtime_paths: RuntimePaths,
+    agent_reply_memberships: AgentReplyMembershipIndex,
 ) -> str:
     """Generate a welcome message for callers without a live turn-policy candidate source."""
     if sender_id is None:
         candidate_entities = configured_routable_entity_ids_for_room(config, room.room_id, runtime_paths)
     else:
-        candidate_entities = await responder_candidate_entities_for_room(client, room, sender_id, config, runtime_paths)
+        candidate_entities = await responder_candidate_entities_for_room(
+            client,
+            room,
+            sender_id,
+            config,
+            runtime_paths,
+            agent_reply_memberships,
+        )
     return _format_welcome_message(candidate_entities, config, runtime_paths)
 
 
@@ -256,6 +269,7 @@ async def _desktop_agent_for_room(
             requester_user_id,
             context.config,
             context.runtime_paths,
+            context.agent_reply_memberships,
         )
     else:
         candidates = await context.responder_candidates_for_room(room, requester_user_id)
@@ -316,6 +330,7 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                 requester_user_id,
                 context.config,
                 context.runtime_paths,
+                context.agent_reply_memberships,
             )
         else:
             candidate_entities = await context.responder_candidates_for_room(room, requester_user_id)
@@ -443,6 +458,17 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
             room_id=room.room_id,
             thread_id=effective_thread_id,
             requester_user_id=requester_user_id,
+        )
+
+    elif command.type == CommandType.ROOM_MODEL:
+        response_text = await handle_room_model_command(
+            command.args.get("args_text", ""),
+            client=context.client,
+            config=context.config,
+            runtime_paths=context.runtime_paths,
+            room_id=room.room_id,
+            requester_user_id=requester_user_id,
+            sender_user_id=event.sender,
         )
 
     elif command.type == CommandType.THREAD_MODE:

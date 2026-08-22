@@ -17,10 +17,10 @@ import pytest
 from structlog.testing import capture_logs
 
 from mindroom.background_tasks import wait_for_background_tasks
-from mindroom.bot import AgentBot, TeamBot, _create_best_effort_task_wrapper
+from mindroom.bot import AgentBot, _create_best_effort_task_wrapper
 from mindroom.cancellation import request_task_cancel
 from mindroom.coalescing import CoalescingDrainResult, CoalescingGate, IngressAdmissionClosedError, ReadyPendingEvent
-from mindroom.coalescing_batch import CoalescedBatch, CoalescingKey, PendingEvent
+from mindroom.coalescing_batch import CoalescingKey, PendingEvent, PreparedTurn, RequesterCoalescingOwner
 from mindroom.config.agent import AgentConfig
 from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
@@ -33,6 +33,7 @@ from mindroom.dispatch_handoff import PendingDispatchMetadata
 from mindroom.dispatch_source import IMAGE_SOURCE_KIND, MEDIA_SOURCE_KIND, VOICE_SOURCE_KIND
 from mindroom.event_journal import EventClass, EventKind
 from mindroom.handled_turns import TurnRecord
+from mindroom.ingress_lanes import ReceiptLaneKey
 from mindroom.matrix.client import DeliveredMatrixEvent
 from mindroom.matrix.client_session import MatrixSyncStorage
 from mindroom.matrix.decrypt_failure import e2ee_stats
@@ -55,6 +56,8 @@ from tests.bot_helpers import (
     FencedRoomRecorder,
     _configured_team_test_config,
     _configured_team_user,
+    make_test_agent_bot,
+    make_test_team_bot,
 )
 from tests.conftest import (
     TEST_PASSWORD,
@@ -64,6 +67,8 @@ from tests.conftest import (
     install_runtime_journal_support,
     install_shutdown_drain_mocks,
     make_matrix_client_mock,
+    make_pending_event,
+    membership_epoch_is_active,
     request_envelope,
     runtime_paths_for,
     test_runtime_paths,
@@ -80,6 +85,12 @@ if TYPE_CHECKING:
     from mindroom.event_journal import PrincipalStore
     from mindroom.event_journal.models import DepartureOutcome, DepartureSource
     from mindroom.final_delivery import FinalDeliveryOutcome
+
+
+async def _membership_accepts_question(store: PrincipalStore, room_id: str, epoch: int) -> bool:
+    """Probe the same active-membership predicate used by prompt admission."""
+    return await membership_epoch_is_active(store, room_id, epoch)
+
 
 _STORE_GENERATION = "test-store-generation"
 
@@ -98,7 +109,7 @@ def _config(tmp_path: Path, *, authorize_senders: bool = False) -> Config:
 
 def _agent_bot(tmp_path: Path, *, agent_name: str = "code", authorize_senders: bool = False) -> AgentBot:
     config = _config(tmp_path, authorize_senders=authorize_senders)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=AgentMatrixUser(
             agent_name=agent_name,
             password=TEST_PASSWORD,
@@ -227,7 +238,7 @@ async def test_warm_join_decrypt_notice_waits_for_trusted_sync_containing_room(
 ) -> None:
     """Fenced Megolm events request recovery but stay visibly silent until trusted sync."""
     room_id = "!room:localhost"
-    bot = _agent_bot(tmp_path)
+    bot = _agent_bot(tmp_path, authorize_senders=True)
     bot.client = make_matrix_client_mock(user_id=bot.agent_user.user_id)
     bot.client.outgoing_key_requests = {}
     bot._first_sync_done = True
@@ -280,7 +291,6 @@ async def test_warm_join_decrypt_notice_waits_for_trusted_sync_containing_room(
         capture_logs(),
         patch("mindroom.bot_room_lifecycle.get_joined_rooms", AsyncMock(return_value=[])),
         patch("mindroom.bot_room_lifecycle.join_room", new=join_while_sync_is_live),
-        patch("mindroom.bot.is_authorized_sender", return_value=True),
         patch("mindroom.matrix.decrypt_failure._send_decrypt_failure_notice", new=notice),
     ):
         await bot.join_configured_rooms()
@@ -594,7 +604,6 @@ async def test_restart_loads_only_exact_unfinished_join_decrypt_fence(
         ),
         patch.object(restarted_bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(restarted_bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
         patch(
             "mindroom.bot_room_lifecycle.get_joined_rooms",
             AsyncMock(return_value=[room_id, trusted_room_id]),
@@ -737,9 +746,22 @@ def _register_counted_source_callbacks(bot: AgentBot, client: nio.AsyncClient) -
 def _timeline_response(
     transport: str,
     room_id: str,
-    event: nio.Event,
+    event: nio.Event | tuple[nio.Event, ...],
+    *,
+    final_membership: str = "join",
 ) -> nio.SyncResponse | nio.SlidingSyncResponse:
+    events = event if isinstance(event, tuple) else (event,)
     if transport == "classic":
+        room = {
+            "timeline": {
+                "events": [item.source for item in events],
+                "limited": False,
+                "prev_batch": "p0",
+            },
+            "state": {"events": []},
+            "ephemeral": {"events": []},
+            "account_data": {"events": []},
+        }
         response = nio.SyncResponse.from_dict(
             {
                 "next_batch": "s_after_failure",
@@ -747,19 +769,8 @@ def _timeline_response(
                 "device_lists": {"changed": [], "left": []},
                 "rooms": {
                     "invite": {},
-                    "leave": {},
-                    "join": {
-                        room_id: {
-                            "timeline": {
-                                "events": [event.source],
-                                "limited": False,
-                                "prev_batch": "p0",
-                            },
-                            "state": {"events": []},
-                            "ephemeral": {"events": []},
-                            "account_data": {"events": []},
-                        },
-                    },
+                    "leave": {room_id: room} if final_membership == "leave" else {},
+                    "join": {room_id: room} if final_membership == "join" else {},
                 },
                 "to_device": {"events": []},
                 "presence": {"events": []},
@@ -773,8 +784,8 @@ def _timeline_response(
             "pos": "s_after_failure",
             "rooms": {
                 room_id: {
-                    "membership": "join",
-                    "timeline": [event.source],
+                    "membership": final_membership,
+                    "timeline": [item.source for item in events],
                 },
             },
         },
@@ -799,6 +810,26 @@ def _room_member_event(event_id: str = "$member-join") -> nio.RoomMemberEvent:
     return event
 
 
+def _own_room_member_event(
+    event_id: str,
+    user_id: str,
+    membership: str,
+    timestamp: int,
+) -> nio.RoomMemberEvent:
+    event = nio.RoomMemberEvent.from_dict(
+        {
+            "type": "m.room.member",
+            "event_id": event_id,
+            "sender": user_id if membership == "join" else "@admin:localhost",
+            "state_key": user_id,
+            "origin_server_ts": timestamp,
+            "content": {"membership": membership},
+        },
+    )
+    assert isinstance(event, nio.RoomMemberEvent)
+    return event
+
+
 def _sync_response(
     next_batch: str,
     *,
@@ -814,9 +845,9 @@ def _sync_response(
 
 
 def _pending(event: nio.RoomMessageText) -> PendingEvent:
-    return PendingEvent(
-        event=event,
-        room=nio.MatrixRoom("!room:localhost", "@mindroom:localhost"),
+    return make_pending_event(
+        event,
+        nio.MatrixRoom("!room:localhost", "@mindroom:localhost"),
         source_kind="message",
     )
 
@@ -910,7 +941,6 @@ async def test_bot_start_restores_saved_sync_token(tmp_path: Path) -> None:
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -936,7 +966,6 @@ async def test_bot_start_gives_mindroom_sync_cursor_ownership(
         patch("mindroom.bot.login_agent_user", login),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -969,7 +998,6 @@ async def test_bot_start_leaves_trusted_joined_room_unfenced_for_catch_up(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
         patch("mindroom.bot_room_lifecycle.get_joined_rooms", get_joined_rooms),
     ):
         await bot.start()
@@ -1002,7 +1030,6 @@ async def test_bot_start_keeps_fences_when_joined_rooms_query_is_unavailable(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
         patch("mindroom.bot_room_lifecycle.get_joined_rooms", get_joined_rooms),
     ):
         await bot.start()
@@ -1028,7 +1055,6 @@ async def test_bot_start_skips_joined_rooms_query_without_pending_join_fences(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
         patch("mindroom.bot_room_lifecycle.get_joined_rooms", get_joined_rooms),
     ):
         await bot.start()
@@ -1055,9 +1081,9 @@ async def test_orchestrated_entity_start_defers_turn_recovery_to_coordinator(
     with (
         patch.object(bot, "ensure_user_account", AsyncMock()),
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
+        patch("mindroom.bot.set_before_sync_response_callback") as set_before_sync_response_callback,
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
         await wait_for_background_tasks(timeout=1, owner=bot._runtime_view)
@@ -1066,6 +1092,10 @@ async def test_orchestrated_entity_start_defers_turn_recovery_to_coordinator(
     # replay stays gated until the coordinator releases it.
     start_worker.assert_called_once_with()
     release_turn_replay.assert_not_called()
+    if agent_name == ROUTER_AGENT_NAME:
+        set_before_sync_response_callback.assert_called_once_with(client, bot._before_sync_response_admission)
+    else:
+        set_before_sync_response_callback.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1089,7 +1119,6 @@ async def test_start_runs_pending_invite_recovery_after_callbacks_and_running(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -1105,7 +1134,7 @@ async def test_orchestrated_team_start_gates_turn_recovery_on_responder_fleet(
     """Team startup must leave turn-backed replay gated until its member fleet starts."""
     config = _configured_team_test_config(tmp_path)
     runtime_paths = runtime_paths_for(config)
-    bot = TeamBot(
+    bot = make_test_team_bot(
         _configured_team_user(config, runtime_paths),
         tmp_path,
         config=config,
@@ -1125,7 +1154,6 @@ async def test_orchestrated_team_start_gates_turn_recovery_on_responder_fleet(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
         await wait_for_background_tasks(timeout=1, owner=bot._runtime_view)
@@ -1154,6 +1182,7 @@ async def test_authoritative_leave_fences_the_room_without_discarding_continuity
         store_generation=_STORE_GENERATION,
     )
     response = MagicMock(spec=nio.SyncResponse)
+    response.next_batch = "s_after_leave"
     response.rooms = MagicMock(join={}, leave={"!left:localhost": MagicMock()})
 
     await bot._apply_own_room_membership_from_sync(response)
@@ -1180,14 +1209,22 @@ async def test_leave_fences_before_failing_call_reconciliation(
     """Call cleanup cannot suspend or fail before the departure is fenced."""
     bot = _agent_bot(tmp_path)
     response = MagicMock(spec=nio.SyncResponse)
+    response.next_batch = "s_after_leave"
     response.rooms = MagicMock(join={}, leave={"!left:localhost": MagicMock()})
     operation_order: list[str] = []
 
     class OrderRecordingStore(FencedRoomRecorder):
         """Record that the fence ran before call cleanup."""
 
-        async def fence_departure(self, room_id: str, *, source: DepartureSource) -> DepartureOutcome:
+        async def fence_departure(
+            self,
+            room_id: str,
+            *,
+            source: DepartureSource,
+            report_observation_id: str | None = None,
+        ) -> DepartureOutcome:
             """Note where this invalidation fell relative to call cleanup."""
+            del report_observation_id
             operation_order.append("fence")
             return await super().fence_departure(room_id, source=source)
 
@@ -1224,7 +1261,6 @@ async def test_bot_start_rejects_checkpoint_from_reset_store_generation(tmp_path
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -1251,7 +1287,6 @@ async def test_bot_start_clears_checkpoint_when_store_generation_is_unavailable(
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -1279,7 +1314,6 @@ async def test_legacy_v2_sync_token_path_is_not_parsed(tmp_path: Path) -> None:
         patch("mindroom.bot.login_agent_user", AsyncMock(return_value=client)),
         patch.object(bot, "_set_avatar_if_available", AsyncMock()),
         patch.object(bot, "_set_presence_with_model_info", AsyncMock()),
-        patch("mindroom.bot.interactive.init_persistence"),
     ):
         await bot.start()
 
@@ -2277,6 +2311,152 @@ async def test_tokenless_dispatch_persistence_failure_defers_cursor_replay(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["classic", "sliding"])
+async def test_leave_and_rejoin_apply_before_a_later_timeline_message_is_admitted(
+    tmp_path: Path,
+    transport: str,
+) -> None:
+    """A message after an explicit rejoin belongs to the new membership epoch."""
+    bot = _agent_bot(tmp_path)
+    client = nio.AsyncClient(
+        "https://example.org",
+        bot.matrix_id.full_id,
+        config=nio.AsyncClientConfig(
+            encryption_enabled=False,
+            backfill_limited_timelines=True,
+        ),
+    )
+    bot.client = client
+    if transport == "classic":
+        client.next_batch = "s_before_rejoin"
+    room_id = "!room:localhost"
+    message = _text_event(f"$after-rejoin-{transport}", "hello again", 3)
+    response = _timeline_response(
+        transport,
+        room_id,
+        (
+            _own_room_member_event("$leave", bot.matrix_id.full_id, "leave", 1),
+            _own_room_member_event("$join", bot.matrix_id.full_id, "join", 2),
+            message,
+        ),
+    )
+    bot._journal_dispatcher.register(client)
+
+    try:
+        await client.receive_response(response)
+        assert await bot._journal_dispatcher.store.membership_epoch(room_id) == 1
+        if isinstance(response, nio.SyncResponse):
+            await bot._apply_own_room_membership_from_sync(response)
+        else:
+            await bot._apply_own_room_membership_from_sliding_sync(response)
+
+        store = bot._journal_dispatcher.store
+        assert await store.membership_epoch(room_id) == 1
+        assert await store.is_pending(message.event_id)
+        assert await _is_projected(store, room_id=room_id, event_id=message.event_id)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["classic", "sliding"])
+async def test_explicit_join_closes_a_preceding_truncated_leave_before_message_admission(
+    tmp_path: Path,
+    transport: str,
+) -> None:
+    """A sync-token departure still orders before a later explicit join."""
+    bot = _agent_bot(tmp_path)
+    client = nio.AsyncClient(
+        "https://example.org",
+        bot.matrix_id.full_id,
+        config=nio.AsyncClientConfig(
+            encryption_enabled=False,
+            backfill_limited_timelines=True,
+        ),
+    )
+    bot.client = client
+    if transport == "classic":
+        client.next_batch = "s_before_truncated_leave"
+    room_id = "!room:localhost"
+    bot._journal_dispatcher.register(client)
+    left = _timeline_response(transport, room_id, (), final_membership="leave")
+    message = _text_event(f"$after-truncated-{transport}", "hello again", 2)
+    joined = _timeline_response(
+        transport,
+        room_id,
+        (
+            _own_room_member_event("$join-after-truncated", bot.matrix_id.full_id, "join", 1),
+            message,
+        ),
+    )
+
+    try:
+        if isinstance(left, nio.SyncResponse):
+            await bot._apply_own_room_membership_from_sync(left)
+        else:
+            await bot._apply_own_room_membership_from_sliding_sync(left)
+        assert not await _membership_accepts_question(bot._journal_dispatcher.store, room_id, 1)
+
+        await client.receive_response(joined)
+
+        store = bot._journal_dispatcher.store
+        assert await _membership_accepts_question(store, room_id, 1)
+        assert await store.is_pending(message.event_id)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["classic", "sliding"])
+async def test_delayed_old_join_does_not_rearm_a_newer_local_departure(
+    tmp_path: Path,
+    transport: str,
+) -> None:
+    """A historical join owns the preceding report, not the current epoch."""
+    bot = _agent_bot(tmp_path)
+    client = nio.AsyncClient(
+        "https://example.org",
+        bot.matrix_id.full_id,
+        config=nio.AsyncClientConfig(
+            encryption_enabled=False,
+            backfill_limited_timelines=True,
+        ),
+    )
+    bot.client = client
+    if transport == "classic":
+        client.next_batch = "s_before_delayed_reports"
+    room_id = "!room:localhost"
+    await bot._membership_fence.fence_local_departure(room_id)
+    await bot._membership_fence.note_membership_restarted(room_id)
+    await bot._membership_fence.fence_local_departure(room_id)
+    response = _timeline_response(
+        transport,
+        room_id,
+        (
+            _own_room_member_event("$leave-1", bot.matrix_id.full_id, "leave", 1),
+            _own_room_member_event("$ban-1", bot.matrix_id.full_id, "ban", 2),
+            _own_room_member_event("$join-1", bot.matrix_id.full_id, "join", 3),
+            _own_room_member_event("$leave-2", bot.matrix_id.full_id, "leave", 4),
+        ),
+        final_membership="leave",
+    )
+    bot._journal_dispatcher.register(client)
+
+    try:
+        await client.receive_response(response)
+        if isinstance(response, nio.SyncResponse):
+            await bot._apply_own_room_membership_from_sync(response)
+        else:
+            await bot._apply_own_room_membership_from_sliding_sync(response)
+
+        store = bot._journal_dispatcher.store
+        assert await store.membership_epoch(room_id) == 2
+        assert not await _membership_accepts_question(store, room_id, 2)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["classic", "sliding"])
 async def test_nio_replays_event_rejected_before_durable_dispatch_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3148,7 +3328,7 @@ async def test_failed_coalesced_dispatch_returns_exact_source_to_durable_retry(t
         retried.set()
         return TurnDispatchOutcome.INTENTIONALLY_IGNORED
 
-    async def failing_dispatch(_batch: CoalescedBatch) -> None:
+    async def failing_dispatch(_batch: PreparedTurn) -> None:
         msg = "coalesced dispatch failed"
         raise RuntimeError(msg)
 
@@ -3157,13 +3337,13 @@ async def test_failed_coalesced_dispatch_returns_exact_source_to_durable_retry(t
         on_message=recovered_callback,
     )
     bot._journal_dispatcher.room_for_id = lambda _room_id: room
-    bot._coalescing_gate._dispatch_batch = failing_dispatch
+    bot._coalescing_gate._dispatch_turn = failing_dispatch
     await bot._journal_dispatcher.admit_out_of_band(room, event, EventKind.MESSAGE, EventClass.ACTIONABLE, live=False)
 
     await bot._coalescing_gate.admit(
-        CoalescingKey(room.room_id, None, event.sender),
+        CoalescingKey(room.room_id, None, RequesterCoalescingOwner(event.sender)),
         ready_result=ReadyPendingEvent(
-            pending_event=PendingEvent(event=event, room=room, source_kind="message"),
+            pending_event=make_pending_event(event, room, source_kind="message"),
         ),
         source_event_id=event.event_id,
         source_kind="message",
@@ -3196,9 +3376,9 @@ def test_failed_coalesced_dispatch_retries_every_source_kind(
 
     bot._retry_failed_coalesced_dispatch(
         (
-            PendingEvent(
-                event=event,
-                room=nio.MatrixRoom("!room:localhost", bot.agent_user.user_id),
+            make_pending_event(
+                event,
+                nio.MatrixRoom("!room:localhost", bot.agent_user.user_id),
                 source_kind=source_kind,
             ),
         ),
@@ -3236,7 +3416,7 @@ async def test_lane_terminal_drop_returns_deferred_source_to_retry_owner(
         if failure_mode == "readiness_none":
             return None
         return ReadyPendingEvent(
-            pending_event=PendingEvent(event=event, room=room, source_kind="message"),
+            pending_event=make_pending_event(event, room, source_kind="message"),
         )
 
     if failure_mode == "lane_delivery_failure":
@@ -3246,10 +3426,10 @@ async def test_lane_terminal_drop_returns_deferred_source_to_retry_owner(
             AsyncMock(side_effect=RuntimeError("lane delivery failed")),
         )
 
-    slot = bot._coalescing_gate.enter_lane(room_id=room.room_id, sender_id=event.sender)
+    slot = bot._coalescing_gate.enter_lane(ReceiptLaneKey(room_id=room.room_id, sender_id=event.sender))
     bot._coalescing_gate.submit_lane_slot(
         slot,
-        key=CoalescingKey(room.room_id, None, event.sender),
+        key=CoalescingKey(room.room_id, None, RequesterCoalescingOwner(event.sender)),
         source_event_id=event.event_id,
         source_kind="message",
         ready_task=asyncio.create_task(resolve_readiness()),
@@ -3285,26 +3465,26 @@ async def test_receive_time_gate_shutdown_drains_unresolved_admission() -> None:
             },
         ),
     )
-    key = CoalescingKey(room.room_id, "$thread", "@user:localhost")
+    key = CoalescingKey(room.room_id, "$thread", RequesterCoalescingOwner("@user:localhost"))
     release_ready = asyncio.Event()
     dispatched: list[list[str]] = []
 
     async def dispatch_batch(batch: object) -> None:
-        dispatched.append(list(batch.source_event_ids))
+        dispatched.append(list(batch.handled_turn.source_event_ids))
 
     async def ready_event() -> object:
         await release_ready.wait()
         return ReadyPendingEvent(
-            pending_event=PendingEvent(event=event, room=room, source_kind="message"),
+            pending_event=make_pending_event(event, room, source_kind="message"),
         )
 
     gate = CoalescingGate(
-        dispatch_batch=dispatch_batch,
+        dispatch_turn=dispatch_batch,
         debounce_seconds=lambda: 60.0,
         is_shutting_down=lambda: True,
     )
 
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3328,7 +3508,7 @@ async def test_receive_time_gate_shutdown_does_not_poison_later_generation() -> 
     """A shutdown drain should not prevent a later clean sync generation from admitting prompts."""
     room = MagicMock(spec=nio.MatrixRoom)
     room.room_id = "!room:localhost"
-    key = CoalescingKey(room.room_id, "$thread", "@user:localhost")
+    key = CoalescingKey(room.room_id, "$thread", RequesterCoalescingOwner("@user:localhost"))
     dispatched: list[list[str]] = []
 
     def text_event(event_id: str, body: str) -> nio.RoomMessageText:
@@ -3347,11 +3527,11 @@ async def test_receive_time_gate_shutdown_does_not_poison_later_generation() -> 
         )
 
     async def dispatch_batch(batch: object) -> None:
-        dispatched.append(list(batch.source_event_ids))
+        dispatched.append(list(batch.handled_turn.source_event_ids))
 
     shutting_down = True
     gate = CoalescingGate(
-        dispatch_batch=dispatch_batch,
+        dispatch_turn=dispatch_batch,
         debounce_seconds=lambda: 60.0,
         is_shutting_down=lambda: shutting_down,
     )
@@ -3361,10 +3541,10 @@ async def test_receive_time_gate_shutdown_does_not_poison_later_generation() -> 
     async def waiting_ready() -> object:
         await waiting_release.wait()
         return ReadyPendingEvent(
-            pending_event=PendingEvent(event=text_event("$waiting", "waiting"), room=room, source_kind="message"),
+            pending_event=make_pending_event(text_event("$waiting", "waiting"), room, source_kind="message"),
         )
 
-    waiting_slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    waiting_slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         waiting_slot,
         key=key,
@@ -3381,10 +3561,10 @@ async def test_receive_time_gate_shutdown_does_not_poison_later_generation() -> 
 
     async def next_ready() -> object:
         return ReadyPendingEvent(
-            pending_event=PendingEvent(event=text_event("$next", "next"), room=room, source_kind="message"),
+            pending_event=make_pending_event(text_event("$next", "next"), room, source_kind="message"),
         )
 
-    next_slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    next_slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         next_slot,
         key=key,
@@ -3409,12 +3589,12 @@ async def test_shutdown_drain_cancels_stuck_ready_task_without_cancelling_dispat
             cancelled.set()
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3439,16 +3619,18 @@ async def test_shutdown_drain_counts_self_cancelled_ready_task_as_incomplete() -
         raise asyncio.CancelledError
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    unresolved_front_slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    unresolved_front_slot = gate.enter_lane(
+        ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id),
+    )
     ready_task = asyncio.create_task(cancelled_ready())
     await asyncio.gather(ready_task, return_exceptions=True)
     assert ready_task.cancelled()
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3469,11 +3651,11 @@ async def test_shutdown_drain_counts_self_cancelled_ready_task_as_incomplete() -
 async def test_shutdown_drain_releases_stuck_pre_admission_lane_slot() -> None:
     """Bounded drains should release unresolved lane slots and reject late admission."""
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    slot = gate.enter_lane(room_id="!room:localhost", sender_id="@user:localhost")
+    slot = gate.enter_lane(ReceiptLaneKey(room_id="!room:localhost", sender_id="@user:localhost"))
 
     result = await gate.drain_all(ready_timeout_seconds=0.01)
 
@@ -3483,7 +3665,7 @@ async def test_shutdown_drain_releases_stuck_pre_admission_lane_slot() -> None:
     with pytest.raises(IngressAdmissionClosedError):
         gate.submit_lane_slot(
             slot,
-            key=CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost"),
+            key=CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost")),
             source_event_id="$late:localhost",
             source_kind="message",
             ready_result=ReadyPendingEvent(
@@ -3508,7 +3690,6 @@ async def test_shutdown_ready_timeout_closes_ready_result_returned_during_cancel
             kind="test",
             payload=object(),
             close=close_metadata,
-            requires_solo_batch=False,
         ),
     )
 
@@ -3520,12 +3701,12 @@ async def test_shutdown_ready_timeout_closes_ready_result_returned_during_cancel
             return ReadyPendingEvent(pending_event=pending_event)
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3557,12 +3738,12 @@ async def test_shutdown_timeout_reaches_already_running_ready_wait() -> None:
             cancelled.set()
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: False,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3587,18 +3768,18 @@ async def test_ready_task_self_cancellation_finishes_no_ready() -> None:
     async def cancelled_ready() -> ReadyPendingEvent | None:
         raise asyncio.CancelledError
 
-    batches: list[CoalescedBatch] = []
+    batches: list[PreparedTurn] = []
 
-    async def dispatch_batch(batch: CoalescedBatch) -> None:
+    async def dispatch_batch(batch: PreparedTurn) -> None:
         batches.append(batch)
 
     gate = CoalescingGate(
-        dispatch_batch=dispatch_batch,
+        dispatch_turn=dispatch_batch,
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: False,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
     gate.submit_lane_slot(
         slot,
         key=key,
@@ -3619,16 +3800,16 @@ async def test_enter_lane_during_active_bounded_shutdown_returns_released_counte
     shutting_down = False
 
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: shutting_down,
     )
-    old_slot = gate.enter_lane(room_id="!room:localhost", sender_id="@user:localhost")
+    old_slot = gate.enter_lane(ReceiptLaneKey(room_id="!room:localhost", sender_id="@user:localhost"))
     shutting_down = True
     drain_task = asyncio.create_task(gate.drain_all(ready_timeout_seconds=0.05))
     await asyncio.sleep(0)
 
-    slot = gate.enter_lane(room_id="!room:localhost", sender_id="@user:localhost")
+    slot = gate.enter_lane(ReceiptLaneKey(room_id="!room:localhost", sender_id="@user:localhost"))
 
     assert slot.closed is True
     assert slot.released is True
@@ -3637,7 +3818,7 @@ async def test_enter_lane_during_active_bounded_shutdown_returns_released_counte
     with pytest.raises(IngressAdmissionClosedError):
         gate.submit_lane_slot(
             slot,
-            key=CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost"),
+            key=CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost")),
             source_event_id="$late:localhost",
             source_kind="message",
             ready_result=ReadyPendingEvent(
@@ -3658,12 +3839,12 @@ async def test_shutdown_timeout_reaches_already_running_same_window_lane_slot_wa
     shutting_down = False
     wait_entered = asyncio.Event()
     gate = CoalescingGate(
-        dispatch_batch=AsyncMock(),
+        dispatch_turn=AsyncMock(),
         debounce_seconds=lambda: 0.01,
         is_shutting_down=lambda: shutting_down,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
-    target_slot = gate.enter_lane(room_id=key.room_id, sender_id=key.requester_user_id)
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
+    target_slot = gate.enter_lane(ReceiptLaneKey(room_id=key.room_id, sender_id=key.owner.requester_user_id))
 
     original_wait_for_lane_slots = gate._wait_for_lane_slots
 
@@ -3699,18 +3880,18 @@ async def test_shutdown_in_flight_dispatch_failure_marks_drain_incomplete() -> N
     dispatch_entered = asyncio.Event()
     fail_dispatch = asyncio.Event()
 
-    async def dispatch_batch(_batch: CoalescedBatch) -> None:
+    async def dispatch_batch(_batch: PreparedTurn) -> None:
         dispatch_entered.set()
         await fail_dispatch.wait()
         message = "dispatch failed"
         raise RuntimeError(message)
 
     gate = CoalescingGate(
-        dispatch_batch=dispatch_batch,
+        dispatch_turn=dispatch_batch,
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
     await gate.admit(
         key,
         ready_result=ReadyPendingEvent(pending_event=_pending(_text_event("$text:localhost", "typed", 1000))),
@@ -3738,18 +3919,18 @@ async def test_shutdown_in_flight_dispatch_cancellation_marks_drain_incomplete()
     dispatch_raised_self_cancel = asyncio.Event()
     cancel_dispatch = asyncio.Event()
 
-    async def dispatch_batch(_batch: CoalescedBatch) -> None:
+    async def dispatch_batch(_batch: PreparedTurn) -> None:
         dispatch_entered.set()
         await cancel_dispatch.wait()
         dispatch_raised_self_cancel.set()
         raise asyncio.CancelledError
 
     gate = CoalescingGate(
-        dispatch_batch=dispatch_batch,
+        dispatch_turn=dispatch_batch,
         debounce_seconds=lambda: 0.0,
         is_shutting_down=lambda: True,
     )
-    key = CoalescingKey("!room:localhost", "$thread:localhost", "@user:localhost")
+    key = CoalescingKey("!room:localhost", "$thread:localhost", RequesterCoalescingOwner("@user:localhost"))
     await gate.admit(
         key,
         ready_result=ReadyPendingEvent(pending_event=_pending(_text_event("$text:localhost", "typed", 1000))),

@@ -4,15 +4,16 @@ icon: lucide/wrench
 
 # Agent Orchestration
 
-Use these tools and presets to coordinate other agents, save reusable Dynamic Workflows, change runtime configuration, import OpenClaw-style workspaces, and keep long-lived Claude coding sessions alive across turns.
+Use these tools and presets to recover requester-scoped OAuth connections, coordinate other agents, save reusable Dynamic Workflows, change runtime configuration, import OpenClaw-style workspaces, and keep long-lived Claude coding sessions alive across turns.
 
 ## What This Page Covers
 
 This page documents the built-in tools in the `agent-orchestration` group.
-Use these tools when you need multi-agent coordination, reusable workflow runs, runtime config changes, config-only presets, or persistent Claude Agent SDK sessions.
+Use these tools when you need requester-scoped OAuth recovery, multi-agent coordination, reusable workflow runs, runtime config changes, config-only presets, or persistent Claude Agent SDK sessions.
 
 ## Tools On This Page
 
+- [`oauth_connections`] - Issue a browser-confirmed reset for one requester-scoped OAuth connection.
 - [`subagents`] - Spawn Matrix-backed sub-agent sessions and message them later by session key or label.
 - [`delegate`] - Run another configured agent as a one-shot specialist and return its answer inline.
 - [`dynamic_workflow`] - Create, update, run, and inspect saved Dynamic Workflows with persisted report artifacts.
@@ -24,7 +25,8 @@ Use these tools when you need multi-agent coordination, reusable workflow runs, 
 
 ## Common Setup Notes
 
-All eight entries on this page are MindRoom-native orchestration features rather than third-party OAuth integrations.
+All nine entries on this page are MindRoom-native orchestration features rather than third-party toolkits.
+[`oauth_connections`] manages connections used by other provider-backed tools and has no credentials of its own.
 Only [`claude_agent`] has tool-specific credential fields.
 [`delegate`] and [`self_config`] can be added automatically based on agent config, so they are not limited to explicit `tools:` entries.
 `agents.<name>.delegate_to` auto-enables [`delegate`] when the list is non-empty and the current delegation depth is below the hard limit of 3.
@@ -36,6 +38,58 @@ Only [`claude_agent`] has tool-specific credential fields.
 [`openclaw_compat`] is a config preset, not a runtime toolkit.
 `Config.expand_tool_names()` expands presets and implied tools while deduping and preserving order.
 For [`openclaw_compat`], that means `matrix_message` is added directly and `attachments` is added indirectly through `Config.IMPLIED_TOOLS`.
+
+## [`oauth_connections`]
+
+`oauth_connections` lets an agent recover a stuck or revoked MindRoom-managed OAuth connection without exposing broader credential-management controls.
+
+### What It Does
+
+The toolkit exposes only `reset_oauth_connection(provider_id)`.
+The provider must back one of the current agent's configured tools through that tool's `auth_provider` metadata.
+The call returns a time-limited, retryable, requester-bound browser link and does not change credentials itself.
+The authenticated browser confirmation retires the matching MCP OAuth session for that credential scope when applicable, deletes the matching local scoped credential under the same lock used by token refresh, and then opens the provider authorization page.
+The reset does not revoke the grant at the external provider.
+Opening the link without confirming is non-destructive.
+Confirming when no local credential exists is safe and still continues to provider authorization.
+
+### Configuration
+
+Enable the tool alongside the OAuth-backed tools the agent may recover.
+
+```yaml
+agents:
+  researcher:
+    display_name: Researcher
+    role: Work with connected documents and recover revoked connections
+    model: sonnet
+    worker_scope: user_agent
+    tools:
+      - oauth_connections
+      - google_drive
+```
+
+### Browser Confirmation And Requester Scope
+
+The tool call itself is non-destructive: it only issues a browser URL and never deletes credentials or retires MCP sessions.
+Normal `tool_approval` policy still applies, so a matching `require_approval` rule can pause the tool call before it issues that URL.
+The browser page is the human approval boundary: its GET only displays the action, and its POST performs the reset.
+The link freezes the provider, credential service, invoking agent, canonical requester, credential scope, worker key, connection generation, and a stable reset operation ID.
+Only the original authenticated human requester can open and confirm the link.
+Both link issuance and confirmation apply `authorization.agent_reply_permissions` for the current agent, including configured sender aliases.
+The resolved credential scope must be `user` or `user_agent`; shared and unscoped credentials are refused.
+Use the authenticated dashboard connection controls to disconnect and reconnect shared or installation-level credentials.
+A `user` reset affects the current requester across agents, while a `user_agent` reset affects only the current requester and current agent.
+Providers that define requester-scoped credentials, such as GitHub, may resolve to `user` scope independently of the agent's `worker_scope`.
+
+### Notes
+
+- `oauth_connections` always runs in the primary MindRoom runtime, even if it appears in `worker_tools`.
+- Invalid, unavailable, unconfigured, unauthorized, expired, or mismatched links fail before credential deletion or MCP session disconnection.
+- Use the returned link, confirm the reset, complete provider authorization, then retry the original provider-backed tool call.
+- If the browser retries after the stable reset completed, MindRoom skips deletion and MCP retirement, so it cannot disturb a later reconnection.
+- Credential deletion and the stable reset receipt commit atomically, so a restart observes either the intact connection or the completed reset.
+- The browser link expires after 10 minutes; run `reset_oauth_connection()` again to issue a fresh link.
 
 ## [`subagents`]
 
@@ -206,8 +260,9 @@ Participants can be `ephemeral_agent` or `room_agent`.
 An `ephemeral_agent` can declare `id`, `name`, `role`, `description`, `model`, `tools`, and `instructions`.
 Ephemeral participant `tools` may grant any registered tool except agent-infrastructure tools (`memory`, `delegate`, `self_config`, `compact_context`, `dynamic_workflow`, `dynamic_tools`).
 Every participant tool must also be listed in `permissions.tools`.
-Participant tool calls require per-call user approval in the originating room unless the tool is pre-approved by the caller's `dynamic_workflow` `allowed_tools` config.
-Setting `allowed_tools` to `["*"]` pre-approves every granted tool.
+Dynamic Workflow participants cannot suspend and resume a model run for human approval.
+A participant grant is rejected when any exposed function would require approval under the operator's `tool_approval` policy and the caller's `dynamic_workflow` `allowed_tools` config.
+Setting `allowed_tools` to `["*"]` makes every granted tool eligible except system-mutating tools and functions still gated by an operator-authored approval rule.
 A `room_agent` can declare `id`, `agent`, and an empty `tools` list.
 Room-agent participants must already be available to the requester in the current room, use their configured model, and run without tools, skills, knowledge, durable state, or preloaded context files.
 Step types are `transform_step`, `agent_step`, and `report_step`.
@@ -268,9 +323,9 @@ list_workflows()
 get_workflow_run("brief-report", "run_...")
 ```
 
-### Pre-approving participant tools
+### Allowing participant tools
 
-Configure `allowed_tools` on the calling agent's `dynamic_workflow` tool entry to skip per-call approval for trusted tools.
+Configure `allowed_tools` on the calling agent's `dynamic_workflow` tool entry to make trusted tools eligible for embedded participants.
 
 ```yaml
 agents:
@@ -281,15 +336,17 @@ agents:
           allowed_tools: [duckduckgo, website]
 ```
 
-Use `allowed_tools: ["*"]` to pre-approve every tool a workflow grants.
-Tools outside `allowed_tools` still run, but each call posts an approval card in the originating room and waits for the requester's decision.
+Use `allowed_tools: ["*"]` to make every granted non-system-mutating tool eligible.
+Tools outside `allowed_tools` are rejected because Dynamic Workflow has no resumable Matrix approval lifecycle.
+Operator-authored approval rules retain precedence, so a matching `require_approval` rule still makes that function unavailable.
+System-mutating tools (`claude_agent`, `config_manager`, `scheduler`, and `subagents`) are always unavailable to embedded participants.
 
 ### Notes
 
 - Dynamic Workflow runs execute synchronously on the current tool call path today.
 - Long-running background workflow management, workflow-activation approval cards, Matrix history grants, attachment grants, and knowledge-base grants are future work.
 - Ephemeral agents can only use models allowed by both the workflow permissions and the caller's current model policy.
-- Granted tools run with the calling agent's tool routing (credentials, worker sandboxing, and egress proxying), and the tool-hook bridge applies plugin gating plus the per-call approval flow.
+- Granted tools run with the calling agent's tool routing (credentials, worker sandboxing, and egress proxying), and the tool-hook bridge applies plugin gating.
 - Room-agent participants can reuse only agents that normal room routing would expose to the requester.
 - Runtime caps are enforced for sync and async runs, and async runs are marked failed at the deadline even if participant cancellation is delayed.
 
@@ -501,7 +558,7 @@ update_own_config(
 `openclaw_compat` is not a runtime toolkit.
 The registered factory returns an empty `Toolkit`, and the real behavior comes from `Config.TOOL_PRESETS`.
 `Config.expand_tool_names()` expands `openclaw_compat` into `shell`, `coding`, `duckduckgo`, `website`, `browser`, `scheduler`, `subagents`, and `matrix_message`.
-`matrix_message` then implies `attachments`, so the effective enabled set also includes `attachments` even though the preset does not list it directly.
+`matrix_message` then implies `attachments` and `matrix_room`, so the effective enabled set includes both companion toolkits even though the preset does not list them directly.
 Preset expansion dedupes while preserving order, so adding `openclaw_compat` alongside one of its member tools does not create duplicates.
 This preset is meant for OpenClaw-compatible workspace behavior inside MindRoom rather than for cloning the full OpenClaw gateway control plane.
 

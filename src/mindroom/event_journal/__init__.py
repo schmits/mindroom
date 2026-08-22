@@ -12,8 +12,20 @@ from mindroom.history_recovery import (
     HistoryRecoveryState,
     RoomHistoryRecovery,
 )
+from mindroom.interactive_models import InteractiveSelection
 
-from .approvals import RecordedApprovalDecision, StoredApprovalCard
+from .approval_card_state import ApprovalCardReservation, RecordedApprovalDecision
+from .approval_continuations import (
+    ApprovalCall,
+    ApprovalContinuation,
+    ApprovalDecision,
+    ApprovalMemoryTurn,
+)
+from .approvals import (
+    StoredApprovalCard,
+    UnreadableApprovalCard,
+)
+from .background_approvals import BackgroundApprovalDecision
 from .identity import decode_thread_id, delivery_transaction_id, encode_thread_id
 from .membership import MembershipFence, MembershipView
 from .models import (
@@ -22,6 +34,7 @@ from .models import (
     ConversationCursor,
     ConversationPage,
     DeliveryAcknowledgement,
+    DeliveryProjectionPendingError,
     DeliveryStage,
     DepartureObservation,
     DepartureOutcome,
@@ -32,23 +45,25 @@ from .models import (
     HydrationPolicy,
     InboundEvent,
     JournalEvent,
-    OutboxDelivery,
+    MatrixDelivery,
     PendingPage,
     RefreshRequest,
     SemanticConsumer,
     TerminalTurnWrite,
+    UnreadableMatrixDelivery,
     VisibleMessage,
 )
+from .outbox import matrix_delivery_payload
 from .projection import ProjectedEvent, replacement_target, thread_root, visible_content
 from .store import EventJournalStore, PrincipalStore, TurnRecordStore
 from .views import (
     AdmissionView,
-    ApprovalView,
+    ApprovalDeliveryView,
     ConversationReadView,
     DispatchView,
     HistoryRecoveryRecordView,
     HydrationView,
-    OutboxView,
+    MatrixDeliveryView,
     PendingTurnView,
     RelationView,
     ReplayView,
@@ -58,11 +73,18 @@ __all__ = [
     "TURN_BACKED_KINDS",
     "AdmissionResult",
     "AdmissionView",
-    "ApprovalView",
+    "ApprovalCall",
+    "ApprovalCardReservation",
+    "ApprovalContinuation",
+    "ApprovalDecision",
+    "ApprovalDeliveryView",
+    "ApprovalMemoryTurn",
+    "BackgroundApprovalDecision",
     "ConversationCursor",
     "ConversationPage",
     "ConversationReadView",
     "DeliveryAcknowledgement",
+    "DeliveryProjectionPendingError",
     "DeliveryStage",
     "DepartureObservation",
     "DepartureOutcome",
@@ -78,11 +100,12 @@ __all__ = [
     "HydrationPolicy",
     "HydrationView",
     "InboundEvent",
+    "InteractiveSelection",
     "JournalEvent",
+    "MatrixDelivery",
+    "MatrixDeliveryView",
     "MembershipFence",
     "MembershipView",
-    "OutboxDelivery",
-    "OutboxView",
     "PendingPage",
     "PendingTurnView",
     "PrincipalStore",
@@ -96,10 +119,13 @@ __all__ = [
     "StoredApprovalCard",
     "TerminalTurnWrite",
     "TurnRecordStore",
+    "UnreadableApprovalCard",
+    "UnreadableMatrixDelivery",
     "VisibleMessage",
     "decode_thread_id",
     "delivery_transaction_id",
     "encode_thread_id",
+    "matrix_delivery_payload",
     "replacement_target",
     "thread_root",
     "visible_content",

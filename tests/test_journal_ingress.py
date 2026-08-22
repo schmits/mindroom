@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import AsyncMock
 
 import nio
 import pytest
@@ -21,10 +22,13 @@ from mindroom.constants import (
     STREAM_STATUS_STREAMING,
 )
 from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
+from mindroom.dispatch_recovery_context import turn_dispatch_recovery_active
 from mindroom.event_journal import (
+    DeliveryProjectionPendingError,
     DepartureSource,
     EventClass,
     EventKind,
+    PendingPage,
     SemanticConsumer,
     VisibleMessage,
 )
@@ -47,7 +51,7 @@ from tests.test_event_journal_store import corrupt
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sized
 
-    from mindroom.event_journal import EventJournalStore, JournalEvent, PendingPage, PrincipalStore
+    from mindroom.event_journal import EventJournalStore, JournalEvent, PrincipalStore
 
 pytestmark = pytest.mark.asyncio
 
@@ -364,6 +368,25 @@ class TestAdmissionAdapter:
         """An unthreaded message has no thread."""
         inbound = inbound_event(ROOM, text_event("$m"), EventKind.MESSAGE, EventClass.ACTIONABLE)
         assert inbound.thread_id is None
+
+    async def test_a_delivery_echo_keeps_its_matrix_transaction_id(self) -> None:
+        """Projection can identify an owned echo before outbox acknowledgement."""
+        event = nio.Event.parse_event(
+            {
+                "event_id": "$echo",
+                "sender": BOT,
+                "origin_server_ts": 1,
+                "type": "m.room.message",
+                "content": {"msgtype": "m.text", "body": "answer"},
+                "unsigned": {"transaction_id": "tx-final"},
+            },
+        )
+        assert isinstance(event, nio.Event)
+
+        projected = projected_event(ROOM, event, EventKind.MESSAGE, self_sender=BOT)
+
+        assert projected is not None
+        assert projected.transaction_id == "tx-final"
 
     async def test_a_reaction_does_not_touch_the_projection(self) -> None:
         """A reaction does not touch the projection."""
@@ -1153,6 +1176,33 @@ class TestDurableAdmission:
         with pytest.raises(nio.CallbackNotAcceptedError):
             await ingress._admit(room(), text_event("$m"), nio.TimelineEventProvenance.LIVE)
 
+    async def test_a_pending_delivery_projection_schedules_recovery_before_refusing(self) -> None:
+        """The outbox must be woken before nio retries the blocked source."""
+
+        class ProjectionPending:
+            principal_id = "agent@alice"
+
+            async def admit(self, *_args: object, **_kwargs: object) -> None:
+                msg = "projection pending"
+                raise DeliveryProjectionPendingError(msg)
+
+        recovery_requests = 0
+
+        def schedule_recovery() -> None:
+            nonlocal recovery_requests
+            recovery_requests += 1
+
+        ingress = JournalIngress(
+            store=ProjectionPending(),  # type: ignore[arg-type]
+            self_sender=BOT,
+            on_delivery_recovery_needed=schedule_recovery,
+        )
+
+        with pytest.raises(nio.CallbackNotAcceptedError):
+            await ingress._admit(room(), text_event("$m", "1"), nio.TimelineEventProvenance.LIVE)
+
+        assert recovery_requests == 1
+
     async def test_redelivery_after_a_crash_creates_one_turn(
         self,
         alice: PrincipalStore,
@@ -1391,6 +1441,120 @@ class TestPendingEventWorker:
         assert handled == ["$first", "$second", "$third"]
         assert peak_concurrent == 1
         assert await alice.unsettled_event_ids() == frozenset()
+
+    async def test_stop_prevents_a_waiting_recovery_drain_from_starting_a_late_lane(
+        self,
+        alice: PrincipalStore,
+    ) -> None:
+        """A drain already waiting on a lane cannot outlive worker shutdown."""
+        existing_lane_started = asyncio.Event()
+        existing_lane_cancelled = asyncio.Event()
+        finish_cancellation = asyncio.Event()
+        late_lane_started = asyncio.Event()
+
+        async def handle(event: JournalEvent) -> bool:
+            del event
+            late_lane_started.set()
+            await asyncio.Event().wait()
+            return True
+
+        async def existing_lane() -> None:
+            existing_lane_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                existing_lane_cancelled.set()
+                await finish_cancellation.wait()
+                raise
+
+        await self._admit(alice, text_event("$message"))
+        worker = PendingEventWorker(store=alice, handle=handle)
+        lane = asyncio.create_task(existing_lane())
+        worker._lanes[ROOM] = lane
+        await existing_lane_started.wait()
+
+        draining = asyncio.create_task(worker.drain_once())
+        await asyncio.sleep(0)
+        stopping = asyncio.create_task(worker.stop())
+        try:
+            await existing_lane_cancelled.wait()
+            finish_cancellation.set()
+
+            await stopping
+            await asyncio.wait_for(draining, timeout=1.0)
+            await asyncio.sleep(0)
+
+            assert not late_lane_started.is_set()
+            assert worker._lanes == {}
+        finally:
+            finish_cancellation.set()
+            draining.cancel()
+            for tracked_lane in worker._lanes.values():
+                tracked_lane.cancel()
+            await asyncio.gather(stopping, draining, *worker._lanes.values(), return_exceptions=True)
+
+    async def test_a_pre_stop_recovery_drain_cannot_dispatch_after_restart(
+        self,
+        alice: PrincipalStore,
+    ) -> None:
+        """Restarting does not make an old drain current again."""
+        first_read_started = asyncio.Event()
+        release_first_read = asyncio.Event()
+        handled = asyncio.Event()
+
+        @dataclass
+        class BlockingFirstRead:
+            inner: PrincipalStore
+            pending_calls: int = 0
+
+            async def pending(
+                self,
+                *,
+                limit: int = 256,
+                after_receipt_order: int | None = None,
+                runtime_generation: str = "unmanaged",
+            ) -> PendingPage:
+                self.pending_calls += 1
+                if self.pending_calls == 1:
+                    page = await self.inner.pending(
+                        limit=limit,
+                        after_receipt_order=after_receipt_order,
+                        runtime_generation=runtime_generation,
+                    )
+                    first_read_started.set()
+                    await release_first_read.wait()
+                    return page
+                return PendingPage((), resume_after=None, reached_end=True, unreadable_rows=0)
+
+            async def is_pending(self, event_id: str) -> bool:
+                return await self.inner.is_pending(event_id)
+
+            async def settle(self, event_id: str) -> None:
+                await self.inner.settle(event_id)
+
+        async def handle(event: JournalEvent) -> bool:
+            del event
+            handled.set()
+            return True
+
+        await self._admit(alice, text_event("$message"))
+        worker = PendingEventWorker(store=BlockingFirstRead(alice), handle=handle)
+        stale_drain = asyncio.create_task(worker.drain_once())
+        await first_read_started.wait()
+
+        await worker.stop()
+        worker.start()
+        try:
+            release_first_read.set()
+            await asyncio.wait_for(stale_drain, timeout=1.0)
+            await asyncio.sleep(0)
+
+            assert not handled.is_set()
+        finally:
+            release_first_read.set()
+            await worker.stop()
+            stale_drain.cancel()
+            await asyncio.gather(stale_drain, return_exceptions=True)
 
     async def test_one_stalled_room_does_not_block_another(
         self,
@@ -1803,6 +1967,7 @@ class TestOutOfBandDispatch:
                 on_room_lifecycle=on_room_lifecycle,
                 on_redaction=cast("Any", noop),
                 on_decryption_failure=cast("Any", noop),
+                on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: False,
                 turn_has_live_claim=lambda _event_id: False,
             ),
@@ -1892,6 +2057,7 @@ class TestDeferralOwnership:
                 on_room_lifecycle=cast("Any", noop),
                 on_redaction=cast("Any", noop),
                 on_decryption_failure=cast("Any", noop),
+                on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: gate_owns,
                 turn_has_live_claim=lambda _event_id: turn_claimed,
             ),
@@ -1919,6 +2085,25 @@ class TestDeferralOwnership:
 
         assert dispatcher._deferral_is_live(reaction) is True
 
+    async def test_approval_owned_source_bypasses_normal_ingress(self, alice: PrincipalStore) -> None:
+        """A prepared paused run resumes before hooks, routing, or ignore settlement can reinterpret it."""
+        dispatcher = self._dispatcher(alice)
+        continuation = AsyncMock(return_value=False)
+        on_message = AsyncMock(return_value=TurnDispatchOutcome.INTENTIONALLY_IGNORED)
+        dispatcher.callbacks = replace(
+            dispatcher.callbacks,
+            on_message=on_message,
+            on_approval_continuation=continuation,
+        )
+        dispatcher.release_turn_replay()
+        message = await self._admitted(alice, text_event("$approval-source"), EventKind.MESSAGE)
+
+        assert not await dispatcher._run_event(message)
+
+        continuation.assert_awaited_once_with("$approval-source")
+        on_message.assert_not_awaited()
+        assert await alice.is_pending("$approval-source")
+
     async def test_replay_parked_on_the_fleet_is_not_a_lost_owner(self, alice: PrincipalStore) -> None:
         """Turn replay waits for responders to exist, and is released by draining.
 
@@ -1930,6 +2115,28 @@ class TestDeferralOwnership:
         message = await self._admitted(alice, text_event("$m"), EventKind.MESSAGE)
 
         assert dispatcher._deferral_is_live(message) is True
+
+    async def test_interactive_reaction_replay_waits_for_fleet_recovery(self, alice: PrincipalStore) -> None:
+        """A claimed selection needs the same startup boundary as the turn it resumes."""
+        recovered: list[bool] = []
+
+        async def on_reaction(_room: nio.MatrixRoom, _event: nio.Event) -> TurnDispatchOutcome:
+            recovered.append(turn_dispatch_recovery_active())
+            return TurnDispatchOutcome.INTENTIONALLY_IGNORED
+
+        dispatcher = self._dispatcher(alice)
+        dispatcher.callbacks = replace(dispatcher.callbacks, on_reaction=on_reaction)
+        await self._admitted(alice, reaction_event("$r"), EventKind.REACTION)
+        await alice.claim_semantic_consumer("$r", SemanticConsumer.INTERACTIVE_REACTION)
+        reaction = await alice.load_event("$r")
+        assert reaction is not None
+
+        assert await dispatcher._run_event(reaction) is False
+        assert recovered == []
+
+        dispatcher.release_turn_replay()
+        assert await dispatcher._run_event(reaction) is True
+        assert recovered == [True]
 
     async def test_a_source_the_coalescing_gate_still_holds_is_owned(self, alice: PrincipalStore) -> None:
         """A batch still debouncing has no turn claim yet, and is not abandoned."""
@@ -1975,6 +2182,7 @@ class TestUnsettledLifecycleIdentities:
                 on_room_lifecycle=cast("Any", noop),
                 on_redaction=cast("Any", noop),
                 on_decryption_failure=cast("Any", noop),
+                on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: False,
                 turn_has_live_claim=lambda _event_id: False,
             ),
@@ -2412,8 +2620,13 @@ class _FlakyReplayView:
         *,
         limit: int = 256,
         after_receipt_order: int | None = None,
+        runtime_generation: str = "unmanaged",
     ) -> PendingPage:
-        return await self.inner.pending(limit=limit, after_receipt_order=after_receipt_order)
+        return await self.inner.pending(
+            limit=limit,
+            after_receipt_order=after_receipt_order,
+            runtime_generation=runtime_generation,
+        )
 
     async def is_pending(self, event_id: str) -> bool:
         if event_id in self.fail_is_pending:
@@ -2527,6 +2740,7 @@ class TestRecoveryDoesNotReenterALiveTurn:
                 on_room_lifecycle=cast("Any", noop),
                 on_redaction=cast("Any", noop),
                 on_decryption_failure=cast("Any", noop),
+                on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: gate_owns,
                 turn_has_live_claim=lambda event_id: event_id in live_claims,
             ),
@@ -2731,6 +2945,29 @@ class TestTimelineMemberProvenance:
         assert ingress.timeline_member_event_class(event) is None
 
 
+class TestLiveRoomMembershipTransitions:
+    """Only durably admitted live membership deltas may update authorization state."""
+
+    async def test_live_transition_runs_but_recovered_and_history_do_not(self, alice: PrincipalStore) -> None:
+        """Replayed lifecycle rows must not regress a newer authoritative snapshot."""
+        on_live_transition = AsyncMock()
+        ingress = JournalIngress(
+            store=alice,
+            self_sender=BOT,
+            room_lifecycle_enabled=lambda: True,
+            on_live_room_membership_transition=on_live_transition,
+        )
+        live = member_event("$live")
+        recovered = member_event("$recovered")
+        history = member_event("$history")
+
+        await ingress._admit(room(), live, nio.TimelineEventProvenance.LIVE)
+        await ingress._admit(room(), recovered, nio.TimelineEventProvenance.RECOVERED)
+        await ingress._admit(room(), history, nio.TimelineEventProvenance.HISTORY)
+
+        on_live_transition.assert_awaited_once_with(ROOM, live)
+
+
 def message_event(
     event_id: str,
     msgtype: str,
@@ -2828,6 +3065,7 @@ class TestAdmittedWorkReachesItsCallback:
                 on_room_lifecycle=cast("Any", noop),
                 on_redaction=cast("Any", noop),
                 on_decryption_failure=cast("Any", noop),
+                on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: False,
                 turn_has_live_claim=lambda _event_id: False,
             ),

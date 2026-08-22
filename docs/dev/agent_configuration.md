@@ -11,7 +11,7 @@ You can generate a starter config with `mindroom config init`.
 
 ## Configuration Structure
 
-The configuration file has these top-level sections:
+The configuration file has these common top-level sections; see the exhaustive [configuration reference](../configuration/index.md) for additional runtime, prompt, MCP, trigger, approval, call, event-journal, debug, and Matrix-sync sections.
 
 1. **agents** - Configure individual agents and their capabilities
 2. **teams** - Multi-agent collaboration groups
@@ -21,7 +21,7 @@ The configuration file has these top-level sections:
 6. **memory** - Memory system configuration (mem0, file-backed, or disabled)
 7. **knowledge_bases** - File-backed RAG knowledge bases
 8. **router** - Agent routing system configuration
-9. **voice** - Voice message processing (STT + command intelligence)
+9. **voice** - Voice message processing with STT, mention normalization, and light ASR cleanup
 10. **authorization** - Fine-grained user and room permissions
 11. **matrix_room_access** - Managed room access mode and discoverability
 12. **matrix_space** - Optional root Matrix Space for grouping rooms
@@ -62,7 +62,6 @@ Each model entry supports these fields:
 - **provider** (required) - Provider name (see list below)
 - **id** (required) - Model ID specific to the provider
 - **host** - Optional host URL (e.g., for Ollama or OpenAI-compatible servers)
-- **api_key** - Optional API key (usually set via env vars instead)
 - **extra_kwargs** - Additional provider-specific parameters (e.g., `base_url`)
 - **context_window** - Actual provider context window size in tokens; when set, MindRoom uses it for compaction summary input and as the default replay-planning window unless compaction config sets a smaller `replay_window_tokens`, and applies a final replay-fit step that may reduce or disable persisted replay for that run; on `vertexai_claude` models it additionally enables request-time fitting that trims replayed history when a request would exceed the window
 
@@ -70,7 +69,11 @@ Each model entry supports these fields:
 
 - **anthropic** - Claude models (requires `ANTHROPIC_API_KEY`)
 - **azure** - Azure OpenAI deployments (requires `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT`)
+- **bedrock_claude** - Claude models through Amazon Bedrock
 - **openai** - OpenAI and OpenAI-compatible models (requires `OPENAI_API_KEY`)
+- **codex** / **openai_codex** - OpenAI models through a Codex CLI ChatGPT login
+- **kimi** / **kimi_code** - Kimi models through a Kimi Code CLI login
+- **llama_cpp** - Local OpenAI-compatible llama.cpp servers
 - **ollama** - Local models via Ollama (requires `OLLAMA_HOST`, defaults to `http://localhost:11434`)
 - **openrouter** - Access multiple models through OpenRouter (requires `OPENROUTER_API_KEY`)
 - **gemini** / **google** - Google Gemini models (requires `GOOGLE_API_KEY`)
@@ -79,6 +82,7 @@ Each model entry supports these fields:
 - **deepseek** - DeepSeek models (requires `DEEPSEEK_API_KEY`)
 - **zai** - Z.ai GLM models (requires `ZAI_API_KEY`)
 - **cerebras** - Cerebras-hosted models (requires `CEREBRAS_API_KEY`)
+- **synthetic** - Internal Lorem Ipsum model for local tests and load generation
 
 ## Memory Configuration
 
@@ -162,7 +166,7 @@ agents:
 - **agent_name**: The configured identifier used for agent config and aliases; provisioning may propose a `mindroom_<agent_name>` username when an account is missing, but runtime identity always comes from persisted Matrix account state.
 - **display_name**: A friendly name shown in conversations
 - **role**: A brief description of the agent's purpose
-- **tools**: List of tools the agent can use — plain strings or single-key dicts with inline config overrides (see Available Tools below and [Per-Agent Tool Configuration](../configuration/agents.md#per-agent-tool-configuration))
+- **tools**: List of tools the agent can use — plain strings or single-key dicts with inline config overrides, including `script` controls such as `allowed_tools`, concurrency, call-rate, and runtime limits (see Available Tools below, [Per-Agent Tool Configuration](../configuration/agents.md#per-agent-tool-configuration), and [Background Python Scripts](../tools/background-scripts.md))
 - **include_default_tools**: Whether to merge `defaults.tools` into this agent's `tools` (default: true)
 - **skills**: Skill names the agent can use
 - **instructions**: Specific guidelines for the agent's behavior
@@ -297,7 +301,7 @@ voice:
     # api_key: null  # Optional API key for STT service
     # host: null  # Optional host URL for self-hosted STT
   intelligence:
-    model: default  # Model for command recognition
+    model: default  # Model for mention normalization and light ASR cleanup
 ```
 
 ## Authorization Configuration
@@ -316,12 +320,17 @@ authorization:
   agent_reply_permissions:
     "*":
       - "@owner:example.com"
+    code:
+      users:
+        - "@operator:example.com"
+      joined_rooms:
+        - dev
 ```
 
 - **global_users**: Users with access to all rooms
 - **room_permissions**: Per-room user allowlists
 - **aliases**: Map canonical Matrix user IDs to bridge aliases
-- **agent_reply_permissions**: Per-agent/team reply allowlists (`*` key applies to all entities)
+- **agent_reply_permissions**: Per-agent/team reply policies using the user-list shorthand or structured `users` and managed-room `joined_rooms` grants (`*` applies only when no explicit entity policy exists)
 
 ## Matrix Room Access Configuration
 
@@ -359,7 +368,7 @@ Default settings inherited by all agents unless overridden:
 
 ```yaml
 defaults:
-  tools: [scheduler]  # Tools added to every agent
+  tools: [scheduler]  # Merged into agents unless include_default_tools: false
   markdown: true
   enable_streaming: true
   show_stop_button: true
@@ -462,7 +471,7 @@ Below is a representative selection:
 
 ### Development Tools
 - **docker** - Manage Docker containers (requires Docker installed)
-- **github** - Interact with GitHub repositories (requires token)
+- **github** - Interact with GitHub repositories (requester-scoped OAuth or explicit access token)
 - **jira** - Jira issue tracking (requires API token)
 - **linear** - Linear issue tracking (requires API key)
 
@@ -495,7 +504,7 @@ Below is a representative selection:
 - **notion** - Notion workspace integration (requires API key)
 
 ### Special Tool Bundles
-- **openclaw_compat** - Convenience bundle that expands to: shell, coding, duckduckgo, website, browser, scheduler, subagents, matrix_message (matrix_message also implies attachments via `IMPLIED_TOOLS`)
+- **openclaw_compat** - Convenience bundle that expands to shell, coding, duckduckgo, website, browser, scheduler, subagents, and matrix_message, which also implies attachments and matrix_room through `IMPLIED_TOOLS`.
 
 ## Example Agent Configurations
 
@@ -596,11 +605,11 @@ Some tools need additional setup:
 - **googlesearch** - Set up Google API credentials
 - **tavily** - Get API key from Tavily
 - **exa** - Get API key from Exa
-- **github** - Create a GitHub personal access token
 - **telegram** - Create a Telegram bot and get token
 - **email** - Configure SMTP server details
 
-### Tools requiring OAuth:
+### Tools requiring OAuth or credentials:
+- **github** - GitHub App user OAuth, with an explicit access token or `GITHUB_ACCESS_TOKEN` as a higher-precedence alternative
 - **gmail**, **google_calendar**, **google_docs**, **google_drive**, **google_sheets** - Google OAuth
 - **homeassistant** - Home Assistant OAuth or long-lived access token
 - **spotify** - Manually supplied Spotify OAuth access token

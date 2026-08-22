@@ -10,11 +10,20 @@ from html import escape as html_escape
 from typing import TYPE_CHECKING, Any, Literal
 from weakref import WeakValueDictionary
 
+import nio
 from nio.exceptions import SendRetryError
 
 from mindroom import constants, interactive
-from mindroom.constants import SKIP_MENTIONS_KEY
-from mindroom.event_journal import OutboxDelivery, OutboxView, TerminalTurnWrite
+from mindroom.constants import DURABLE_FINAL_OUTCOME_KEY, DURABLE_FINAL_OUTCOME_VERSION, SKIP_MENTIONS_KEY
+from mindroom.event_journal import (
+    MatrixDelivery,
+    MatrixDeliveryView,
+    ProjectedEvent,
+    TerminalTurnWrite,
+    matrix_delivery_payload,
+    replacement_target,
+    thread_root,
+)
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.handled_turns import TurnRecord, TurnRecordCodec
 from mindroom.hooks import (
@@ -37,18 +46,27 @@ from mindroom.hooks import (
 )
 from mindroom.matrix.client_delivery import (
     DeliveredMatrixEvent,
+    MatrixDeliveryFailure,
+    MatrixDeliveryFailureKind,
+    MatrixSendOutcome,
     build_edit_event_content,
+    edit_message_outcome,
     edit_message_result,
+    resolve_room_encryption_outcome,
+    send_message_outcome,
     send_message_result,
 )
-from mindroom.matrix.large_messages import prepare_large_message
+from mindroom.matrix.large_messages import MatrixEventTooLargeError, prepare_large_message
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_message_content
-from mindroom.matrix.room_history_reads import find_response_event_ids_via_room_messages
-from mindroom.response_delivery import (
+from mindroom.matrix.room_history_reads import (
+    find_outbox_delivery_event_id_via_room_messages,
+)
+from mindroom.matrix_delivery import (
     DeliveryStage,
+    MatrixDeliveryWorker,
+    PermanentDeliveryError,
     RecoveryOutcome,
-    ResponseDelivery,
     SendDelivery,
     TurnHandoff,
 )
@@ -70,7 +88,6 @@ from mindroom.streaming import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
-    import nio
     import structlog
 
     from mindroom.constants import RuntimePaths
@@ -106,6 +123,10 @@ def _is_placeholder_delivery_failure(failure_reason: str) -> bool:
 
 class _DeliveryRefusedError(RuntimeError):
     """Matrix declined one outbox delivery, leaving it unacknowledged."""
+
+
+class _DeliveryObservationError(RuntimeError):
+    """Matrix did not provide authoritative metadata for a delivered event."""
 
 
 @dataclass(frozen=True)
@@ -238,6 +259,8 @@ class SendTextRequest:  # noqa: D101
     # text by editing that message; the placeholder is therefore the delivery
     # whose duplication a reader would see, and it is the initial stage.
     delivery_stage: DeliveryStage = DeliveryStage.FINAL
+    defer_source_handoff: bool = False
+    delivery_result: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +275,8 @@ class EditTextRequest:  # noqa: D101
     # the answer reaches the room as an edit of it, so this is the delivery
     # whose loss leaves a user looking at "Thinking..." for good.
     delivery_turn_id: str | None = None
+    defer_source_handoff: bool = False
+    delivery_result: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -264,6 +289,7 @@ class FinalDeliveryRequest:  # noqa: D101
     extra_content: dict[str, Any] | None
     existing_event_is_placeholder: bool = False
     skip_mentions: bool = False
+    defer_source_handoff: bool = False
 
 
 @dataclass(frozen=True)
@@ -362,7 +388,7 @@ class DeliveryGatewayDeps:
     redact_message_event: Callable[..., Awaitable[bool]]
     resolver: ConversationResolver
     response_hooks: ResponseHookService
-    outbox: OutboxView
+    outbox: MatrixDeliveryView
     # Contract 2's handoff: the journal owns an actionable source until the
     # turn's answer is durably owed to a room, and this is where that becomes
     # true. Everything after it is the outbox's to recover.
@@ -383,6 +409,22 @@ class DeliveryGatewayDeps:
     # that leaves the row open to a mutation that derived before the commit and
     # lands after it, which erases the event the answer is stored under.
     terminal_turn_committed: Callable[[str, str], Awaitable[None]] | None = None
+
+
+_MATRIX_DELIVERY_FAILURE_REASONS: dict[MatrixDeliveryFailureKind, str] = {
+    MatrixDeliveryFailureKind.ENCRYPTION_GUARD: "encrypted delivery rejected by local trust policy",
+    MatrixDeliveryFailureKind.UNKNOWN_ENCRYPTION_STATE: "room encryption state unknown",
+    MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE: "matrix event exceeds the hard size limit",
+    MatrixDeliveryFailureKind.SEND_EXCEPTION: "matrix delivery raised a local exception",
+    MatrixDeliveryFailureKind.UNEXPECTED_RESPONSE: "matrix delivery returned an unexpected response",
+}
+
+
+def _matrix_delivery_failure_reason(outcome: MatrixSendOutcome) -> str:
+    """Translate one typed Matrix delivery failure into the gateway failure vocabulary."""
+    if isinstance(outcome, MatrixDeliveryFailure):
+        return f"{_MATRIX_DELIVERY_FAILURE_REASONS[outcome.kind]}: {outcome.detail}"
+    return "matrix delivery failed"
 
 
 @dataclass(frozen=True)
@@ -423,6 +465,36 @@ class DeliveryGateway:
     def _cancelled_error_failure_reason(error: asyncio.CancelledError) -> str:
         """Normalize CancelledError values to the canonical cancellation reason strings."""
         return cancel_failure_reason(classify_cancel_source(error))
+
+    def terminal_outcome_without_visible_event(
+        self,
+        *,
+        terminal_status: Literal["cancelled", "error"],
+        failure_reason: str,
+    ) -> FinalDeliveryOutcome:
+        """Return the terminal outcome for one turn with no visible event to finalize."""
+        return FinalDeliveryOutcome(
+            terminal_status=terminal_status,
+            event_id=None,
+            failure_reason=failure_reason,
+        )
+
+    def cancelled_terminal_outcome(
+        self,
+        outcome: FinalDeliveryOutcome,
+        *,
+        failure_reason: str,
+    ) -> FinalDeliveryOutcome:
+        """Return the cancelled derivative of one delivery outcome, preserving visible facts."""
+        return FinalDeliveryOutcome(
+            terminal_status="cancelled",
+            event_id=outcome.final_visible_event_id,
+            is_visible_response=outcome.final_visible_event_id is not None,
+            final_visible_body=outcome.final_visible_body,
+            failure_reason=failure_reason,
+            tool_trace=outcome.tool_trace,
+            extra_content=outcome.extra_content,
+        )
 
     async def _cleanup_completed_placeholder_only_stream(
         self,
@@ -582,13 +654,13 @@ class DeliveryGateway:
         would tell every downstream consumer that the event says something it
         does not -- under the event ID of the message that really was sent.
         """
-        row = await self.deps.outbox.load_delivery(turn_id=turn_id, stage=stage)
+        row = await self.deps.outbox.load_matrix_delivery(delivery_id=turn_id, stage=stage)
         content = dict(row.payload) if row is not None else fallback
         return DeliveredMatrixEvent(event_id=event_id, content_sent=content)
 
     async def _send_claimed(
         self,
-        claimed: OutboxDelivery,
+        claimed: MatrixDelivery,
         *,
         retry_sync_recovery: bool,
     ) -> DeliveredMatrixEvent:
@@ -601,19 +673,92 @@ class DeliveryGateway:
         duplicate, and leave the durable result and the room disagreeing
         forever.
         """
-        delivered = await send_message_result(
+        outcome = await send_message_outcome(
             self._client(),
             claimed.room_id,
             dict(claimed.payload),
             retry_sync_recovery=retry_sync_recovery,
             transaction_id=claimed.transaction_id,
+            content_is_prepared=True,
+        )
+        if isinstance(outcome, MatrixDeliveryFailure):
+            detail = _matrix_delivery_failure_reason(outcome)
+            if outcome.kind is MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
+                raise PermanentDeliveryError(detail)
+            msg = f"Matrix refused delivery for turn {claimed.delivery_id!r} stage {claimed.stage.value!r}: {detail}"
+            raise _DeliveryRefusedError(msg)
+        return outcome
+
+    async def _observe_matrix_event(
+        self,
+        *,
+        room_id: str,
+        event_id: str,
+    ) -> ProjectedEvent | None:
+        """Read one event's authoritative ordering metadata from Matrix."""
+        client = self._client()
+        response = await client.room_get_event(room_id, event_id)
+        if not isinstance(response, nio.RoomGetEventResponse):
+            msg = f"Matrix could not read delivered event {event_id!r} in {room_id!r}"
+            raise _DeliveryObservationError(msg)
+        event = response.event
+        if isinstance(event, nio.MegolmEvent):
+            msg = f"Matrix could not decrypt delivered event {event_id!r} in {room_id!r}"
+            raise _DeliveryObservationError(msg)
+        if event.event_id != event_id or event.sender != client.user_id:
+            msg = f"Matrix returned the wrong delivered event for {event_id!r}"
+            raise _DeliveryObservationError(msg)
+        source = event.source
+        source_room_id = source.get("room_id") if isinstance(source, dict) else None
+        if source_room_id is not None and source_room_id != room_id:
+            msg = f"Matrix returned delivered event {event_id!r} from the wrong room"
+            raise _DeliveryObservationError(msg)
+        timestamp = event.server_timestamp
+        if not isinstance(timestamp, int) or isinstance(timestamp, bool):
+            msg = f"Matrix returned delivered event {event_id!r} without a server timestamp"
+            raise _DeliveryObservationError(msg)
+        unsigned = source.get("unsigned") if isinstance(source, dict) else None
+        if isinstance(unsigned, dict) and "redacted_because" in unsigned:
+            return None
+        content = source.get("content") if isinstance(source, dict) else None
+        if not isinstance(content, dict):
+            msg = f"Matrix returned delivered event {event_id!r} without content"
+            raise _DeliveryObservationError(msg)
+        return ProjectedEvent(
+            event_id=event_id,
+            room_id=room_id,
+            thread_id=thread_root(content),
+            sender=event.sender,
+            origin_server_ts=timestamp,
+            transaction_id=event.transaction_id if isinstance(event.transaction_id, str) else None,
+            content=content,
+            replaces_event_id=replacement_target(content),
+            redacts_event_id=None,
+        )
+
+    async def _observe_delivered(self, claimed: MatrixDelivery, event_id: str) -> tuple[ProjectedEvent, ...]:
+        """Return the target and result one delivered outbox row made visible."""
+        if claimed.edits_event_id is None and not claimed.has_interactive_prompt:
+            return ()
+        projections: list[ProjectedEvent] = []
+        if claimed.edits_event_id is not None:
+            target = await self._observe_matrix_event(
+                room_id=claimed.room_id,
+                event_id=claimed.edits_event_id,
+            )
+            if target is None:
+                return ()
+            projections.append(target)
+        delivered = await self._observe_matrix_event(
+            room_id=claimed.room_id,
+            event_id=event_id,
         )
         if delivered is None:
-            msg = f"Matrix refused delivery for turn {claimed.turn_id!r} stage {claimed.stage.value!r}"
-            raise _DeliveryRefusedError(msg)
-        return delivered
+            return ()
+        projections.append(delivered)
+        return tuple(projections)
 
-    def _response_delivery(self, send: SendDelivery, *, handoff: TurnHandoff | None) -> ResponseDelivery:
+    def _response_delivery(self, send: SendDelivery, *, handoff: TurnHandoff | None) -> MatrixDeliveryWorker:
         """Return the outbox writer, for a live delivery or for recovery.
 
         Both go through here so they cannot drift. They did: recovery was built
@@ -625,15 +770,17 @@ class DeliveryGateway:
         it resends rows that already exist, and the sources those rows answer
         were handed over when the rows were first recorded.
         """
-        return ResponseDelivery(
+        return MatrixDeliveryWorker(
             store=self.deps.outbox,
             send=send,
+            observe_delivered=self._observe_delivered,
+            event_type="m.room.message",
             sending_device_id=self.deps.sending_device_id(),
             resolve_delivered=self._delivered_under_a_previous_device,
             handoff=handoff,
             terminal_turn_for=self._terminal_turn_write,
             terminal_turn_committed=self.deps.terminal_turn_committed,
-            turn_locks=self._delivery_turn_locks,
+            delivery_locks=self._delivery_turn_locks,
         )
 
     def _terminal_turn_write(self, turn_id: str, event_id: str) -> TerminalTurnWrite | None:
@@ -655,52 +802,20 @@ class DeliveryGateway:
             record_json=json.dumps(TurnRecordCodec._to_ledger_record(record)),
         )
 
-    async def _delivered_under_a_previous_device(self, claimed: OutboxDelivery) -> str | None:
-        """Return the answer an earlier device already put in the room, if it did.
-
-        Reached only when the frozen transaction ID has stopped being proof,
-        which is a re-login between the attempt and the retry. The room itself
-        is then the only witness, so it is read the same way replayed turns
-        read it: find a message from this bot replying to the sources this turn
-        answers.
-
-        The turn's sources come from the durable ledger rather than from
-        anything this process remembers, because the process that made the
-        first attempt is gone. A turn the ledger has never heard of resolves to
-        its own anchor event, which is the right question for the uncoalesced
-        case and the only one available for the rest.
-
-        This finds answers, not every message. The scan matches a genuine
-        reply -- ``is_falling_back`` false, pointing at a source -- which is
-        what an agent answering a user sends. A delivery with no source to
-        reply to, a scheduled message or a hook-emitted notice, matches
-        nothing and reads as "not delivered", so it is sent. That is the same
-        blind resend as before this guard existed: unchanged for the cases it
-        cannot see, and correct for the ones it can.
-        """
+    async def _delivered_under_a_previous_device(self, claimed: MatrixDelivery) -> str | None:
+        """Return the exact marker-bearing event an earlier device delivered."""
         client = self._client()
         response_sender = client.user_id
         if not response_sender:
             return None
-        source_event_ids = self.deps.turn_handoff.sources_for_turn(claimed.turn_id)
-        delivered = await find_response_event_ids_via_room_messages(
+        return await find_outbox_delivery_event_id_via_room_messages(
             client,
             claimed.room_id,
-            response_sender=response_sender,
-            source_event_ids=source_event_ids,
+            delivery_sender=response_sender,
+            source_event_ids=(),
+            delivery_content=claimed.payload,
+            delivery_event_type=claimed.event_type,
         )
-        if len(delivered) > 1:
-            # Two visible answers to the same sources is the duplicate this
-            # lookup exists to prevent, already committed. Adopting one at
-            # random would bind every later edit to a coin flip, so the row
-            # stays unacknowledged and a human-visible error is raised rather
-            # than a third answer sent.
-            msg = (
-                f"Turn {claimed.turn_id!r} has {len(delivered)} visible answers in {claimed.room_id}, "
-                f"so no single one can be adopted after the sending device changed"
-            )
-            raise RuntimeError(msg)
-        return next(iter(delivered), None)
 
     async def recover_deliveries(self) -> RecoveryOutcome:
         """Resend every delivery whose Matrix outcome this process cannot know.
@@ -718,7 +833,7 @@ class DeliveryGateway:
         Nothing escapes here.
         """
 
-        async def send(claimed: OutboxDelivery) -> str:
+        async def send(claimed: MatrixDelivery) -> str:
             delivered = await self._send_claimed(claimed, retry_sync_recovery=True)
             return delivered.event_id
 
@@ -729,7 +844,7 @@ class DeliveryGateway:
         request: SendTextRequest,
         room_id: str,
         content: dict[str, Any],
-    ) -> DeliveredMatrixEvent | None:
+    ) -> MatrixSendOutcome | None:
         """Send one built message, through the outbox when it belongs to a turn.
 
         A send with no turn behind it -- a voice echo, a command confirmation,
@@ -739,50 +854,62 @@ class DeliveryGateway:
         """
         client = self._client()
         if request.delivery_turn_id is None:
-            return await send_message_result(
+            return await send_message_outcome(
                 client,
                 room_id,
                 content,
                 retry_sync_recovery=request.retry_sync_recovery,
             )
-        # Prepared before the row is written, so the frozen payload is the one
-        # that goes on the wire. Uploading the sidecar after the claim left the
-        # row holding the oversized original while Matrix received an MXC
-        # reference, and a recovery resend would upload again -- minting a new
-        # MXC, and new encrypted-file keys, under a transaction ID the
-        # homeserver had already accepted. Preparing twice is harmless: an
-        # already-prepared payload is below the size limit, so this is a no-op
-        # for it, including on the recovery path.
-        content = await self._prepared_for_the_wire(
-            room_id,
-            content,
-            turn_id=request.delivery_turn_id,
-            stage=request.delivery_stage,
-        )
         requested_delivery: DeliveredMatrixEvent | None = None
 
-        async def send(claimed: OutboxDelivery) -> str:
+        async def send(claimed: MatrixDelivery) -> str:
             nonlocal requested_delivery
             delivered = await self._send_claimed(claimed, retry_sync_recovery=request.retry_sync_recovery)
             if claimed.stage is request.delivery_stage:
                 requested_delivery = delivered
             return delivered.event_id
 
+        # Prepared before the row is written, so the frozen payload is the one
+        # that goes on the wire. Uploading the sidecar after the claim left the
+        # row holding the oversized original while Matrix received an MXC
+        # reference, and a recovery resend would upload again -- minting a new
+        # MXC, and new encrypted-file keys, under a transaction ID the
+        # homeserver had already accepted. An attempted row is already frozen,
+        # so preparation is skipped and `enqueue` leaves that stored payload
+        # untouched for the claimed send below.
+        prepared = await self._prepared_for_the_wire(
+            room_id,
+            content,
+            turn_id=request.delivery_turn_id,
+            stage=request.delivery_stage,
+        )
+        if isinstance(prepared, MatrixDeliveryFailure):
+            if prepared.kind is not MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
+                return prepared
+            preparation_failure: MatrixDeliveryFailure | None = prepared
+        else:
+            preparation_failure = None
+            content = prepared
+
         try:
-            event_id = await self._response_delivery(send, handoff=self.deps.turn_handoff).deliver(
-                turn_id=request.delivery_turn_id,
+            handoff = None if request.defer_source_handoff else self.deps.turn_handoff
+            event_id = await self._response_delivery(send, handoff=handoff).deliver(
+                delivery_id=request.delivery_turn_id,
                 stage=request.delivery_stage,
                 room_id=room_id,
                 thread_id=request.target.resolved_thread_id,
                 payload=content,
+                result=request.delivery_result,
+                permanent_failure_reason=(
+                    _matrix_delivery_failure_reason(preparation_failure) if preparation_failure is not None else None
+                ),
             )
         except _DeliveryRefusedError:
             return None
         if event_id is None:
-            # The membership this turn answered has ended. The room it was
-            # answering is not the room the bot is in now, so there is nothing
-            # to send and nothing to recover.
-            return None
+            # The delivery was withdrawn by membership or ended in an explicit
+            # permanent failure, so there is nothing left for recovery to send.
+            return preparation_failure
         if requested_delivery is not None and requested_delivery.event_id == event_id:
             return requested_delivery
         # The delivery was already acknowledged, so nothing was sent and the
@@ -826,12 +953,16 @@ class DeliveryGateway:
             )
         if request.skip_mentions:
             content[SKIP_MENTIONS_KEY] = True
-        failure_reason = "send_message_result returned None"
+        failure_reason = "durable Matrix delivery was refused"
         try:
-            delivered = await self._send_content(request, resolved_target.room_id, content)
+            outcome = await self._send_content(request, resolved_target.room_id, content)
         except SendRetryError:
             delivered = None
             failure_reason = "matrix timeline recovery still blocked the send"
+        else:
+            delivered = outcome if isinstance(outcome, DeliveredMatrixEvent) else None
+            if isinstance(outcome, MatrixDeliveryFailure):
+                failure_reason = _matrix_delivery_failure_reason(outcome)
         if delivered is not None:
             self.deps.logger.info("Sent response", event_id=delivered.event_id, **resolved_target.log_context)
             return delivered.event_id
@@ -847,7 +978,7 @@ class DeliveryGateway:
         request: EditTextRequest,
         room_id: str,
         content: dict[str, Any],
-    ) -> DeliveredMatrixEvent | None:
+    ) -> MatrixSendOutcome | None:
         """Apply one edit, through the outbox when it carries a turn's answer.
 
         Once a turn has a placeholder, its answer reaches the room as an edit
@@ -862,7 +993,7 @@ class DeliveryGateway:
         """
         client = self._client()
         if request.delivery_turn_id is None:
-            return await edit_message_result(
+            return await edit_message_outcome(
                 client,
                 room_id,
                 request.event_id,
@@ -870,6 +1001,35 @@ class DeliveryGateway:
                 request.new_text,
                 retry_sync_recovery=request.retry_sync_recovery,
             )
+        delivered: DeliveredMatrixEvent | None = None
+
+        async def send(claimed: MatrixDelivery) -> str:
+            # The frozen row, not the request that produced it. `edit_message_result`
+            # would rebuild the envelope from the current closure, which is the same
+            # bytes on a first attempt and the wrong ones on a second: a row is frozen
+            # once attempted, so a regenerated answer would go out under a transaction
+            # ID the homeserver has already seen -- dropped as a duplicate if the first
+            # attempt landed, visible while the durable row says otherwise if it did
+            # not. The stored envelope already is what that helper would build.
+            nonlocal delivered
+            outcome = await send_message_outcome(
+                client,
+                claimed.room_id,
+                dict(claimed.payload),
+                operation="edit_message",
+                retry_sync_recovery=request.retry_sync_recovery,
+                transaction_id=claimed.transaction_id,
+                content_is_prepared=True,
+            )
+            if isinstance(outcome, MatrixDeliveryFailure):
+                detail = _matrix_delivery_failure_reason(outcome)
+                if outcome.kind is MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
+                    raise PermanentDeliveryError(detail)
+                msg = f"Matrix refused the final edit for turn {claimed.delivery_id!r}: {detail}"
+                raise _DeliveryRefusedError(msg)
+            delivered = outcome
+            return outcome.event_id
+
         # What is stored is the finished wire event, not the text it was built
         # from. Recovery sends the row exactly as frozen and has no request to
         # rebuild from, so anything reconstructed at send time -- the replace
@@ -885,54 +1045,43 @@ class DeliveryGateway:
         # is built here: the row has to hold the finished wire event. A sidecar
         # uploaded after the claim would leave the row holding the oversized
         # original while Matrix received an MXC reference, and a resend would
-        # upload again under a transaction ID already accepted. Preparing an
-        # already-prepared payload is a no-op, so the recovery path is safe.
-        envelope = await self._prepared_for_the_wire(
+        # upload again under a transaction ID already accepted. An attempted
+        # row is already frozen, so preparation is skipped and
+        # `enqueue` leaves that stored envelope untouched for the claimed send.
+        prepared = await self._prepared_for_the_wire(
             room_id,
             envelope,
             turn_id=request.delivery_turn_id,
             stage=DeliveryStage.FINAL,
         )
-        delivered: DeliveredMatrixEvent | None = None
-
-        async def send(claimed: OutboxDelivery) -> str:
-            # The frozen row, not the request that produced it. `edit_message_result`
-            # would rebuild the envelope from the current closure, which is the same
-            # bytes on a first attempt and the wrong ones on a second: a row is frozen
-            # once attempted, so a regenerated answer would go out under a transaction
-            # ID the homeserver has already seen -- dropped as a duplicate if the first
-            # attempt landed, visible while the durable row says otherwise if it did
-            # not. The stored envelope already is what that helper would build.
-            nonlocal delivered
-            edited = await send_message_result(
-                client,
-                claimed.room_id,
-                dict(claimed.payload),
-                operation="edit_message",
-                retry_sync_recovery=request.retry_sync_recovery,
-                transaction_id=claimed.transaction_id,
-            )
-            if edited is None:
-                msg = f"Matrix refused the final edit for turn {claimed.turn_id!r}"
-                raise _DeliveryRefusedError(msg)
-            delivered = edited
-            return edited.event_id
+        if isinstance(prepared, MatrixDeliveryFailure):
+            if prepared.kind is not MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE:
+                return prepared
+            preparation_failure = prepared
+        else:
+            preparation_failure = None
+            envelope = prepared
 
         try:
-            event_id = await self._response_delivery(send, handoff=self.deps.turn_handoff).deliver(
-                turn_id=request.delivery_turn_id,
+            handoff = None if request.defer_source_handoff else self.deps.turn_handoff
+            event_id = await self._response_delivery(send, handoff=handoff).deliver(
+                delivery_id=request.delivery_turn_id,
                 stage=DeliveryStage.FINAL,
                 room_id=room_id,
                 thread_id=request.target.resolved_thread_id,
                 payload=envelope,
+                result=request.delivery_result,
                 edits_event_id=request.event_id,
+                permanent_failure_reason=(
+                    _matrix_delivery_failure_reason(preparation_failure) if preparation_failure is not None else None
+                ),
             )
         except _DeliveryRefusedError:
             return None
         if event_id is None:
-            # The membership this turn answered has ended, so its answer is
-            # not this bot's to give in the room it is in now.
-            return None
+            # The delivery was withdrawn by membership or ended in an explicit
+            # permanent failure, so there is nothing left for recovery to send.
+            return preparation_failure
         if delivered is not None:
             return delivered
         # Already acknowledged: this turn's answer reached the room on an
@@ -952,12 +1101,16 @@ class DeliveryGateway:
             extra_content=request.extra_content,
         )
 
-        failure_reason = "edit_message_result returned None"
+        failure_reason = "durable Matrix edit was refused"
         try:
-            delivered = await self._edit_content(request, target.room_id, content)
+            outcome = await self._edit_content(request, target.room_id, content)
         except SendRetryError:
             delivered = None
             failure_reason = "matrix timeline recovery still blocked the edit"
+        else:
+            delivered = outcome if isinstance(outcome, DeliveredMatrixEvent) else None
+            if isinstance(outcome, MatrixDeliveryFailure):
+                failure_reason = _matrix_delivery_failure_reason(outcome)
         if delivered is not None:
             self.deps.logger.info("Edited message", event_id=request.event_id, **target.log_context)
             return True
@@ -1093,6 +1246,26 @@ class DeliveryGateway:
 
         interactive_response = interactive.parse_and_format_interactive(draft.response_text, extract_mapping=True)
         display_text = interactive_response.formatted_text
+        delivery_extra_content = dict(draft.extra_content or {})
+        if interactive_response.interactive_metadata is not None:
+            delivery_extra_content.update(
+                interactive.build_prompt_content(
+                    interactive_response.interactive_metadata,
+                    creator_agent=self.deps.agent_name,
+                    source_event_id=request.identity.response_envelope.source_event_id,
+                ),
+            )
+        delivery_result: dict[str, object] | None = None
+        if request.defer_source_handoff:
+            metadata = interactive_response.interactive_metadata
+            # Older readers recognize any mapping here as a successful FINAL.
+            # Keep that rolling-read signal bounded; the complete result is
+            # local outbox state and cannot make the Matrix event impossible.
+            delivery_extra_content[DURABLE_FINAL_OUTCOME_KEY] = {"version": DURABLE_FINAL_OUTCOME_VERSION}
+            delivery_result = {
+                "body": display_text,
+                "interactive": metadata.to_metadata() if metadata is not None else None,
+            }
 
         if request.existing_event_id is not None:
             edited = await self.edit_text(
@@ -1101,9 +1274,11 @@ class DeliveryGateway:
                     event_id=request.existing_event_id,
                     new_text=display_text,
                     tool_trace=draft.tool_trace,
-                    extra_content=draft.extra_content,
+                    extra_content=delivery_extra_content,
                     delivery_turn_id=request.identity.response_envelope.source_event_id,
                     retry_sync_recovery=True,
+                    defer_source_handoff=request.defer_source_handoff,
+                    delivery_result=delivery_result,
                 ),
             )
             if edited:
@@ -1114,7 +1289,7 @@ class DeliveryGateway:
                     final_visible_body=display_text,
                     delivery_kind="edited",
                     tool_trace=tuple(draft.tool_trace or ()),
-                    extra_content=draft.extra_content,
+                    extra_content=delivery_extra_content,
                     interactive_metadata=interactive_response.interactive_metadata,
                 )
 
@@ -1126,7 +1301,7 @@ class DeliveryGateway:
                         identity=request.identity,
                         failure_reason="delivery_failed",
                         tool_trace=draft.tool_trace,
-                        extra_content=draft.extra_content,
+                        extra_content=delivery_extra_content,
                     ),
                 )
             return FinalDeliveryOutcome(
@@ -1135,7 +1310,7 @@ class DeliveryGateway:
                 is_visible_response=True,
                 failure_reason="delivery_failed",
                 tool_trace=tuple(draft.tool_trace or ()),
-                extra_content=draft.extra_content,
+                extra_content=delivery_extra_content,
             )
         event_id = await self.send_text(
             SendTextRequest(
@@ -1143,12 +1318,14 @@ class DeliveryGateway:
                 response_text=display_text,
                 skip_mentions=request.skip_mentions,
                 tool_trace=draft.tool_trace,
-                extra_content=draft.extra_content,
+                extra_content=delivery_extra_content,
                 retry_sync_recovery=True,
                 # The Matrix event that caused this turn. The handled-turn
                 # ledger already keys on it, and it re-derives to the same
                 # value after a restart, which a generated ID would not.
                 delivery_turn_id=request.identity.response_envelope.source_event_id,
+                defer_source_handoff=request.defer_source_handoff,
+                delivery_result=delivery_result,
             ),
         )
         if event_id is None:
@@ -1157,7 +1334,7 @@ class DeliveryGateway:
                 event_id=None,
                 failure_reason="delivery_failed",
                 tool_trace=tuple(draft.tool_trace or ()),
-                extra_content=draft.extra_content,
+                extra_content=delivery_extra_content,
             )
         return FinalDeliveryOutcome(
             terminal_status="completed",
@@ -1166,7 +1343,7 @@ class DeliveryGateway:
             final_visible_body=display_text,
             delivery_kind="sent",
             tool_trace=tuple(draft.tool_trace or ()),
-            extra_content=draft.extra_content,
+            extra_content=delivery_extra_content,
             interactive_metadata=interactive_response.interactive_metadata,
         )
 
@@ -1282,7 +1459,8 @@ class DeliveryGateway:
                 SKIP_MENTIONS_KEY: True,
             },
         )
-        delivered = await send_message_result(self._client(), target.room_id, content)
+        outcome = await send_message_outcome(self._client(), target.room_id, content)
+        delivered = outcome if isinstance(outcome, DeliveredMatrixEvent) else None
         if delivered is not None:
             self.deps.logger.info("Sent compaction lifecycle notice", event_id=delivered.event_id, **target.log_context)
             return delivered.event_id
@@ -1370,13 +1548,14 @@ class DeliveryGateway:
                 SKIP_MENTIONS_KEY: True,
             },
         )
-        delivered = await edit_message_result(
+        outcome = await edit_message_outcome(
             self._client(),
             target.room_id,
             event_id,
             content,
             body,
         )
+        delivered = outcome if isinstance(outcome, DeliveredMatrixEvent) else None
         if delivered is not None:
             self.deps.logger.info("Edited compaction lifecycle notice", event_id=event_id, **target.log_context)
             return
@@ -1423,6 +1602,8 @@ class DeliveryGateway:
             terminal_send=self._durable_terminal_send(delivery_turn_id, request.target),
             final_text_transform=self._final_text_transform(request.identity),
             transport_is_current=self._stream_transport_gate(delivery_turn_id, request.target.room_id),
+            interactive_creator_agent=self.deps.agent_name,
+            interactive_source_event_id=delivery_turn_id,
         )
 
     def _stream_transport_gate(
@@ -1473,7 +1654,7 @@ class DeliveryGateway:
                     content,
                     retry_sync_recovery=retry_sync_recovery,
                 )
-            return await self._send_content(
+            outcome = await self._send_content(
                 SendTextRequest(
                     target=target,
                     response_text="",
@@ -1484,6 +1665,7 @@ class DeliveryGateway:
                 target.room_id,
                 content,
             )
+            return outcome if isinstance(outcome, DeliveredMatrixEvent) else None
 
         return terminal_send
 
@@ -1494,19 +1676,48 @@ class DeliveryGateway:
         *,
         turn_id: str,
         stage: DeliveryStage,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | MatrixDeliveryFailure:
         """Prepare a payload for the wire, unless a frozen one already exists.
 
         Preparation can upload a sidecar, so it must not run for a turn whose
-        answer is already acknowledged. That row is what `flush` returns, its
-        payload is frozen and `enqueue` refuses to overwrite it, so preparing
-        again would upload an attachment nothing can ever reference -- or fail,
-        and take down a rerun whose answer is already durable and visible.
+        row has already been attempted. That row is frozen and `enqueue`
+        refuses to overwrite it, so preparing again would upload an attachment
+        nothing can ever reference -- or fail before the durable payload gets
+        another chance to reach Matrix.
+
+        A durable row may be replayed after room encryption is enabled, and an
+        attempted row cannot be rebuilt. Durable sidecars therefore use the
+        encrypted form before the payload is frozen, even while the room is
+        currently plaintext. Direct sends keep standard plaintext sidecars and
+        rebuild only if encryption changes during their upload.
         """
-        existing = await self.deps.outbox.load_delivery(turn_id=turn_id, stage=stage)
-        if existing is not None and existing.acknowledged_event_id is not None:
+        existing = await self.deps.outbox.load_matrix_delivery(delivery_id=turn_id, stage=stage)
+        if existing is not None and existing.attempted:
             return content
-        return await prepare_large_message(self._client(), room_id, content)
+        client = self._client()
+        encryption_outcome = await resolve_room_encryption_outcome(
+            client,
+            room_id,
+            operation="prepare_durable_delivery",
+        )
+        if isinstance(encryption_outcome, MatrixDeliveryFailure):
+            return encryption_outcome
+        wire_content = matrix_delivery_payload(
+            self.deps.outbox.principal_id,
+            turn_id,
+            stage,
+            content,
+        )
+        try:
+            return await prepare_large_message(
+                client,
+                room_id,
+                wire_content,
+                room_encrypted=encryption_outcome,
+                prepare_for_encrypted_delivery=True,
+            )
+        except MatrixEventTooLargeError as error:
+            return MatrixDeliveryFailure(MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, str(error))
 
     def _final_text_transform(self, identity: ResponseIdentity) -> FinalTextTransform:
         """Return the hook that shapes the answer before its terminal payload is built.
@@ -1558,7 +1769,7 @@ class DeliveryGateway:
                     display_text,
                     retry_sync_recovery=retry_sync_recovery,
                 )
-            return await self._edit_content(
+            outcome = await self._edit_content(
                 EditTextRequest(
                     target=target,
                     event_id=event_id,
@@ -1569,6 +1780,7 @@ class DeliveryGateway:
                 target.room_id,
                 content,
             )
+            return outcome if isinstance(outcome, DeliveredMatrixEvent) else None
 
         return terminal_edit
 
@@ -1916,11 +2128,7 @@ class DeliveryGateway:
                 event_id=event_id,
                 is_visible_response=event_id is not None,
                 final_visible_body=final_visible_body,
-                cancel_source=(
-                    cancel_source_from_failure_reason(stream_outcome.failure_reason)
-                    if stream_outcome.terminal_status == "cancelled"
-                    else None
-                ),
+                cancel_source=stream_outcome.resolved_cancel_source,
                 failure_reason="stream_finalize_failed",
                 tool_trace=tuple(request.tool_trace or ()),
                 extra_content=request.extra_content,

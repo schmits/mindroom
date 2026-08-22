@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom.bot import AgentBot
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.matrix.client_room_admin import RoomJoinOutcome
@@ -17,6 +16,7 @@ from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.thread_history_result import thread_history_result
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.orchestrator import _MultiAgentOrchestrator
+from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
     agent_response_should_respond,
@@ -214,7 +214,7 @@ class TestDMMessageContext:
             display_name="Test Agent",
             password=TEST_PASSWORD,
         )
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
@@ -276,7 +276,7 @@ class TestDMIntegration:
             password=TEST_PASSWORD,
         )
 
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
@@ -331,7 +331,7 @@ class TestDMIntegration:
         )
 
         # Important: bot is NOT configured for the DM room
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
@@ -349,10 +349,6 @@ class TestDMIntegration:
         generate_response = AsyncMock()
         install_generate_response_mock(bot, generate_response)
 
-        # Mock helper functions
-        async def mock_handle(*args: object, **kwargs: object) -> None:
-            pass
-
         with (
             patch.object(
                 bot._conversation_resolver,
@@ -363,7 +359,6 @@ class TestDMIntegration:
             patch("mindroom.matrix.event_info.EventInfo.from_event") as mock_thread_info,
             patch("mindroom.conversation_resolver._should_skip_mentions", return_value=False),
             patch("mindroom.text_ingress_dispatch.is_dm_room", return_value=True),  # This is a DM room
-            patch("mindroom.turn_controller.interactive.handle_text_response", new=mock_handle),
         ):
             # Mock thread info to return no thread
             mock_thread_info.return_value = EventInfo(
@@ -433,7 +428,7 @@ class TestDMIntegration:
         )
 
         # Agent is NOT configured for any rooms
-        bot = AgentBot(
+        bot = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
@@ -447,9 +442,6 @@ class TestDMIntegration:
         generate_response = AsyncMock()
         install_generate_response_mock(bot, generate_response)
 
-        async def mock_handle(*args: object, **kwargs: object) -> None:
-            pass
-
         with (
             patch.object(
                 bot._conversation_resolver,
@@ -460,7 +452,6 @@ class TestDMIntegration:
             patch("mindroom.matrix.event_info.EventInfo.from_event") as mock_thread_info,
             patch("mindroom.conversation_resolver._should_skip_mentions", return_value=False),
             patch("mindroom.text_ingress_dispatch.is_dm_room", return_value=True),  # This is a DM room
-            patch("mindroom.turn_controller.interactive.handle_text_response", new=mock_handle),
         ):
             # Mock thread info to return no thread
             mock_thread_info.return_value = EventInfo(

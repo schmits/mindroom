@@ -18,6 +18,7 @@ from typing_extensions import TypeIs
 
 from mindroom.event_journal import (
     AdmissionResult,
+    DeliveryProjectionPendingError,
     EventClass,
     EventKind,
     InboundEvent,
@@ -29,7 +30,7 @@ from mindroom.matrix.media import MATRIX_MEDIA_EVENT_TYPES, parse_matrix_media_e
 from mindroom.matrix.transport_progress import is_transport_progress_revision
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping
 
     from mindroom.event_journal import AdmissionView, JournalEvent
 
@@ -37,6 +38,7 @@ logger = get_logger(__name__)
 
 _TOOL_APPROVAL_RESPONSE_EVENT_TYPE = "io.mindroom.tool_approval_response"
 _SECURITY_METADATA_KEY = "io.mindroom.dispatch_recovery_security"
+_DEPARTED_MEMBERSHIPS = frozenset({"leave", "ban"})
 
 # Kinds whose events carry conversation content, and so update the projection.
 _PROJECTED_KINDS = frozenset({EventKind.MESSAGE, EventKind.MEDIA, EventKind.REDACTION})
@@ -218,6 +220,7 @@ def projected_event(
         content=content,
         replaces_event_id=None,
         redacts_event_id=redacts,
+        transaction_id=event.transaction_id,
     )
     if is_transport_progress_revision(projected, self_sender=self_sender):
         return None
@@ -331,9 +334,12 @@ class JournalIngress:
     # ready for them, which the timeline callback cannot decide for itself.
     room_lifecycle_enabled: Callable[[], bool] = lambda: False
     on_event_admitted: Callable[[nio.MatrixRoom, nio.Event], None] = lambda _room, _event: None
+    on_live_room_membership_transition: Callable[[str, nio.RoomMemberEvent], Awaitable[None]] | None = None
     # A refused admission must also stop the sync checkpoint advancing past the
     # event, or the next process would never see it again.
     on_persist_failure: Callable[[], None] = lambda: None
+    on_delivery_recovery_needed: Callable[[], None] = lambda: None
+    on_own_membership_transition: Callable[[str, str, bool], Awaitable[None]] | None = None
     # What nio said about the room-member events of the response being
     # delivered, for the consumers that run once the response is complete.
     timeline_member_provenance: TimelineMemberProvenance = field(
@@ -348,9 +354,19 @@ class JournalIngress:
     def _admission_kind(self, event: nio.Event) -> EventKind | None:
         """Return the kind this event is admitted as, or nothing."""
         kind = _event_kind(event)
-        if kind is None and isinstance(event, nio.RoomMemberEvent) and self.room_lifecycle_enabled():
+        if (
+            kind is None
+            and isinstance(event, nio.RoomMemberEvent)
+            and (self.room_lifecycle_enabled() or self._is_own_membership_transition(event))
+        ):
             return EventKind.ROOM_LIFECYCLE
         return kind
+
+    def _is_own_membership_transition(self, event: nio.RoomMemberEvent) -> bool:
+        """Return whether one event changes this bot's own room membership."""
+        return event.state_key == self.self_sender and (
+            event.membership in _DEPARTED_MEMBERSHIPS or event.membership == "join"
+        )
 
     def timeline_member_event_class(self, event: nio.Event) -> EventClass | None:
         """Return the class nio's provenance gives one member event, if it said.
@@ -380,11 +396,28 @@ class JournalIngress:
         if kind is None:
             return
         event_class = _event_class_for(provenance, event)
+        if (
+            isinstance(event, nio.RoomMemberEvent)
+            and self._is_own_membership_transition(event)
+            and not self.room_lifecycle_enabled()
+        ):
+            event_class = EventClass.CONTEXT_ONLY
         try:
             admission = await self.store.admit(
                 inbound_event(room.room_id, event, kind, event_class),
                 projected_event(room.room_id, event, kind, self_sender=self.self_sender),
             )
+            if isinstance(event, nio.RoomMemberEvent):
+                await self._apply_own_membership_transition(room.room_id, event, provenance)
+                if (
+                    provenance is nio.TimelineEventProvenance.LIVE
+                    and self.on_live_room_membership_transition is not None
+                ):
+                    await self.on_live_room_membership_transition(room.room_id, event)
+        except DeliveryProjectionPendingError as error:
+            self.on_delivery_recovery_needed()
+            self.on_persist_failure()
+            raise nio.CallbackNotAcceptedError(str(error)) from error
         except Exception as error:
             # Refusing acceptance is the whole point: nio keeps the event for
             # redelivery and does not advance the checkpoint past it.
@@ -400,3 +433,20 @@ class JournalIngress:
             # an older checkpoint.
             self.on_event_admitted(room, event)
         self.on_admitted()
+
+    async def _apply_own_membership_transition(
+        self,
+        room_id: str,
+        event: nio.RoomMemberEvent,
+        provenance: nio.TimelineEventProvenance,
+    ) -> None:
+        """Fence explicit self departures and rejoins before later timeline admission."""
+        if event.state_key != self.self_sender or provenance is nio.TimelineEventProvenance.HISTORY:
+            return
+        apply_transition = self.on_own_membership_transition
+        if apply_transition is None or not self._is_own_membership_transition(event):
+            return
+        if event.membership in _DEPARTED_MEMBERSHIPS:
+            await apply_transition(room_id, event.event_id, False)
+            return
+        await apply_transition(room_id, event.event_id, True)

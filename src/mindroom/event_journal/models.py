@@ -6,8 +6,13 @@ from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING
 
+from mindroom.interactive_models import INTERACTIVE_PROMPT_KEY
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+DURABLE_DELIVERY_ID_KEY = "io.mindroom.delivery_id"
 
 
 class EventClass(StrEnum):
@@ -69,6 +74,10 @@ class AdmissionResult(StrEnum):
     DUPLICATE = "duplicate"
 
 
+class DeliveryProjectionPendingError(RuntimeError):
+    """An interactive source arrived before a visible delivery was projected."""
+
+
 class DeliveryStage(StrEnum):
     """The delivery points that must survive a crash."""
 
@@ -96,6 +105,9 @@ class DepartureObservation(StrEnum):
     # The same departure observed again, by either observer, with no rejoin in
     # between for a second departure to have happened in.
     ALREADY_FENCED = "already_fenced"
+    # The same stable Matrix departure observation was replayed after its first
+    # application had already committed.
+    REPEATED_REPORT = "repeated_report"
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +117,7 @@ class DepartureOutcome:
     observation: DepartureObservation
     membership_epoch: int
     owed_reports: int
+    reported_run_epoch: int | None = None
 
     @property
     def fenced(self) -> bool:
@@ -137,9 +150,9 @@ class JournalEvent:
     Carries neither the class that decided whether it was actionable nor the
     membership it was admitted under. Both are settled at admission and read
     from the row by the journal itself -- the class becomes the ``pending``
-    state, and the epoch is asked for by ``admitted_membership_epoch`` when a
-    delivery is fenced. Replaying them beside the event would offer a consumer
-    a second, staler way to ask the same questions.
+    state, and delivery ownership is derived from the admitted row when intent
+    is recorded. Replaying them beside the event would offer a consumer a
+    second, staler way to ask the same questions.
     """
 
     event_id: str
@@ -276,14 +289,17 @@ class ConversationCursor:
 class RefreshRequest:
     """A logical message whose visible revision must be refetched.
 
-    Produced when the currently visible revision was redacted. The token is the
-    redaction's journal receipt order, and a refetch installs its result only
-    while that exact token is still current.
+    Produced when the currently visible revision was redacted or withheld as a
+    sidecar preview. The revision identity disambiguates projections that do
+    not have a journal receipt, while the token identifies the exact debt
+    raised for that revision. A refetch installs its result only while both are
+    still current.
     """
 
     room_id: str
     thread_id: str | None
     logical_event_id: str
+    revision_event_id: str
     refresh_token: int
     membership_epoch: int
 
@@ -304,12 +320,13 @@ class ConversationPage:
 
 
 @dataclass(frozen=True, slots=True)
-class OutboxDelivery:
+class MatrixDelivery:
     """One claimed, immutable Matrix delivery."""
 
-    turn_id: str
+    delivery_id: str
     stage: DeliveryStage
     room_id: str
+    membership_epoch: int
     thread_id: str | None
     transaction_id: str
     payload: Mapping[str, object]
@@ -318,16 +335,47 @@ class OutboxDelivery:
     # The scan key recovery pages on. Without it a pass that fails a whole page
     # re-reads the same page forever and never reaches what is behind it.
     created_at_ns: int
+    # Semantic facts retained locally for post-acknowledgement recovery. They
+    # are intentionally separate from ``payload``, which is Matrix wire data.
+    result: Mapping[str, object] | None = None
+    event_type: str = "m.room.message"
     # Whether this row has already been offered to the homeserver. Together
     # with the device below it answers the only question a resend needs: can
     # the frozen transaction ID still collapse onto the event a previous
     # attempt produced?
     attempted: bool = False
+    # An obsolete delivery stays as an identity tombstone so late work cannot
+    # cross into a newer membership, but recovery never sends it again.
+    retired: bool = False
+    # A definitive refusal of this immutable payload. Unlike retirement, this
+    # records a delivery failure rather than an obsolete membership identity.
+    permanent_failure_reason: str | None = None
     # The device that offered it, or None when none is recorded. A Matrix
     # transaction ID deduplicates within one device, so a row attempted by a
     # device this process is no longer logged in as carries an ID the
     # homeserver would accept as new.
     sending_device_id: str | None = None
+
+    @property
+    def permanently_failed(self) -> bool:
+        """Return whether this immutable payload has a terminal refusal."""
+        return self.permanent_failure_reason is not None
+
+    @property
+    def has_interactive_prompt(self) -> bool:
+        """Return whether this frozen payload carries an interactive prompt."""
+        return INTERACTIVE_PROMPT_KEY in self.payload
+
+
+@dataclass(frozen=True, slots=True)
+class UnreadableMatrixDelivery:
+    """Durable delivery debt whose frozen payload cannot be decoded."""
+
+    delivery_id: str
+    stage: DeliveryStage
+    room_id: str
+    created_at_ns: int
+    error: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,7 +392,7 @@ class DeliveryAcknowledgement:
 
     # The event the row names now: this call's if it bound the row, the
     # winner's if it did not, and ``None`` when there is no row left to name
-    # one -- a membership fence deleted it between the send and this write.
+    # one. Membership fences retain rows as retired identity tombstones.
     settled_event_id: str | None
     # Whether this call's conditional update is the one that bound the row.
     # The only thing that licenses writing anything beside the row.

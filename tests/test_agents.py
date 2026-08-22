@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import stat
@@ -23,6 +24,7 @@ from agno.tools.function import Function
 from agno.tools.toolkit import Toolkit
 from pydantic import ValidationError
 
+from mindroom import agents as agents_module
 from mindroom import prompts
 from mindroom.agent_storage import get_agent_runtime_state_dbs
 from mindroom.agents import (
@@ -50,7 +52,7 @@ from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import ROUTER_AGENT_NAME, RuntimePaths, resolve_runtime_paths
-from mindroom.credentials import CredentialsManager, load_scoped_credentials
+from mindroom.credentials import CredentialsManager, get_runtime_credentials_manager, load_scoped_credentials
 from mindroom.entity_resolution import managed_entity_power_user_ids_for_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.history.runtime import close_team_runtime_state_dbs
@@ -166,6 +168,7 @@ def _create_agent_for_test(agent_name: str, config: Config, **kwargs: object) ->
         config,
         runtime_paths_for(config),
         execution_identity=execution_identity,
+        supports_native_tool_approval=True,
         **kwargs,
     )
 
@@ -577,16 +580,18 @@ def test_agent_role_omits_tool_that_failed_to_build(
     assert "Worker backend:" not in agent.role
 
 
+@pytest.mark.parametrize("tool_name", ["report_publishing", "oauth_connections"])
 @patch("mindroom.agent_storage.SqliteDb")
 def test_agent_role_keeps_direct_toolkit_local_when_worker_routing_is_requested(
     _mock_storage: MagicMock,  # noqa: PT019
     tmp_path: Path,
+    tool_name: str,
 ) -> None:
     """Agent-context toolkits should stay local because they bypass registry proxy wrapping."""
     config = _test_config()
-    config.agents["general"].tools = ["report_publishing"]
+    config.agents["general"].tools = [tool_name]
     config.agents["general"].include_default_tools = False
-    config.agents["general"].worker_tools = ["report_publishing"]
+    config.agents["general"].worker_tools = [tool_name]
     config.agents["general"].worker_scope = "user_agent"
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
@@ -599,9 +604,87 @@ def test_agent_role_keeps_direct_toolkit_local_when_worker_routing_is_requested(
 
     agent = _create_agent_for_test("general", config=_bind_runtime_paths(config, runtime_paths))
 
-    assert "All available tools run in the primary MindRoom runtime: `report_publishing`." in agent.role
+    assert [tool.name for tool in agent.tools] == [tool_name]
+    assert f"All available tools run in the primary MindRoom runtime: `{tool_name}`." in agent.role
     assert "No tools use a worker runtime." in agent.role
     assert "Worker backend:" not in agent.role
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "credential_service", "credential_agent_scope"),
+    [
+        pytest.param("github", "github_oauth", None, id="github"),
+        pytest.param("google_docs", "google_docs_oauth", "general", id="google-docs"),
+    ],
+)
+@pytest.mark.parametrize("unreadable_kind", ["corrupt_plaintext", "wrong_key"])
+@patch("mindroom.agent_storage.SqliteDb")
+def test_unreadable_oauth_credentials_leave_agent_reset_tool_available(
+    _mock_storage: MagicMock,  # noqa: PT019
+    tmp_path: Path,
+    tool_name: str,
+    credential_service: str,
+    credential_agent_scope: str | None,
+    unreadable_kind: str,
+) -> None:
+    """Unreadable OAuth state must not prevent an agent from exposing its recovery tool."""
+    active_key = base64.urlsafe_b64encode(b"a" * 32).decode()
+    wrong_key = base64.urlsafe_b64encode(b"b" * 32).decode()
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "mindroom_data",
+        process_env={
+            "MINDROOM_CREDENTIALS_ENCRYPTION_KEY": active_key,
+            "MINDROOM_PUBLIC_URL": "https://mindroom.example.test",
+        },
+    )
+    config = _test_config()
+    config.agents["general"].tools = [tool_name, "oauth_connections"]
+    config.agents["general"].include_default_tools = False
+    config.agents["general"].worker_scope = "user_agent"
+    config = _bind_runtime_paths(config, runtime_paths)
+    scoped_manager = get_runtime_credentials_manager(runtime_paths).for_primary_runtime_scope(
+        "@alice:example.org",
+        credential_agent_scope,
+    )
+    credentials_path = scoped_manager.get_credentials_path(credential_service)
+    if unreadable_kind == "wrong_key":
+        CredentialsManager(
+            scoped_manager.base_path,
+            shared_base_path=scoped_manager.shared_base_path,
+            encryption_key=wrong_key,
+        ).save_credentials(
+            credential_service,
+            {
+                "token": "unreadable-access-token",
+                "refresh_token": "unreadable-refresh-token",
+                "_source": "oauth",
+            },
+        )
+    else:
+        credentials_path.parent.mkdir(parents=True, exist_ok=True)
+        credentials_path.write_bytes(b"corrupt-plaintext-secret")
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id="session-alice",
+    )
+
+    agent = create_agent(
+        "general",
+        config=config,
+        runtime_paths=runtime_paths,
+        execution_identity=identity,
+        supports_native_tool_approval=True,
+    )
+
+    toolkits = {tool.name: tool for tool in agent.tools}
+    assert tool_name in toolkits
+    assert "reset_oauth_connection" in toolkits["oauth_connections"].async_functions
 
 
 @patch("mindroom.agent_storage.SqliteDb")
@@ -899,6 +982,7 @@ def test_create_agent_continues_when_implied_tool_import_fails(
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -912,6 +996,7 @@ def test_create_agent_continues_when_implied_tool_import_fails(
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
             worker_target,
+            authorization,
         )
         if name == "browser":
             missing_dependency_message = "No module named 'playwright'"
@@ -957,6 +1042,7 @@ def test_create_agent_continues_when_tool_lookup_reports_unknown_tool(
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -970,6 +1056,7 @@ def test_create_agent_continues_when_tool_lookup_reports_unknown_tool(
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
             worker_target,
+            authorization,
         )
         if name == "stale_tool":
             msg = "Unknown tool: stale_tool"
@@ -1277,6 +1364,49 @@ def test_resolve_agent_runtime_uses_shared_agent_roots_for_shared_agents(tmp_pat
     assert runtime.workspace is None
     assert runtime.tool_base_dir is None
     assert runtime.file_memory_root is None
+
+
+def test_resolve_agent_runtime_routes_shared_sessions_to_explicit_session_storage(tmp_path: Path) -> None:
+    """Session state may live off the canonical workspace storage root."""
+    session_storage = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage)},
+    )
+    config = _bind_runtime_paths(_test_config(), runtime_paths)
+
+    runtime = resolve_agent_runtime("general", config, runtime_paths, execution_identity=None)
+
+    assert runtime.state_root == agent_state_root_path(runtime_paths.storage_root, "general")
+    assert runtime.session_state_root == session_storage / "agents" / "general"
+
+
+def test_resolve_agent_runtime_routes_private_sessions_to_explicit_session_storage(tmp_path: Path) -> None:
+    """Private session paths preserve their stable storage-relative identity."""
+    session_storage = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage)},
+    )
+    config = _test_config()
+    config.agents["general"].private = AgentPrivateConfig(per="user")
+    config = _bind_runtime_paths(config, runtime_paths)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@alice:example.org",
+        room_id="!room:example.org",
+        thread_id="$thread",
+        resolved_thread_id="$thread",
+        session_id="s1",
+    )
+
+    runtime = resolve_agent_runtime("general", config, runtime_paths, execution_identity=identity)
+
+    relative_state_root = runtime.state_root.relative_to(runtime_paths.storage_root)
+    assert runtime.session_state_root == session_storage / relative_state_root
 
 
 def test_runtime_resolution_exports_public_resolved_agent_execution_contract(tmp_path: Path) -> None:
@@ -2074,6 +2204,29 @@ def test_get_agent_uses_storage_path_for_sessions_and_learning(mock_storage: Mag
 
 
 @patch("mindroom.agent_storage.SqliteDb")
+def test_get_agent_routes_only_sessions_to_explicit_session_storage(
+    mock_storage: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Dedicated session storage must not move learning or workspace state."""
+    storage_root = tmp_path / "storage"
+    session_storage_root = tmp_path / "session-state"
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=storage_root,
+        process_env={"MINDROOM_SESSION_STORAGE_PATH": str(session_storage_root)},
+    )
+    config = _bind_runtime_paths(_test_config(), runtime_paths)
+
+    _create_agent_for_test("general", config=config)
+
+    db_files = [Path(str(call.kwargs["db_file"])) for call in mock_storage.call_args_list]
+    assert session_storage_root / "agents" / "general" / "sessions" / "general.db" in db_files
+    assert agent_state_root_path(storage_root, "general") / "learning" / "general.db" in db_files
+    assert agent_state_root_path(storage_root, "general") / "sessions" / "general.db" not in db_files
+
+
+@patch("mindroom.agent_storage.SqliteDb")
 def test_get_agent_uses_worker_storage_for_sessions_and_learning(mock_storage: MagicMock, tmp_path: Path) -> None:
     """Worker scope should not change the canonical session and learning paths."""
     config = _test_config()
@@ -2183,6 +2336,7 @@ def test_create_agent_loads_shared_worker_scoped_tool_credentials_with_explicit_
         tool_output_workspace_root: object | None = None,
         tool_output_auto_save_threshold_bytes: int = 50 * 1024,
         worker_target: object | None = None,
+        authorization: object | None = None,
     ) -> MagicMock:
         del (
             _runtime_paths,
@@ -2194,6 +2348,7 @@ def test_create_agent_loads_shared_worker_scoped_tool_credentials_with_explicit_
             allowed_shared_services,
             tool_output_workspace_root,
             tool_output_auto_save_threshold_bytes,
+            authorization,
         )
         credentials = load_scoped_credentials(
             tool_name,
@@ -3134,6 +3289,140 @@ def test_tool_function_filter_prunes_resolved_functions() -> None:
     assert filtered is toolkit
     assert set(toolkit.functions) == {"safe"}
     assert toolkit.async_functions == {}
+
+
+def test_native_approval_capability_marks_only_potentially_gated_calls() -> None:
+    """Continuation-capable runners expose gated calls through Agno confirmation only."""
+
+    async def dangerous_async() -> None:
+        return None
+
+    config = Config.model_validate(
+        {
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [
+                    {"match": "dangerous*", "action": "require_approval"},
+                    {"match": "safe", "action": "auto_approve"},
+                ],
+            },
+        },
+    )
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="dangerous", entrypoint=lambda: None),
+            Function(name="dangerous_async", entrypoint=dangerous_async),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=True,
+    )
+
+    assert filtered is toolkit
+    assert toolkit.functions["dangerous"].requires_confirmation is True
+    assert toolkit.async_functions["dangerous_async"].requires_confirmation is True
+    assert toolkit.functions["dangerous"].approval_type == "mindroom_policy"
+    assert toolkit.async_functions["dangerous_async"].approval_type == "mindroom_policy"
+    assert toolkit.functions["safe"].requires_confirmation is not True
+
+
+def test_non_resumable_tool_surface_hides_potentially_gated_calls() -> None:
+    """An embedded agent must not receive a gated function it cannot suspend and resume."""
+
+    async def dangerous_async() -> None:
+        return None
+
+    config = Config.model_validate(
+        {
+            "tool_approval": {
+                "default": "auto_approve",
+                "rules": [
+                    {"match": "dangerous*", "action": "require_approval"},
+                    {"match": "safe", "action": "auto_approve"},
+                ],
+            },
+        },
+    )
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="dangerous", entrypoint=lambda: None),
+            Function(name="dangerous_async", entrypoint=dangerous_async),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is toolkit
+    assert set(toolkit.functions) == {"safe"}
+    assert toolkit.async_functions == {}
+
+
+def test_non_resumable_tool_surface_hides_native_confirmation_calls() -> None:
+    """An authored Agno confirmation must not escape onto a surface with no resume owner."""
+    config = Config.model_validate({"tool_approval": {"default": "auto_approve"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[
+            Function(name="native_confirmation", entrypoint=lambda: None, requires_confirmation=True),
+            Function(name="safe", entrypoint=lambda: None),
+        ],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is toolkit
+    assert set(toolkit.functions) == {"safe"}
+
+
+def test_native_approval_capability_preserves_tool_authored_confirmation() -> None:
+    """MindRoom marks only policy pauses, leaving an authored confirmation distinguishable."""
+    config = Config.model_validate({"tool_approval": {"default": "require_approval"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[Function(name="native_confirmation", entrypoint=lambda: None, requires_confirmation=True)],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=True,
+    )
+
+    assert filtered is toolkit
+    assert toolkit.functions["native_confirmation"].requires_confirmation is True
+    assert toolkit.functions["native_confirmation"].approval_type is None
+
+
+def test_non_resumable_tool_surface_drops_an_empty_toolkit() -> None:
+    """A channel that hides every function must not register an unusable toolkit name."""
+    config = Config.model_validate({"tool_approval": {"default": "require_approval"}})
+    toolkit = Toolkit(
+        name="approval-test",
+        tools=[Function(name="dangerous", entrypoint=lambda: None)],
+    )
+
+    filtered = agents_module.apply_tool_approval_capability(
+        toolkit,
+        config,
+        supports_native_tool_approval=False,
+    )
+
+    assert filtered is None
 
 
 @pytest.mark.asyncio

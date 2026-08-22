@@ -11,6 +11,8 @@ import os
 import stat
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,7 +63,7 @@ from mindroom.tool_system.metadata import (
 )
 from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
 from mindroom.tool_system.registration import register_tool_with_metadata
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context, worker_progress_pump_scope
+from mindroom.tool_system.runtime_context import tool_runtime_context, worker_progress_pump_scope
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge, prepend_tool_hook_bridge
 from mindroom.tool_system.worker_proxy_client import WorkerProxyClientConfig, execute_worker_proxy_request
 from mindroom.tool_system.worker_routing import (
@@ -76,6 +78,9 @@ from mindroom.workers.backend import WorkerBackendError
 from mindroom.workers.backends.local import local_worker_state_paths_for_root
 from mindroom.workers.backends.static_runner import StaticSandboxRunnerBackend
 from mindroom.workers.models import WorkerHandle, WorkerReadyProgress, WorkerSpec
+from tests.authorization_helpers import (
+    make_test_tool_runtime_context,
+)
 from tests.conftest import (
     FakeCredentialsManager,
     make_conversation_reader_mock,
@@ -103,6 +108,52 @@ _TEST_KUBERNETES_CONFIG_SNAPSHOT: dict[str, object] = {
 _TEST_RUNTIME_PATHS = resolve_runtime_paths(config_path=Path("config.yaml"), process_env={})
 
 
+@pytest.fixture(autouse=True)
+def _isolate_primary_worker_manager_runtime() -> Iterator[None]:
+    """Reopen the process-global worker runtime around final-shutdown tests."""
+    workers_runtime_module._reset_primary_worker_manager()
+    try:
+        yield
+    finally:
+        workers_runtime_module._reset_primary_worker_manager()
+
+
+@pytest.mark.asyncio
+async def test_worker_proxy_executor_isolated_from_default_pool_and_preserves_context() -> None:
+    """Worker proxy calls must not queue behind unrelated default-pool work."""
+    loop = asyncio.get_running_loop()
+    default_executor = ThreadPoolExecutor(max_workers=1)
+    replacement_executor = ThreadPoolExecutor()
+    loop.set_default_executor(default_executor)
+    default_started = threading.Event()
+    release_default = threading.Event()
+    request_scope = ContextVar[str]("test_worker_proxy_request_scope")
+
+    def block_default_executor() -> None:
+        default_started.set()
+        release_default.wait(timeout=5)
+
+    default_blocker = loop.run_in_executor(None, block_default_executor)
+    assert default_started.wait(timeout=1)
+    token = request_scope.set("request-scope")
+
+    try:
+        result = await asyncio.wait_for(
+            sandbox_proxy_module._run_in_worker_proxy_executor(request_scope.get),
+            timeout=1,
+        )
+
+        assert result == "request-scope"
+        assert not default_blocker.done()
+    finally:
+        request_scope.reset(token)
+        release_default.set()
+        await default_blocker
+        loop.set_default_executor(replacement_executor)
+        default_executor.shutdown(wait=True)
+        replacement_executor.shutdown(wait=True)
+
+
 def test_approved_egress_tool_stays_primary_even_when_sandbox_mode_all(tmp_path: Path) -> None:
     """Policy API grants must be requested from the primary runtime, not a worker."""
     runtime_paths = resolve_runtime_paths(
@@ -117,6 +168,20 @@ def test_approved_egress_tool_stays_primary_even_when_sandbox_mode_all(tmp_path:
     assert not sandbox_proxy_module.sandbox_proxy_enabled_for_tool(
         "approved_egress",
         runtime_paths=runtime_paths,
+    )
+
+
+def test_github_oauth_tool_stays_primary_when_worker_routing_is_requested(tmp_path: Path) -> None:
+    """Requester OAuth credentials must remain in the primary runtime credential boundary."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        process_env={},
+    )
+
+    assert not sandbox_proxy_module.sandbox_proxy_enabled_for_tool(
+        "github",
+        runtime_paths=runtime_paths,
+        worker_tools_override=["github"],
     )
 
 
@@ -2827,7 +2892,7 @@ def test_proxy_worker_routed_lease_skips_non_grantable_shared_credentials(
     entrypoint = tool.functions["add"].entrypoint
     assert entrypoint is not None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -2924,7 +2989,7 @@ def test_proxy_includes_worker_routing_identity(monkeypatch: pytest.MonkeyPatch)
     expected_worker_key = resolve_worker_key("user_agent", execution_identity, agent_name="code")
     assert expected_worker_key is not None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -3034,7 +3099,7 @@ def test_proxy_user_agent_shared_agent_sends_explicit_empty_private_visibility(
     expected_worker_key = resolve_worker_key("user_agent", execution_identity, agent_name="code")
     assert expected_worker_key is not None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -3437,11 +3502,57 @@ def test_shutdown_primary_worker_manager_resets_cached_runtime_manager() -> None
     assert workers_runtime_module._RETIRED_PRIMARY_WORKER_MANAGER_ENTRIES == []
 
 
-def test_docker_worker_manager_retires_obsolete_cached_manager_until_lease_release(
+def test_explicit_primary_worker_reset_reopens_construction_after_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A leased manager should survive replacement until the request-scoped lease is released."""
+    """Final shutdown rejects new builds until an explicit process reset establishes a new epoch."""
+    workers_runtime_module._reset_primary_worker_manager()
+
+    class _FakeWorkerManager:
+        def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        workers_runtime_module,
+        "_primary_worker_backend_config_signature",
+        lambda *_args, **_kwargs: ("reset-generation",),
+    )
+    monkeypatch.setattr(
+        workers_runtime_module,
+        "_build_primary_worker_manager",
+        lambda *_args, **_kwargs: _FakeWorkerManager(),
+    )
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
+
+    try:
+        workers_runtime_module.shutdown_primary_worker_manager(timeout_seconds=0.0)
+        with pytest.raises(WorkerBackendError, match="shut down"):
+            workers_runtime_module.get_primary_worker_manager(
+                runtime_paths,
+                proxy_url=None,
+                proxy_token=None,
+                storage_root=tmp_path,
+            )
+
+        workers_runtime_module._reset_primary_worker_manager()
+        manager = workers_runtime_module.get_primary_worker_manager(
+            runtime_paths,
+            proxy_url=None,
+            proxy_token=None,
+            storage_root=tmp_path,
+        )
+
+        assert isinstance(manager, _FakeWorkerManager)
+    finally:
+        workers_runtime_module._reset_primary_worker_manager()
+
+
+def test_superseded_worker_manager_disposes_when_its_last_lease_releases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A superseded manager shuts down exactly once when its final borrower releases it."""
     workers_runtime_module._reset_primary_worker_manager()
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "docker")
     monkeypatch.setenv("MINDROOM_DOCKER_WORKER_IMAGE", "ghcr.io/mindroom-ai/mindroom:latest")
@@ -3521,6 +3632,7 @@ def test_docker_worker_manager_retires_obsolete_cached_manager_until_lease_relea
     assert first_manager.shutdown_calls == 1
     assert build_order == [str(first_storage_path), str(second_storage_path)]
     workers_runtime_module._reset_primary_worker_manager()
+    assert first_manager.shutdown_calls == 1
     assert second_manager.shutdown_calls == 1
 
 
@@ -3681,11 +3793,11 @@ def test_docker_worker_manager_preserves_cached_manager_when_new_build_fails(
     assert first_manager.shutdown_calls == 1
 
 
-def test_docker_worker_manager_replacement_succeeds_even_if_previous_shutdown_would_raise(
+def test_docker_worker_manager_replacement_disposes_previous_once_despite_shutdown_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Retired-manager shutdown failures should not poison the replacement manager or later requests."""
+    """The final lease release disposes a superseded manager exactly once even on failure."""
     workers_runtime_module._reset_primary_worker_manager()
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "docker")
     monkeypatch.setenv("MINDROOM_DOCKER_WORKER_IMAGE", "ghcr.io/mindroom-ai/mindroom:latest")
@@ -3858,11 +3970,11 @@ def test_docker_worker_manager_build_does_not_hold_cache_lock(
     workers_runtime_module._reset_primary_worker_manager()
 
 
-def test_docker_worker_manager_replacement_does_not_hold_cache_lock_during_retired_shutdown(
+def test_docker_worker_manager_replacement_disposes_unleased_generation_before_return(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A slow retired-manager shutdown must not block cache reads of the new active manager."""
+    """An unleased superseded manager is disposed before replacement acquisition returns."""
     workers_runtime_module._reset_primary_worker_manager()
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "docker")
     monkeypatch.setenv("MINDROOM_DOCKER_WORKER_IMAGE", "ghcr.io/mindroom-ai/mindroom:latest")
@@ -3938,7 +4050,11 @@ def test_docker_worker_manager_replacement_does_not_hold_cache_lock_during_retir
 
     replacement_thread = threading.Thread(target=_replace_manager)
     replacement_thread.start()
-    assert shutdown_started.wait(timeout=5.0)
+    assert shutdown_started.wait(timeout=1.0)
+    assert replacement_thread.is_alive()
+    allow_shutdown.set()
+    replacement_thread.join(timeout=5.0)
+    assert not replacement_thread.is_alive()
 
     second_manager = workers_runtime_module.get_primary_worker_manager(
         second_runtime_paths,
@@ -3946,9 +4062,6 @@ def test_docker_worker_manager_replacement_does_not_hold_cache_lock_during_retir
         proxy_token=_TEST_AUTH_TOKEN,
         storage_root=second_storage_path,
     )
-
-    allow_shutdown.set()
-    replacement_thread.join(timeout=5.0)
 
     assert thread_result["manager"] is second_manager
     workers_runtime_module._reset_primary_worker_manager()
@@ -4358,7 +4471,7 @@ def test_get_worker_manager_passes_committed_snapshot_from_tool_runtime_context(
         captured_kwargs.update(kwargs)
         return object()
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -4411,7 +4524,7 @@ def test_get_worker_manager_reuses_cached_kubernetes_validation_snapshot(
         captured_snapshots.append(kwargs["kubernetes_tool_validation_snapshot"])
         return object()
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -4503,7 +4616,7 @@ def test_proxy_leases_worker_manager_with_committed_runtime_context(
         assert worker_manager is fake_worker_manager
         return {}, None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -4694,7 +4807,7 @@ async def test_kubernetes_backend_misconfiguration_raises_instead_of_running_loc
     entrypoint = tool.async_functions["run_shell_command"].entrypoint
     assert entrypoint is not None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -5414,7 +5527,7 @@ async def test_docker_backend_misconfiguration_raises_instead_of_running_locally
     entrypoint = tool.async_functions["run_shell_command"].entrypoint
     assert entrypoint is not None
 
-    runtime_context = ToolRuntimeContext(
+    runtime_context = make_test_tool_runtime_context(
         agent_name="code",
         target=MessageTarget.resolve(
             room_id="!room:example.org",
@@ -5707,6 +5820,8 @@ class TestWorkerToolsOverride:
             "google_drive",
             "google_sheets",
             "homeassistant",
+            "invite_router",
+            "oauth_connections",
             "todo",
         ],
     )

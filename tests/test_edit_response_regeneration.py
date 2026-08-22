@@ -22,7 +22,6 @@ from agno.session.team import TeamSession
 from mindroom import interactive
 from mindroom.agent_storage import get_agent_session
 from mindroom.agents import remove_run_by_event_id
-from mindroom.bot import AgentBot, TeamBot
 from mindroom.coalescing_batch import tagged_coalesced_prompt
 from mindroom.commands import config_confirmation
 from mindroom.config.main import Config
@@ -50,7 +49,7 @@ from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.response_runner import ResponseRequest, _ResponseGenerationOutcome
 from mindroom.session_ids import create_session_id
-from tests.bot_helpers import dispatch_reaction_durably
+from tests.bot_helpers import dispatch_reaction_durably, make_test_agent_bot, make_test_team_bot
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_side_effect,
@@ -70,6 +69,8 @@ from tests.identity_helpers import fixture_entity_matrix_id, persist_entity_acco
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+
+    from mindroom.bot import AgentBot, TeamBot
 
 
 def _room_send_response(event_id: str) -> MagicMock:
@@ -333,7 +334,7 @@ async def test_bot_regenerates_response_on_edit(tmp_path: Path) -> None:
     config = _test_config(tmp_path)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -441,7 +442,7 @@ async def test_bot_regenerates_response_on_edit(tmp_path: Path) -> None:
         ),
         patch.object(bot._conversation_resolver, "extract_message_context", new_callable=AsyncMock) as mock_context,
         patch(
-            "mindroom.delivery_gateway.send_message_result",
+            "mindroom.delivery_gateway.send_message_outcome",
             new=AsyncMock(side_effect=delivered_matrix_side_effect("$edit")),
         ) as mock_edit,
     ):
@@ -477,8 +478,18 @@ async def test_bot_regenerates_response_on_edit(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bot_edit_hooks_see_hydrated_sidecar_edit_body(tmp_path: Path) -> None:
-    """Edit regeneration should use the resolved edited body from a v2 sidecar."""
+@pytest.mark.parametrize(
+    ("download_succeeds", "expected_body"),
+    [(True, "@test_agent what is 99+1?"), (False, "Preview edit")],
+    ids=("hydrated", "preview_fallback"),
+)
+async def test_bot_edit_hooks_see_best_available_sidecar_edit_body(
+    tmp_path: Path,
+    *,
+    download_succeeds: bool,
+    expected_body: str,
+) -> None:
+    """Edit regeneration should keep the preview when a v2 sidecar cannot be hydrated."""
     agent_user = AgentMatrixUser(
         agent_name="test_agent",
         user_id="@mindroom_test_agent:example.com",
@@ -486,7 +497,7 @@ async def test_bot_edit_hooks_see_hydrated_sidecar_edit_body(tmp_path: Path) -> 
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -494,8 +505,8 @@ async def test_bot_edit_hooks_see_hydrated_sidecar_edit_body(tmp_path: Path) -> 
         rooms=["!test:example.com"],
     )
     bot.client = make_matrix_client_mock(user_id="@mindroom_test_agent:example.com")
-    bot.client.download = AsyncMock(
-        return_value=MagicMock(
+    download_response = (
+        MagicMock(
             spec=nio.DownloadResponse,
             body=json.dumps(
                 {
@@ -511,8 +522,11 @@ async def test_bot_edit_hooks_see_hydrated_sidecar_edit_body(tmp_path: Path) -> 
                     },
                 },
             ).encode("utf-8"),
-        ),
+        )
+        if download_succeeds
+        else nio.DownloadError("missing")
     )
+    bot.client.download = AsyncMock(return_value=download_response)
     replace_edit_regenerator_deps(bot)
     bot.logger = MagicMock()
 
@@ -580,7 +594,7 @@ async def test_bot_edit_hooks_see_hydrated_sidecar_edit_body(tmp_path: Path) -> 
         await bot._on_message(room, edit_event)
 
     emitted_envelope = mock_emit_hooks.await_args.kwargs["envelope"]
-    assert emitted_envelope.body == "@test_agent what is 99+1?"
+    assert emitted_envelope.body == expected_body
 
 
 @pytest.mark.asyncio
@@ -593,7 +607,7 @@ async def test_bot_edit_regeneration_does_not_rerun_response_gating_after_hydrat
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path, agent_names=("test_agent", "other_agent"))
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -680,7 +694,7 @@ async def test_handle_message_edit_reuses_persisted_target_and_thread_scope(
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -925,7 +939,7 @@ async def test_team_bot_regenerates_edits_against_team_history_storage(tmp_path:
     )
     config = _team_test_config(tmp_path)
     runtime_paths = runtime_paths_for(config)
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1089,7 +1103,7 @@ async def test_bot_ignores_edit_without_previous_response(tmp_path: Path) -> Non
     config = _test_config(tmp_path)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1173,7 +1187,7 @@ async def test_bot_ignores_agent_edits(tmp_path: Path) -> None:
     config = _test_config(tmp_path, agent_names=("test_agent", "helper_agent"))
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1321,7 +1335,7 @@ async def test_bot_ignores_agent_edits_from_actual_persisted_id_after_drift(tmp_
     state.add_account("agent_helper_agent", "actual_helper_agent", "pw", domain="example.com")
     state.save(runtime_paths=runtime_paths)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1395,7 +1409,7 @@ async def test_handle_message_edit_rebuilds_coalesced_prompt_for_non_primary_edi
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1554,7 +1568,7 @@ async def test_handle_message_edit_reuses_existing_response_without_placeholder_
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1670,7 +1684,7 @@ async def test_handle_message_edit_does_not_remark_response_when_regeneration_is
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1781,7 +1795,7 @@ async def test_handle_message_edit_does_not_mark_regeneration_success_when_exist
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -1898,7 +1912,7 @@ async def test_handle_message_edit_rebuilds_coalesced_prompt_from_persisted_run_
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2078,7 +2092,7 @@ async def test_load_turn_prefers_newest_matching_run(tmp_path: Path) -> None:
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2153,7 +2167,7 @@ async def test_load_turn_keeps_ledger_anchor_for_interactive_selection(tmp_path:
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2219,7 +2233,7 @@ async def test_handle_message_edit_recovers_missing_ledger_row_from_interrupted_
     config = _test_config(tmp_path)
     session_id = create_session_id("!test:example.com", None)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2354,7 +2368,7 @@ async def test_handle_message_edit_uses_persisted_interrupted_response_event_id_
     config = _test_config(tmp_path)
     session_id = create_session_id("!test:example.com", None)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2520,7 +2534,7 @@ async def test_team_handle_message_edit_uses_persisted_interrupted_response_even
     runtime_paths = runtime_paths_for(config)
     session_id = create_session_id("!test:example.com", None)
 
-    bot = TeamBot(
+    bot = make_test_team_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2655,7 +2669,7 @@ async def test_edit_regenerator_preserves_interactive_selection_run_metadata(tmp
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2796,7 +2810,7 @@ async def test_suppressed_interactive_regeneration_keeps_ledger_anchor(
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -2931,7 +2945,7 @@ async def test_load_turn_prefers_newest_match_across_thread_and_room_sessions(tm
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3021,7 +3035,7 @@ async def test_handle_message_edit_skips_when_turn_context_was_not_recorded(
     )
 
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3130,7 +3144,7 @@ async def test_handle_message_edit_recovers_missing_ledger_row_from_persisted_ru
     config = _test_config(tmp_path)
     config.agents["test_agent"].thread_mode = "room"
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3339,7 +3353,7 @@ async def test_handle_message_edit_recovers_threaded_turn_using_resolved_context
         password="test_password",  # noqa: S106
     )
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3491,7 +3505,7 @@ async def test_handle_message_edit_recovers_missing_single_turn_without_rerunnin
     config = _test_config(tmp_path)
     config.agents["test_agent"].thread_mode = "room"
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3642,7 +3656,7 @@ async def test_handle_message_edit_recovers_newer_run_response_event_id_after_re
 
     async def start_bot() -> AgentBot:
         """Build one warmed bot, the way startup does before any callback runs."""
-        started = AgentBot(
+        started = make_test_agent_bot(
             agent_user=agent_user,
             storage_path=tmp_path,
             config=config,
@@ -3837,7 +3851,7 @@ async def test_on_reaction_tracks_response_event_id(tmp_path: Path) -> None:
     config = _test_config(tmp_path)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3883,36 +3897,40 @@ async def test_on_reaction_tracks_response_event_id(tmp_path: Path) -> None:
     reaction_event.reacts_to = "$question:example.com"
     reaction_event.key = "1️⃣"
 
-    # Mock interactive.handle_reaction to return a result
-    with (
-        patch("mindroom.bot.interactive.handle_reaction", new_callable=AsyncMock) as mock_handle_reaction,
-        patch("mindroom.bot.is_authorized_sender", return_value=True),
-        patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock) as mock_send_text,
-        patch.object(bot._response_runner, "generate_response", new_callable=AsyncMock) as mock_generate_response,
-        patch.object(bot._conversation_resolver, "fetch_thread_history", new_callable=AsyncMock) as mock_fetch_history,
-    ):
-        # Setup mocks
-        mock_handle_reaction.return_value = interactive.InteractiveSelection(
+    claim_interactive = AsyncMock(
+        return_value=interactive.InteractiveSelection(
             question_event_id="$question:example.com",
             question_text="Choose one",
             selection_key="1️⃣",
             selected_label="Option 1",
             selected_value="Option 1",
             thread_id="thread_id",
-        )
+        ),
+    )
+    with (
+        patch.object(
+            unwrap_extracted_collaborator(bot._journal_dispatcher),
+            "claim_interactive_reaction",
+            new=claim_interactive,
+        ),
+        patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock) as mock_send_text,
+        patch.object(bot._response_runner, "generate_response", new_callable=AsyncMock) as mock_generate_response,
+        patch.object(bot._conversation_resolver, "fetch_thread_history", new_callable=AsyncMock) as mock_fetch_history,
+    ):
         mock_send_text.return_value = "$ack_event:example.com"
         mock_generate_response.return_value = _delivery_resolution("$response_event:example.com")
         mock_fetch_history.return_value = thread_history_result([], is_full_history=True)
 
         # Process the reaction event
         await dispatch_reaction_durably(bot, room, reaction_event)
+        await bot._response_runner.drain_inbox_responses()
 
         # Verify that the bot tracked the response correctly
         assert bot._turn_store.is_handled("$question:example.com")
         assert _response_event_id(bot, "$question:example.com") == "$response_event:example.com"
 
         # Verify the methods were called with correct parameters
-        mock_handle_reaction.assert_called_once()
+        claim_interactive.assert_awaited_once()
         mock_send_text.assert_called_once()
         mock_generate_response.assert_called_once()
 
@@ -3923,8 +3941,8 @@ async def test_on_reaction_tracks_response_event_id(tmp_path: Path) -> None:
         assert request.thread_id == "thread_id"
         assert request.response_envelope.source_event_id == "$reaction:example.com"
         assert request.matrix_run_metadata == {
-            MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$question:example.com"],
-            MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY: ["$reaction:example.com"],
+            MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$reaction:example.com"],
+            MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY: ["$question:example.com"],
             **_run_response_context_metadata(
                 response_owner="test_agent",
                 history_scope=_agent_history_scope("test_agent"),
@@ -3945,7 +3963,7 @@ async def test_on_reaction_leaves_question_retryable_when_ack_response_is_suppre
 
     config = _test_config(tmp_path)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -3984,21 +4002,26 @@ async def test_on_reaction_leaves_question_retryable_when_ack_response_is_suppre
     reaction_event.reacts_to = "$question:example.com"
     reaction_event.key = "1️⃣"
 
-    with (
-        patch("mindroom.bot.interactive.handle_reaction", new_callable=AsyncMock) as mock_handle_reaction,
-        patch("mindroom.bot.is_authorized_sender", return_value=True),
-        patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock) as mock_send_text,
-        patch.object(bot._response_runner, "generate_response", new_callable=AsyncMock) as mock_generate_response,
-        patch.object(bot._conversation_resolver, "fetch_thread_history", new_callable=AsyncMock) as mock_fetch_history,
-    ):
-        mock_handle_reaction.return_value = interactive.InteractiveSelection(
+    claim_interactive = AsyncMock(
+        return_value=interactive.InteractiveSelection(
             question_event_id="$question:example.com",
             question_text="Choose one",
             selection_key="1️⃣",
             selected_label="Option 1",
             selected_value="Option 1",
             thread_id="thread_id",
-        )
+        ),
+    )
+    with (
+        patch.object(
+            unwrap_extracted_collaborator(bot._journal_dispatcher),
+            "claim_interactive_reaction",
+            new=claim_interactive,
+        ),
+        patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock) as mock_send_text,
+        patch.object(bot._response_runner, "generate_response", new_callable=AsyncMock) as mock_generate_response,
+        patch.object(bot._conversation_resolver, "fetch_thread_history", new_callable=AsyncMock) as mock_fetch_history,
+    ):
         mock_send_text.return_value = "$ack_event:example.com"
         mock_generate_response.return_value = _delivery_resolution(None)
         mock_fetch_history.return_value = thread_history_result([], is_full_history=True)
@@ -4006,6 +4029,7 @@ async def test_on_reaction_leaves_question_retryable_when_ack_response_is_suppre
         # The worker records the failure and leaves the event pending rather
         # than propagating it, so the question stays retryable.
         await dispatch_reaction_durably(bot, room, reaction_event)
+        await bot._response_runner.drain_inbox_responses()
 
         assert await bot._journal_dispatcher.store.is_pending(reaction_event.event_id)
         assert bot._turn_store.is_handled("$question:example.com") is False
@@ -4026,7 +4050,7 @@ async def test_on_message_routes_interactive_text_selection_through_turn_control
     )
 
     config = _test_config(tmp_path)
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4078,22 +4102,22 @@ async def test_on_message_routes_interactive_text_selection_through_turn_control
         "origin_server_ts": 1000000,
         "type": "m.room.message",
     }
+    interactive_questions = MagicMock()
+    interactive_questions.claim_interactive_text = AsyncMock(
+        return_value=interactive.InteractiveSelection(
+            question_event_id="$question:example.com",
+            question_text="Choose one",
+            selection_key="1",
+            selected_label="Option 1",
+            selected_value="Option 1",
+            thread_id="$thread:example.com",
+        ),
+    )
+    replace_turn_controller_deps(bot, interactive_questions=interactive_questions)
 
     with (
         patch("mindroom.ingress_validation.is_authorized_sender", return_value=True),
         patch.object(bot._turn_policy, "can_reply_to_sender", return_value=True),
-        patch(
-            "mindroom.turn_controller.interactive.handle_text_response",
-            new_callable=AsyncMock,
-            return_value=interactive.InteractiveSelection(
-                question_event_id="$question:example.com",
-                question_text="Choose one",
-                selection_key="1",
-                selected_label="Option 1",
-                selected_value="Option 1",
-                thread_id="$thread:example.com",
-            ),
-        ) as mock_handle_text_response,
         patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock, return_value="$ack:example.com"),
         patch.object(
             bot._response_runner,
@@ -4107,19 +4131,19 @@ async def test_on_message_routes_interactive_text_selection_through_turn_control
             new_callable=AsyncMock,
             return_value=thread_history_result([], is_full_history=True),
         ),
-        patch.object(bot._turn_controller, "_dispatch_text_message", new_callable=AsyncMock) as mock_dispatch_text,
+        patch("mindroom.turn_controller.dispatch_text_message", new_callable=AsyncMock) as mock_dispatch_text,
     ):
         await bot._on_message(room, message_event)
 
-    mock_handle_text_response.assert_awaited_once()
+    interactive_questions.claim_interactive_text.assert_awaited_once()
     mock_dispatch_text.assert_not_awaited()
     request = mock_generate_response.await_args.args[0]
     assert request.reply_to_event_id == "$question:example.com"
     assert request.thread_id == "$thread:example.com"
     assert request.existing_event_id == "$ack:example.com"
     assert request.matrix_run_metadata == {
-        MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$question:example.com"],
-        MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY: ["$selection:example.com"],
+        MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$selection:example.com"],
+        MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY: ["$question:example.com"],
         **_run_response_context_metadata(
             response_owner="test_agent",
             history_scope=_agent_history_scope("test_agent"),
@@ -4137,6 +4161,7 @@ async def test_on_message_routes_interactive_text_selection_through_turn_control
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
 async def test_on_reaction_respects_agent_reply_permissions(tmp_path: Path) -> None:
     """Disallowed reactions must not consume interactive questions."""
     agent_user = AgentMatrixUser(
@@ -4162,7 +4187,7 @@ async def test_on_reaction_respects_agent_reply_permissions(tmp_path: Path) -> N
         tmp_path,
     )
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4181,13 +4206,15 @@ async def test_on_reaction_respects_agent_reply_permissions(tmp_path: Path) -> N
     )
 
     room = nio.MatrixRoom(room_id="!test:example.com", own_user_id="@mindroom_test_agent:example.com")
-    interactive._active_questions.clear()
-    interactive.register_interactive_question(
-        event_id="$question:example.com",
-        room_id=room.room_id,
-        thread_id=None,
-        option_map={"1️⃣": "Option 1", "1": "Option 1"},
-        agent_name="test_agent",
+    claim_interactive = AsyncMock(
+        return_value=interactive.InteractiveSelection(
+            question_event_id="$question:example.com",
+            question_text="Choose one",
+            selection_key="1️⃣",
+            selected_label="Option 1",
+            selected_value="Option 1",
+            thread_id=None,
+        ),
     )
 
     disallowed_reaction = nio.ReactionEvent.from_dict(
@@ -4229,7 +4256,11 @@ async def test_on_reaction_respects_agent_reply_permissions(tmp_path: Path) -> N
     allowed_reaction.key = "1️⃣"
 
     with (
-        patch("mindroom.bot.is_authorized_sender", return_value=True),
+        patch.object(
+            unwrap_extracted_collaborator(bot._journal_dispatcher),
+            "claim_interactive_reaction",
+            new=claim_interactive,
+        ),
         patch.object(bot._delivery_gateway, "send_text", new_callable=AsyncMock) as mock_send_text,
         patch.object(bot._response_runner, "generate_response", new_callable=AsyncMock) as mock_generate_response,
     ):
@@ -4237,18 +4268,20 @@ async def test_on_reaction_respects_agent_reply_permissions(tmp_path: Path) -> N
         mock_generate_response.return_value = _delivery_resolution("$response_event:example.com")
 
         await dispatch_reaction_durably(bot, room, disallowed_reaction)
+        claim_interactive.assert_not_awaited()
         mock_send_text.assert_not_called()
         mock_generate_response.assert_not_called()
 
         await dispatch_reaction_durably(bot, room, allowed_reaction)
+        await bot._response_runner.drain_inbox_responses()
 
-    interactive._active_questions.clear()
-
+    claim_interactive.assert_awaited_once()
     mock_send_text.assert_called_once()
     mock_generate_response.assert_called_once()
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("enforce_turn_authorization")
 async def test_config_confirmation_blocked_by_reply_permissions(tmp_path: Path) -> None:
     """Disallowed senders must not trigger config confirmation reactions."""
     agent_user = AgentMatrixUser(
@@ -4274,7 +4307,7 @@ async def test_config_confirmation_blocked_by_reply_permissions(tmp_path: Path) 
         tmp_path,
     )
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4318,7 +4351,6 @@ async def test_config_confirmation_blocked_by_reply_permissions(tmp_path: Path) 
     )
 
     with (
-        patch("mindroom.bot.is_authorized_sender", return_value=True),
         patch("mindroom.bot.config_confirmation.handle_confirmation_reaction", new_callable=AsyncMock) as mock_confirm,
     ):
         await dispatch_reaction_durably(bot, room, reaction_event)
@@ -4348,7 +4380,7 @@ async def test_committed_config_confirmation_resumes_before_changed_reply_permis
         ),
         tmp_path,
     )
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4416,7 +4448,7 @@ async def test_on_media_message_tracks_relay_event_id(tmp_path: Path) -> None:
     config = _test_config(tmp_path, voice_enabled=True)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4507,6 +4539,7 @@ async def test_on_media_message_tracks_relay_event_id(tmp_path: Path) -> None:
             voice_event,
             config,
             runtime_paths_for(config),
+            bot._runtime_view.agent_reply_memberships,
         )
         mock_generate_response.assert_called_once()
 
@@ -4525,7 +4558,7 @@ async def test_on_media_message_no_transcription_still_marks_relayed(tmp_path: P
     config = _test_config(tmp_path, voice_enabled=True)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4617,6 +4650,7 @@ async def test_on_media_message_no_transcription_still_marks_relayed(tmp_path: P
             voice_event,
             config,
             runtime_paths_for(config),
+            bot._runtime_view.agent_reply_memberships,
         )
         mock_generate_response.assert_called_once()
 
@@ -4646,7 +4680,7 @@ async def test_unauthorized_user_cannot_edit_regenerate(tmp_path: Path) -> None:
     )
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -4724,7 +4758,7 @@ async def test_on_media_message_unauthorized_sender_marks_responded(tmp_path: Pa
     config = _test_config(tmp_path, voice_enabled=True)
 
     # Create the bot
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,

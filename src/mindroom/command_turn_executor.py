@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     import structlog
 
     from mindroom.commands.parsing import Command
-    from mindroom.dispatch_handoff import TextDispatchEvent
+    from mindroom.dispatch_handoff import PreparedIngress
     from mindroom.handled_turns import TurnRecord
     from mindroom.hooks import HookMatrixAdmin
     from mindroom.inbound_turn_normalizer import InboundTurnNormalizer
@@ -73,7 +73,7 @@ class CommandTurnExecutor:
     async def execute(
         self,
         room: nio.MatrixRoom,
-        event: TextDispatchEvent,
+        event: PreparedIngress,
         requester_user_id: str,
         command: Command,
         *,
@@ -151,6 +151,7 @@ class CommandTurnExecutor:
             send_response=send_response,
             reload_plugins=reload_plugins,
             responder_candidates_for_room=self.deps.turn_policy.responder_candidates_for_room,
+            agent_reply_memberships=self.deps.runtime.agent_reply_memberships,
         )
         await handle_command(
             context=context,
@@ -270,7 +271,7 @@ class CommandTurnExecutor:
     async def execute_if_owned(
         self,
         room: nio.MatrixRoom,
-        event: TextDispatchEvent,
+        event: PreparedIngress,
         requester_user_id: str,
         command: Command,
         *,

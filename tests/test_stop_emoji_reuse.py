@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path  # noqa: TC003
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
 
-from mindroom.bot import AgentBot
 from mindroom.cancellation import USER_STOP_CANCEL_MSG
 from mindroom.config.main import Config
 from mindroom.handled_turns import TurnRecord
@@ -18,15 +18,19 @@ from mindroom.logging_config import setup_logging
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
 from mindroom.stop import StopManager
-from tests.bot_helpers import dispatch_reaction_durably
+from tests.bot_helpers import dispatch_reaction_durably, make_test_agent_bot
 from tests.conftest import (
     bind_runtime_paths,
     install_send_response_mock,
     orchestrator_runtime_paths,
     runtime_paths_for,
     test_runtime_paths,
+    unwrap_extracted_collaborator,
 )
 from tests.identity_helpers import entity_ids, persist_entity_accounts
+
+if TYPE_CHECKING:
+    from mindroom.bot import AgentBot
 
 
 async def _drain_stop_cleanup(stop_manager: StopManager) -> None:
@@ -81,7 +85,7 @@ async def test_stop_emoji_only_stops_during_generation(tmp_path: Path) -> None:
     config = _stop_test_config(tmp_path)
     agent_user = _stop_test_agent_user(config)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -117,18 +121,19 @@ async def test_stop_emoji_only_stops_during_generation(tmp_path: Path) -> None:
         },
     )
 
-    # Mock interactive.handle_reaction so the test only exercises stop-vs-fallthrough behavior.
-    with patch("mindroom.bot.interactive.handle_reaction") as mock_handle_reaction:
-        mock_handle_reaction.return_value = None
-
+    claim_interactive = AsyncMock(return_value=None)
+    with patch.object(
+        unwrap_extracted_collaborator(bot._journal_dispatcher),
+        "claim_interactive_reaction",
+        new=claim_interactive,
+    ):
         # Case 1: Message is NOT being generated - should handle as interactive
         await dispatch_reaction_durably(bot, room, reaction_event)
 
-        # Should have called interactive.handle_reaction since message wasn't being tracked
-        mock_handle_reaction.assert_called_once()
+        claim_interactive.assert_awaited_once()
 
         # Reset the mock
-        mock_handle_reaction.reset_mock()
+        claim_interactive.reset_mock()
 
         # Case 2: Message IS being generated - should handle as stop button
         # Track a message as being generated
@@ -155,8 +160,7 @@ async def test_stop_emoji_only_stops_during_generation(tmp_path: Path) -> None:
         )
         await dispatch_reaction_durably(bot, room, active_reaction_event)
 
-        # Should NOT have called interactive.handle_reaction since it was handled as stop
-        mock_handle_reaction.assert_not_called()
+        claim_interactive.assert_not_awaited()
         send_response.assert_not_awaited()
 
         # The task should have been cancelled
@@ -169,7 +173,7 @@ async def test_stop_emoji_hard_cancels_and_schedules_agno_cleanup_when_run_id_pr
     config = _stop_test_config(tmp_path)
     agent_user = _stop_test_agent_user(config)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -226,7 +230,7 @@ async def test_stop_emoji_threaded_target_sends_no_acknowledgement(tmp_path: Pat
     config = _stop_test_config(tmp_path)
     agent_user = _stop_test_agent_user(config)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -623,7 +627,7 @@ async def test_stop_emoji_from_agent_falls_through(tmp_path: Path) -> None:
         password="test_password",  # noqa: S106
     )
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -656,9 +660,12 @@ async def test_stop_emoji_from_agent_falls_through(tmp_path: Path) -> None:
         },
     )
 
-    with patch("mindroom.bot.interactive.handle_reaction") as mock_handle_reaction:
-        mock_handle_reaction.return_value = None  # No interactive result
-
+    claim_interactive = AsyncMock(return_value=None)
+    with patch.object(
+        unwrap_extracted_collaborator(bot._journal_dispatcher),
+        "claim_interactive_reaction",
+        new=claim_interactive,
+    ):
         # Track a message as being generated
         task = MagicMock()  # Use MagicMock instead of AsyncMock for the task
         task.done = MagicMock(return_value=False)  # done() is a regular method, not async
@@ -671,8 +678,8 @@ async def test_stop_emoji_from_agent_falls_through(tmp_path: Path) -> None:
         # Process the reaction from an agent
         await dispatch_reaction_durably(bot, room, reaction_event)
 
-        # Should have called interactive.handle_reaction (fell through)
-        mock_handle_reaction.assert_called_once()
+        # Managed-agent reactions cannot answer this agent's interactive prompt.
+        claim_interactive.assert_not_awaited()
 
         # Task should NOT have been cancelled (agents can't stop generation)
         task.cancel.assert_not_called()
@@ -699,7 +706,7 @@ async def test_stop_reaction_blocked_by_reply_permissions(tmp_path: Path) -> Non
     persist_entity_accounts(config, runtime_paths_for(config))
     agent_user = _stop_test_agent_user(config)
 
-    bot = AgentBot(
+    bot = make_test_agent_bot(
         agent_user=agent_user,
         storage_path=tmp_path,
         config=config,
@@ -742,8 +749,7 @@ async def test_stop_reaction_blocked_by_reply_permissions(tmp_path: Path) -> Non
     send_response = AsyncMock()
     install_send_response_mock(bot, send_response)
 
-    with patch("mindroom.bot.is_authorized_sender", return_value=True):
-        await dispatch_reaction_durably(bot, room, reaction_event)
+    await dispatch_reaction_durably(bot, room, reaction_event)
 
     # Task should NOT have been cancelled — sender is disallowed
     task.cancel.assert_not_called()
