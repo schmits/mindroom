@@ -1,1 +1,1 @@
-$(cat outputs/test_dynamic_workflows_updated.py)
+PLACEHOLDER
