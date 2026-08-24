@@ -1,1 +1,1 @@
-PLACEHOLDER
+$(cat content_tool.txt)
