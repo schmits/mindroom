@@ -159,6 +159,23 @@ class DynamicWorkflowPromotionTools(Toolkit):
             ttl_minutes=self._approval_ttl_minutes,
         )
         rollback = _validate_rollback_policy(request.rollback_policy, expected_spec_hash=spec_hash)
+        rollback_authorization = None
+        rollback_authorization_hash = None
+        if rollback.get("authorization_ref") is not None:
+            rollback_authorization = self._read_json_object_artifact(
+                cast("str", rollback["authorization_ref"]),
+                description="rollback authorization",
+            )
+            rollback_authorization_hash = _sha256_json(rollback_authorization)
+            _validate_rollback_authorization(
+                rollback_authorization,
+                rollback,
+                workflow_id=workflow_id,
+                target_scope=request.target_scope,
+                target_ref=request.target_ref,
+                approved_by=request.approved_by,
+                ttl_minutes=self._approval_ttl_minutes,
+            )
         promotion_id = _promotion_id(request.target_scope, request.target_ref, workflow_id)
         promotion_record = _promotion_record(
             promotion_id=promotion_id,
@@ -171,12 +188,12 @@ class DynamicWorkflowPromotionTools(Toolkit):
             approval_hash=approval_hash,
             target=target,
             rollback=rollback,
+            rollback_authorization_hash=rollback_authorization_hash,
             actor=context.agent_name,
             requester_id=context.requester_id,
         )
-        audit_record = _audit_record(promotion_record, action="preflight" if request.preflight or request.dry_run else "apply")
-
         if request.preflight or request.dry_run:
+            audit_record = _audit_record(promotion_record, action="preflight" if request.preflight else "dry_run")
             return {
                 "mode": "dry_run" if request.dry_run else "preflight",
                 "persisted": False,
@@ -188,14 +205,13 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 "message": "Promotion preflight passed; no state was persisted.",
             }
 
-        return self._persist_apply(state_root, promotion_id, promotion_record, audit_record)
+        return self._persist_apply(state_root, promotion_id, promotion_record)
 
     def _persist_apply(
         self,
         state_root: Path,
         promotion_id: str,
         promotion_record: dict[str, object],
-        audit_record: dict[str, object],
     ) -> dict[str, object]:
         with _state_lock(state_root):
             current_path = state_root / "promotions" / f"{promotion_id}.json"
@@ -204,20 +220,39 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 existing_hash = cast("str | None", existing.get("spec_hash"))
                 if existing_hash == promotion_record["spec_hash"] and existing.get("status") == "active":
                     raise ValueError("Approval replay detected: this promotion is already active for the same spec hash and scope.")
+                existing_hash = _sha256_json(existing)
                 if _rollback_is_abuse(cast("dict[str, object]", promotion_record["rollback_policy"]), existing):
                     raise ValueError("Rollback abuse detected: restore/delete actions require previous promotion authorization.")
-                promotion_record["previous_promotion_hash"] = _sha256_json(existing)
+                _validate_rollback_previous_binding(cast("dict[str, object]", promotion_record["rollback_policy"]), existing_hash)
+                promotion_record["previous_promotion_hash"] = existing_hash
             else:
                 promotion_record["previous_promotion_hash"] = None
-            audit_record["previous_promotion_hash"] = promotion_record["previous_promotion_hash"]
+                _validate_rollback_previous_binding(cast("dict[str, object]", promotion_record["rollback_policy"]), None)
+            audit_record = _audit_record(promotion_record, action="apply")
             audit_hash = _sha256_json(audit_record)
             audit_record["audit_hash"] = audit_hash
-            write_json_file_durable(current_path, promotion_record, indent=2, sort_keys=True, trailing_newline=True)
             audit_path = state_root / "audit" / f"{_utc_stamp()}-{promotion_id}-{audit_hash[:12]}.json"
-            write_json_file_durable(audit_path, audit_record, indent=2, sort_keys=True, trailing_newline=True)
+            write_json_file_durable(
+                audit_path,
+                audit_record,
+                indent=2,
+                sort_keys=True,
+                trailing_newline=True,
+                strict_atomic_replace=True,
+            )
             fsync_directory_durable(state_root / "audit")
-            if not current_path.exists() or not audit_path.exists():
-                raise ValueError("Audit failure: promotion or audit record was not durably written.")
+            if not audit_path.exists():
+                raise ValueError("Audit failure: audit record was not durably written.")
+            write_json_file_durable(
+                current_path,
+                promotion_record,
+                indent=2,
+                sort_keys=True,
+                trailing_newline=True,
+                strict_atomic_replace=True,
+            )
+            if not current_path.exists():
+                raise ValueError("Audit failure: promotion record was not durably written.")
         return {
             "mode": "apply",
             "persisted": True,
@@ -484,6 +519,72 @@ def _validate_rollback_policy(policy: dict[str, object], *, expected_spec_hash: 
     return copy.deepcopy(policy)
 
 
+def _validate_rollback_authorization(
+    authorization: dict[str, object],
+    policy: dict[str, object],
+    *,
+    workflow_id: str,
+    target_scope: str,
+    target_ref: str,
+    approved_by: str,
+    ttl_minutes: int,
+) -> None:
+    action = policy.get("action")
+    if action not in {"restore_previous", "tombstone", "delete"}:
+        return
+    if authorization.get("schema_version") != _PROMOTION_SCHEMA_VERSION:
+        raise ValueError("Stale schema: rollback authorization schema_version mismatch.")
+    if authorization.get("status") != "approved":
+        if authorization.get("status") in _REVOKED_APPROVAL_STATUSES:
+            raise ValueError("Rollback authorization is expired, revoked, redacted, denied, or otherwise not active.")
+        raise ValueError("Rollback authorization is not approved.")
+    if authorization.get("redacted") is True or authorization.get("revoked") is True:
+        raise ValueError("Rollback authorization is revoked or redacted.")
+    _require_equal(authorization, "workflow_id", workflow_id, "rollback authorization workflow_id mismatch")
+    _require_equal(authorization, "target_scope", target_scope, "rollback authorization target_scope mismatch")
+    _require_equal(authorization, "target_ref", target_ref, "rollback authorization target_ref mismatch")
+    _require_equal(authorization, "approved_by", approved_by, "rollback authorization approved_by mismatch")
+    authorized_action = authorization.get("rollback_action")
+    authorized_actions = authorization.get("rollback_actions")
+    if authorized_action != action and not (isinstance(authorized_actions, list) and action in authorized_actions):
+        raise ValueError("Rollback authorization action mismatch.")
+    expected_previous = policy.get("expected_previous_promotion_hash")
+    authorized_previous = authorization.get("previous_promotion_hash")
+    if not isinstance(expected_previous, str) or not isinstance(authorized_previous, str):
+        raise ValueError("Rollback authorization requires previous_promotion_hash binding.")
+    if _normalize_hash(authorized_previous, "rollback_authorization.previous_promotion_hash") != _normalize_hash(
+        expected_previous, "rollback_policy.expected_previous_promotion_hash"
+    ):
+        raise ValueError("Rollback authorization previous_promotion_hash mismatch.")
+    event_id = authorization.get("event_id")
+    if not isinstance(event_id, str) or not _MATRIX_EVENT_RE.fullmatch(event_id):
+        raise ValueError("Rollback authorization must include an unambiguous Matrix event_id.")
+    approved_at = _parse_time(cast("str | None", authorization.get("approved_at")))
+    expires_at = _parse_time(cast("str | None", authorization.get("expires_at")))
+    now = datetime.now(UTC)
+    if approved_at is None:
+        raise ValueError("Rollback authorization must include approved_at.")
+    if approved_at > now + timedelta(minutes=5):
+        raise ValueError("Rollback authorization approved_at is in the future.")
+    if now - approved_at > timedelta(minutes=ttl_minutes):
+        raise ValueError("Rollback authorization is expired.")
+    if expires_at is not None and now >= expires_at:
+        raise ValueError("Rollback authorization is expired.")
+
+
+def _validate_rollback_previous_binding(policy: dict[str, object], previous_promotion_hash: str | None) -> None:
+    action = policy.get("action")
+    if action not in {"restore_previous", "tombstone", "delete"}:
+        return
+    expected_previous = policy.get("expected_previous_promotion_hash")
+    if previous_promotion_hash is None:
+        raise ValueError("Rollback action requires an existing active promotion to bind authorization.")
+    if not isinstance(expected_previous, str):
+        raise ValueError("Rollback action requires expected_previous_promotion_hash binding.")
+    if _normalize_hash(expected_previous, "rollback_policy.expected_previous_promotion_hash") != previous_promotion_hash:
+        raise ValueError("rollback_policy expected_previous_promotion_hash mismatch.")
+
+
 def _rollback_is_abuse(policy: dict[str, object], existing: dict[str, object]) -> bool:
     action = policy.get("action")
     if action not in {"restore_previous", "tombstone", "delete"}:
@@ -530,6 +631,7 @@ def _promotion_record(**fields: object) -> dict[str, object]:
         "approved_by": request.approved_by,
         "reason": request.reason,
         "rollback_policy": fields["rollback"],
+        "rollback_authorization_hash": fields["rollback_authorization_hash"],
         "created_at": _iso_now(),
         "created_by": fields["actor"],
         "requester_id": fields["requester_id"],
