@@ -1,1 +1,1 @@
-PLACEHOLDER
+$(cat tmp/dynamic-workflow-promotion-fix-work/plugins/dynamic-workflow-promotion/workflow_promotion_impl.py)
