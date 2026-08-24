@@ -163,7 +163,18 @@ def _parent_ledger_enabled(settings: Mapping[str, object]) -> bool:
 
 
 def _wake_bridge_enabled(settings: Mapping[str, object]) -> bool:
-    return _as_bool(settings.get("wake_bridge_enabled"), default=True)
+    configured = settings.get("wake_bridge_enabled")
+    if configured is not None:
+        return _as_bool(configured, default=False)
+    if not _parent_ledger_enabled(settings):
+        return False
+    return any(
+        (
+            _as_non_empty_string(settings.get("notify_room_id")) is not None,
+            _as_non_empty_string(settings.get("parent_ledger_room_id")) is not None,
+            _as_bool(settings.get("parent_ledger_to_source_room"), default=False),
+        ),
+    )
 
 
 def _mind_mention_mxid(settings: Mapping[str, object]) -> str:
