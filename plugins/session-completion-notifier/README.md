@@ -48,8 +48,7 @@ plugins:
       # Log the payload through the MindRoom logger. Defaults to false.
       log_payload: false
       # Optional Matrix notification sink. If omitted, but parent_ledger_room_id
-      # is configured with parent_ledger_enabled:true, completion wake notifications
-      # are sent to that parent room. With no destination, no Matrix notification is sent.
+      # is configured, completion wake notifications are sent to that parent room.
       notify_room_id: "!ops:example.org"
       notify_thread_id: "$thread"   # optional
       # Or send back to the source room/thread instead of notify_room_id.
@@ -60,6 +59,10 @@ plugins:
       # legacy JSON notifications. Set true to wake for notify/source destinations.
       wake_bridge_enabled: true
       mind_mention_mxid: "@mindroom_mind_mm3j9z5u:mindroom.chat"
+      # Prefer the original sessions_spawn parent thread for wake delivery.
+      # Defaults to true; falls back to notify_room_id/notify_thread_id.
+      prefer_parent_thread_wake: true
+      parent_session_max_entries: 512
       # Optional plugin-local dedupe persisted below ctx.state_root.
       # The state file is bounded, atomically replaced, and process-local locked
       # so duplicate concurrent terminal hooks do not both notify.
@@ -86,7 +89,9 @@ Hook timeouts are set to 1000 ms and normal MindRoom hook execution isolates plu
 
 Wake notifications are intent-gated. With no configured destination (`notify_room_id`, `send_to_source_room:true`, `parent_ledger_room_id`, or `parent_ledger_to_source_room:true`), no Matrix notification is sent. If `wake_bridge_enabled: false` is explicit, the plugin keeps the legacy passive JSON notification body with `trigger_dispatch=False` (or only the passive ledger when no destination is configured). If `wake_bridge_enabled` is omitted, existing explicit operator intent still wakes Mind when `parent_ledger_enabled: true` is combined with a configured notify or parent-ledger destination. Operators may also set `wake_bridge_enabled: true` explicitly for notify/source destinations. The default for `send_to_source_room` remains `false`, so source-room delivery is opt-in.
 
-Wake notifications use a data-minimized plaintext body that explicitly mentions `@mindroom_mind_mm3j9z5u:mindroom.chat` and includes only resumable correlation metadata such as status, agent, room/thread IDs, source/response event IDs, correlation ID, response kind, delivery kind, and failure reason. The hook sends these with `trigger_dispatch=True` so Mind can resume from a configured parent/notify thread or room. The full minimized payload is also attached as `mindroom.session_completion` extra content for machine readers. Response text is not included in the wake body or persisted plugin state; `include_response_text` and `log_payload` both default to `false`.
+Wake notifications use a data-minimized plaintext body that explicitly mentions `@mindroom_mind_mm3j9z5u:mindroom.chat` and includes only resumable correlation metadata such as status, agent, room/thread IDs, source/response event IDs, correlation ID, response kind, delivery kind, and failure reason. The hook sends these with `trigger_dispatch=True` so Mind can resume from the recorded parent thread or a configured notify/parent thread or room. The full minimized payload is also attached as `mindroom.session_completion` extra content for machine readers. Response text is not included in the wake body or persisted plugin state; `include_response_text` and `log_payload` both default to `false`.
+
+When `prefer_parent_thread_wake` is true (default), the plugin first tries to wake the original parent context that called `sessions_spawn`. It records only bounded plugin-local routing state in `parent_sessions.json`: child session key, parent room ID, parent thread ID, target agent, and timestamps. Completion notifications for that child session are sent to the recorded parent room/thread. If no mapping exists, the plugin falls back to `notify_room_id`/`notify_thread_id`, then source-room or parent-ledger destinations only when those explicit settings are enabled. This state is stored under runtime plugin state outside the watched plugin source tree and never includes response text.
 
 ## Parent ledger bridge
 

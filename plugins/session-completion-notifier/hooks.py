@@ -11,6 +11,7 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import time
@@ -18,9 +19,11 @@ from time import time
 from mindroom.hooks import (
     EVENT_MESSAGE_AFTER_RESPONSE,
     EVENT_MESSAGE_CANCELLED,
+    EVENT_TOOL_AFTER_CALL,
     AfterResponseContext,
     CancelledResponseContext,
     MessageEnvelope,
+    ToolAfterCallContext,
     hook,
 )
 
@@ -36,6 +39,8 @@ _PARENT_LEDGER_STATE_EVENT_TYPE = "mindroom.session_completion.ledger"
 _PARENT_LEDGER_STATE_VERSION = 1
 _DEFAULT_PARENT_LEDGER_MAX_ENTRIES = 256
 _DEFAULT_MIND_MENTION_MXID = "@mindroom_mind_mm3j9z5u:mindroom.chat"
+_PARENT_SESSIONS_FILE = "parent_sessions.json"
+_DEFAULT_PARENT_SESSION_MAX_ENTRIES = 512
 
 
 def _as_bool(value: object, *, default: bool = False) -> bool:
@@ -161,11 +166,15 @@ def _wake_bridge_enabled(settings: Mapping[str, object]) -> bool:
     configured = settings.get("wake_bridge_enabled")
     if configured is not None:
         return _as_bool(configured, default=False)
-    # Backward-compatible intent gate: existing deployments that explicitly
-    # enabled the parent ledger and configured a Matrix destination should wake
-    # Mind without requiring a new flag, while passive notify-only deployments
-    # keep the prior non-dispatching JSON notification unless opted in.
-    return _parent_ledger_enabled(settings)
+    if not _parent_ledger_enabled(settings):
+        return False
+    return any(
+        (
+            _as_non_empty_string(settings.get("notify_room_id")) is not None,
+            _as_non_empty_string(settings.get("parent_ledger_room_id")) is not None,
+            _as_bool(settings.get("parent_ledger_to_source_room"), default=False),
+        ),
+    )
 
 
 def _mind_mention_mxid(settings: Mapping[str, object]) -> str:
@@ -197,7 +206,7 @@ def _plugin_source_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _safe_state_root(ctx: AfterResponseContext | CancelledResponseContext) -> Path:
+def _safe_state_root(ctx: AfterResponseContext | CancelledResponseContext | ToolAfterCallContext) -> Path:
     """Return plugin state outside this plugin source tree, even for misbased runtime state."""
     source_root = _plugin_source_root()
     candidate = ctx.state_root.resolve()
@@ -475,17 +484,130 @@ async def _mark_seen(ctx: AfterResponseContext | CancelledResponseContext, paylo
     return False
 
 
-def _notification_destination(
+def _parent_sessions_path(ctx: AfterResponseContext | CancelledResponseContext | ToolAfterCallContext) -> Path:
+    return _safe_state_root(ctx) / _PARENT_SESSIONS_FILE
+
+
+def _coerce_parent_sessions(raw: object) -> dict[str, dict[str, object]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    raw_sessions = raw.get("sessions")
+    if not isinstance(raw_sessions, Mapping):
+        return {}
+    sessions: dict[str, dict[str, object]] = {}
+    allowed_fields = {"room_id", "thread_id", "agent", "first_seen_at", "updated_at"}
+    for key, value in raw_sessions.items():
+        if not isinstance(key, str) or not key or not isinstance(value, Mapping):
+            continue
+        room_id = _as_non_empty_string(value.get("room_id"))
+        if room_id is None:
+            continue
+        entry = {field: value[field] for field in allowed_fields if field in value}
+        entry["room_id"] = room_id
+        thread_id = _as_non_empty_string(value.get("thread_id"))
+        entry["thread_id"] = thread_id
+        sessions[key] = entry
+    return sessions
+
+
+def _load_parent_sessions(path: Path) -> dict[str, dict[str, object]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return _coerce_parent_sessions(raw)
+
+
+def _bounded_parent_sessions(
+    sessions: dict[str, dict[str, object]],
+    *,
+    max_entries: int,
+) -> dict[str, dict[str, object]]:
+    if len(sessions) <= max_entries:
+        return sessions
+
+    def updated_at(item: tuple[str, dict[str, object]]) -> float:
+        value = item[1].get("updated_at")
+        return float(value) if isinstance(value, int | float) else 0.0
+
+    return dict(sorted(sessions.items(), key=updated_at)[-max_entries:])
+
+
+async def _record_parent_session_mapping(ctx: ToolAfterCallContext, session_key: str, target_agent: str | None) -> None:
+    room_id = _as_non_empty_string(ctx.room_id)
+    if room_id is None:
+        return
+    max_entries = _as_positive_int(
+        ctx.settings.get("parent_session_max_entries"),
+        default=_DEFAULT_PARENT_SESSION_MAX_ENTRIES,
+    )
+    try:
+        path = _parent_sessions_path(ctx)
+        async with await _dedupe_lock(path):
+            now = time()
+            sessions = _load_parent_sessions(path)
+            existing = sessions.get(session_key, {})
+            first_seen_at = existing.get("first_seen_at")
+            sessions[session_key] = {
+                "room_id": room_id,
+                "thread_id": _as_non_empty_string(ctx.thread_id),
+                "agent": target_agent,
+                "first_seen_at": float(first_seen_at) if isinstance(first_seen_at, int | float) else now,
+                "updated_at": now,
+            }
+            content = {
+                "version": 1,
+                "updated_at": now,
+                "sessions": _bounded_parent_sessions(sessions, max_entries=max_entries),
+            }
+            _write_json_state(path, content)
+    except Exception as exc:  # pragma: no cover - defensive isolation around plugin-local state.
+        ctx.logger.warning("Session completion parent-session state unavailable", error=str(exc))
+
+
+def _parent_session_entry(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    envelope: MessageEnvelope,
+) -> Mapping[str, object] | None:
+    entry = _load_parent_sessions(_parent_sessions_path(ctx)).get(envelope.target.session_id)
+    return entry if isinstance(entry, Mapping) else None
+
+
+def _parent_destination(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    envelope: MessageEnvelope,
+) -> _NotificationDestination | None:
+    if not _as_bool(ctx.settings.get("prefer_parent_thread_wake"), default=True):
+        return None
+    entry = _parent_session_entry(ctx, envelope)
+    if entry is None:
+        return None
+    room_id = _as_non_empty_string(entry.get("room_id"))
+    if room_id is None:
+        return None
+    return _NotificationDestination(
+        room_id=room_id,
+        thread_id=_as_non_empty_string(entry.get("thread_id")),
+        source="parent_session_state",
+    )
+
+
+def _fallback_notification_destination(
     settings: Mapping[str, object],
     envelope: MessageEnvelope,
-) -> tuple[str, str | None] | None:
+) -> _NotificationDestination | None:
     room_id = settings.get("notify_room_id")
     send_to_source = _as_bool(settings.get("send_to_source_room"), default=False)
+    source = "notify_room"
     if not isinstance(room_id, str) or not room_id.strip():
         if send_to_source:
             room_id = envelope.room_id
+            source = "source_room"
         elif _parent_ledger_enabled(settings):
             room_id = _parent_ledger_room_id(settings, envelope)
+            source = "parent_ledger_room"
         else:
             room_id = None
     if room_id is None:
@@ -495,7 +617,21 @@ def _notification_destination(
     thread_id = configured_thread.strip() if isinstance(configured_thread, str) and configured_thread.strip() else None
     if thread_id is None and send_to_source:
         thread_id = envelope.target.resolved_thread_id
-    return room_id.strip(), thread_id
+    return _NotificationDestination(room_id=room_id.strip(), thread_id=thread_id, source=source)
+
+
+def _notification_destination(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    envelope: MessageEnvelope,
+) -> _NotificationDestination | None:
+    return _parent_destination(ctx, envelope) or _fallback_notification_destination(ctx.settings, envelope)
+
+
+@dataclass(frozen=True, slots=True)
+class _NotificationDestination:
+    room_id: str
+    thread_id: str | None
+    source: str
 
 
 def _wake_notification_text(settings: Mapping[str, object], payload: Mapping[str, object]) -> str:
@@ -519,10 +655,9 @@ async def _emit_notification(
     if _as_bool(ctx.settings.get("log_payload"), default=False):
         ctx.logger.info("Session completion notification", payload=payload)
 
-    destination = _notification_destination(ctx.settings, envelope)
+    destination = _notification_destination(ctx, envelope)
     if destination is None:
         return
-    room_id, thread_id = destination
 
     wake_bridge_enabled = _wake_bridge_enabled(ctx.settings)
     text = (
@@ -533,14 +668,36 @@ async def _emit_notification(
 
     try:
         await ctx.send_message(
-            room_id,
+            destination.room_id,
             text,
-            thread_id=thread_id,
-            extra_content={"mindroom.session_completion": payload},
+            thread_id=destination.thread_id,
+            extra_content={
+                "mindroom.session_completion": payload,
+                "mindroom.session_completion_destination": destination.source,
+            },
             trigger_dispatch=wake_bridge_enabled,
         )
     except Exception as exc:  # pragma: no cover - defensive isolation around transport adapters.
         ctx.logger.warning("Session completion notification send failed", error=str(exc), payload=payload)
+
+
+@hook(EVENT_TOOL_AFTER_CALL, name="record_parent_session_spawn", timeout_ms=300)
+async def record_parent_session_spawn(ctx: ToolAfterCallContext) -> None:
+    """Record the parent thread for subagent sessions spawned from this context."""
+    if not _enabled(ctx.settings) or ctx.blocked or ctx.error is not None or ctx.tool_name != "sessions_spawn":
+        return
+    if not isinstance(ctx.result, str):
+        return
+    try:
+        result = json.loads(ctx.result)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(result, Mapping) or result.get("status") != "ok":
+        return
+    session_key = _as_non_empty_string(result.get("session_key"))
+    if session_key is None:
+        return
+    await _record_parent_session_mapping(ctx, session_key, _as_non_empty_string(result.get("target_agent")))
 
 
 @hook(EVENT_MESSAGE_AFTER_RESPONSE, name="notify_after_response", timeout_ms=1000)
@@ -565,6 +722,7 @@ __all__ = [
     "_completed_payload",
     "_ledger_summary",
     "_safe_state_root",
+    "record_parent_session_spawn",
     "notify_after_response",
     "notify_cancelled_response",
 ]
