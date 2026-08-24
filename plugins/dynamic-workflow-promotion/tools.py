@@ -58,6 +58,14 @@ if TYPE_CHECKING:
             default=1440,
             description="Maximum approval age accepted by apply operations.",
         ),
+        ConfigField(
+            name="self_actor_ids",
+            label="Self Actor IDs",
+            type="string[]",
+            required=False,
+            default=[],
+            description="Optional acting agent Matrix IDs/names that must not approve their own promotions.",
+        ),
     ],
     agent_override_fields=[
         ConfigField(
@@ -91,6 +99,14 @@ if TYPE_CHECKING:
             required=False,
             default=1440,
             description="Per-agent approval TTL.",
+        ),
+        ConfigField(
+            name="self_actor_ids",
+            label="Self Actor IDs",
+            type="string[]",
+            required=False,
+            default=[],
+            description="Per-agent acting Matrix IDs/names that must not approve their own promotions.",
         ),
     ],
     dependencies=[],
