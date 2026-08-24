@@ -77,11 +77,13 @@ class DynamicWorkflowPromotionTools(Toolkit):
         allowed_artifact_roots: list[str] | str | None = None,
         allowed_approvers: list[str] | str | None = None,
         approval_ttl_minutes: int = 1440,
+        self_actor_ids: list[str] | str | None = None,
     ) -> None:
         self._state_root_override = state_root
         self._allowed_artifact_roots = _normalize_roots(allowed_artifact_roots)
         self._allowed_approvers = frozenset(_normalize_string_list(allowed_approvers))
         self._approval_ttl_minutes = _validate_ttl(approval_ttl_minutes)
+        self._self_actor_ids = frozenset(_normalize_string_list(self_actor_ids))
         super().__init__(name="dynamic_workflow_promotion", tools=[self.promote_dynamic_workflow_spec])
 
     def promote_dynamic_workflow_spec(
@@ -122,7 +124,7 @@ class DynamicWorkflowPromotionTools(Toolkit):
         context = get_tool_runtime_context()
         if context is None:
             raise ValueError("Dynamic Workflow promotion requires an active tool runtime context.")
-        if request.approved_by == context.requester_id or request.approved_by == context.agent_name:
+        if _is_self_approval(request.approved_by, context, configured_self_actor_ids=self._self_actor_ids):
             raise ValueError("Self-promotion is not allowed.")
         if self._allowed_approvers and request.approved_by not in self._allowed_approvers:
             raise ValueError("Approval evidence approver is not allowed for this promotion tool configuration.")
@@ -653,8 +655,31 @@ def _audit_record(promotion_record: dict[str, object], *, action: str) -> dict[s
         "approved_by": promotion_record["approved_by"],
         "reason": promotion_record["reason"],
         "operation_id": promotion_record["operation_id"],
+        "created_by": promotion_record.get("created_by"),
+        "requester_id": promotion_record.get("requester_id"),
         "recorded_at": _iso_now(),
     }
+
+
+def _actor_self_approval_ids(context: object, *, configured_self_actor_ids: frozenset[str]) -> set[str]:
+    identities = set(configured_self_actor_ids)
+    for attr in (
+        "agent_name",
+        "agent_id",
+        "actor_id",
+        "actor_name",
+        "matrix_id",
+        "user_id",
+        "sender_id",
+    ):
+        value = getattr(context, attr, None)
+        if isinstance(value, str) and value.strip():
+            identities.add(value.strip())
+    return identities
+
+
+def _is_self_approval(approved_by: str, context: object, *, configured_self_actor_ids: frozenset[str]) -> bool:
+    return approved_by in _actor_self_approval_ids(context, configured_self_actor_ids=configured_self_actor_ids)
 
 
 def _require_equal(data: dict[str, object], key: str, expected: object, message: str) -> None:

@@ -236,16 +236,55 @@ def test_dry_run_and_preflight_validate_without_persisting(tmp_path: Path) -> No
     assert not (tmp_path / "state" / "audit").exists()
 
 
-def test_self_promotion_fails_closed(tmp_path: Path) -> None:
+def test_delegated_human_approval_matching_requester_passes_for_agent_builder(tmp_path: Path) -> None:
     refs = _write_artifacts(tmp_path, approved_by="@requester:example.org")
-    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
+    state = tmp_path / "state"
+    tool = DynamicWorkflowPromotionTools(state_root=str(state), allowed_artifact_roots=[str(tmp_path)])
 
-    with _runtime_context(tmp_path):
+    with _runtime_context(tmp_path, agent_name="Agent Builder"):
         payload = _call(tool, refs, approved_by="@requester:example.org")
+
+    data = json.loads(payload)
+    assert data["status"] == "ok"
+    promotion = json.loads(Path(data["promotion_record_ref"]).read_text(encoding="utf-8"))
+    assert promotion["approved_by"] == "@requester:example.org"
+    assert promotion["requester_id"] == "@requester:example.org"
+    assert promotion["created_by"] == "Agent Builder"
+
+
+def test_acting_agent_self_approval_fails_closed(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, approved_by="@agent-builder:example.org")
+    tool = DynamicWorkflowPromotionTools(
+        state_root=str(tmp_path / "state"),
+        allowed_artifact_roots=[str(tmp_path)],
+        self_actor_ids=["@agent-builder:example.org"],
+    )
+
+    with _runtime_context(tmp_path, agent_name="Agent Builder", agent_id="@agent-builder:example.org"):
+        payload = _call(tool, refs, approved_by="@agent-builder:example.org")
 
     data = json.loads(payload)
     assert data["status"] == "error"
     assert "Self-promotion" in data["message"]
+
+
+def test_audit_records_requester_approver_and_promoter(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, approved_by="@requester:example.org")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
+
+    with _runtime_context(tmp_path, agent_name="Agent Builder", agent_id="@agent-builder:example.org"):
+        payload = _call(tool, refs, approved_by="@requester:example.org")
+
+    data = json.loads(payload)
+    assert data["status"] == "ok"
+    promotion = json.loads(Path(data["promotion_record_ref"]).read_text(encoding="utf-8"))
+    audit = json.loads(Path(data["audit_record_ref"]).read_text(encoding="utf-8"))
+    assert promotion["approved_by"] == "@requester:example.org"
+    assert promotion["requester_id"] == "@requester:example.org"
+    assert promotion["created_by"] == "Agent Builder"
+    assert audit["approved_by"] == "@requester:example.org"
+    assert audit["requester_id"] == "@requester:example.org"
+    assert audit["created_by"] == "Agent Builder"
 
 
 def _call(
@@ -363,11 +402,19 @@ def _sha256_file(path: Path) -> str:
 
 
 class _runtime_context:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        requester_id: str = "@requester:example.org",
+        agent_name: str = "Toolsmith",
+        agent_id: str | None = None,
+    ) -> None:
         self._manager = None
         self._context = SimpleNamespace(
-            requester_id="@requester:example.org",
-            agent_name="Toolsmith",
+            requester_id=requester_id,
+            agent_name=agent_name,
+            agent_id=agent_id,
             runtime_paths=SimpleNamespace(storage_root=tmp_path / "runtime"),
         )
 
