@@ -65,7 +65,50 @@ def test_apply_persists_promotion_and_audit(tmp_path: Path) -> None:
     assert promotion["workflow_id"] == "review_flow"
     assert promotion["spec_hash"] == refs["spec_hash"]
     assert audit["promotion_id"] == promotion["promotion_id"]
+    assert audit["record_hash"] == _sha256_json(promotion)
+    assert "previous_promotion_hash" in promotion
     assert "record" not in audit
+
+
+def test_audit_write_failure_does_not_publish_active_promotion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    refs = _write_artifacts(tmp_path)
+    state = tmp_path / "state"
+    tool = DynamicWorkflowPromotionTools(state_root=str(state), allowed_artifact_roots=[str(tmp_path)])
+
+    def fail_audit(path: Path, *_args: object, **_kwargs: object) -> None:
+        if path.parent.name == "audit":
+            raise OSError("simulated audit fsync failure")
+        raise AssertionError("promotion write must not run before durable audit succeeds")
+
+    monkeypatch.setattr(_MODULE, "write_json_file_durable", fail_audit)
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "simulated audit fsync failure" in data["message"]
+    assert not (state / "promotions").exists()
+
+
+def test_audit_directory_fsync_failure_does_not_publish_active_promotion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    refs = _write_artifacts(tmp_path)
+    state = tmp_path / "state"
+    tool = DynamicWorkflowPromotionTools(state_root=str(state), allowed_artifact_roots=[str(tmp_path)])
+
+    def fail_audit_dir(path: Path) -> None:
+        if path.name == "audit":
+            raise OSError("simulated audit directory fsync failure")
+
+    monkeypatch.setattr(_MODULE, "fsync_directory_durable", fail_audit_dir)
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "simulated audit directory fsync failure" in data["message"]
+    assert not (state / "promotions").exists()
 
 
 def test_expected_hash_mismatch_fails_closed(tmp_path: Path) -> None:
@@ -109,6 +152,90 @@ def test_forbidden_workflow_tool_fails_closed(tmp_path: Path) -> None:
     assert "Forbidden Dynamic Workflow tool grant" in data["message"]
 
 
+def test_expired_revoked_and_redacted_approvals_fail_closed(tmp_path: Path) -> None:
+    cases = [
+        {"approved_at": (datetime.now(UTC) - timedelta(days=2)).isoformat().replace("+00:00", "Z")},
+        {"status": "revoked"},
+        {"status": "approved", "redacted": True},
+    ]
+    for idx, approval_overrides in enumerate(cases):
+        case_dir = tmp_path / f"case-{idx}"
+        case_dir.mkdir()
+        refs = _write_artifacts(case_dir, approval_overrides=approval_overrides)
+        tool = DynamicWorkflowPromotionTools(state_root=str(case_dir / "state"), allowed_artifact_roots=[str(case_dir)])
+
+        with _runtime_context(case_dir):
+            payload = _call(tool, refs)
+
+        data = json.loads(payload)
+        assert data["status"] == "error"
+        assert "expired" in data["message"] or "revoked" in data["message"] or "redacted" in data["message"]
+        assert not (case_dir / "state" / "promotions").exists()
+
+
+def test_rollback_authorization_requires_fresh_bound_non_revoked_evidence(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    refs = _write_artifacts(tmp_path)
+    tool = DynamicWorkflowPromotionTools(state_root=str(state), allowed_artifact_roots=[str(tmp_path)])
+
+    with _runtime_context(tmp_path):
+        first = json.loads(_call(tool, refs))
+    assert first["status"] == "ok"
+    previous_hash = _sha256_json(json.loads(Path(first["promotion_record_ref"]).read_text(encoding="utf-8")))
+
+    next_spec = dict(WORKFLOW_SPEC, name="Review Flow v2")
+    next_refs = _write_artifacts(tmp_path / "next", spec=next_spec)
+    auth_ref = _write_rollback_authorization(tmp_path / "next", previous_hash=previous_hash)
+    rollback_policy = {
+        "action": "restore_previous",
+        "expected_spec_hash": next_refs["spec_hash"],
+        "authorization_ref": auth_ref,
+        "expected_previous_promotion_hash": previous_hash,
+    }
+    with _runtime_context(tmp_path):
+        second = json.loads(_call(tool, next_refs, rollback_policy=rollback_policy))
+    assert second["status"] == "ok"
+
+    revoked_refs = _write_artifacts(tmp_path / "revoked", spec=dict(WORKFLOW_SPEC, name="Review Flow v3"))
+    revoked_auth = _write_rollback_authorization(
+        tmp_path / "revoked",
+        previous_hash=_sha256_json(json.loads(Path(second["promotion_record_ref"]).read_text(encoding="utf-8"))),
+        overrides={"status": "revoked"},
+    )
+    revoked_policy = {
+        "action": "delete",
+        "expected_spec_hash": revoked_refs["spec_hash"],
+        "authorization_ref": revoked_auth,
+        "expected_previous_promotion_hash": _sha256_json(json.loads(Path(second["promotion_record_ref"]).read_text(encoding="utf-8"))),
+    }
+    with _runtime_context(tmp_path):
+        revoked = json.loads(_call(tool, revoked_refs, rollback_policy=revoked_policy))
+    assert revoked["status"] == "error"
+    assert "Rollback authorization" in revoked["message"]
+
+
+def test_dry_run_and_preflight_validate_without_persisting(tmp_path: Path) -> None:
+    bad_refs = _write_artifacts(tmp_path / "bad", approval_overrides={"target_ref": "!other:example.org"})
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
+
+    with _runtime_context(tmp_path):
+        dry_run_bad = json.loads(_call(tool, bad_refs, dry_run=True))
+    assert dry_run_bad["status"] == "error"
+    assert "target_ref mismatch" in dry_run_bad["message"]
+    assert not (tmp_path / "state" / "promotions").exists()
+
+    refs = _write_artifacts(tmp_path / "good")
+    with _runtime_context(tmp_path):
+        dry_run_ok = json.loads(_call(tool, refs, dry_run=True))
+        preflight_ok = json.loads(_call(tool, refs, preflight=True))
+    assert dry_run_ok["status"] == "ok"
+    assert dry_run_ok["mode"] == "dry_run"
+    assert preflight_ok["status"] == "ok"
+    assert preflight_ok["mode"] == "preflight"
+    assert not (tmp_path / "state" / "promotions").exists()
+    assert not (tmp_path / "state" / "audit").exists()
+
+
 def test_self_promotion_fails_closed(tmp_path: Path) -> None:
     refs = _write_artifacts(tmp_path, approved_by="@requester:example.org")
     tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
@@ -127,6 +254,8 @@ def _call(
     *,
     approved_by: str = "@approver:example.org",
     preflight: bool = False,
+    dry_run: bool = False,
+    rollback_policy: dict[str, object] | None = None,
 ) -> str:
     return tool.promote_dynamic_workflow_spec(
         workflow_spec_ref=refs["spec_ref"],
@@ -136,9 +265,9 @@ def _call(
         approved_by=approved_by,
         approval_evidence_ref=refs["approval_ref"],
         expected_spec_hash=refs["spec_hash"],
-        dry_run=False,
+        dry_run=dry_run,
         preflight=preflight,
-        rollback_policy={"action": "disable", "expected_spec_hash": refs["spec_hash"]},
+        rollback_policy=rollback_policy or {"action": "disable", "expected_spec_hash": refs["spec_hash"]},
         reason="approved narrow promotion",
     )
 
@@ -148,7 +277,9 @@ def _write_artifacts(
     *,
     spec: dict[str, object] | None = None,
     approved_by: str = "@approver:example.org",
+    approval_overrides: dict[str, object] | None = None,
 ) -> dict[str, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     workflow_spec = spec or WORKFLOW_SPEC
     spec_path = tmp_path / "workflow.json"
     _write_json(spec_path, workflow_spec)
@@ -174,6 +305,8 @@ def _write_artifacts(
         "approved_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
         "reason": "approved narrow promotion",
     }
+    if approval_overrides:
+        approval.update(approval_overrides)
     validation_path = tmp_path / "validation.json"
     approval_path = tmp_path / "approval.json"
     _write_json(validation_path, validation)
@@ -186,8 +319,41 @@ def _write_artifacts(
     }
 
 
+def _write_rollback_authorization(
+    directory: Path,
+    *,
+    previous_hash: str,
+    overrides: dict[str, object] | None = None,
+) -> str:
+    authorization = {
+        "schema_version": 1,
+        "status": "approved",
+        "workflow_id": "review_flow",
+        "target_scope": "room",
+        "target_ref": "!room:example.org",
+        "approved_by": "@approver:example.org",
+        "event_id": "$rollback:example.org",
+        "approved_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        "rollback_actions": ["restore_previous", "tombstone", "delete"],
+        "previous_promotion_hash": previous_hash,
+    }
+    if overrides:
+        authorization.update(overrides)
+    path = directory / "rollback-authorization.json"
+    _write_json(path, authorization)
+    return str(path)
+
+
 def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _sha256_json(data: object) -> str:
+    import hashlib
+
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
