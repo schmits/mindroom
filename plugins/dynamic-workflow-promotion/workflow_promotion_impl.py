@@ -34,23 +34,11 @@ _MATRIX_USER_RE = re.compile(r"^@[A-Za-z0-9_.=/-]+:[A-Za-z0-9.-]+$")
 _MATRIX_ROOM_RE = re.compile(r"^![^:]+:[A-Za-z0-9.-]+$")
 _MATRIX_EVENT_RE = re.compile(r"^\$[^:]+:[A-Za-z0-9.-]+$")
 _HASH_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
-_FORBIDDEN_WORKFLOW_TOOLS = frozenset(
-    {
-        "claude_agent",
-        "config_manager",
-        "delegate",
-        "dynamic_tools",
-        "dynamic_workflow",
-        "dynamic_workflow_promotion",
-        "github",
-        "invite_router",
-        "memory",
-        "repo_workspace",
-        "scheduler",
-        "self_config",
-        "subagents",
-    }
-)
+_FORBIDDEN_WORKFLOW_TOOLS = frozenset({
+    "claude_agent", "config_manager", "delegate", "dynamic_tools", "dynamic_workflow",
+    "dynamic_workflow_promotion", "github", "invite_router", "memory", "repo_workspace",
+    "scheduler", "self_config", "subagents",
+})
 
 
 @dataclass(frozen=True)
@@ -100,7 +88,6 @@ class DynamicWorkflowPromotionTools(Toolkit):
         rollback_policy: dict[str, Any],
         reason: str,
     ) -> str:
-        """Promote one validated Dynamic Workflow spec with hash-bound approval evidence."""
         try:
             request = _promotion_input(
                 workflow_spec_ref=workflow_spec_ref,
@@ -115,10 +102,9 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 rollback_policy=rollback_policy,
                 reason=reason,
             )
-            result = self._promote(request)
+            return _payload("ok", **self._promote(request))
         except (OSError, ValueError, DynamicWorkflowError) as exc:
             return _payload("error", message=str(exc))
-        return _payload("ok", **result)
 
     def _promote(self, request: PromotionInput) -> dict[str, object]:
         context = get_tool_runtime_context()
@@ -141,10 +127,10 @@ class DynamicWorkflowPromotionTools(Toolkit):
         _validate_workflow_tools(validated_spec, runtime_paths=context.runtime_paths)
         validation_artifact = self._read_json_object_artifact(request.validated_artifact_ref, description="validation artifact")
         approval_evidence = self._read_json_object_artifact(request.approval_evidence_ref, description="approval evidence")
-        validation_hash = _sha256_json(validation_artifact)
-        approval_hash = _sha256_json(approval_evidence)
         target = _target_identity(request.target_scope, request.target_ref)
         workflow_id = str(validated_spec["id"])
+        validation_hash = _sha256_json(validation_artifact)
+        approval_hash = _sha256_json(approval_evidence)
 
         _validate_validation_artifact(
             validation_artifact,
@@ -165,16 +151,12 @@ class DynamicWorkflowPromotionTools(Toolkit):
             ttl_minutes=self._approval_ttl_minutes,
         )
         rollback = _validate_rollback_policy(request.rollback_policy, expected_spec_hash=spec_hash)
-        rollback_authorization = None
         rollback_authorization_hash = None
         if rollback.get("authorization_ref") is not None:
-            rollback_authorization = self._read_json_object_artifact(
-                cast("str", rollback["authorization_ref"]),
-                description="rollback authorization",
-            )
-            rollback_authorization_hash = _sha256_json(rollback_authorization)
+            authorization = self._read_json_object_artifact(cast("str", rollback["authorization_ref"]), description="rollback authorization")
+            rollback_authorization_hash = _sha256_json(authorization)
             _validate_rollback_authorization(
-                rollback_authorization,
+                authorization,
                 rollback,
                 workflow_id=workflow_id,
                 target_scope=request.target_scope,
@@ -210,21 +192,14 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 "audit_hash": _sha256_json(audit_record),
                 "message": "Promotion preflight passed; no state was persisted.",
             }
-
         return self._persist_apply(state_root, promotion_id, promotion_record)
 
-    def _persist_apply(
-        self,
-        state_root: Path,
-        promotion_id: str,
-        promotion_record: dict[str, object],
-    ) -> dict[str, object]:
+    def _persist_apply(self, state_root: Path, promotion_id: str, promotion_record: dict[str, object]) -> dict[str, object]:
         with _state_lock(state_root):
             current_path = state_root / "promotions" / f"{promotion_id}.json"
             existing = _load_json_object(current_path) if current_path.exists() else None
             if existing is not None:
-                existing_hash = cast("str | None", existing.get("spec_hash"))
-                if existing_hash == promotion_record["spec_hash"] and existing.get("status") == "active":
+                if existing.get("spec_hash") == promotion_record["spec_hash"] and existing.get("status") == "active":
                     raise ValueError("Approval replay detected: this promotion is already active for the same spec hash and scope.")
                 existing_hash = _sha256_json(existing)
                 if _rollback_is_abuse(cast("dict[str, object]", promotion_record["rollback_policy"]), existing):
@@ -238,25 +213,11 @@ class DynamicWorkflowPromotionTools(Toolkit):
             audit_hash = _sha256_json(audit_record)
             audit_record["audit_hash"] = audit_hash
             audit_path = state_root / "audit" / f"{_utc_stamp()}-{promotion_id}-{audit_hash[:12]}.json"
-            write_json_file_durable(
-                audit_path,
-                audit_record,
-                indent=2,
-                sort_keys=True,
-                trailing_newline=True,
-                strict_atomic_replace=True,
-            )
+            write_json_file_durable(audit_path, audit_record, indent=2, sort_keys=True, trailing_newline=True, strict_atomic_replace=True)
             fsync_directory_durable(state_root / "audit")
             if not audit_path.exists():
                 raise ValueError("Audit failure: audit record was not durably written.")
-            write_json_file_durable(
-                current_path,
-                promotion_record,
-                indent=2,
-                sort_keys=True,
-                trailing_newline=True,
-                strict_atomic_replace=True,
-            )
+            write_json_file_durable(current_path, promotion_record, indent=2, sort_keys=True, trailing_newline=True, strict_atomic_replace=True)
             if not current_path.exists():
                 raise ValueError("Audit failure: promotion record was not durably written.")
         return {
@@ -282,26 +243,11 @@ class DynamicWorkflowPromotionTools(Toolkit):
         context = get_tool_runtime_context()
         if context is None:
             raise ValueError("Dynamic Workflow promotion requires an active tool runtime context.")
-        data, _bytes, _digest = self._read_json_artifact(
-            artifact_ref,
-            description=description,
-            storage_root=context.runtime_paths.storage_root,
-        )
+        data, _bytes, _digest = self._read_json_artifact(artifact_ref, description=description, storage_root=context.runtime_paths.storage_root)
         return data
 
-    def _read_json_artifact(
-        self,
-        artifact_ref: str,
-        *,
-        description: str,
-        storage_root: Path,
-    ) -> tuple[dict[str, object], bytes, str]:
-        path = _resolve_artifact_ref(
-            artifact_ref,
-            self._allowed_artifact_roots,
-            storage_root=storage_root,
-            description=description,
-        )
+    def _read_json_artifact(self, artifact_ref: str, *, description: str, storage_root: Path) -> tuple[dict[str, object], bytes, str]:
+        path = _resolve_artifact_ref(artifact_ref, self._allowed_artifact_roots, storage_root=storage_root, description=description)
         raw = path.read_bytes()
         try:
             parsed = json.loads(raw.decode("utf-8"))
@@ -318,29 +264,16 @@ def _payload(status: str, **fields: object) -> str:
 
 def _promotion_input(**kwargs: object) -> PromotionInput:
     required = (
-        "workflow_spec_ref",
-        "validated_artifact_ref",
-        "target_scope",
-        "target_ref",
-        "approved_by",
-        "approval_evidence_ref",
-        "expected_spec_hash",
-        "dry_run",
-        "preflight",
-        "rollback_policy",
-        "reason",
+        "workflow_spec_ref", "validated_artifact_ref", "target_scope", "target_ref", "approved_by",
+        "approval_evidence_ref", "expected_spec_hash", "dry_run", "preflight", "rollback_policy", "reason",
     )
     for field in required:
         if field not in kwargs:
             raise ValueError(f"Missing required promotion input '{field}'.")
     text_fields = {field: _required_ref_text(cast("str", kwargs[field]), field) for field in required[:7]}
-    reason = _required_reason(cast("str", kwargs["reason"]))
-    if len(reason) < 8:
-        raise ValueError("Promotion reason must be at least 8 characters.")
     target_scope = text_fields["target_scope"]
     if target_scope not in _TARGET_SCOPES:
         raise ValueError("Ambiguous scope: target_scope must be one of agent, room, thread, tenant.")
-    expected_spec_hash = _normalize_hash(text_fields["expected_spec_hash"], "expected_spec_hash")
     approved_by = text_fields["approved_by"]
     if not _MATRIX_USER_RE.fullmatch(approved_by):
         raise ValueError("approved_by must be a full Matrix user ID.")
@@ -351,6 +284,9 @@ def _promotion_input(**kwargs: object) -> PromotionInput:
     preflight = kwargs["preflight"]
     if not isinstance(dry_run, bool) or not isinstance(preflight, bool):
         raise ValueError("dry_run and preflight must be booleans.")
+    reason = _required_reason(cast("str", kwargs["reason"]))
+    if len(reason) < 8:
+        raise ValueError("Promotion reason must be at least 8 characters.")
     return PromotionInput(
         workflow_spec_ref=text_fields["workflow_spec_ref"],
         validated_artifact_ref=text_fields["validated_artifact_ref"],
@@ -358,7 +294,7 @@ def _promotion_input(**kwargs: object) -> PromotionInput:
         target_ref=text_fields["target_ref"],
         approved_by=approved_by,
         approval_evidence_ref=text_fields["approval_evidence_ref"],
-        expected_spec_hash=expected_spec_hash,
+        expected_spec_hash=_normalize_hash(text_fields["expected_spec_hash"], "expected_spec_hash"),
         dry_run=dry_run,
         preflight=preflight,
         rollback_policy=cast("dict[str, object]", rollback_policy),
@@ -390,22 +326,8 @@ def _normalize_hash(value: str, field_name: str) -> str:
     return value.removeprefix("sha256:").lower()
 
 
-def _resolve_artifact_ref(
-    artifact_ref: str,
-    allowed_roots: tuple[Path, ...],
-    *,
-    storage_root: Path,
-    description: str,
-) -> Path:
-    """Resolve a durable promotion artifact reference.
-
-    ``artifact://<relative-path>`` is the canonical shared-artifact scheme. It
-    resolves beneath ``<storage_root>/artifacts`` so preflight callers cannot
-    accidentally bind tenant/room promotion to an agent-local workspace path.
-    Absolute local paths remain available only for explicitly configured plugin
-    roots, which keeps existing guarded deployments working without accepting
-    Toolsmith-local relative paths as durable references.
-    """
+def _resolve_artifact_ref(artifact_ref: str, allowed_roots: tuple[Path, ...], *, storage_root: Path, description: str) -> Path:
+    """Resolve a durable promotion artifact reference."""
     if description == "workflow spec" and artifact_ref.lower().endswith((".md", ".markdown")):
         raise ValueError("workflow spec artifact ref must point to canonical workflow spec JSON, not Markdown.")
     if artifact_ref.startswith("artifact://"):
@@ -415,24 +337,21 @@ def _resolve_artifact_ref(
     else:
         candidate = Path(artifact_ref).expanduser()
         if not candidate.is_absolute():
-            raise ValueError(
-                f"{description} artifact ref must use artifact:// shared artifacts or an allowed absolute local path."
-            )
+            raise ValueError(f"{description} artifact ref must use artifact:// shared artifacts or an allowed absolute local path.")
         path = candidate.resolve()
-        if allowed_roots:
-            for root in allowed_roots:
-                try:
-                    path = resolve_base_dir_path(root, str(path))
-                    break
-                except ValueError:
-                    continue
-            else:
-                raise ValueError(f"{description} artifact ref is outside configured allowed_artifact_roots.")
-        else:
+        if not allowed_roots:
             raise ValueError(
                 f"{description} artifact ref must use artifact:// shared artifacts "
                 "or be under configured allowed_artifact_roots."
             )
+        for root in allowed_roots:
+            try:
+                path = resolve_base_dir_path(root, str(path))
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"{description} artifact ref is outside configured allowed_artifact_roots.")
     if description == "workflow spec" and path.suffix.lower() != ".json":
         raise ValueError("workflow spec artifact must be canonical JSON.")
     if not path.is_file():
@@ -447,8 +366,7 @@ def _resolve_shared_artifact_ref(artifact_ref: str, *, storage_root: Path, descr
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(f"{description} artifact ref must stay within the shared artifact namespace.")
-    artifacts_root = (storage_root / "artifacts").resolve()
-    return resolve_base_dir_path(artifacts_root, relative_path.as_posix())
+    return resolve_base_dir_path((storage_root / "artifacts").resolve(), relative_path.as_posix())
 
 
 def _normalize_roots(value: list[str] | str | None) -> tuple[Path, ...]:
@@ -486,8 +404,7 @@ def _validate_workflow_tools(spec: dict[str, object], *, runtime_paths: object) 
         for participant in participants:
             if isinstance(participant, dict):
                 participant_tools.update(_string_set(participant.get("tools")))
-    all_tools = permission_tools | participant_tools
-    for tool in sorted(all_tools):
+    for tool in sorted(permission_tools | participant_tools):
         if tool == "*" or tool in _FORBIDDEN_WORKFLOW_TOOLS:
             raise ValueError(f"Forbidden Dynamic Workflow tool grant: {tool}.")
         if tool not in TOOL_METADATA:
@@ -507,15 +424,7 @@ def _string_set(value: object) -> set[str]:
     return result
 
 
-def _validate_validation_artifact(
-    artifact: dict[str, object],
-    *,
-    workflow_id: str,
-    spec_hash: str,
-    target_scope: str,
-    target_ref: str,
-    approved_by: str,
-) -> None:
+def _validate_validation_artifact(artifact: dict[str, object], *, workflow_id: str, spec_hash: str, target_scope: str, target_ref: str, approved_by: str) -> None:
     if artifact.get("schema_version") != _PROMOTION_SCHEMA_VERSION:
         raise ValueError("Stale schema: validation artifact schema_version mismatch.")
     if artifact.get("status") not in {"validated", "ok"}:
@@ -524,22 +433,11 @@ def _validate_validation_artifact(
     _require_equal(artifact, "spec_hash", spec_hash, "validation artifact spec_hash mismatch")
     _require_equal(artifact, "target_scope", target_scope, "validation artifact target_scope mismatch")
     _require_equal(artifact, "target_ref", target_ref, "validation artifact target_ref mismatch")
-    allowed_approver = artifact.get("approved_by")
-    if allowed_approver is not None and allowed_approver != approved_by:
+    if artifact.get("approved_by") is not None and artifact.get("approved_by") != approved_by:
         raise ValueError("Validation artifact approved_by mismatch.")
 
 
-def _validate_approval_evidence(
-    evidence: dict[str, object],
-    *,
-    workflow_id: str,
-    spec_hash: str,
-    target_scope: str,
-    target_ref: str,
-    approved_by: str,
-    reason: str,
-    ttl_minutes: int,
-) -> None:
+def _validate_approval_evidence(evidence: dict[str, object], *, workflow_id: str, spec_hash: str, target_scope: str, target_ref: str, approved_by: str, reason: str, ttl_minutes: int) -> None:
     if evidence.get("schema_version") != _PROMOTION_SCHEMA_VERSION:
         raise ValueError("Stale schema: approval evidence schema_version mismatch.")
     if evidence.get("status") != "approved":
@@ -553,22 +451,7 @@ def _validate_approval_evidence(
     _require_equal(evidence, "approved_by", approved_by, "approval evidence approved_by mismatch")
     if evidence.get("reason") not in {None, reason}:
         raise ValueError("Approval evidence reason mismatch.")
-    event_id = evidence.get("event_id")
-    if not isinstance(event_id, str) or not _MATRIX_EVENT_RE.fullmatch(event_id):
-        raise ValueError("Approval evidence must include an unambiguous Matrix event_id.")
-    if evidence.get("redacted") is True or evidence.get("revoked") is True:
-        raise ValueError("Approval is revoked or redacted.")
-    approved_at = _parse_time(cast("str | None", evidence.get("approved_at")))
-    expires_at = _parse_time(cast("str | None", evidence.get("expires_at")))
-    now = datetime.now(UTC)
-    if approved_at is None:
-        raise ValueError("Approval evidence must include approved_at.")
-    if approved_at > now + timedelta(minutes=5):
-        raise ValueError("Approval evidence approved_at is in the future.")
-    if now - approved_at > timedelta(minutes=ttl_minutes):
-        raise ValueError("Approval evidence is expired.")
-    if expires_at is not None and now >= expires_at:
-        raise ValueError("Approval evidence is expired.")
+    _validate_evidence_time_and_event(evidence, label="Approval evidence", ttl_minutes=ttl_minutes)
 
 
 def _validate_rollback_policy(policy: dict[str, object], *, expected_spec_hash: str) -> dict[str, object]:
@@ -578,22 +461,12 @@ def _validate_rollback_policy(policy: dict[str, object], *, expected_spec_hash: 
     rollback_hash = policy.get("expected_spec_hash")
     if rollback_hash is not None and _normalize_hash(cast("str", rollback_hash), "rollback_policy.expected_spec_hash") != expected_spec_hash:
         raise ValueError("rollback_policy expected_spec_hash mismatch.")
-    authorization_ref = policy.get("authorization_ref")
-    if action in {"restore_previous", "tombstone", "delete"} and not isinstance(authorization_ref, str):
+    if action in {"restore_previous", "tombstone", "delete"} and not isinstance(policy.get("authorization_ref"), str):
         raise ValueError("Rollback action requires equal-or-stronger authorization_ref.")
     return copy.deepcopy(policy)
 
 
-def _validate_rollback_authorization(
-    authorization: dict[str, object],
-    policy: dict[str, object],
-    *,
-    workflow_id: str,
-    target_scope: str,
-    target_ref: str,
-    approved_by: str,
-    ttl_minutes: int,
-) -> None:
+def _validate_rollback_authorization(authorization: dict[str, object], policy: dict[str, object], *, workflow_id: str, target_scope: str, target_ref: str, approved_by: str, ttl_minutes: int) -> None:
     action = policy.get("action")
     if action not in {"restore_previous", "tombstone", "delete"}:
         return
@@ -603,8 +476,6 @@ def _validate_rollback_authorization(
         if authorization.get("status") in _REVOKED_APPROVAL_STATUSES:
             raise ValueError("Rollback authorization is expired, revoked, redacted, denied, or otherwise not active.")
         raise ValueError("Rollback authorization is not approved.")
-    if authorization.get("redacted") is True or authorization.get("revoked") is True:
-        raise ValueError("Rollback authorization is revoked or redacted.")
     _require_equal(authorization, "workflow_id", workflow_id, "rollback authorization workflow_id mismatch")
     _require_equal(authorization, "target_scope", target_scope, "rollback authorization target_scope mismatch")
     _require_equal(authorization, "target_ref", target_ref, "rollback authorization target_ref mismatch")
@@ -617,29 +488,30 @@ def _validate_rollback_authorization(
     authorized_previous = authorization.get("previous_promotion_hash")
     if not isinstance(expected_previous, str) or not isinstance(authorized_previous, str):
         raise ValueError("Rollback authorization requires previous_promotion_hash binding.")
-    if _normalize_hash(authorized_previous, "rollback_authorization.previous_promotion_hash") != _normalize_hash(
-        expected_previous, "rollback_policy.expected_previous_promotion_hash"
-    ):
+    if _normalize_hash(authorized_previous, "rollback_authorization.previous_promotion_hash") != _normalize_hash(expected_previous, "rollback_policy.expected_previous_promotion_hash"):
         raise ValueError("Rollback authorization previous_promotion_hash mismatch.")
-    event_id = authorization.get("event_id")
+    _validate_evidence_time_and_event(authorization, label="Rollback authorization", ttl_minutes=ttl_minutes)
+
+
+def _validate_evidence_time_and_event(evidence: dict[str, object], *, label: str, ttl_minutes: int) -> None:
+    if evidence.get("redacted") is True or evidence.get("revoked") is True:
+        raise ValueError(f"{label} is revoked or redacted.")
+    event_id = evidence.get("event_id")
     if not isinstance(event_id, str) or not _MATRIX_EVENT_RE.fullmatch(event_id):
-        raise ValueError("Rollback authorization must include an unambiguous Matrix event_id.")
-    approved_at = _parse_time(cast("str | None", authorization.get("approved_at")))
-    expires_at = _parse_time(cast("str | None", authorization.get("expires_at")))
+        raise ValueError(f"{label} must include an unambiguous Matrix event_id.")
+    approved_at = _parse_time(cast("str | None", evidence.get("approved_at")))
+    expires_at = _parse_time(cast("str | None", evidence.get("expires_at")))
     now = datetime.now(UTC)
     if approved_at is None:
-        raise ValueError("Rollback authorization must include approved_at.")
+        raise ValueError(f"{label} must include approved_at.")
     if approved_at > now + timedelta(minutes=5):
-        raise ValueError("Rollback authorization approved_at is in the future.")
-    if now - approved_at > timedelta(minutes=ttl_minutes):
-        raise ValueError("Rollback authorization is expired.")
-    if expires_at is not None and now >= expires_at:
-        raise ValueError("Rollback authorization is expired.")
+        raise ValueError(f"{label} approved_at is in the future.")
+    if now - approved_at > timedelta(minutes=ttl_minutes) or (expires_at is not None and now >= expires_at):
+        raise ValueError(f"{label} is expired.")
 
 
 def _validate_rollback_previous_binding(policy: dict[str, object], previous_promotion_hash: str | None) -> None:
-    action = policy.get("action")
-    if action not in {"restore_previous", "tombstone", "delete"}:
+    if policy.get("action") not in {"restore_previous", "tombstone", "delete"}:
         return
     expected_previous = policy.get("expected_previous_promotion_hash")
     if previous_promotion_hash is None:
@@ -651,10 +523,7 @@ def _validate_rollback_previous_binding(policy: dict[str, object], previous_prom
 
 
 def _rollback_is_abuse(policy: dict[str, object], existing: dict[str, object]) -> bool:
-    action = policy.get("action")
-    if action not in {"restore_previous", "tombstone", "delete"}:
-        return False
-    return policy.get("authorization_ref") in {None, existing.get("approval_evidence_ref")}
+    return policy.get("action") in {"restore_previous", "tombstone", "delete"} and policy.get("authorization_ref") in {None, existing.get("approval_evidence_ref")}
 
 
 def _target_identity(scope: str, target_ref: str) -> dict[str, str]:
@@ -726,15 +595,7 @@ def _audit_record(promotion_record: dict[str, object], *, action: str) -> dict[s
 
 def _actor_self_approval_ids(context: object, *, configured_self_actor_ids: frozenset[str]) -> set[str]:
     identities = set(configured_self_actor_ids)
-    for attr in (
-        "agent_name",
-        "agent_id",
-        "actor_id",
-        "actor_name",
-        "matrix_id",
-        "user_id",
-        "sender_id",
-    ):
+    for attr in ("agent_name", "agent_id", "actor_id", "actor_name", "matrix_id", "user_id", "sender_id"):
         value = getattr(context, attr, None)
         if isinstance(value, str) and value.strip():
             identities.add(value.strip())
@@ -763,4 +624,38 @@ def _load_json_object(path: Path) -> dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Existing promotion record is invalid.")
-    return cast("dict[str, object]
+    return cast("dict[str, object]", data)
+
+
+@contextmanager
+def _state_lock(state_root: Path):
+    lock_dir = state_root / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / "promotion.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_text(data: str) -> str:
+    return _sha256_bytes(data.encode("utf-8"))
+
+
+def _sha256_json(data: object) -> str:
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return _sha256_bytes(encoded)
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _utc_stamp() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
