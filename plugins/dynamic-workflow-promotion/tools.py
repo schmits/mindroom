@@ -40,7 +40,7 @@ if TYPE_CHECKING:
             type="string[]",
             required=False,
             default=[],
-            description="Optional roots for workflow/validation/approval artifact references.",
+            description="Optional roots for guarded absolute local artifact references; artifact:// uses shared runtime artifacts.",
         ),
         ConfigField(
             name="allowed_approvers",
@@ -82,7 +82,7 @@ if TYPE_CHECKING:
             type="string[]",
             required=False,
             default=[],
-            description="Per-agent allowed artifact roots.",
+            description="Per-agent guarded absolute local artifact roots; artifact:// uses shared runtime artifacts.",
         ),
         ConfigField(
             name="allowed_approvers",
