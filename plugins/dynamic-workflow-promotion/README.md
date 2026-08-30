@@ -8,7 +8,9 @@ Safety boundaries:
 
 - no core runtime changes;
 - no broad config writer and no default grants;
-- local JSON artifact refs only, optionally constrained by `allowed_artifact_roots`;
+- canonical shared artifact refs use `artifact://<relative-path>` and resolve under the runtime storage root's `artifacts/` namespace;
+- `workflow_spec_ref` must resolve to readable canonical JSON, not a Markdown wrapper or Toolsmith-local relative path;
+- absolute local refs are accepted only when explicitly constrained by `allowed_artifact_roots` for guarded compatibility;
 - fails closed on spec substitution, approval replay, stale schema, ambiguous scope, self-promotion, expired/revoked/redacted approval evidence, forbidden workflow tool grants, rollback abuse, or audit write failure.
 
 Rollback actions are represented in the typed promotion record. `restore_previous`, `tombstone`, and `delete` require an equal-or-stronger `authorization_ref` and are rejected if they reuse the existing promotion approval reference.

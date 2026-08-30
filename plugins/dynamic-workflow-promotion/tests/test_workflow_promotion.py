@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import shutil
 import importlib.util
 import sys
 from types import SimpleNamespace
@@ -29,6 +30,171 @@ WORKFLOW_SPEC = {
     "participants": [{"id": "writer", "kind": "ephemeral_agent", "name": "Writer"}],
     "workflow": [{"id": "draft", "type": "agent_step", "participant": "writer", "prompt": "Draft."}],
 }
+
+
+def test_toolsmith_workspace_relative_workflow_spec_ref_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    refs = _write_artifacts(tmp_path)
+    workspace = tmp_path / "toolsmith_workspace"
+    workspace.mkdir()
+    shutil.copyfile(Path(refs["spec_ref"]), workspace / "workflow.json")
+    refs["spec_ref"] = "workflow.json"
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
+
+    with monkeypatch.context() as patched:
+        patched.chdir(workspace)
+        with _runtime_context(tmp_path):
+            payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "artifact://" in data["message"]
+    assert not (tmp_path / "state" / "promotions").exists()
+
+
+def test_preflight_accepts_canonical_shared_artifact_ref(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "ok"
+    assert data["mode"] == "preflight"
+    assert data["persisted"] is False
+
+
+def test_markdown_workflow_spec_wrapper_fails_closed(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    wrapper = tmp_path / "runtime" / "artifacts" / "workflow.md"
+    wrapper.write_text(f"See canonical spec at {refs['spec_ref']}\n", encoding="utf-8")
+    refs["spec_ref"] = "artifact://workflow.md"
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "not Markdown" in data["message"]
+
+
+def test_shared_artifact_hash_mismatch_fails_closed(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    spec_path = tmp_path / "runtime" / "artifacts" / "workflow.json"
+    spec_path.write_text(json.dumps({**WORKFLOW_SPEC, "name": "Tampered"}, sort_keys=True), encoding="utf-8")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "Spec substitution" in data["message"]
+
+
+def test_validation_and_approval_binding_preserved_for_shared_refs(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    validation_path = tmp_path / "runtime" / "artifacts" / "validation.json"
+    validation = json.loads(validation_path.read_text(encoding="utf-8"))
+    validation["target_ref"] = "!other:example.org"
+    validation_path.write_text(json.dumps(validation, sort_keys=True), encoding="utf-8")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "validation artifact target_ref mismatch" in data["message"]
+
+
+def test_tenant_preflight_dry_run_succeeds_only_with_real_shared_artifacts(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True, target_scope="tenant", target_ref="tenant")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        ok = json.loads(_call(tool, refs, target_scope="tenant", target_ref="tenant", dry_run=True, preflight=True))
+
+    assert ok["status"] == "ok"
+    assert ok["mode"] == "dry_run"
+    assert ok["persisted"] is False
+    assert not (tmp_path / "state" / "promotions").exists()
+
+    refs["spec_ref"] = "artifact://missing.json"
+    with _runtime_context(tmp_path):
+        missing = json.loads(_call(tool, refs, target_scope="tenant", target_ref="tenant", dry_run=True, preflight=True))
+
+    assert missing["status"] == "error"
+    assert "readable file" in missing["message"]
+
+
+def test_absolute_validation_ref_without_allowed_roots_fails_closed(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    refs["validation_ref"] = str(tmp_path / "validation.json")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "validation artifact artifact ref must use artifact://" in data["message"]
+    assert not (tmp_path / "state" / "promotions").exists()
+
+
+def test_absolute_approval_ref_without_allowed_roots_fails_closed(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path, use_shared_refs=True)
+    refs["approval_ref"] = str(tmp_path / "approval.json")
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"))
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "approval evidence artifact ref must use artifact://" in data["message"]
+    assert not (tmp_path / "state" / "promotions").exists()
+
+
+def test_absolute_rollback_authorization_ref_without_allowed_roots_fails_closed(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    refs = _write_artifacts(tmp_path / "current", use_shared_refs=True)
+    tool = DynamicWorkflowPromotionTools(state_root=str(state))
+
+    with _runtime_context(tmp_path / "current"):
+        first = json.loads(_call(tool, refs))
+    assert first["status"] == "ok"
+    previous_hash = _sha256_json(json.loads(Path(first["promotion_record_ref"]).read_text(encoding="utf-8")))
+
+    next_refs = _write_artifacts(tmp_path / "next", spec=dict(WORKFLOW_SPEC, name="Review Flow v2"), use_shared_refs=True)
+    auth_ref = _write_rollback_authorization(tmp_path / "next", previous_hash=previous_hash)
+    rollback_policy = {
+        "action": "restore_previous",
+        "expected_spec_hash": next_refs["spec_hash"],
+        "authorization_ref": auth_ref,
+        "expected_previous_promotion_hash": previous_hash,
+    }
+
+    with _runtime_context(tmp_path / "next"):
+        payload = _call(tool, next_refs, rollback_policy=rollback_policy, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "error"
+    assert "rollback authorization artifact ref must use artifact://" in data["message"]
+
+
+def test_absolute_refs_under_allowed_roots_remain_supported(tmp_path: Path) -> None:
+    refs = _write_artifacts(tmp_path)
+    tool = DynamicWorkflowPromotionTools(state_root=str(tmp_path / "state"), allowed_artifact_roots=[str(tmp_path)])
+
+    with _runtime_context(tmp_path):
+        payload = _call(tool, refs, preflight=True)
+
+    data = json.loads(payload)
+    assert data["status"] == "ok"
+    assert data["mode"] == "preflight"
+    assert data["persisted"] is False
 
 
 def test_preflight_does_not_persist(tmp_path: Path) -> None:
@@ -295,12 +461,14 @@ def _call(
     preflight: bool = False,
     dry_run: bool = False,
     rollback_policy: dict[str, object] | None = None,
+    target_scope: str = "room",
+    target_ref: str = "!room:example.org",
 ) -> str:
     return tool.promote_dynamic_workflow_spec(
         workflow_spec_ref=refs["spec_ref"],
         validated_artifact_ref=refs["validation_ref"],
-        target_scope="room",
-        target_ref="!room:example.org",
+        target_scope=target_scope,
+        target_ref=target_ref,
         approved_by=approved_by,
         approval_evidence_ref=refs["approval_ref"],
         expected_spec_hash=refs["spec_hash"],
@@ -317,6 +485,9 @@ def _write_artifacts(
     spec: dict[str, object] | None = None,
     approved_by: str = "@approver:example.org",
     approval_overrides: dict[str, object] | None = None,
+    use_shared_refs: bool = False,
+    target_scope: str = "room",
+    target_ref: str = "!room:example.org",
 ) -> dict[str, str]:
     tmp_path.mkdir(parents=True, exist_ok=True)
     workflow_spec = spec or WORKFLOW_SPEC
@@ -328,8 +499,8 @@ def _write_artifacts(
         "status": "validated",
         "workflow_id": workflow_spec["id"],
         "spec_hash": spec_hash,
-        "target_scope": "room",
-        "target_ref": "!room:example.org",
+        "target_scope": target_scope,
+        "target_ref": target_ref,
         "approved_by": approved_by,
     }
     approval = {
@@ -337,8 +508,8 @@ def _write_artifacts(
         "status": "approved",
         "workflow_id": workflow_spec["id"],
         "spec_hash": spec_hash,
-        "target_scope": "room",
-        "target_ref": "!room:example.org",
+        "target_scope": target_scope,
+        "target_ref": target_ref,
         "approved_by": approved_by,
         "event_id": "$approval:example.org",
         "approved_at": (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
@@ -350,6 +521,21 @@ def _write_artifacts(
     approval_path = tmp_path / "approval.json"
     _write_json(validation_path, validation)
     _write_json(approval_path, approval)
+    if use_shared_refs:
+        artifacts_root = tmp_path / "runtime" / "artifacts"
+        artifacts_root.mkdir(parents=True, exist_ok=True)
+        shared_spec = artifacts_root / "workflow.json"
+        shared_validation = artifacts_root / "validation.json"
+        shared_approval = artifacts_root / "approval.json"
+        shutil.copyfile(spec_path, shared_spec)
+        shutil.copyfile(validation_path, shared_validation)
+        shutil.copyfile(approval_path, shared_approval)
+        return {
+            "spec_ref": "artifact://workflow.json",
+            "validation_ref": "artifact://validation.json",
+            "approval_ref": "artifact://approval.json",
+            "spec_hash": spec_hash,
+        }
     return {
         "spec_ref": str(spec_path),
         "validation_ref": str(validation_path),
