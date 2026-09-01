@@ -1,1 +1,0 @@
-$(cd mindroom_repo && cat plugins/session-completion-notifier/hooks.py)
