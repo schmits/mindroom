@@ -12,6 +12,7 @@ import json
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import time
@@ -82,10 +83,70 @@ def _enabled(settings: Mapping[str, object]) -> bool:
     return _as_bool(settings.get("enabled"), default=True)
 
 
-def _in_configured_scope(settings: Mapping[str, object], envelope: MessageEnvelope) -> bool:
+class _ObservedAgentTrust(str, Enum):
+    DIRECT = "direct"
+    MAPPED = "mapped"
+    MISSING = "missing"
+
+
+@dataclass(frozen=True, slots=True)
+class _ObservedAgentScope:
+    physical_agent: str
+    effective_agent: str
+    logical_agent: str | None
+    trust: _ObservedAgentTrust
+
+
+def _logical_parent_session_agent(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    envelope: MessageEnvelope,
+) -> tuple[str | None, _ObservedAgentTrust]:
+    if envelope.agent_name != "mind":
+        return None, _ObservedAgentTrust.DIRECT
+    session_id = _as_non_empty_string(envelope.target.session_id)
+    if session_id is None:
+        return None, _ObservedAgentTrust.MISSING
+    entry = _parent_session_entry(ctx, envelope)
+    if entry is None:
+        return None, _ObservedAgentTrust.MISSING
+    mapped_agent = _as_non_empty_string(entry.get("agent"))
+    if mapped_agent is None:
+        return None, _ObservedAgentTrust.MISSING
+    return mapped_agent, _ObservedAgentTrust.MAPPED
+
+
+def _observed_agent_scope(
+    ctx: AfterResponseContext | CancelledResponseContext,
+    envelope: MessageEnvelope,
+) -> _ObservedAgentScope:
+    logical_agent, trust = _logical_parent_session_agent(ctx, envelope)
+    effective_agent = logical_agent or envelope.agent_name
+    return _ObservedAgentScope(
+        physical_agent=envelope.agent_name,
+        effective_agent=effective_agent,
+        logical_agent=logical_agent,
+        trust=trust,
+    )
+
+
+def _in_configured_scope(
+    settings: Mapping[str, object],
+    envelope: MessageEnvelope,
+    observed_scope: _ObservedAgentScope | None = None,
+) -> bool:
     allowed_agents = _string_set(settings.get("agents") or settings.get("allowed_agents"))
-    if allowed_agents is not None and envelope.agent_name not in allowed_agents:
-        return False
+    if allowed_agents is not None:
+        scope = observed_scope or _ObservedAgentScope(
+            physical_agent=envelope.agent_name,
+            effective_agent=envelope.agent_name,
+            logical_agent=None,
+            trust=_ObservedAgentTrust.DIRECT,
+        )
+        candidates = {scope.physical_agent}
+        if scope.logical_agent is not None and scope.trust is _ObservedAgentTrust.MAPPED:
+            candidates.add(scope.logical_agent)
+        if not candidates & allowed_agents:
+            return False
 
     allowed_rooms = _string_set(settings.get("rooms") or settings.get("allowed_rooms"))
     return not (allowed_rooms is not None and envelope.room_id not in allowed_rooms)
@@ -100,11 +161,18 @@ def _room_payload(envelope: MessageEnvelope) -> dict[str, str | None]:
     }
 
 
-def _completed_payload(ctx: AfterResponseContext) -> dict[str, object]:
+def _completed_payload(
+    ctx: AfterResponseContext,
+    observed_scope: _ObservedAgentScope | None = None,
+) -> dict[str, object]:
     result = ctx.result
+    scope = observed_scope or _observed_agent_scope(ctx, result.envelope)
     payload: dict[str, object] = {
         "status": "completed",
-        "agent": result.envelope.agent_name,
+        "agent": scope.effective_agent,
+        "physical_agent": scope.physical_agent,
+        "logical_agent": scope.logical_agent,
+        "observed_agent_trust": scope.trust.value,
         "room": _room_payload(result.envelope),
         "source_event_id": result.envelope.source_event_id,
         "response_event_id": result.response_event_id,
@@ -120,12 +188,19 @@ def _completed_payload(ctx: AfterResponseContext) -> dict[str, object]:
     return payload
 
 
-def _cancelled_payload(ctx: CancelledResponseContext) -> dict[str, object]:
+def _cancelled_payload(
+    ctx: CancelledResponseContext,
+    observed_scope: _ObservedAgentScope | None = None,
+) -> dict[str, object]:
     info = ctx.info
+    scope = observed_scope or _observed_agent_scope(ctx, info.envelope)
     status = "error" if info.failure_reason else "cancelled"
     return {
         "status": status,
-        "agent": info.envelope.agent_name,
+        "agent": scope.effective_agent,
+        "physical_agent": scope.physical_agent,
+        "logical_agent": scope.logical_agent,
+        "observed_agent_trust": scope.trust.value,
         "room": _room_payload(info.envelope),
         "source_event_id": info.envelope.source_event_id,
         "response_event_id": info.visible_response_event_id,
@@ -245,6 +320,9 @@ def _ledger_summary(payload: Mapping[str, object]) -> dict[str, object]:
         "key": _terminal_key(payload),
         "status": payload.get("status"),
         "agent": payload.get("agent"),
+        "physical_agent": payload.get("physical_agent"),
+        "logical_agent": payload.get("logical_agent"),
+        "observed_agent_trust": payload.get("observed_agent_trust"),
         "room_id": room_id,
         "thread_id": thread_id,
         "source_event_id": payload.get("source_event_id"),
@@ -269,6 +347,9 @@ _PARENT_LEDGER_ENTRY_FIELDS = frozenset(
         "response_kind",
         "delivery_kind",
         "failure_reason",
+        "physical_agent",
+        "logical_agent",
+        "observed_agent_trust",
         "first_seen_at",
         "updated_at",
     },
@@ -703,24 +784,32 @@ async def record_parent_session_spawn(ctx: ToolAfterCallContext) -> None:
 @hook(EVENT_MESSAGE_AFTER_RESPONSE, name="notify_after_response", timeout_ms=1000)
 async def notify_after_response(ctx: AfterResponseContext) -> None:
     """Emit a minimized terminal notification for completed visible responses."""
-    if not _enabled(ctx.settings) or not _in_configured_scope(ctx.settings, ctx.result.envelope):
+    if not _enabled(ctx.settings):
         return
-    await _emit_notification(ctx, _completed_payload(ctx), ctx.result.envelope)
+    observed_scope = _observed_agent_scope(ctx, ctx.result.envelope)
+    if not _in_configured_scope(ctx.settings, ctx.result.envelope, observed_scope):
+        return
+    await _emit_notification(ctx, _completed_payload(ctx, observed_scope), ctx.result.envelope)
 
 
 @hook(EVENT_MESSAGE_CANCELLED, name="notify_cancelled_response", timeout_ms=1000)
 async def notify_cancelled_response(ctx: CancelledResponseContext) -> None:
     """Emit a minimized terminal notification for cancelled/error terminal outcomes."""
-    if not _enabled(ctx.settings) or not _in_configured_scope(ctx.settings, ctx.info.envelope):
+    if not _enabled(ctx.settings):
         return
-    await _emit_notification(ctx, _cancelled_payload(ctx), ctx.info.envelope)
+    observed_scope = _observed_agent_scope(ctx, ctx.info.envelope)
+    if not _in_configured_scope(ctx.settings, ctx.info.envelope, observed_scope):
+        return
+    await _emit_notification(ctx, _cancelled_payload(ctx, observed_scope), ctx.info.envelope)
 
 
 # Export pure helpers for plugin-local tests without depending on private runtime internals.
 __all__ = [
     "_cancelled_payload",
     "_completed_payload",
+    "_in_configured_scope",
     "_ledger_summary",
+    "_observed_agent_scope",
     "_safe_state_root",
     "record_parent_session_spawn",
     "notify_after_response",
