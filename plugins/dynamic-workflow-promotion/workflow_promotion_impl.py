@@ -18,10 +18,10 @@ from agno.tools import Toolkit
 
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
 from mindroom.durable_write import fsync_directory_durable, write_json_file_durable
+from mindroom.dynamic_workflows.store import DynamicWorkflowStore
 from mindroom.dynamic_workflows.validation import DynamicWorkflowError, validate_workflow_spec
 from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
 from mindroom.tool_system.runtime_context import get_plugin_state_root, get_tool_runtime_context
-from mindroom.tools.path_safety import resolve_base_dir_path
 
 _PLUGIN_NAME = "dynamic-workflow-promotion"
 _PROMOTION_SCHEMA_VERSION = 1
@@ -192,9 +192,16 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 "audit_hash": _sha256_json(audit_record),
                 "message": "Promotion preflight passed; no state was persisted.",
             }
-        return self._persist_apply(state_root, promotion_id, promotion_record)
+        return self._persist_apply(state_root, promotion_id, promotion_record, workflow_spec=validated_spec)
 
-    def _persist_apply(self, state_root: Path, promotion_id: str, promotion_record: dict[str, object]) -> dict[str, object]:
+    def _persist_apply(
+        self,
+        state_root: Path,
+        promotion_id: str,
+        promotion_record: dict[str, object],
+        *,
+        workflow_spec: dict[str, object],
+    ) -> dict[str, object]:
         with _state_lock(state_root):
             current_path = state_root / "promotions" / f"{promotion_id}.json"
             existing = _load_json_object(current_path) if current_path.exists() else None
@@ -220,6 +227,7 @@ class DynamicWorkflowPromotionTools(Toolkit):
             write_json_file_durable(current_path, promotion_record, indent=2, sort_keys=True, trailing_newline=True, strict_atomic_replace=True)
             if not current_path.exists():
                 raise ValueError("Audit failure: promotion record was not durably written.")
+            self._materialize_promoted_workflow(promotion_record, workflow_spec=workflow_spec)
         return {
             "mode": "apply",
             "persisted": True,
@@ -231,6 +239,57 @@ class DynamicWorkflowPromotionTools(Toolkit):
             "promotion_record_ref": str(current_path),
             "audit_record_ref": str(audit_path),
         }
+
+    def _materialize_promoted_workflow(
+        self,
+        promotion_record: dict[str, object],
+        *,
+        workflow_spec: dict[str, object],
+    ) -> None:
+        """Project one active promotion into the runtime Dynamic Workflow store.
+
+        The promotion plugin remains the writer/audit owner for shared-scope
+        approvals. Once an apply record is durably published, the plugin also
+        owns projecting the validated, hash-bound spec into the ordinary
+        DynamicWorkflowStore so room/tenant lookup and run paths consume normal
+        workflow records instead of depending on core read-time hotpatches.
+        """
+        context = get_tool_runtime_context()
+        if context is None:
+            raise ValueError("Dynamic Workflow promotion requires an active tool runtime context.")
+        scope = str(promotion_record["target_scope"])
+        owner_id = str(promotion_record["target_ref"])
+        workflow_id = str(promotion_record["workflow_id"])
+        reason = str(promotion_record.get("reason") or "audited Dynamic Workflow promotion")
+        actor = str(promotion_record.get("created_by") or _PLUGIN_NAME)
+        store = DynamicWorkflowStore(context.runtime_paths.storage_root)
+        try:
+            summary = store.get_workflow(workflow_id=workflow_id, scope=scope, owner_id=owner_id)
+        except DynamicWorkflowError:
+            store.create_workflow(
+                spec=workflow_spec,
+                scope=scope,
+                owner_id=owner_id,
+                created_by=actor,
+                reason=reason,
+            )
+            return
+        current_spec = store.load_workflow_revision(
+            workflow_id=workflow_id,
+            scope=scope,
+            owner_id=owner_id,
+            revision=summary.active_revision,
+        )
+        if _sha256_json(current_spec) == _sha256_json(workflow_spec):
+            return
+        store.update_workflow(
+            workflow_id=workflow_id,
+            scope=scope,
+            owner_id=owner_id,
+            patch=workflow_spec,
+            updated_by=actor,
+            reason=reason,
+        )
 
     def _state_root(self, context: object) -> Path:
         if self._state_root_override:
@@ -342,11 +401,11 @@ def _resolve_artifact_ref(artifact_ref: str, allowed_roots: tuple[Path, ...], *,
         if not allowed_roots:
             raise ValueError(
                 f"{description} artifact ref must use artifact:// shared artifacts "
-                "or be under configured allowed_artifact_roots."
+                "or be under configured allowed_artifact_roots.",
             )
         for root in allowed_roots:
             try:
-                path = resolve_base_dir_path(root, str(path))
+                path = _resolve_base_dir_path(root, str(path))
                 break
             except ValueError:
                 continue
@@ -366,7 +425,20 @@ def _resolve_shared_artifact_ref(artifact_ref: str, *, storage_root: Path, descr
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(f"{description} artifact ref must stay within the shared artifact namespace.")
-    return resolve_base_dir_path((storage_root / "artifacts").resolve(), relative_path.as_posix())
+    return _resolve_base_dir_path((storage_root / "artifacts").resolve(), relative_path.as_posix())
+
+
+def _resolve_base_dir_path(base_dir: Path, path: str) -> Path:
+    """Resolve one artifact path under base_dir without importing built-in tool modules."""
+    requested = Path(path)
+    candidate = requested if requested.is_absolute() else base_dir / requested
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(base_dir.resolve())
+    except ValueError as exc:
+        msg = f"Path '{path}' resolves outside allowed base_dir '{base_dir}'."
+        raise ValueError(msg) from exc
+    return resolved
 
 
 def _normalize_roots(value: list[str] | str | None) -> tuple[Path, ...]:
