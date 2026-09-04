@@ -16,12 +16,14 @@ from typing import Any, cast
 
 from agno.tools import Toolkit
 
+from mindroom import yaml_io
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
 from mindroom.durable_write import fsync_directory_durable, write_json_file_durable
+from mindroom.dynamic_workflows import store as dwf_store
+from mindroom.dynamic_workflows.store import DynamicWorkflowStore, DynamicWorkflowSummary
 from mindroom.dynamic_workflows.validation import DynamicWorkflowError, validate_workflow_spec
 from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
 from mindroom.tool_system.runtime_context import get_plugin_state_root, get_tool_runtime_context
-from mindroom.tools.path_safety import resolve_base_dir_path
 
 _PLUGIN_NAME = "dynamic-workflow-promotion"
 _PROMOTION_SCHEMA_VERSION = 1
@@ -164,6 +166,8 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 approved_by=request.approved_by,
                 ttl_minutes=self._approval_ttl_minutes,
             )
+        if request.target_scope == "thread":
+            raise ValueError("Thread-scoped Dynamic Workflow materialization is not supported by this promotion plugin yet.")
         promotion_id = _promotion_id(request.target_scope, request.target_ref, workflow_id)
         promotion_record = _promotion_record(
             promotion_id=promotion_id,
@@ -192,9 +196,16 @@ class DynamicWorkflowPromotionTools(Toolkit):
                 "audit_hash": _sha256_json(audit_record),
                 "message": "Promotion preflight passed; no state was persisted.",
             }
-        return self._persist_apply(state_root, promotion_id, promotion_record)
+        return self._persist_apply(state_root, promotion_id, promotion_record, workflow_spec=validated_spec)
 
-    def _persist_apply(self, state_root: Path, promotion_id: str, promotion_record: dict[str, object]) -> dict[str, object]:
+    def _persist_apply(
+        self,
+        state_root: Path,
+        promotion_id: str,
+        promotion_record: dict[str, object],
+        *,
+        workflow_spec: dict[str, object],
+    ) -> dict[str, object]:
         with _state_lock(state_root):
             current_path = state_root / "promotions" / f"{promotion_id}.json"
             existing = _load_json_object(current_path) if current_path.exists() else None
@@ -217,9 +228,17 @@ class DynamicWorkflowPromotionTools(Toolkit):
             fsync_directory_durable(state_root / "audit")
             if not audit_path.exists():
                 raise ValueError("Audit failure: audit record was not durably written.")
+            pending_record = dict(promotion_record)
+            pending_record["status"] = "materialization_pending"
+            pending_path = state_root / "pending" / f"{promotion_id}.json"
+            write_json_file_durable(pending_path, pending_record, indent=2, sort_keys=True, trailing_newline=True, strict_atomic_replace=True)
+            if not pending_path.exists():
+                raise ValueError("Promotion projection failure: pending promotion record was not durably written.")
+            self._materialize_promoted_workflow(promotion_record, workflow_spec=workflow_spec)
             write_json_file_durable(current_path, promotion_record, indent=2, sort_keys=True, trailing_newline=True, strict_atomic_replace=True)
             if not current_path.exists():
                 raise ValueError("Audit failure: promotion record was not durably written.")
+            pending_path.unlink(missing_ok=True)
         return {
             "mode": "apply",
             "persisted": True,
@@ -231,6 +250,118 @@ class DynamicWorkflowPromotionTools(Toolkit):
             "promotion_record_ref": str(current_path),
             "audit_record_ref": str(audit_path),
         }
+
+    def _materialize_promoted_workflow(
+        self,
+        promotion_record: dict[str, object],
+        *,
+        workflow_spec: dict[str, object],
+    ) -> None:
+        """Project one active promotion into the runtime Dynamic Workflow store.
+
+        The promotion plugin remains the writer/audit owner for shared-scope
+        approvals. Once an apply record is durably published, the plugin also
+        owns projecting the validated, hash-bound spec into the ordinary
+        DynamicWorkflowStore so room/tenant lookup and run paths consume normal
+        workflow records instead of depending on core read-time hotpatches.
+        """
+        context = get_tool_runtime_context()
+        if context is None:
+            raise ValueError("Dynamic Workflow promotion requires an active tool runtime context.")
+        scope = str(promotion_record["target_scope"])
+        owner_id = str(promotion_record["target_ref"])
+        workflow_id = str(promotion_record["workflow_id"])
+        reason = str(promotion_record.get("reason") or "audited Dynamic Workflow promotion")
+        actor = str(promotion_record.get("created_by") or _PLUGIN_NAME)
+        store = DynamicWorkflowStore(context.runtime_paths.storage_root)
+        try:
+            summary = store.get_workflow(workflow_id=workflow_id, scope=scope, owner_id=owner_id)
+        except DynamicWorkflowError:
+            store.create_workflow(
+                spec=workflow_spec,
+                scope=scope,
+                owner_id=owner_id,
+                created_by=actor,
+                reason=reason,
+            )
+            return
+        current_spec = store.load_workflow_revision(
+            workflow_id=workflow_id,
+            scope=scope,
+            owner_id=owner_id,
+            revision=summary.active_revision,
+        )
+        if _sha256_json(current_spec) == _sha256_json(workflow_spec):
+            return
+        self._replace_promoted_workflow_revision(
+            store,
+            workflow_id=workflow_id,
+            scope=scope,
+            owner_id=owner_id,
+            workflow_spec=workflow_spec,
+            updated_by=actor,
+            reason=reason,
+            created_by=summary.created_by,
+            created_at=summary.created_at,
+            archived=summary.archived,
+        )
+        updated_summary = store.get_workflow(workflow_id=workflow_id, scope=scope, owner_id=owner_id)
+        materialized_spec = store.load_workflow_revision(
+            workflow_id=workflow_id,
+            scope=scope,
+            owner_id=owner_id,
+            revision=updated_summary.active_revision,
+        )
+        if materialized_spec != workflow_spec:
+            raise ValueError("Promotion projection failure: materialized workflow revision did not exactly match approved spec.")
+
+
+    def _replace_promoted_workflow_revision(
+        self,
+        store: DynamicWorkflowStore,
+        *,
+        workflow_id: str,
+        scope: str,
+        owner_id: str,
+        workflow_spec: dict[str, object],
+        updated_by: str,
+        reason: str,
+        created_by: str,
+        created_at: str,
+        archived: bool,
+    ) -> None:
+        """Publish an exact approved spec as the next active runtime revision.
+
+        DynamicWorkflowStore.update_workflow applies recursive merge patches,
+        which is correct for normal edits but unsafe for audited promotion: omitted
+        fields from the approved artifact must be removed from the active runtime
+        revision. This plugin-owned projection path writes the next revision from
+        the validated spec itself, preserving store layout while avoiding merge
+        residue.
+        """
+        workflow_dir = store._workflow_dir(scope, owner_id, workflow_id)
+        with dwf_store._workflow_lock(workflow_dir):
+            next_revision = store._next_revision(workflow_dir)
+            now = dwf_store._utc_now()
+            revision_spec = copy.deepcopy(workflow_spec)
+            revision_spec["revision"] = next_revision
+            revision_spec["revision_reason"] = reason
+            revision_spec["updated_by"] = updated_by
+            revision_spec["updated_at"] = now
+            summary = DynamicWorkflowSummary(
+                workflow_id=workflow_id,
+                scope=scope,
+                owner_id=owner_id,
+                active_revision=next_revision,
+                name=str(workflow_spec["name"]),
+                description=str(workflow_spec.get("description", "")),
+                created_by=created_by,
+                created_at=created_at,
+                updated_at=now,
+                archived=archived,
+            )
+            _atomic_write_yaml(workflow_dir / "revisions" / f"{next_revision}.yaml", revision_spec)
+            _atomic_write_yaml(workflow_dir / "workflow.yaml", _summary_to_yaml(summary))
 
     def _state_root(self, context: object) -> Path:
         if self._state_root_override:
@@ -256,6 +387,28 @@ class DynamicWorkflowPromotionTools(Toolkit):
         if not isinstance(parsed, dict):
             raise ValueError(f"{description} artifact must contain a JSON object.")
         return cast("dict[str, object]", parsed), raw, _sha256_bytes(raw)
+
+
+def _summary_to_yaml(summary: DynamicWorkflowSummary) -> dict[str, object]:
+    return {
+        "id": summary.workflow_id,
+        "scope": summary.scope,
+        "owner_id": summary.owner_id,
+        "active_revision": summary.active_revision,
+        "name": summary.name,
+        "description": summary.description,
+        "created_by": summary.created_by,
+        "created_at": summary.created_at,
+        "updated_at": summary.updated_at,
+        "archived": summary.archived,
+    }
+
+
+def _atomic_write_yaml(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(yaml_io.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _payload(status: str, **fields: object) -> str:
@@ -342,11 +495,11 @@ def _resolve_artifact_ref(artifact_ref: str, allowed_roots: tuple[Path, ...], *,
         if not allowed_roots:
             raise ValueError(
                 f"{description} artifact ref must use artifact:// shared artifacts "
-                "or be under configured allowed_artifact_roots."
+                "or be under configured allowed_artifact_roots.",
             )
         for root in allowed_roots:
             try:
-                path = resolve_base_dir_path(root, str(path))
+                path = _resolve_base_dir_path(root, str(path))
                 break
             except ValueError:
                 continue
@@ -366,7 +519,20 @@ def _resolve_shared_artifact_ref(artifact_ref: str, *, storage_root: Path, descr
     relative_path = Path(relative)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(f"{description} artifact ref must stay within the shared artifact namespace.")
-    return resolve_base_dir_path((storage_root / "artifacts").resolve(), relative_path.as_posix())
+    return _resolve_base_dir_path((storage_root / "artifacts").resolve(), relative_path.as_posix())
+
+
+def _resolve_base_dir_path(base_dir: Path, path: str) -> Path:
+    """Resolve one artifact path under base_dir without importing built-in tool modules."""
+    requested = Path(path)
+    candidate = requested if requested.is_absolute() else base_dir / requested
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(base_dir.resolve())
+    except ValueError as exc:
+        msg = f"Path '{path}' resolves outside allowed base_dir '{base_dir}'."
+        raise ValueError(msg) from exc
+    return resolved
 
 
 def _normalize_roots(value: list[str] | str | None) -> tuple[Path, ...]:
