@@ -227,6 +227,7 @@ visibility = [
 [[modules]]
 path = "mindroom.pending_event_worker"
 depends_on = [
+    "mindroom.cancellation",
     "mindroom.logging_config",
 ]
 visibility = ["mindroom.journal_dispatch"]
@@ -523,11 +524,6 @@ visibility = [
 path = "mindroom.agno_session_persistence_patch"
 depends_on = ["mindroom.background_tasks"]
 visibility = ["mindroom.agent_storage"]
-
-[[modules]]
-path = "mindroom.agno_tool_wrapper_patch"
-depends_on = []
-visibility = ["mindroom.tool_system.tool_hooks"]
 
 [[modules]]
 path = "mindroom.agent_run_context"
@@ -1013,7 +1009,10 @@ depends_on = [
     "mindroom.knowledge",
     "mindroom.logging_config",
     "mindroom.routing",
+    "mindroom.requester_identity",
     "mindroom.teams",
+    "mindroom.tool_system.context_bound_streams",
+    "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.worker_routing",
 ]
 
@@ -1325,6 +1324,7 @@ depends_on = [
 path = "mindroom.custom_tools.attachments"
 depends_on = [
     "mindroom.matrix.client_delivery",
+    "mindroom.matrix.media",
     "mindroom.tool_system.output_files",
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.sandbox_proxy",
@@ -1389,6 +1389,14 @@ depends_on = [
     "mindroom.matrix.room_history_reads",
     "mindroom.custom_tools.matrix_helpers",
     "mindroom.matrix.client_visible_messages",
+    "mindroom.tool_system.runtime_context",
+]
+
+[[modules]]
+path = "mindroom.custom_tools.thread_resolution"
+depends_on = [
+    "mindroom.matrix.thread_room_scan",
+    "mindroom.thread_tags",
     "mindroom.tool_system.runtime_context",
 ]
 
@@ -3431,6 +3439,7 @@ depends_on = [
 path = "mindroom.tool_system.context_bound_streams"
 depends_on = []
 visibility = [
+    "mindroom.api.openai_compat",
     "mindroom.llm_request_logging",
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.worker_routing",
@@ -3551,7 +3560,6 @@ depends_on = ["mindroom.constants"]
 [[modules]]
 path = "mindroom.tool_system.tool_hooks"
 depends_on = [
-    "mindroom.agno_tool_wrapper_patch",
     "mindroom.hooks",
     "mindroom.llm_request_logging",
     "mindroom.tool_system.runtime_context",
@@ -4581,6 +4589,7 @@ expose = [
 ]
 from = ["mindroom.matrix.thread_room_scan"]
 visibility = [
+    "mindroom.custom_tools.thread_resolution",
     "mindroom.custom_tools.thread_summary",
     "mindroom.custom_tools.thread_tags",
     "mindroom.matrix.thread_mutation_impact",
@@ -4748,6 +4757,9 @@ expose = [
     "WorkerProgressEvent",
     "WorkerProgressPump",
     "ToolRuntimeContext",
+    "DetachedRequesterContext",
+    "detached_requester_context",
+    "get_detached_requester_context",
     "ToolRuntimeModelBinding",
     "ToolRuntimeHookBindings",
     "ToolRuntimeSupport",

@@ -742,6 +742,12 @@ The sync status indicator in the header shows:
 - **Sync Error** - Sync failed
 - **Disconnected** - Lost connection to backend
 
+If another dashboard tab or a server-side edit changes the configuration, saving an older draft can return HTTP 409.
+The dashboard keeps your draft and shows persistent recovery guidance, including in the raw configuration recovery editor.
+Copy any changes you want to keep, refresh the page to load the current configuration, then reapply and save your changes.
+Further save attempts are rejected locally while the conflict remains; editing the draft or refreshing agent policies does not resolve it.
+The dashboard does not automatically reload and retry a full replacement, because that could overwrite another writer's changes.
+
 ### Theme and Responsive Design
 
 Toggle between dark and light themes. The dashboard adapts to desktop and mobile devices.
@@ -1503,6 +1509,8 @@ matrix_space:
 matrix_sync:
   mode: classic                    # Default: classic
   sliding_timeline_limit: 100       # Per-room Sliding window, minimum 1
+  max_response_bytes: 16777216      # Per-session HTTP response limit: 16 MiB
+  max_pending_bytes: 67108864       # Per-session encoded pending output limit: 64 MiB
 
 # Timezone for scheduled tasks (optional)
 timezone: America/Los_Angeles      # Default: UTC
@@ -1517,6 +1525,20 @@ See [Authorization](https://docs.mindroom.chat/authorization/) for the current a
 The root Space invitation roster is the union of managed-room `invite_users`, and those invitees do not automatically receive Space admin power.
 Root Space admin reconciliation is grant-only and preserves existing Matrix admins.
 Demote stale Space admins manually in a Matrix client when needed.
+
+## Matrix Sync Limits
+
+`matrix_sync.max_response_bytes` and `matrix_sync.max_pending_bytes` accept positive integers in bytes and apply to both Classic and Sliding Sync.
+The defaults are 16 MiB per HTTP response and 64 MiB of encoded pending output per sync session.
+If a large initial sync exceeds the durable input bound, increase `max_response_bytes` enough to fit the response.
+If preparing events exceeds the durable pending bound, increase `max_pending_bytes` enough to fit the encoded output.
+These are separate budgets: encoded events can take more space than the HTTP response, so raising the response limit may also require raising the pending limit.
+Each bot owns its own sync session; allow sufficient memory and disk space when increasing these limits.
+Changing either setting through config reload restarts running agents to apply it.
+
+Large initial syncs may also need more startup time.
+`MINDROOM_MATRIX_SYNC_STARTUP_TIMEOUT_SECONDS` controls the first-sync watchdog allowance, and runtime Helm chart values under `probes.startup` control the Kubernetes startup probe allowance.
+Size those time allowances independently of the byte limits.
 
 ## Credential Seeds
 
@@ -7203,7 +7225,7 @@ Use these tools when you need to send or inspect Matrix messages, manage thread 
 - [`matrix_room`] - Inspect Matrix room metadata, members, thread roots, and room state.
 - [`matrix_voice_message`] - Generate speech from text and send it as a Matrix voice note.
 - [`thread_tags`] - Add, remove, and inspect shared tags on a Matrix thread.
-- [`thread_resolution`] - Explicitly resolve or reopen the active Matrix thread.
+- [`thread_resolution`] - Explicitly resolve or reopen Matrix threads in the current room.
 - [`thread_summary`] - Set or update a Matrix thread summary from the current room and thread context.
 - [`thread_model`] - List models or show, switch, and reset the model override for the current Matrix thread.
 - [`matrix_api`] - Use a low-level Matrix event and state API with explicit room and event IDs.
@@ -7418,12 +7440,14 @@ list_thread_tags(exclude_tag="resolved", include_untagged=True)
 
 ## [`thread_resolution`]
 
-`thread_resolution` gives an agent explicit permission to resolve or reopen its active Matrix thread.
+`thread_resolution` gives an agent explicit permission to resolve or reopen Matrix threads in the current room.
 
 ### What It Does
 
-`thread_resolution` exposes `resolve_thread()` and `reopen_thread()`.
-Both functions require an active thread and always target its canonical thread root.
+`thread_resolution` exposes `resolve_thread(thread_id=None)` and `reopen_thread(thread_id=None)`.
+Without `thread_id`, both functions require an active thread and target its canonical thread root.
+Pass a thread root or reply event ID to target another thread in the current room, including when calling from the room timeline.
+Explicit IDs are normalized to their canonical thread root, and unresolved targets return an error without changing any thread.
 `resolve_thread()` adds the `resolved` lifecycle tag, while `reopen_thread()` removes it.
 
 ### Configuration
@@ -7445,7 +7469,12 @@ agents:
 ```python
 resolve_thread()
 reopen_thread()
+resolve_thread(thread_id="$completed-thread:example.org")
+reopen_thread(thread_id="$completed-thread:example.org")
 ```
+
+To clear completed project threads, use `list_thread_tags(exclude_tag="resolved", include_untagged=True)` to find candidates, then call `resolve_thread(thread_id=...)` for each selected thread.
+Check the listing's `truncated` flag before treating it as complete.
 
 ### Notes
 
@@ -7607,6 +7636,10 @@ matrix_api(
 `list_attachments()` returns the attachment IDs currently available in tool runtime context, the resolved metadata payloads, and any `missing_attachment_ids`.
 Pass a context-available attachment ID as `target` to return only that attachment; an ID outside the current context returns an error.
 `get_attachment()` returns a single attachment record, including the runtime-local path, when called with only an attachment ID.
+`get_attachment(attachment_id, view=True)` sends image, audio, video, or document content (including PDF) to the model, including local files and attachments from earlier in the conversation.
+Viewing requires a model and provider adapter that support the media type, and a readable, context-scoped file no larger than 20 MiB.
+Rejected media requests retry without the media and give the agent explicit guidance to use the attachment ID/path with other available tools; known adapter omissions receive the same guidance.
+It cannot be combined with `mindroom_output_path`.
 `get_attachment(attachment_id, mindroom_output_path="relative/path")` saves the attachment bytes into the agent workspace and returns a `mindroom_tool_output` save receipt with the saved path, byte count, binary format, and SHA256 digest.
 Use `mindroom_output_path` before handing attachments to worker-routed workspace tools such as `file`, `coding`, `python`, or `shell`, because the runtime-local path may not exist inside the worker workspace.
 In shell tools, the agent workspace is exposed as `$MINDROOM_AGENT_WORKSPACE`; in worker-routed shell and python tools it is also `~` and `$HOME`, so a saved path like `incoming/file.txt` can also be read as `~/incoming/file.txt`.
@@ -15295,10 +15328,21 @@ agents:
 | Operation | Description |
 |-----------|-------------|
 | `list_attachments(target?)` | List metadata for attachments in the current context (ID, kind, local_path, filename, MIME type, size, room_id, thread_id, sender, event_timestamp, created_at) |
-| `get_attachment(attachment_id, mindroom_output_path?)` | Return one context attachment record, or save its bytes to a workspace-relative path and return a save receipt |
+| `get_attachment(attachment_id, mindroom_output_path?, view=False)` | Return metadata, save bytes to a workspace-relative path, or send media/document content to the model with `view=True` |
 | `register_attachment(file_path)` | Register a local file path as a context attachment ID (`att_*`) |
 
-When `mindroom_output_path` is omitted, `get_attachment()` returns the attachment metadata response, including the runtime-local `local_path`.
+By default, `get_attachment()` returns the attachment metadata response, including the runtime-local `local_path`.
+Use `get_attachment("att_...", view=True)` to inspect media from earlier in the conversation or a local file registered with `register_attachment(file_path)`.
+This sends the attachment bytes to the configured model, using native image, audio, video, or document inputs rather than putting binary data in tool text.
+It supports PNG, JPEG, GIF, and WebP images, audio, video, and Agno-supported document types including PDF and plain text, with a 20 MiB limit per attachment.
+Image format is detected from the bytes; other media uses the attachment's MIME type and filename.
+The selected model and its provider adapter must support the media type and may impose stricter format or size limits.
+The attachment must be available in the current context and have a readable local file.
+`view=True` cannot be combined with `mindroom_output_path`.
+If the provider rejects inline media, MindRoom retries the request without it and explicitly tells the agent that the removed content was not inspected.
+Known adapter omissions use the same guidance, so unsupported media is not silently dropped.
+The agent can then call `get_attachment` without `view` to obtain metadata or save the file, and use other available extraction, transcription, or analysis tools.
+This does not provision another model, grant credentials, or automatically delegate the task.
 For worker-routed agents, prefer `get_attachment("att_...", mindroom_output_path="incoming/file.ext")` before processing an attachment with `file`, `coding`, `python`, or `shell`, because the runtime-local path may not exist inside the worker workspace.
 `mindroom_output_path` must be a file path relative to the agent workspace.
 It must not be empty, absolute, point at the workspace root, contain `..` or NUL bytes, start with `~`, or contain `$` or `%` characters.
@@ -16947,6 +16991,30 @@ Client `system` / `developer` messages are prepended to the prompt. They augment
 | Unset | Unset/`false` | All requests return 401 (locked) |
 
 The OpenAI-compatible API uses its own auth (`OPENAI_COMPAT_API_KEYS`), separate from the dashboard API auth. In standalone mode, the dashboard `/api/*` endpoints can be protected with `MINDROOM_API_KEY`; the browser dashboard uses a same-origin auth cookie, while CLI and curl clients can still send `Authorization: Bearer ...`. These are independent: `MINDROOM_API_KEY` secures the dashboard, while `OPENAI_COMPAT_API_KEYS` secures the `/v1/*` chat completions endpoints.
+
+### Requester identities and delegation
+
+Bind selected API keys to Matrix user IDs with a JSON object in `.env`:
+
+```dotenv
+OPENAI_COMPAT_API_KEYS=sk-astrbot,sk-legacy
+OPENAI_COMPAT_API_KEY_REQUESTERS='{"sk-astrbot":"@alice:example.org"}'
+```
+
+The key must still appear in `OPENAI_COMPAT_API_KEYS`; a mapping alone never authenticates a caller.
+Restart MindRoom after changing these environment settings.
+Mapped identities must be concrete human Matrix user IDs, and `authorization.aliases` resolves bridge identities to their canonical requester.
+The request body's `user` field and requester headers cannot override this identity.
+
+Mapped callers only see and invoke models allowed by the existing responder access policy, including every member of a selected team.
+Auto-routing uses the same permitted agents.
+`delegate_task` checks both the caller agent's `delegate_to` list and the requester's access to each target, and propagates the requester into nested runs and their metadata.
+Grant access with `agents.<name>.access.users`, administrator membership, or a ready managed `members_of_rooms` membership snapshot.
+There is no current Matrix room for `/v1`, so `current_room_members` cannot grant access, and missing or stale room membership fails closed.
+
+Unmapped keys retain their existing model access but cannot delegate.
+Mapped sessions also include the canonical requester in their namespace, preventing a reassigned key from inheriting the previous requester's session.
+Room-context tools and approval-gated tools remain unavailable in delegated API runs.
 
 ## Limitations
 
