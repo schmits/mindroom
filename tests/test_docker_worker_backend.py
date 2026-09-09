@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -26,11 +27,13 @@ from mindroom.constants import (
     resolve_runtime_paths,
     runtime_paths_with_storage_root,
 )
+from mindroom.private_instance_identity_store import ensure_private_instance_identity
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY, SHARED_CREDENTIALS_PATH_ENV
 from mindroom.script_runs.models import script_worker_key_for_run
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
     agent_state_root_path,
+    private_instance_scope_root_path,
     resolve_unscoped_worker_key,
     resolve_worker_key,
     worker_dir_name,
@@ -45,6 +48,7 @@ from mindroom.workers.backends.docker import (
     _load_docker_client_and_errors,
     _worker_health_compatibility_error,
     _WorkerImageIncompatibleError,
+    check_docker_workers_absent_for_storage_upgrade,
     ensure_docker_dependencies,
 )
 from mindroom.workers.backends.docker_config import (
@@ -63,6 +67,9 @@ from mindroom.workers.compatibility import WORKER_PROTOCOL_VERSION
 from mindroom.workers.models import WorkerReadyProgress, WorkerSpec
 from mindroom.workers.runtime import primary_worker_backend_available, primary_worker_backend_name
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _TEST_AUTH_TOKEN = "test-token"  # noqa: S105
 _ROTATED_AUTH_TOKEN = "rotated-token"  # noqa: S105
@@ -124,13 +131,13 @@ class _FakeContainer:
         self.reload()
 
     def stop(self, timeout: int = 10) -> None:
-        assert timeout == 10
+        assert timeout > 0
         self.stopped += 1
         self.status = "exited"
         self.reload()
 
     def remove(self, force: bool = True) -> None:
-        assert force is True
+        del force
         self.removed += 1
         self.status = "removed"
 
@@ -149,6 +156,7 @@ class _FakeContainersApi:
         self.by_name: dict[str, _FakeContainer] = {}
         self.created_containers: list[_FakeContainer] = []
         self.run_calls: list[dict[str, object]] = []
+        self.list_calls: list[dict[str, object]] = []
         self.next_host_port = 43001
         self.images = images
         self.auto_pull_missing_image = auto_pull_missing_image
@@ -158,6 +166,24 @@ class _FakeContainersApi:
         if container is None or container.status == "removed":
             raise _FakeNotFoundError(name)
         return container
+
+    def list(self, **kwargs: object) -> Sequence[_FakeContainer]:
+        assert kwargs.get("all") is True
+        raw_filters = kwargs.get("filters")
+        applied_filters = dict(raw_filters) if isinstance(raw_filters, dict) else {}
+        self.list_calls.append(applied_filters)
+        label_filters = applied_filters.get("label", [])
+        expected_labels = {
+            item.split("=", 1)[0]: item.split("=", 1)[1]
+            for item in label_filters
+            if isinstance(item, str) and "=" in item
+        }
+        return [
+            container
+            for container in self.by_name.values()
+            if container.status != "removed"
+            and not any(container.attrs["Config"]["Labels"].get(key) != value for key, value in expected_labels.items())
+        ]
 
     def run(self, image: str, **kwargs: object) -> _FakeContainer:
         if self.auto_pull_missing_image and self.images is not None and image not in self.images.by_name:
@@ -183,17 +209,16 @@ class _FakeContainersApi:
             labels=dict(labels) if isinstance(labels, dict) else {},
             user=str(kwargs["user"]) if kwargs.get("user") is not None else None,
         )
-        if isinstance(volumes, dict):
+        if isinstance(volumes, list):
             container.attrs["Mounts"] = [
                 {
                     "Type": "bind",
                     "Source": source,
-                    "Destination": str(spec.get("bind", "")),
-                    "Mode": str(spec.get("mode", "")),
-                    "RW": str(spec.get("mode", "rw")) != "ro",
+                    "Destination": destination,
+                    "Mode": mode,
+                    "RW": mode != "ro",
                 }
-                for source, spec in volumes.items()
-                if isinstance(source, str) and isinstance(spec, dict)
+                for source, destination, mode in (volume.rsplit(":", 2) for volume in volumes)
             ]
         self.by_name[container.name] = container
         self.created_containers.append(container)
@@ -230,6 +255,7 @@ class _FakeImagesApi:
 
 class _FakeDockerClient:
     def __init__(self, *, auto_pull_missing_image: bool = False) -> None:
+        self.api = SimpleNamespace(timeout=None)
         self.images = _FakeImagesApi()
         self.containers = _FakeContainersApi(
             images=self.images,
@@ -497,6 +523,15 @@ models:
 """.lstrip()
 
 
+def _volumes_by_source(volumes: object) -> dict[str, dict[str, str]]:
+    """Index single-destination fixtures; alias tests inspect the full mount list."""
+    assert isinstance(volumes, list)
+    return {
+        source: {"bind": destination, "mode": mode}
+        for source, destination, mode in (volume.rsplit(":", 2) for volume in volumes)
+    }
+
+
 def _projection_root(volumes: dict[str, dict[str, str]]) -> Path:
     return next(Path(source) for source, spec in volumes.items() if spec["bind"] == "/app/config-host")
 
@@ -683,6 +718,116 @@ def _backend(
         lambda container: f"http://127.0.0.1:{backend._container_host_port(container)}/api/sandbox-runner/execute",
     )
     return backend, fake_client, sync_calls
+
+
+def _docker_preflight_runtime_paths(tmp_path: Path) -> RuntimePaths:
+    return resolve_primary_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env={
+            "MINDROOM_WORKER_BACKEND": "docker",
+            "MINDROOM_DOCKER_WORKER_IMAGE": "ghcr.io/mindroom-ai/mindroom:latest",
+            "MINDROOM_DOCKER_WORKER_LABELS_JSON": json.dumps({"mindroom.ai/tenant": "test"}),
+        },
+    )
+
+
+@pytest.mark.parametrize("status", ["running", "exited"])
+@pytest.mark.parametrize("label", ["test", "historical"])
+def test_docker_storage_preflight_rejects_workers_without_changing_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: str,
+    label: str,
+) -> None:
+    """Any remaining container blocks relocation, even with stale labels and metadata."""
+    runtime_paths = _docker_preflight_runtime_paths(tmp_path)
+    backend, fake_client, _sync_calls = _backend(monkeypatch, tmp_path, runtime_paths=runtime_paths)
+    handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=0.0)
+    container = fake_client.containers.get(handle.worker_id)
+    container.status = status
+    container.attrs["Config"]["Labels"]["mindroom.ai/tenant"] = label
+    metadata = tmp_path / "workers" / worker_dir_name(_TEST_UNSCOPED_WORKER_KEY) / "metadata" / "worker.json"
+    before = metadata.read_bytes()
+    sentinel = metadata.parents[1] / "retained.bin"
+    sentinel.write_bytes(b"retained worker bytes")
+
+    with pytest.raises(WorkerBackendError, match=r"(?i)remove|absent"):
+        check_docker_workers_absent_for_storage_upgrade(runtime_paths, timeout_seconds=5.0)
+
+    assert container.stopped == 0
+    assert container.removed == 0
+    assert metadata.read_bytes() == before
+    assert sentinel.read_bytes() == b"retained worker bytes"
+
+
+@pytest.mark.parametrize("metadata_bytes", [None, b"invalid json", b"{}"])
+def test_docker_storage_preflight_ignores_stale_metadata_and_foreign_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    metadata_bytes: bytes | None,
+) -> None:
+    """Only the live runtime namespace decides absence; durable metadata stays untouched."""
+    runtime_paths = _docker_preflight_runtime_paths(tmp_path)
+    backend, fake_client, _sync_calls = _backend(monkeypatch, tmp_path, runtime_paths=runtime_paths)
+    handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=0.0)
+    container = fake_client.containers.get(handle.worker_id)
+    container.attrs["Config"]["Labels"]["mindroom.ai/runtime-namespace"] = "another-runtime"
+    metadata = tmp_path / "workers" / worker_dir_name(_TEST_UNSCOPED_WORKER_KEY) / "metadata" / "worker.json"
+    if metadata_bytes is None:
+        metadata.unlink()
+    else:
+        metadata.write_bytes(metadata_bytes)
+
+    check_docker_workers_absent_for_storage_upgrade(runtime_paths, timeout_seconds=5.0)
+
+    assert container.stopped == 0
+    assert container.removed == 0
+    assert (metadata.read_bytes() if metadata.exists() else None) == metadata_bytes
+    assert 0.0 < fake_client.api.timeout <= 5.0
+
+
+@pytest.mark.parametrize("inventory", [None, {}, "", [object()]])
+def test_docker_storage_preflight_rejects_unverified_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    inventory: object,
+) -> None:
+    """Malformed or nonempty API results cannot authorize migration."""
+    runtime_paths = _docker_preflight_runtime_paths(tmp_path)
+    _worker_backend, fake_client, _sync_calls = _backend(monkeypatch, tmp_path, runtime_paths=runtime_paths)
+    monkeypatch.setattr(fake_client.containers, "list", lambda **_kwargs: inventory)
+    with pytest.raises(WorkerBackendError):
+        check_docker_workers_absent_for_storage_upgrade(runtime_paths, timeout_seconds=5.0)
+
+
+@pytest.mark.parametrize("failure", ["api", "malformed", "timeout"])
+def test_docker_storage_preflight_blocks_unavailable_or_late_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """An API error or exhausted overall deadline cannot authorize migration."""
+    runtime_paths = _docker_preflight_runtime_paths(tmp_path)
+    _worker_backend, fake_client, _sync_calls = _backend(monkeypatch, tmp_path, runtime_paths=runtime_paths)
+    now = [0.0]
+    monkeypatch.setattr("mindroom.workers.backends.docker.time.monotonic", lambda: now[0])
+
+    def inventory(**kwargs: object) -> list[object]:
+        assert kwargs["all"] is True
+        assert kwargs["sparse"] is True
+        if failure == "api":
+            message = "unavailable"
+            raise _FakeDockerError(message)
+        if failure == "malformed":
+            message = "invalid API payload"
+            raise ValueError(message)
+        now[0] = 6.0
+        return []
+
+    monkeypatch.setattr(fake_client.containers, "list", inventory)
+    with pytest.raises(WorkerBackendError):
+        check_docker_workers_absent_for_storage_upgrade(runtime_paths, timeout_seconds=5.0)
 
 
 def _use_real_wait_for_ready(monkeypatch: pytest.MonkeyPatch, backend: DockerWorkerBackend) -> None:
@@ -1305,7 +1450,7 @@ def test_docker_backend_ensures_worker_container_and_bind_mount(
     assert env["HOME"] == "/app/worker/agents/code/workspace"
     assert env["EXTRA_ENV"] == "present"
 
-    volumes = run_call["volumes"]
+    volumes = _volumes_by_source(run_call["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _assert_projected_worker_mounts(tmp_path, volumes, projected_paths)
     _assert_projected_config_snapshot(projection_root, tmp_path)
@@ -1437,8 +1582,8 @@ models:
     narrow_root = worker_root_path(tmp_path, narrow_key)
     assert broad.debug_metadata["state_root"] == str(broad_root)
     assert narrow.debug_metadata["state_root"] == str(narrow_root)
-    broad_volumes = fake_client.containers.run_calls[0]["volumes"]
-    narrow_volumes = fake_client.containers.run_calls[1]["volumes"]
+    broad_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
+    narrow_volumes = _volumes_by_source(fake_client.containers.run_calls[1]["volumes"])
     assert isinstance(broad_volumes, dict)
     assert isinstance(narrow_volumes, dict)
     assert str(broad_root) in broad_volumes
@@ -1512,7 +1657,7 @@ models:
 
     backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = (projection_root / "config.yaml").read_text(encoding="utf-8")
@@ -2028,7 +2173,7 @@ def test_docker_backend_redacts_projected_config_secrets_and_support_state(
 
     backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -2072,6 +2217,44 @@ def test_load_docker_client_auto_installs_optional_runtime(
     assert captured["runtime_paths"] is None
     assert client is fake_client
     assert errors is fake_errors
+
+
+def test_load_docker_client_applies_migration_request_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Migration client construction carries the remaining overall deadline."""
+    captured: dict[str, object] = {}
+    fake_client = object()
+    fake_errors = SimpleNamespace(DockerException=_FakeDockerError, NotFound=_FakeNotFoundError)
+    runtime_paths = _docker_preflight_runtime_paths(tmp_path)
+
+    def from_env(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return fake_client
+
+    def import_module(name: str) -> object:
+        if name == "docker":
+            return SimpleNamespace(from_env=from_env)
+        if name == "docker.errors":
+            return fake_errors
+        msg = f"Unexpected import: {name}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "mindroom.workers.backends.docker.ensure_docker_dependencies",
+        lambda _paths: pytest.fail("migration client must not install dependencies"),
+    )
+    monkeypatch.setattr("mindroom.workers.backends.docker.importlib.import_module", import_module)
+
+    client, _errors = _load_docker_client_and_errors(
+        runtime_paths=runtime_paths,
+        timeout_seconds=4.5,
+        ensure_dependencies=False,
+    )
+
+    assert client is fake_client
+    assert captured == {"environment": runtime_paths.process_env, "timeout": 4.5}
 
 
 def test_ensure_docker_dependencies_uses_explicit_runtime_paths(
@@ -2954,7 +3137,7 @@ models:
 
     backend.ensure_worker(WorkerSpec("v1:default:shared:alpha"), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -3266,7 +3449,7 @@ def test_docker_backend_recreates_container_when_projected_file_asset_changes(
 
     handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
     existing_container = fake_client.containers.by_name[handle.worker_id]
-    first_volumes = fake_client.containers.run_calls[0]["volumes"]
+    first_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(first_volumes, dict)
     first_projection_root = _projection_root(first_volumes)
 
@@ -3281,7 +3464,7 @@ def test_docker_backend_recreates_container_when_projected_file_asset_changes(
     assert existing_container.removed == 1
     assert len(fake_client.containers.run_calls) == 2
 
-    second_volumes = fake_client.containers.run_calls[-1]["volumes"]
+    second_volumes = _volumes_by_source(fake_client.containers.run_calls[-1]["volumes"])
     assert isinstance(second_volumes, dict)
     second_projection_root = _projection_root(second_volumes)
     assert second_projection_root != first_projection_root
@@ -3301,7 +3484,7 @@ def test_docker_backend_recreates_container_when_projected_directory_asset_chang
 
     handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
     existing_container = fake_client.containers.by_name[handle.worker_id]
-    first_volumes = fake_client.containers.run_calls[0]["volumes"]
+    first_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(first_volumes, dict)
     first_projection_root = _projection_root(first_volumes)
 
@@ -3330,7 +3513,7 @@ def test_docker_backend_recreates_container_when_projected_directory_asset_chang
     assert removal_checks == [True]
     assert len(fake_client.containers.run_calls) == 2
 
-    second_volumes = fake_client.containers.run_calls[-1]["volumes"]
+    second_volumes = _volumes_by_source(fake_client.containers.run_calls[-1]["volumes"])
     assert isinstance(second_volumes, dict)
     second_projection_root = _projection_root(second_volumes)
     assert second_projection_root != first_projection_root
@@ -3352,7 +3535,7 @@ def test_docker_backend_projects_only_agent_specific_assets_for_shared_worker(
 
     backend.ensure_worker(WorkerSpec(worker_key), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = (projection_root / "config.yaml").read_text(encoding="utf-8")
@@ -3413,7 +3596,7 @@ models:
 
     backend.ensure_worker(WorkerSpec("v1:default:shared:alpha"), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_readme = (
@@ -3448,7 +3631,7 @@ def test_docker_backend_projects_only_private_user_agent_assets_for_private_agen
 
     backend.ensure_worker(WorkerSpec(worker_key, private_agent_names=frozenset({"alpha"})), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config_data = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -3516,7 +3699,7 @@ models:
 
     backend.ensure_worker(WorkerSpec(worker_key, private_agent_names=frozenset({"alpha"})), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -3570,7 +3753,7 @@ def test_docker_backend_shared_worker_mounts_canonical_agent_root(
 
     backend.ensure_worker(WorkerSpec(worker_key), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     expected_agent_root = (tmp_path / "agents" / "alpha").resolve()
     assert volumes[str(expected_agent_root)] == {
@@ -3732,7 +3915,7 @@ def test_docker_backend_projects_shared_agent_for_narrower_user_agent_worker(
         now=10.0,
     )
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     projected_config = yaml.safe_load((_projection_root(volumes) / "config.yaml").read_text(encoding="utf-8"))
     assert list(projected_config["agents"]) == ["alpha"]
     assert str(agent_state_root_path(tmp_path, "alpha")) in volumes
@@ -3875,7 +4058,7 @@ models:
 
     backend.ensure_worker(WorkerSpec("v1:tenant-123:user:@alice:example.org"), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config_data = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -3941,7 +4124,7 @@ def test_docker_backend_user_agent_mounts_private_root_from_worker_spec(
 
     backend.ensure_worker(WorkerSpec(worker_key, private_agent_names=frozenset({"alpha"})), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     expected_private_root = (tmp_path / "private_instances" / worker_dir_name(worker_key)).resolve()
     assert volumes[str(expected_private_root)] == {
@@ -3952,6 +4135,42 @@ def test_docker_backend_user_agent_mounts_private_root_from_worker_spec(
     env = fake_client.containers.run_calls[0]["environment"]
     assert isinstance(env, dict)
     assert env["HOME"] == "/app/worker"
+
+
+def test_docker_backend_mounts_verified_historical_scope_twice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both historical and canonical destinations retain the same source, including on worker reuse."""
+    config_text, _projected_paths = _private_user_agent_projected_config_fixture(tmp_path)
+    backend, fake_client, _sync_calls = _backend(monkeypatch, tmp_path, config_text=config_text)
+    worker_key = "v1:default:user_agent:~@alice:example.org:alpha"
+    ensure_private_instance_identity(tmp_path, worker_key=worker_key, requester_id="@alice:example.org")
+    canonical = private_instance_scope_root_path(tmp_path, worker_key)
+    legacy = private_instance_scope_root_path(tmp_path, "v1:default:user_agent:@alice:example.org:alpha")
+    legacy.symlink_to(canonical.name, target_is_directory=True)
+    worker_root = worker_root_path(tmp_path, worker_key)
+    original_run = fake_client.containers.run
+
+    def run_with_prepared_alias_targets(image: str, **kwargs: object) -> _FakeContainer:
+        for scope in (canonical, legacy):
+            assert (worker_root / "private_instances" / scope.name).is_dir()
+        return original_run(image, **kwargs)
+
+    monkeypatch.setattr(fake_client.containers, "run", run_with_prepared_alias_targets)
+    spec = WorkerSpec(worker_key, private_agent_names=frozenset({"alpha"}))
+    backend.ensure_worker(spec, now=10.0)
+    backend.ensure_worker(spec, now=11.0)
+
+    assert len(fake_client.containers.run_calls) == 1
+    mounts = fake_client.containers.created_containers[0].attrs["Mounts"]
+    assert {
+        (mount["Source"], mount["Destination"], mount["RW"]) for mount in mounts if mount["Source"] == str(canonical)
+    } == {
+        (str(canonical), f"/app/worker/private_instances/{canonical.name}", True),
+        (str(canonical), f"/app/worker/private_instances/{legacy.name}", True),
+    }
+    assert all(mount["Destination"] != "/app/worker/private_instances" for mount in mounts)
 
 
 def test_docker_script_worker_mounts_the_owning_private_state_scope(
@@ -3973,7 +4192,7 @@ def test_docker_script_worker_mounts_the_owning_private_state_scope(
         now=10.0,
     )
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     expected_private_root = (tmp_path / "private_instances" / worker_dir_name(state_scope_worker_key)).resolve()
     expected_run_root = worker_root_path(tmp_path, worker_key)
@@ -4013,7 +4232,7 @@ def test_docker_backend_rejects_private_user_agent_container_without_target_visi
 
     handle = backend.ensure_worker(WorkerSpec(worker_key, private_agent_names=frozenset({"alpha"})), now=20.0)
     assert len(fake_client.containers.run_calls) == 1
-    second_volumes = fake_client.containers.run_calls[0]["volumes"]
+    second_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(second_volumes, dict)
     expected_private_root = (tmp_path / "private_instances" / worker_dir_name(worker_key)).resolve()
     assert second_volumes[str(expected_private_root)] == {
@@ -4051,7 +4270,7 @@ models:
 
     backend.ensure_worker(WorkerSpec("v1:default:shared:code"), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_config = yaml.safe_load((projection_root / "config.yaml").read_text(encoding="utf-8"))
@@ -4308,7 +4527,7 @@ def test_docker_backend_rebuilds_incomplete_projection_snapshot(
 
     handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
     existing_container = fake_client.containers.by_name[handle.worker_id]
-    first_volumes = fake_client.containers.run_calls[0]["volumes"]
+    first_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(first_volumes, dict)
     projection_root = _projection_root(first_volumes)
 
@@ -4317,7 +4536,7 @@ def test_docker_backend_rebuilds_incomplete_projection_snapshot(
 
     backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=20.0)
 
-    second_volumes = fake_client.containers.run_calls[-1]["volumes"]
+    second_volumes = _volumes_by_source(fake_client.containers.run_calls[-1]["volumes"])
     assert isinstance(second_volumes, dict)
     second_projection_root = _projection_root(second_volumes)
     replacement_container = fake_client.containers.by_name[handle.worker_id]
@@ -4341,7 +4560,7 @@ def test_docker_backend_rebuilds_corrupted_ready_projection_snapshot(
 
     handle = backend.ensure_worker(WorkerSpec(_TEST_UNSCOPED_WORKER_KEY), now=10.0)
     existing_container = fake_client.containers.by_name[handle.worker_id]
-    first_volumes = fake_client.containers.run_calls[0]["volumes"]
+    first_volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(first_volumes, dict)
     projection_root = _projection_root(first_volumes)
 
@@ -4373,7 +4592,7 @@ def test_docker_backend_disambiguates_colliding_projected_knowledge_base_ids(
 
     backend.ensure_worker(WorkerSpec("v1:default:shared:alpha"), now=10.0)
 
-    volumes = fake_client.containers.run_calls[0]["volumes"]
+    volumes = _volumes_by_source(fake_client.containers.run_calls[0]["volumes"])
     assert isinstance(volumes, dict)
     projection_root = _projection_root(volumes)
     projected_knowledge_root = projection_root / ".mindroom-worker-assets" / "knowledge_bases"

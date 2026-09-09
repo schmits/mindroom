@@ -87,6 +87,7 @@ visibility = [
 path = "mindroom.tool_schema_cache"
 depends_on = []
 visibility = [
+    "mindroom.mcp_gateway.tools",
     "mindroom.history.prompt_tokens",
     "mindroom.tool_system.plugins",
 ]
@@ -107,6 +108,9 @@ depends_on = [
     "mindroom.tool_system.worker_routing",
 ]
 visibility = [
+    "mindroom.api.sandbox_worker_prep",
+    "mindroom.workers.backends._dedicated_worker_common",
+    "mindroom.private_storage_migration",
     "mindroom.private_instance_identity",
     "mindroom.runtime_resolution",
 ]
@@ -724,6 +728,7 @@ depends_on = [
     "mindroom.tool_system.approval_exemptions",
 ]
 visibility = [
+    "mindroom.mcp_gateway.tools",
     "mindroom.agents",
     "mindroom.approval_inbound",
     "mindroom.approval_response",
@@ -751,6 +756,8 @@ visibility = [
 [[modules]]
 path = "mindroom.oauth.credential_store"
 depends_on = [
+    "mindroom.credential_policy",
+    "mindroom.tool_system.worker_routing",
     "mindroom.credentials",
     "mindroom.logging_config",
     "mindroom.oauth.providers",
@@ -1025,15 +1032,23 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.connections"
 depends_on = [
-    "mindroom.access_policy",
     "mindroom.api.auth",
     "mindroom.api.config_lifecycle",
-    "mindroom.api.dashboard_credential_scope",
     "mindroom.api.oauth",
+    "mindroom.api.personal_agent",
     "mindroom.constants",
     "mindroom.oauth",
     "mindroom.oauth.service",
     "mindroom.tool_system.catalog",
+]
+
+[[modules]]
+path = "mindroom.api.personal_agent"
+depends_on = [
+    "mindroom.access_policy",
+    "mindroom.matrix.identity",
+    "mindroom.requester_identity",
+    "mindroom.tool_system.worker_routing",
 ]
 
 [[modules]]
@@ -1066,6 +1081,8 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.main"
 depends_on = [
+    "mindroom.private_storage_migration",
+    "mindroom.api.mcp_gateway",
     "mindroom.api.connections",
     "mindroom.api.thread_exports",
     "mindroom.agent_policy",
@@ -1250,6 +1267,7 @@ path = "mindroom.api.sandbox_worker_prep"
 depends_on = [
     "mindroom.api.sandbox_exec",
     "mindroom.logging_config",
+    "mindroom.private_instance_identity_store",
     "mindroom.tool_system.sandbox_proxy",
     "mindroom.tool_system.worker_routing",
     "mindroom.workers.backend",
@@ -1759,6 +1777,7 @@ visibility = ["mindroom.orchestrator"]
 [[modules]]
 path = "mindroom.orchestrator"
 depends_on = [
+    "mindroom.private_storage_migration",
     "mindroom.agent_reply_membership_sync",
     "mindroom.agents",
     "mindroom.event_journal_open",
@@ -2243,6 +2262,7 @@ depends_on = [
 path = "mindroom.mcp.toolkit"
 depends_on = ["mindroom.mcp.function_surface"]
 visibility = [
+    "mindroom.mcp_gateway.toolkits",
     "mindroom.agents",
     "mindroom.mcp.registry",
     "mindroom.orchestrator",
@@ -3558,6 +3578,7 @@ depends_on = [
     "mindroom.workers.models",
 ]
 visibility = [
+    "mindroom.mcp_gateway.tools",
     "mindroom.tool_system.sandbox_proxy",
 ]
 
@@ -4133,6 +4154,7 @@ expose = [
     "ensure_default_agent_workspaces",
     "get_agent_toolkit_names",
     "remove_run_by_event_id",
+    "resolve_runtime_worker_tools",
     "show_tool_calls_for_agent",
 ]
 from = ["mindroom.agents"]
@@ -4722,6 +4744,7 @@ from = ["mindroom.tool_system.dependencies"]
 expose = [
     "LiveToolDispatchContext",
     "ToolDispatchContext",
+    "WorkerRuntimeContext",
     "WorkerProgressEvent",
     "WorkerProgressPump",
     "ToolRuntimeContext",
@@ -4735,6 +4758,7 @@ expose = [
     "emit_custom_event",
     "execution_identity_matches_tool_runtime_context",
     "get_worker_progress_pump",
+    "get_worker_runtime_context",
     "get_plugin_state_root",
     "get_tool_runtime_context",
     "get_tool_runtime_media_attachment",
@@ -4744,6 +4768,7 @@ expose = [
     "runtime_context_from_dispatch_context",
     "tool_runtime_context",
     "worker_progress_pump_scope",
+    "worker_runtime_context",
 ]
 from = ["mindroom.tool_system.runtime_context"]
 
@@ -4762,6 +4787,7 @@ from = ["mindroom.thread_export"]
 
 [[interfaces]]
 expose = [
+    "normalize_worker_key_part",
     "ResolvedWorkerTarget",
     "ResolvedWorkerKeyScope",
     "SerializedToolExecutionIdentity",
@@ -4969,8 +4995,116 @@ expose = [
 from = ["mindroom.tool_system.events"]
 
 [[interfaces]]
-expose = ["build_tool_hook_bridge", "prepend_tool_hook_bridge"]
+expose = ["build_tool_hook_bridge", "prepend_tool_hook_bridge", "SyncToolCompletionTracker", "track_sync_tool_completion"]
 from = ["mindroom.tool_system.tool_hooks"]
+
+[[modules]]
+path = "mindroom.api.mcp_gateway"
+depends_on = [
+    "mindroom.api.auth",
+    "mindroom.api.config_lifecycle",
+    "mindroom.api.mcp_clients",
+    "mindroom.api.mcp_scim",
+    "mindroom.api.personal_agent",
+    "mindroom.logging_config",
+    "mindroom.mcp.manager",
+    "mindroom.mcp_gateway.admission",
+    "mindroom.mcp_gateway.accounts",
+    "mindroom.mcp_gateway.consent",
+    "mindroom.mcp_gateway.oauth",
+    "mindroom.mcp_gateway.server",
+    "mindroom.mcp_gateway.store",
+    "mindroom.mcp_gateway.toolkits",
+    "mindroom.mcp_gateway.tools",
+    "mindroom.mcp_gateway.types",
+]
+
+[[modules]]
+path = "mindroom.mcp_gateway.admission"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.consent"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.oauth"
+depends_on = ["mindroom.mcp_gateway.store", "mindroom.mcp_gateway.accounts", "mindroom.mcp_gateway.lifecycle"]
+
+[[modules]]
+path = "mindroom.mcp_gateway.store"
+depends_on = ["mindroom.mcp_gateway.accounting", "mindroom.mcp_gateway.accounts", "mindroom.mcp_gateway.lifecycle"]
+
+[[modules]]
+path = "mindroom.api.mcp_clients"
+depends_on = [
+    "mindroom.api.auth",
+    "mindroom.api.config_lifecycle",
+    "mindroom.api.personal_agent",
+    "mindroom.mcp_gateway.server",
+    "mindroom.requester_identity",
+]
+
+[[modules]]
+path = "mindroom.api.mcp_scim"
+depends_on = ["mindroom.mcp_gateway.accounts"]
+
+[[modules]]
+path = "mindroom.mcp_gateway.accounts"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.lifecycle"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.accounting"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.server"
+depends_on = ["mindroom.logging_config", "mindroom.mcp_gateway.execution", "mindroom.mcp_gateway.types"]
+
+[[modules]]
+path = "mindroom.mcp_gateway.execution"
+depends_on = []
+
+[[modules]]
+path = "mindroom.mcp_gateway.toolkits"
+depends_on = [
+    "mindroom.agents",
+    "mindroom.credentials",
+    "mindroom.logging_config",
+    "mindroom.mcp.toolkit",
+    "mindroom.mcp_gateway.execution",
+    "mindroom.mcp_gateway.types",
+    "mindroom.runtime_resolution",
+    "mindroom.tool_system.catalog",
+    "mindroom.tool_system.tool_hooks",
+]
+
+[[modules]]
+path = "mindroom.mcp_gateway.tools"
+depends_on = [
+    "mindroom.hooks",
+    "mindroom.mcp_gateway.execution",
+    "mindroom.mcp_gateway.toolkits",
+    "mindroom.mcp_gateway.types",
+    "mindroom.oauth.providers",
+    "mindroom.tool_approval",
+    "mindroom.tool_schema_cache",
+    "mindroom.tool_system.catalog",
+    "mindroom.tool_system.dynamic_toolkits",
+    "mindroom.tool_system.plugins",
+    "mindroom.tool_system.runtime_context",
+    "mindroom.tool_system.tool_hooks",
+    "mindroom.tool_system.worker_proxy_client",
+    "mindroom.tool_system.worker_routing",
+]
+
+[[modules]]
+path = "mindroom.mcp_gateway.types"
+depends_on = []
 
 [[interfaces]]
 expose = ["bind_script_tool_broker", "router"]
@@ -5091,3 +5225,26 @@ visibility = ["mindroom.api.main"]
 path = "mindroom.cli.thread_export"
 depends_on = ["mindroom.constants", "mindroom.thread_export.models"]
 visibility = ["mindroom.cli.main"]
+
+
+[[modules]]
+path = "mindroom.private_storage_migration"
+depends_on = [
+    "mindroom.background_tasks",
+    "mindroom.durable_write",
+    "mindroom.file_locks",
+    "mindroom.private_instance_identity_store",
+    "mindroom.tool_system.worker_routing",
+    "mindroom.workers.storage_preflight",
+]
+visibility = ["mindroom.orchestrator", "mindroom.api.main"]
+
+[[modules]]
+path = "mindroom.workers.storage_preflight"
+depends_on = [
+    "mindroom.runtime_env_policy",
+    "mindroom.workers.backend",
+    "mindroom.workers.backends.docker",
+    "mindroom.workers.backends.kubernetes",
+]
+visibility = ["mindroom.private_storage_migration"]
