@@ -1,0 +1,58 @@
+[Unit]
+Description=MindRoom 2026.9.114 static programming runner
+Documentation=https://github.com/mindroom-ai/mindroom/blob/main/docs/deployment/sandbox-proxy.md
+After=network-online.target nftables.service mindroom-static-runner-egress.service
+Wants=network-online.target
+Requires=mindroom-static-runner-egress.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mindroom-static-runner/deployment.env
+EnvironmentFile=/etc/mindroom-static-runner/runner.env
+ExecStartPre=/usr/bin/podman rm -f --ignore mindroom-static-runner
+ExecStart=/usr/bin/podman run --rm --name mindroom-static-runner \
+  --pull=never \
+  --network=host \
+  --read-only \
+  --user=61184:61184 \
+  --cap-drop=all \
+  --security-opt=no-new-privileges \
+  --pids-limit=256 \
+  --cpus=2 \
+  --memory=4g \
+  --memory-swap=4g \
+  --ulimit=nofile=1024:1024 \
+  --ulimit=nproc=256:256 \
+  --tmpfs=/app/workspace:rw,nosuid,nodev,size=2147483648,uid=61184,gid=61184,mode=0700 \
+  --tmpfs=/tmp:rw,nosuid,nodev,size=268435456,uid=61184,gid=61184,mode=0700 \
+  --env=MINDROOM_SANDBOX_RUNNER_MODE=true \
+  --env=MINDROOM_SANDBOX_RUNNER_PORT=8766 \
+  --env=MINDROOM_SANDBOX_RUNNER_EXECUTION_MODE=forkserver \
+  --env=MINDROOM_SANDBOX_RUNNER_SUBPROCESS_TIMEOUT_SECONDS=120 \
+  --env=MINDROOM_STORAGE_PATH=/app/workspace/.mindroom \
+  --env=MINDROOM_SANDBOX_PROXY_TOKEN \
+  --env=HOME=/app/workspace \
+  --env=TMPDIR=/tmp \
+  ${MINDROOM_IMAGE} /app/run-sandbox-runner.sh
+ExecStop=-/usr/bin/podman stop --time=10 mindroom-static-runner
+Restart=always
+RestartSec=3
+TimeoutStartSec=90
+TimeoutStopSec=20
+# Hard ceiling for any background workload: service restart kills the container cgroup.
+RuntimeMaxSec=1h
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
