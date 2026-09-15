@@ -1,0 +1,13 @@
+[Unit]
+Description=Install deny-all network policy for MindRoom static runner workloads
+Before=mindroom-static-runner.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/sbin/nft delete table inet mindroom_static_runner
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/mindroom-static-runner/mindroom-static-runner.nft
+ExecStop=-/usr/sbin/nft delete table inet mindroom_static_runner
+
+[Install]
+WantedBy=multi-user.target
