@@ -1,0 +1,13 @@
+table inet mindroom_static_runner {
+  chain runner_ingress {
+    type filter hook input priority -10; policy accept;
+    iifname "lo" tcp dport 8766 accept
+    tcp dport 8766 reject with tcp reset
+  }
+
+  chain workload_egress {
+    type filter hook output priority -10; policy accept;
+    meta skuid 61184 ct state established,related accept
+    meta skuid 61184 reject
+  }
+}
