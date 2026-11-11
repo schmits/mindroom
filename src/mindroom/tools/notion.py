@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="notion",
+    file_access=ToolFileAccess.NONE,
     display_name="Notion",
     description="Create, update, and search pages in Notion databases",
     category=ToolCategory.PRODUCTIVITY,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("NOTION_API_KEY",),
             label="API Key",
             type="password",
             required=True,
@@ -31,6 +33,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="database_id",
+            env=("NOTION_DATABASE_ID",),
             label="Database ID",
             type="text",
             required=True,
@@ -67,7 +70,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["notion-client"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/notion",
+    docs_url="https://docs.mindroom.chat/tools/project-management/#notion",
     helper_text="Create an integration at [Notion Developers](https://www.notion.so/my-integrations) and share the database with it",
     function_names=("create_page", "search_pages", "update_page"),
 )

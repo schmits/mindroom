@@ -1,0 +1,305 @@
+"""The prompt_curation automation: when an agent's always-loaded files grow too large, ask it to condense them.
+
+The check measures `MEMORY.md` and the always-loaded context files in the workspace it maintains (`private.context_files`
+for a private agent) with the agent's model's token counter.
+When they exceed the trigger, or `MEMORY.md` has more lines than the preload keeps, the prompt asks the agent for a
+bounded cut in a normal visible run.
+Agents told to "clean up" tend to cut most of a file, so verify measures the files again once the run ends and, when
+the result is outside the bounds, asks the agent once to re-check its change.
+Verify never writes the files back, because other conversations with the same agent may write them meanwhile.
+Files are read through no-follow descriptor walks, because worker code writes this workspace.
+"""
+
+from __future__ import annotations
+
+from contextlib import suppress
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import TYPE_CHECKING
+
+from mindroom.automations.registry import automation
+from mindroom.automations.steps import Ask, AutomationContext, Done, workspace_context_files
+from mindroom.config.automations import MAX_FILE_SHRINK, PromptCurationAutomation
+from mindroom.config.resolution import entity_model_name
+from mindroom.logging_config import get_logger
+from mindroom.memory import entrypoint_tokens, entrypoint_withholds_lines, read_scope_memory_files
+from mindroom.path_confinement import read_regular_file_within_root
+from mindroom.providers.registry import model_token_counter
+from mindroom.token_counting.counts import count
+from mindroom.token_counting.families import finish_loading
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+    from pathlib import Path
+
+    from mindroom.config.main import Config
+    from mindroom.llm.provider import TokenCounter
+
+logger = get_logger(__name__)
+
+_ENTRYPOINT = "MEMORY.md"
+_MEMORY_DIR_PREFIX = "memory/"
+_MAX_FILE_BYTES = 1 << 20
+
+
+@dataclass(frozen=True)
+class _CurationPlan:
+    """What one prompt asked for, and the files as they were when it was posted."""
+
+    agent_name: str
+    root: Path
+    settings: PromptCurationAutomation
+    # Curated files, by workspace-relative path, as they were at fire time; only compared, never written.
+    snapshot: Mapping[str, bytes]
+    # Every memory/ topic file the scan read at fire time, so verify can tell detail moved from detail deleted.
+    memory_tokens: int
+    curated: Mapping[str, int]
+    # MEMORY.md lines and tokens at fire time, the tokens as the preload counts them; the preload withholds lines beyond
+    # either memory.file.max_entrypoint_* cap.
+    memory_lines: int
+    entrypoint_tokens: int
+    max_entrypoint_lines: int
+    max_entrypoint_tokens: int
+    upper_tokens: int
+    floor_tokens: int
+    # How the agent's model counts tokens; verify measures the files again with it.
+    counter: TokenCounter
+
+    @property
+    def measured_tokens(self) -> int:
+        """Return the curated files' total at fire time."""
+        return sum(self.curated.values())
+
+
+@dataclass(frozen=True)
+class _CurationResult:
+    """How the files compare with the plan once the run ended."""
+
+    tokens_after: int
+    changed: bool
+    findings: tuple[str, ...] = ()
+
+
+def _read(root: Path, path: str) -> bytes | None:
+    try:
+        return read_regular_file_within_root(root, path, max_bytes=_MAX_FILE_BYTES)
+    except FileNotFoundError:
+        return None
+
+
+def _tokens(counter: TokenCounter, payload: bytes) -> int:
+    return count(counter, payload.decode("utf-8"))
+
+
+def _memory_dir_tokens(root: Path, exclude: Iterable[str], counter: TokenCounter) -> int:
+    """Return the estimated tokens of the memory/ topic files, except ``exclude``.
+
+    Curated files are excluded even under memory/, so their content is counted once.
+    """
+    excluded = set(exclude)
+    return sum(
+        count(counter, memory_file.text)
+        for memory_file in read_scope_memory_files(root)
+        if memory_file.relative_path.startswith(_MEMORY_DIR_PREFIX) and memory_file.relative_path not in excluded
+    )
+
+
+def _curated_paths(config: Config, agent_name: str) -> list[str]:
+    return list(dict.fromkeys([_ENTRYPOINT, *workspace_context_files(config, agent_name)]))
+
+
+def _plan_curation(
+    config: Config,
+    root: Path,
+    agent_name: str,
+    settings: PromptCurationAutomation,
+    counter: TokenCounter,
+) -> _CurationPlan | None:
+    """Return the plan for a due prompt over the file memory at ``root``, or None while the files are within the limits.
+
+    Raises ``OSError``, ``ValueError``, or ``UnicodeDecodeError`` for a file that cannot be read safely.
+    """
+    curated_payloads = {
+        path: payload for path in _curated_paths(config, agent_name) if (payload := _read(root, path)) is not None
+    }
+    curated = {path: _tokens(counter, payload) for path, payload in curated_payloads.items()}
+    measured = sum(curated.values())
+    memory_text = curated_payloads.get(_ENTRYPOINT, b"").decode("utf-8")
+    memory_lines = len(memory_text.splitlines())
+    # Lines the preload withholds never reach the prompt, at any token count; judged as a reply's preload judges them.
+    if measured <= settings.trigger_tokens and not entrypoint_withholds_lines(memory_text, config, counter):
+        return None
+    return _CurationPlan(
+        agent_name=agent_name,
+        root=root,
+        settings=settings,
+        snapshot=curated_payloads,
+        memory_tokens=_memory_dir_tokens(root, curated_payloads, counter),
+        curated=curated,
+        memory_lines=memory_lines,
+        entrypoint_tokens=entrypoint_tokens(memory_text, counter),
+        max_entrypoint_lines=config.memory.file.max_entrypoint_lines,
+        max_entrypoint_tokens=config.memory.file.max_entrypoint_tokens,
+        upper_tokens=round(measured * (1 - settings.min_reduction)),
+        floor_tokens=round(measured * (1 - settings.max_reduction)),
+        counter=counter,
+    )
+
+
+def _curation_prompt(config: Config, plan: _CurationPlan) -> str:
+    """Render the visible prompt that asks the agent for this plan's cut."""
+    return config.render_prompt(
+        "PROMPT_CURATION_PROMPT_TEMPLATE",
+        measured_tokens=plan.measured_tokens,
+        trigger_tokens=plan.settings.trigger_tokens,
+        memory_lines=plan.memory_lines,
+        entrypoint_tokens=plan.entrypoint_tokens,
+        max_entrypoint_lines=plan.max_entrypoint_lines,
+        max_entrypoint_tokens=plan.max_entrypoint_tokens,
+        file_sizes=", ".join(f"{path} ({tokens} tokens)" for path, tokens in plan.curated.items()),
+        upper_tokens=plan.upper_tokens,
+        floor_tokens=plan.floor_tokens,
+        max_file_shrink_percent=round(100 * MAX_FILE_SHRINK),
+    )
+
+
+def _read_after_run(root: Path, path: str) -> bytes | None | OSError | ValueError:
+    """Read one file after the run, returning a read failure instead of raising it."""
+    try:
+        return _read(root, path)
+    except (OSError, ValueError) as error:
+        return error
+
+
+def _findings(
+    plan: _CurationPlan,
+    after_run: Mapping[str, bytes | None | OSError | ValueError],
+) -> tuple[int, list[str]]:
+    """Return the curated files' total after the run and what looks outside the plan's bounds."""
+    after: dict[str, int] = {}
+    unreadable: list[str] = []
+    for path in plan.curated:
+        payload = after_run[path]
+        if isinstance(payload, Exception):
+            unreadable.append(f"{path} cannot be read ({payload})")
+            continue
+        try:
+            after[path] = _tokens(plan.counter, payload or b"")
+        except UnicodeDecodeError:
+            unreadable.append(f"{path} is no longer valid UTF-8")
+    if unreadable:
+        # Without every file's size, totals and loss would read an unreadable file as deleted.
+        return plan.measured_tokens, unreadable
+    # The global loss allowance can hide a small file, such as SOUL.md, being cut whole, so each file has its own bound.
+    findings = [
+        f"{path} shrank {round(100 * (before - after[path]) / before)}% (more than {round(100 * MAX_FILE_SHRINK)}%)"
+        for path, before in plan.curated.items()
+        if before and after[path] < before * (1 - MAX_FILE_SHRINK)
+    ]
+    total = sum(after.values())
+    if total < plan.floor_tokens:
+        findings.append(f"the files total {total} tokens, below the floor of {plan.floor_tokens}")
+    if total >= plan.measured_tokens:
+        findings.append(f"the files did not shrink ({total} tokens)")
+    memory_after = after_run.get(_ENTRYPOINT)
+    lines_after = len(memory_after.decode("utf-8").splitlines()) if isinstance(memory_after, bytes) else 0
+    # Shorter lines alone keep the same lines out of the prompt, so a pass over the line cap must remove some.
+    if plan.memory_lines > plan.max_entrypoint_lines and lines_after >= plan.memory_lines:
+        findings.append(
+            f"MEMORY.md still has {lines_after} lines, more than the {plan.max_entrypoint_lines} that reach your prompt",
+        )
+    if loss := _content_loss(plan, total):
+        findings.append(loss)
+    return total, findings
+
+
+def _content_loss(plan: _CurationPlan, curated_tokens: int) -> str | None:
+    """Describe memory content deleted rather than moved beyond the allowance, or return None."""
+    memory_tokens = _memory_dir_tokens(plan.root, plan.snapshot, plan.counter)
+    lost = plan.measured_tokens + plan.memory_tokens - (curated_tokens + memory_tokens)
+    if lost <= (max_loss := round(plan.settings.max_content_loss * plan.measured_tokens)):
+        return None
+    return f"about {lost} tokens of memory were deleted rather than moved to memory/ (at most {max_loss})"
+
+
+def _verify_curation(plan: _CurationPlan) -> _CurationResult:
+    """Measure the files after the run and describe anything outside the plan's bounds, without writing them."""
+    after_run = {path: _read_after_run(plan.root, path) for path in plan.snapshot}
+    if all(after_run[path] == payload for path, payload in plan.snapshot.items()):
+        # A run can still have deleted memory/ detail without touching the prompt files.
+        loss = _content_loss(plan, plan.measured_tokens)
+        return _CurationResult(tokens_after=plan.measured_tokens, changed=False, findings=(loss,) if loss else ())
+    tokens_after, findings = _findings(plan, after_run)
+    return _CurationResult(tokens_after=tokens_after, changed=True, findings=tuple(findings))
+
+
+def _curation_notice(config: Config, plan: _CurationPlan, result: _CurationResult) -> str:
+    """Return the message posted in the prompt's thread once verify ran; findings ask the agent to re-check."""
+    if result.findings:
+        return config.render_prompt("PROMPT_CURATION_RECHECK_TEMPLATE", findings="; ".join(result.findings))
+    if not result.changed:
+        return f"Prompt maintenance changed nothing; the files stay at {plan.measured_tokens} tokens."
+    return f"✅ Prompt files condensed from {plan.measured_tokens} to {result.tokens_after} tokens."
+
+
+def _stable_counter(counter: TokenCounter) -> TokenCounter:
+    """Return ``counter`` once it counts with a loaded vocabulary, else the stand-in, so verify counts as the plan did.
+
+    Its first count starts loading the vocabulary it counts with, such as cl100k_base for an older OpenAI model, which
+    this waits for. Without network access and a cached vocabulary, loading fails on every run.
+    """
+    with suppress(OSError, ValueError):
+        counter.estimate("a")
+        finish_loading()
+    if counter.estimate("a") is None:
+        return replace(counter, estimate=lambda _text: None)
+    return counter
+
+
+@automation("prompt_curation", requires_file_memory=True)
+def check_curation(ctx: AutomationContext) -> Ask | None:
+    """Return the prompt asking for a cut, or None while the files are within the limits."""
+    if not isinstance(ctx.entry, PromptCurationAutomation):
+        msg = f"prompt_curation cannot run the {ctx.entry.name} entry"
+        raise ValueError(msg)  # noqa: TRY004 - the runner turns ValueError into a visible notice
+    config, agent_name = ctx.config, ctx.agent_name
+    counter = _stable_counter(
+        model_token_counter(
+            config,
+            ctx.runtime_paths,
+            entity_model_name(config, agent_name),
+            execution_identity=ctx.execution_identity,
+        ),
+    )
+    # The workspace of an agent with file memory, which this automation requires, is its file-memory root.
+    plan = _plan_curation(config, ctx.workspace, agent_name, ctx.entry, counter)
+    if plan is None:
+        return None
+    logger.info(
+        "Prompt curation asks for a cut",
+        agent=agent_name,
+        # A field named only "tokens" is redacted as a credential.
+        file_tokens=plan.measured_tokens,
+        memory_lines=plan.memory_lines,
+        target_tokens=plan.upper_tokens,
+        floor_tokens=plan.floor_tokens,
+    )
+    return Ask(_curation_prompt(config, plan), new_thread=True, then=partial(_after_curation, plan))
+
+
+def _after_curation(plan: _CurationPlan, config: Config, thread_id: str, _timed_out: bool) -> Ask | Done:
+    result = _verify_curation(plan)
+    logger.info(
+        "Prompt curation verified",
+        agent=plan.agent_name,
+        changed=result.changed,
+        findings=list(result.findings),
+        tokens_before=plan.measured_tokens,
+        tokens_after=result.tokens_after,
+    )
+    notice = _curation_notice(config, plan, result)
+    if result.findings:
+        # A re-check asks the agent once, like the prompt itself; its answer is not verified again.
+        return Ask(notice, new_thread=False)
+    # A run that stayed within the bounds resolves its thread; an unchanged run leaves it open.
+    return Done(notice, resolve=(thread_id,) if result.changed else ())

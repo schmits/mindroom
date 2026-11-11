@@ -3,34 +3,77 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
-from contextvars import ContextVar
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import Context, ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from agno.db.base import SessionType
-
-from mindroom.agent_storage import get_agent_session, get_team_session
-from mindroom.ai_runtime import finalize_queued_notice_response_turn_async, queued_message_signal_context
-from mindroom.hooks import EVENT_SESSION_STARTED, SessionHookContext, emit
+from mindroom import constants
+from mindroom.ai_runtime import queued_message_signal_context
+from mindroom.background_tasks import create_background_task
+from mindroom.cancellation import current_task_is_process_shutdown
+from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
+from mindroom.final_delivery import (
+    AwaitingApproval,
+    Cancelled,
+    Completed,
+    Failed,
+    Owed,
+    Suppressed,
+    Suppression,
+    hook_failure_reason,
+    outcome_label,
+)
+from mindroom.hooks import (
+    EVENT_MESSAGE_AFTER_RESPONSE,
+    EVENT_MESSAGE_BEFORE_RESPONSE,
+    EVENT_MESSAGE_CANCELLED,
+    EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM,
+    EVENT_TURN_ENDED,
+    EVENT_TURN_PAUSED,
+    EVENT_TURN_RESUMED,
+    EVENT_TURN_STARTED,
+    AfterResponseContext,
+    BeforeResponseContext,
+    CancelledResponseContext,
+    CancelledResponseInfo,
+    FinalResponseDraft,
+    FinalResponseTransformContext,
+    ResponseDraft,
+    ResponseResult,
+    TurnLifecycleContext,
+    TurnOutcome,
+    emit,
+    emit_final_response_transform,
+    emit_transform,
+)
+from mindroom.logging_config import get_logger
 from mindroom.message_target import ResponseLifecycleKey
+from mindroom.mid_turn import QueuedMessage, message_text_for_judgment
 from mindroom.post_response_effects import apply_post_response_effects
-from mindroom.tool_system.runtime_context import resolve_tool_runtime_hook_bindings
+from mindroom.scheduling.scheduled_run_records import record_silent_schedule_result_if_needed
+from mindroom.streaming import strip_matching_visible_tool_markers
+from mindroom.tool_jobs.control import pending_human_messages_context
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
 
-    from agno.db.base import BaseDb
     from structlog.stdlib import BoundLogger
 
-    from mindroom.delivery_gateway import ResponseHookService, ResponseIdentity
-    from mindroom.final_delivery import FinalDeliveryOutcome
-    from mindroom.history.types import HistoryScope
-    from mindroom.hooks import MessageEnvelope
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+    from mindroom.delivery_gateway import ResponseIdentity
+    from mindroom.event_journal.approval_signals import ApprovalSignals, PausedReply
+    from mindroom.final_delivery import FinalDeliveryOutcome, TurnEnding
+    from mindroom.hooks import HookContextSupport, MessageEnvelope
     from mindroom.message_target import MessageTarget
+    from mindroom.mid_turn import MidTurnGate
     from mindroom.post_response_effects import PostResponseEffectsDeps, ResponseOutcome
     from mindroom.timing import DispatchPipelineTiming
-    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.events import ToolTraceEntry
+
+logger = get_logger(__name__)
 
 _LockedResponseResult = TypeVar("_LockedResponseResult")
 
@@ -66,7 +109,7 @@ class ResponseLifecycleReservation:
             self._acquire_task = asyncio.create_task(self._acquire())
         await self._ready.wait()
 
-    def consume(
+    def _consume(
         self,
         coordinator: ResponseLifecycleCoordinator,
         target: MessageTarget,
@@ -139,18 +182,24 @@ def response_lifecycle_reservation_context(
 class _QueuedMessageState:
     """Track queued human ingress while one response lifecycle holds the lock."""
 
-    pending_human_message_event_ids: set[str] = field(default_factory=set)
+    _pending_messages: dict[str, QueuedMessage] = field(default_factory=dict)
+    mid_turn_gate: MidTurnGate | None = None
     _active_response_turns: int = 0
-    _event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Replaced on every change of the queue, so each waiter wakes once per change.
+    _changed: asyncio.Event = field(default_factory=asyncio.Event)
     _idle_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __post_init__(self) -> None:
         self._idle_event.set()
 
+    def pending_message_snapshot(self) -> tuple[QueuedMessage, ...]:
+        """Snapshot queued text in admission order without consuming any event."""
+        return tuple(self._pending_messages.values())
+
     @property
     def pending_human_messages(self) -> int:
         """Return the number of distinct queued human events."""
-        return len(self.pending_human_message_event_ids)
+        return len(self._pending_messages)
 
     def begin_response_turn(self) -> bool:
         existing_turn = self._active_response_turns > 0
@@ -165,18 +214,29 @@ class _QueuedMessageState:
         if self._active_response_turns == 0:
             self._idle_event.set()
 
-    def add_waiting_human_message(self, source_event_id: str) -> bool:
-        previous_count = self.pending_human_messages
-        self.pending_human_message_event_ids.add(source_event_id)
-        self._event.set()
-        return self.pending_human_messages != previous_count
+    def add_waiting_human_message(
+        self,
+        source_event_id: str,
+        *,
+        text: str | None = None,
+        requester_id: str | None = None,
+    ) -> bool:
+        if source_event_id in self._pending_messages:
+            return False
+        progress = self.mid_turn_gate.visible_response_text if self.mid_turn_gate is not None else ""
+        self._pending_messages[source_event_id] = QueuedMessage(source_event_id, text, progress, requester_id)
+        self._notify_changed()
+        return True
 
     def consume_waiting_human_message(self, source_event_id: str) -> None:
-        if source_event_id not in self.pending_human_message_event_ids:
+        if source_event_id not in self._pending_messages:
             return
-        self.pending_human_message_event_ids.remove(source_event_id)
-        if self.pending_human_messages == 0:
-            self._event.clear()
+        del self._pending_messages[source_event_id]
+        self._notify_changed()
+
+    def _notify_changed(self) -> None:
+        self._changed.set()
+        self._changed = asyncio.Event()
 
     def has_pending_human_messages(self) -> bool:
         return self.pending_human_messages > 0
@@ -185,13 +245,34 @@ class _QueuedMessageState:
         return self._active_response_turns > 0
 
     async def wait(self) -> None:
-        await self._event.wait()
+        """Return once a queued message needs the reply's attention; the mid-turn judge can let messages wait."""
+        while True:
+            changed = self._changed
+            if await self._interrupts():
+                return
+            # The judgment can absorb this wait's cancellation (an HTTP client whose own timeout fires with it takes it
+            # for that timeout), so a cancelled wait stops here instead of waiting again.
+            if (task := asyncio.current_task()) is not None and task.cancelling():
+                raise asyncio.CancelledError
+            # A queue that changed while it was judged or acknowledged is judged again at once.
+            await changed.wait()
+
+    async def _interrupts(self) -> bool:
+        pending = self.pending_message_snapshot()
+        if not pending:
+            return False
+        gate = self.mid_turn_gate
+        if gate is None:
+            return True
+
+        def still_queued() -> bool:
+            return pending == self.pending_message_snapshot()
+
+        # A decision counts only for the queue it judged.
+        return not await gate.defers(pending, current=still_queued) and still_queued()
 
     async def wait_until_idle(self) -> None:
         await self._idle_event.wait()
-
-    def is_set(self) -> bool:
-        return self._event.is_set()
 
 
 @dataclass(slots=True)
@@ -202,19 +283,12 @@ class QueuedHumanNoticeReservation:
     _source_event_id: str
     _active: bool = True
 
-    def _release_waiting_human_message(self) -> None:
+    def release(self) -> None:
+        """Stop counting this message as waiting for the running response; idempotent."""
         if not self._active:
             return
         self._state.consume_waiting_human_message(self._source_event_id)
         self._active = False
-
-    def consume(self) -> None:
-        """Mark the reservation as owned by the response lifecycle."""
-        self._release_waiting_human_message()
-
-    def cancel(self) -> None:
-        """Release a reservation that will not reach response lifecycle ownership."""
-        self._release_waiting_human_message()
 
 
 @dataclass
@@ -223,6 +297,47 @@ class ResponseLifecycleCoordinator:
 
     _response_lifecycle_locks: dict[ResponseLifecycleKey, asyncio.Lock] = field(default_factory=dict)
     _thread_queued_signals: dict[ResponseLifecycleKey, _QueuedMessageState] = field(default_factory=dict)
+    # A pending approval counts as an active response turn of its conversation, by approval,
+    # for each paused reply the journal's approval signals report.
+    _approval_holds: dict[str, ResponseLifecycleKey] = field(default_factory=dict)
+    _stop_following_approvals: Callable[[], None] | None = None
+
+    def follow_approval_holds(self, signals: ApprovalSignals, principal_id: str) -> None:
+        """Hold the conversation of each paused reply of ``principal_id``, from the ones paused now, until it ends.
+
+        Later messages wait as they wait behind a running response. The hold
+        does not take the lifecycle lock, so the approval's own resume and
+        settlement still run.
+        """
+        self.stop_following_approval_holds()
+        self._stop_following_approvals = signals.follow_paused_replies(
+            principal_id,
+            paused=self._hold_for_approval,
+            ended=self._release_approval_hold,
+        )
+
+    def stop_following_approval_holds(self) -> None:
+        """Stop learning of paused replies, as a stopping bot does before its replacement follows them."""
+        stop, self._stop_following_approvals = self._stop_following_approvals, None
+        if stop is not None:
+            stop()
+
+    def _hold_for_approval(self, paused: PausedReply) -> None:
+        if paused.approval_id in self._approval_holds:
+            return
+        lifecycle_key = ResponseLifecycleKey(room_id=paused.room_id, thread_id=paused.thread_id)
+        self._approval_holds[paused.approval_id] = lifecycle_key
+        self._queued_signal_for_key(lifecycle_key).begin_response_turn()
+
+    def _release_approval_hold(self, approval_id: str) -> None:
+        lifecycle_key = self._approval_holds.pop(approval_id, None)
+        if lifecycle_key is not None:
+            self._thread_queued_signals[lifecycle_key].finish_response_turn()
+
+    def approval_holds(self, room_id: str, thread_id: str | None) -> tuple[str, ...]:
+        """Return the approvals that hold one conversation."""
+        lifecycle_key = ResponseLifecycleKey(room_id=room_id, thread_id=thread_id)
+        return tuple(approval_id for approval_id, key in self._approval_holds.items() if key == lifecycle_key)
 
     def _has_active_response_for_thread_key(self, lifecycle_key: ResponseLifecycleKey) -> bool:
         queued_signal = self._thread_queued_signals.get(lifecycle_key)
@@ -234,6 +349,13 @@ class ResponseLifecycleCoordinator:
     def has_active_response_for_target(self, target: MessageTarget) -> bool:
         """Return whether one canonical conversation target already has an active turn."""
         return self._has_active_response_for_thread_key(target.lifecycle_key)
+
+    def has_waiting_messages_from(self, target: MessageTarget, requester_id: str) -> bool:
+        """Return whether one requester's messages wait for one canonical conversation's next turn."""
+        queued_signal = self._thread_queued_signals.get(target.lifecycle_key)
+        return queued_signal is not None and any(
+            message.requester_id == requester_id for message in queued_signal.pending_message_snapshot()
+        )
 
     def active_thread_ids_for_room(self, room_id: str) -> frozenset[str | None]:
         """Return canonical thread IDs with active response lifecycles in one room."""
@@ -315,13 +437,25 @@ class ResponseLifecycleCoordinator:
 
     def _get_or_create_queued_signal(self, target: MessageTarget) -> _QueuedMessageState:
         """Return the queued-message signal for one canonical conversation thread."""
-        lifecycle_key = target.lifecycle_key
+        return self._queued_signal_for_key(target.lifecycle_key)
+
+    def _queued_signal_for_key(self, lifecycle_key: ResponseLifecycleKey) -> _QueuedMessageState:
         signal = self._thread_queued_signals.get(lifecycle_key)
         if signal is not None:
             return signal
         signal = _QueuedMessageState()
         self._thread_queued_signals[lifecycle_key] = signal
         return signal
+
+    def visible_progress_callback(
+        self,
+        target: MessageTarget,
+    ) -> Callable[[str, Sequence[ToolTraceEntry]], None] | None:
+        """Bind acknowledged Matrix text to the active response's opted-in judge."""
+        signal = self._thread_queued_signals.get(target.lifecycle_key)
+        if signal is None or signal.mid_turn_gate is None:
+            return None
+        return signal.mid_turn_gate.record_visible_response
 
     @staticmethod
     def _should_signal_queued_message(
@@ -350,7 +484,11 @@ class ResponseLifecycleCoordinator:
         if not self._has_active_response_for_thread_key(target.lifecycle_key):
             return None
         queued_signal = self._get_or_create_queued_signal(target)
-        if not queued_signal.add_waiting_human_message(response_envelope.source_event_id):
+        if not queued_signal.add_waiting_human_message(
+            response_envelope.source_event_id,
+            text=message_text_for_judgment(response_envelope),
+            requester_id=response_envelope.requester_id,
+        ):
             return None
         return QueuedHumanNoticeReservation(queued_signal, response_envelope.source_event_id)
 
@@ -369,7 +507,11 @@ class ResponseLifecycleCoordinator:
             return None
         if not self._should_signal_queued_message(response_envelope):
             return None
-        if not queued_signal.add_waiting_human_message(response_envelope.source_event_id):
+        if not queued_signal.add_waiting_human_message(
+            response_envelope.source_event_id,
+            text=message_text_for_judgment(response_envelope),
+            requester_id=response_envelope.requester_id,
+        ):
             return None
         return response_envelope.source_event_id
 
@@ -392,7 +534,7 @@ class ResponseLifecycleCoordinator:
         reservation: ResponseLifecycleReservation | None,
     ) -> tuple[asyncio.Lock, _QueuedMessageState, str | None]:
         if reservation is not None:
-            return reservation.consume(self, target), reservation._queued_signal, None
+            return reservation._consume(self, target), reservation._queued_signal, None
         lifecycle_lock = self._response_lifecycle_lock(target)
         queued_signal = self._get_or_create_queued_signal(target)
         notice = self._begin_response_turn_notice(
@@ -456,6 +598,7 @@ class ResponseLifecycleCoordinator:
         pipeline_timing: DispatchPipelineTiming | None,
         locked_operation: Callable[[MessageTarget], Awaitable[_LockedResponseResult]],
         signal_queued_message: bool = True,
+        mid_turn_gate: MidTurnGate | None = None,
     ) -> _LockedResponseResult:
         """Run one locked response operation with shared queued-message bookkeeping."""
         self._assert_target_matches_envelope(target, response_envelope)
@@ -470,12 +613,10 @@ class ResponseLifecycleCoordinator:
             # This response now owns the reservation locally. Descendant tasks
             # must acquire their own lifecycle instead of inheriting this one-shot claim.
             _current_response_lifecycle_reservation.set(None)
-        lock_acquired = False
         try:
             if pipeline_timing is not None:
                 pipeline_timing.mark("lock_wait_start")
             await self._acquire_response_turn_lock(lifecycle_lock, reservation)
-            lock_acquired = True
             if pipeline_timing is not None:
                 pipeline_timing.mark("lock_acquired")
             try:
@@ -484,14 +625,18 @@ class ResponseLifecycleCoordinator:
                     notice=notice,
                     queued_signal=queued_signal,
                 )
-                with queued_message_signal_context(queued_signal) as notice_context:
+                queued_signal.mid_turn_gate = mid_turn_gate
+                with (
+                    # A newer human message also releases the reply's tool waits; other queued turns wait for it.
+                    pending_human_messages_context(queued_signal),
+                    queued_message_signal_context(queued_signal, mid_turn_gate=mid_turn_gate),
+                ):
                     try:
                         return await locked_operation(target)
                     finally:
-                        await finalize_queued_notice_response_turn_async(notice_context)
+                        queued_signal.mid_turn_gate = None
             finally:
-                if lock_acquired:
-                    await self._release_response_turn_lock(lifecycle_lock, reservation)
+                await self._release_response_turn_lock(lifecycle_lock, reservation)
         finally:
             await self._finish_response_turn(
                 reservation=reservation,
@@ -499,51 +644,213 @@ class ResponseLifecycleCoordinator:
                 queued_signal=queued_signal,
             )
 
-    async def run_locked_target_operation(
+
+@dataclass
+class ResponseHookService:
+    """Own response hook execution around final delivery."""
+
+    hook_context: HookContextSupport
+    # Passes each final agent reply on to another surface, or returns None when the reply goes nowhere else, so no
+    # task starts for it. It runs in the background, so a slow surface never holds the response lock that
+    # `_emit_after_response` runs under.
+    reply_mirror: Callable[[MessageEnvelope, str], Coroutine[Any, Any, None] | None] | None = None
+
+    async def apply_before_response(
         self,
         *,
-        target: MessageTarget,
-        while_waiting: Callable[[], Awaitable[None]] | None,
-        locked_operation: Callable[[], Awaitable[_LockedResponseResult]],
-    ) -> _LockedResponseResult:
-        """Run a non-response operation under one target's response lock."""
-        lifecycle_lock = self._response_lifecycle_lock(target)
-        acquire_task = asyncio.create_task(lifecycle_lock.acquire())
-        lock_acquired = False
-        try:
-            if while_waiting is None:
-                await acquire_task
-                lock_acquired = True
-                return await locked_operation()
-            while not acquire_task.done():
-                await while_waiting()
-                await asyncio.wait({acquire_task}, timeout=0.01)
-            await acquire_task
-            lock_acquired = True
-            return await locked_operation()
-        finally:
-            if not acquire_task.done():
-                acquire_task.cancel()
-                await asyncio.gather(acquire_task, return_exceptions=True)
-            elif not lock_acquired and not acquire_task.cancelled() and acquire_task.exception() is None:
-                lifecycle_lock.release()
-            if lock_acquired:
-                lifecycle_lock.release()
+        identity: ResponseIdentity,
+        response_text: str,
+        tool_trace: list[ToolTraceEntry] | None,
+        extra_content: dict[str, Any] | None,
+    ) -> ResponseDraft:
+        """Return a whole answer as the ``message:before_response`` hooks leave it; raises what a hook raises."""
+        draft = ResponseDraft(
+            response_text=response_text,
+            response_kind=identity.response_kind,
+            tool_trace=deepcopy(tool_trace) if tool_trace is not None else None,
+            extra_content=deepcopy(extra_content) if extra_content is not None else None,
+            envelope=identity.response_envelope,
+        )
+        if not self.hook_context.registry.has_hooks(EVENT_MESSAGE_BEFORE_RESPONSE):
+            return draft
+        context = BeforeResponseContext(
+            **self.hook_context.base_kwargs(EVENT_MESSAGE_BEFORE_RESPONSE, identity.correlation_id),
+            turn_id=identity.turn_id,
+            draft=draft,
+        )
+        return await emit_transform(self.hook_context.registry, EVENT_MESSAGE_BEFORE_RESPONSE, context)
+
+    async def apply_final_response_transform(
+        self,
+        *,
+        identity: ResponseIdentity,
+        response_text: str,
+    ) -> FinalResponseDraft:
+        """Return a streamed answer's final text as the ``message:final_response_transform`` hooks leave it."""
+        if current_task_is_process_shutdown():
+            raise asyncio.CancelledError
+        draft = FinalResponseDraft(
+            response_text=response_text,
+            response_kind=identity.response_kind,
+            envelope=identity.response_envelope,
+        )
+        if not self.hook_context.registry.has_hooks(EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM):
+            return draft
+        context = FinalResponseTransformContext(
+            **self.hook_context.base_kwargs(EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM, identity.correlation_id),
+            turn_id=identity.turn_id,
+            draft=draft,
+        )
+        draft = await emit_final_response_transform(
+            self.hook_context.registry,
+            EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM,
+            context,
+        )
+        if current_task_is_process_shutdown():
+            raise asyncio.CancelledError
+        return draft
+
+    async def _emit_after_response(
+        self,
+        *,
+        identity: ResponseIdentity,
+        response_text: str,
+        response_event_id: str,
+        delivery_kind: Literal["sent", "edited"],
+    ) -> None:
+        if identity.response_kind == "ai" and self.reply_mirror is not None:
+            try:
+                mirror = self.reply_mirror(identity.response_envelope, response_text)
+                if mirror is not None:
+                    create_background_task(
+                        mirror,
+                        name="reply_mirror",
+                        owner=self.hook_context.runtime,
+                        # Outside the reply's span and context: the mirror is no part of the reply.
+                        context=Context(),
+                    )
+            except Exception:
+                logger.exception(
+                    "Reply mirror failed",
+                    agent=self.hook_context.agent_name,
+                    correlation_id=identity.correlation_id,
+                )
+        if not self.hook_context.registry.has_hooks(EVENT_MESSAGE_AFTER_RESPONSE):
+            return
+        context = AfterResponseContext(
+            **self.hook_context.base_kwargs(EVENT_MESSAGE_AFTER_RESPONSE, identity.correlation_id),
+            turn_id=identity.turn_id,
+            result=ResponseResult(
+                response_text=response_text,
+                response_event_id=response_event_id,
+                delivery_kind=delivery_kind,
+                response_kind=identity.response_kind,
+                envelope=identity.response_envelope,
+            ),
+        )
+        await emit(
+            self.hook_context.registry,
+            EVENT_MESSAGE_AFTER_RESPONSE,
+            context,
+            # The answer is delivered: one cancelled observer does not keep the rest from seeing it.
+            continue_on_cancelled=True,
+        )
+
+    async def _emit_cancelled_response(
+        self,
+        *,
+        identity: ResponseIdentity,
+        visible_response_event_id: str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        if not self.hook_context.registry.has_hooks(EVENT_MESSAGE_CANCELLED):
+            return
+        context = CancelledResponseContext(
+            **self.hook_context.base_kwargs(EVENT_MESSAGE_CANCELLED, identity.correlation_id),
+            turn_id=identity.turn_id,
+            info=CancelledResponseInfo(
+                envelope=identity.response_envelope,
+                visible_response_event_id=visible_response_event_id,
+                response_kind=identity.response_kind,
+                failure_reason=failure_reason,
+            ),
+        )
+        await emit(self.hook_context.registry, EVENT_MESSAGE_CANCELLED, context)
+
+    async def _emit_turn_event(
+        self,
+        event_name: str,
+        identity: ResponseIdentity,
+        outcome: TurnOutcome | None = None,
+    ) -> None:
+        """Run one turn lifecycle event's hooks for the turn ``identity`` names."""
+        if not self.hook_context.registry.has_hooks(event_name):
+            return
+        context = TurnLifecycleContext(
+            **self.hook_context.base_kwargs(event_name, identity.correlation_id),
+            turn_id=identity.turn_id,
+            envelope=identity.response_envelope,
+            outcome=outcome,
+        )
+        # How the turn settled is decided: one cancelled observer of its pause or end does not keep the rest from it.
+        await emit(
+            self.hook_context.registry,
+            event_name,
+            context,
+            continue_on_cancelled=event_name in {EVENT_TURN_PAUSED, EVENT_TURN_ENDED},
+        )
 
 
-@dataclass(frozen=True)
-class _SessionStartedWatch:
-    """Pre-computed session:started eligibility and emission arguments."""
+def _turn_end_for(ending: TurnEnding, *, run_succeeded: bool) -> TurnOutcome | Literal["paused"]:
+    """Return how a settled turn ends for its hooks: paused for approval, or the outcome ``turn:ended`` reports.
 
-    should_watch: bool
-    tool_context: ToolRuntimeContext | None
-    scope: HistoryScope
-    session_id: str
-    room_id: str
-    thread_id: str | None
-    session_type: SessionType
-    correlation_id: str
-    create_storage: Callable[[], BaseDb]
+    A run that failed but answered with its error completed its reply, not its turn; an answer withheld on purpose, or
+    one the outbox still owes, completed it. A failed participation check answers nothing and fails it.
+    """
+    match ending:
+        case AwaitingApproval():
+            return "paused"
+        case Cancelled():
+            return TurnOutcome.CANCELLED
+        case Failed() | Suppressed(reason=Suppression.PARTICIPATION_FAILED):
+            return TurnOutcome.FAILED
+        case Completed() if not run_succeeded:
+            return TurnOutcome.FAILED
+        case _:
+            return TurnOutcome.COMPLETED
+
+
+async def answer_suppression(
+    draft: ResponseDraft,
+    identity: ResponseIdentity,
+    *,
+    entity_name: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> Suppression | None:
+    """Return why a whole answer the hooks left must not be shown, and record a silent schedule's result.
+
+    A hook can suppress it, and neither a silent schedule's no-report answer nor a contact turn's answer is ever shown.
+    """
+    suppression = Suppression.HOOK if draft.suppress else None
+    if suppression is None and draft.envelope.source_kind == SILENT_SCHEDULE_SOURCE_KIND:
+        no_report_text = draft.response_text
+        if draft.tool_trace:
+            no_report_text = strip_matching_visible_tool_markers(no_report_text, draft.tool_trace)
+        if constants.is_silent_schedule_no_report_response(no_report_text):
+            suppression = Suppression.SILENT_NO_REPORT
+    if suppression is None and identity.contact_turn:
+        suppression = Suppression.CONTACT_TURN
+    await record_silent_schedule_result_if_needed(
+        entity_name=entity_name,
+        agent_names=identity.participating_agent_names or (entity_name,),
+        envelope=identity.response_envelope,
+        config=config,
+        runtime_paths=runtime_paths,
+        suppression_reason=None if suppression is None else suppression.value,
+        response_text=draft.response_text,
+    )
+    return suppression
 
 
 @dataclass(frozen=True)
@@ -553,38 +860,6 @@ class ResponseLifecycleDeps:
     response_hooks: ResponseHookService
     logger: BoundLogger
     process_shutdown_requested: Callable[[], bool]
-
-
-def _session_exists(
-    *,
-    storage: BaseDb,
-    session_id: str,
-    session_type: SessionType,
-) -> bool:
-    if session_type is SessionType.TEAM:
-        return get_team_session(storage, session_id) is not None
-    return get_agent_session(storage, session_id) is not None
-
-
-def _response_outcome_label(final_delivery_outcome: FinalDeliveryOutcome | None) -> str:
-    """Return one pipeline outcome label for the canonical final delivery outcome."""
-    if final_delivery_outcome is not None and final_delivery_outcome.suppressed:
-        return "suppressed"
-    if final_delivery_outcome is not None and final_delivery_outcome.terminal_status in {
-        "cancelled",
-        "error",
-        "suspended",
-    }:
-        return final_delivery_outcome.terminal_status
-    if final_delivery_outcome is not None and final_delivery_outcome.delivery_kind is not None:
-        return final_delivery_outcome.delivery_kind
-    if (
-        final_delivery_outcome is not None
-        and final_delivery_outcome.event_id is not None
-        and final_delivery_outcome.is_visible_response
-    ):
-        return "visible_response_preserved"
-    return "no_visible_response"
 
 
 class ResponseLifecycle:
@@ -600,6 +875,42 @@ class ResponseLifecycle:
         self.deps = deps
         self.identity = identity
         self.pipeline_timing = pipeline_timing
+        # How the last finalization settled the turn; None until one ran.
+        self._turn_end: TurnOutcome | Literal["paused"] | None = None
+
+    async def start_turn(self, *, resumed: bool) -> None:
+        """Emit ``turn:started``, or ``turn:resumed`` when the turn's approval resumes it."""
+        await self.deps.response_hooks._emit_turn_event(
+            EVENT_TURN_RESUMED if resumed else EVENT_TURN_STARTED,
+            self.identity,
+        )
+
+    @asynccontextmanager
+    async def turn(self, *, approval_owns_end: Callable[[TurnOutcome], Awaitable[bool]]) -> AsyncIterator[None]:
+        """Run one settlement of the turn, then emit its ``turn:paused``, or its ``turn:ended`` unless an approval owns it.
+
+        How the block's finalization settled the turn decides the event; a block that raised before any finalization
+        ends the turn cancelled for a cancellation and failed for an error. A turn with an approval, paused or resumed,
+        ends when that approval ends, whose settlement emits ``turn:ended``.
+        """
+        cancelled = False
+        try:
+            yield
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            end = self._turn_end or (TurnOutcome.CANCELLED if cancelled else TurnOutcome.FAILED)
+            hooks = self.deps.response_hooks
+            if end == "paused":
+                await hooks._emit_turn_event(EVENT_TURN_PAUSED, self.identity)
+            # With no turn:ended hook there is no end to emit, so no journal read decides who owns it.
+            elif hooks.hook_context.registry.has_hooks(EVENT_TURN_ENDED) and not await approval_owns_end(end):
+                await self.end_turn(end)
+
+    async def end_turn(self, outcome: TurnOutcome) -> None:
+        """Emit the turn's ``turn:ended``."""
+        await self.deps.response_hooks._emit_turn_event(EVENT_TURN_ENDED, self.identity, outcome)
 
     def _raise_if_process_shutdown(self) -> None:
         """Stop best-effort lifecycle work once orderly process shutdown owns cancellation."""
@@ -621,205 +932,102 @@ class ResponseLifecycle:
             error_type=error.__class__.__name__,
         )
 
-    def _session_started_watch_is_needed(
-        self,
-        *,
-        tool_context: ToolRuntimeContext | None,
-        session_id: str,
-        session_type: SessionType,
-        create_storage: Callable[[], BaseDb],
-    ) -> bool:
-        if tool_context is None or not tool_context.hook_registry.has_hooks(EVENT_SESSION_STARTED):
-            return False
-        try:
-            storage = create_storage()
-            try:
-                return not _session_exists(
-                    storage=storage,
-                    session_id=session_id,
-                    session_type=session_type,
-                )
-            finally:
-                storage.close()
-        except Exception as error:
-            self.deps.logger.exception(
-                "Failed to probe session storage for session:started eligibility",
-                session_id=session_id,
-                session_type=str(session_type),
-                failure_reason=str(error),
-            )
-            return False
-
-    def setup_session_watch(
-        self,
-        *,
-        tool_context: ToolRuntimeContext | None,
-        session_id: str,
-        session_type: SessionType,
-        scope: HistoryScope,
-        room_id: str,
-        thread_id: str | None,
-        create_storage: Callable[[], BaseDb],
-    ) -> _SessionStartedWatch:
-        """Pre-compute session:started eligibility for one response path."""
-        return _SessionStartedWatch(
-            should_watch=self._session_started_watch_is_needed(
-                tool_context=tool_context,
-                session_id=session_id,
-                session_type=session_type,
-                create_storage=create_storage,
-            ),
-            tool_context=tool_context,
-            scope=scope,
-            session_id=session_id,
-            room_id=room_id,
-            thread_id=thread_id,
-            session_type=session_type,
-            correlation_id=self.identity.correlation_id,
-            create_storage=create_storage,
-        )
-
-    async def _maybe_emit_session_started(self, watch: _SessionStartedWatch) -> None:
-        if watch.tool_context is None or not watch.should_watch:
-            return
-        storage = watch.create_storage()
-        try:
-            if not _session_exists(storage=storage, session_id=watch.session_id, session_type=watch.session_type):
-                return
-        finally:
-            storage.close()
-
-        bindings = resolve_tool_runtime_hook_bindings(watch.tool_context)
-        context = SessionHookContext(
-            event_name=EVENT_SESSION_STARTED,
-            plugin_name="",
-            settings={},
-            config=watch.tool_context.config,
-            runtime_paths=watch.tool_context.runtime_paths,
-            logger=self.deps.logger.bind(event_name=EVENT_SESSION_STARTED, session_id=watch.session_id),
-            correlation_id=watch.correlation_id,
-            message_sender=bindings.message_sender,
-            matrix_admin=bindings.matrix_admin,
-            room_state_querier=bindings.room_state_querier,
-            room_state_putter=bindings.room_state_putter,
-            agent_name=watch.scope.scope_id if watch.scope.kind == "team" else watch.tool_context.agent_name,
-            scope=watch.scope,
-            session_id=watch.session_id,
-            room_id=watch.room_id,
-            thread_id=watch.thread_id,
-            _hook_registry_state=watch.tool_context.hook_registry_state,
-        )
-        await emit(watch.tool_context.hook_registry, EVENT_SESSION_STARTED, context)
-
-    async def emit_session_started(self, watch: _SessionStartedWatch) -> None:
-        """Emit session:started without aborting delivery on ordinary failures."""
-        if self.deps.process_shutdown_requested():
-            return
-        try:
-            await self._maybe_emit_session_started(watch)
-            if self.deps.process_shutdown_requested():
-                return
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self.deps.logger.exception(
-                "Failed to emit session:started",
-                session_id=watch.session_id,
-                room_id=watch.room_id,
-                thread_id=watch.thread_id,
-                failure_reason=str(error),
-            )
-
     async def finalize(
         self,
         final_delivery_outcome: FinalDeliveryOutcome,
         *,
         build_post_response_outcome: Callable[[FinalDeliveryOutcome], ResponseOutcome],
-        post_response_deps: PostResponseEffectsDeps | Callable[[], PostResponseEffectsDeps],
+        post_response_deps: Callable[[], PostResponseEffectsDeps],
     ) -> FinalDeliveryOutcome:
         """Run outer lifecycle finalization and return the canonical terminal outcome."""
-        if final_delivery_outcome.terminal_status == "suspended":
-            if self.pipeline_timing is not None:
-                self.pipeline_timing.emit_summary(self.deps.logger, outcome="suspended")
+        post_response_outcome = build_post_response_outcome(final_delivery_outcome)
+        self._turn_end = _turn_end_for(final_delivery_outcome.ending, run_succeeded=post_response_outcome.run_succeeded)
+        if isinstance(final_delivery_outcome.ending, AwaitingApproval | Owed):
+            await self._finalize_suspended(
+                final_delivery_outcome,
+                post_response_outcome=post_response_outcome,
+                post_response_deps=post_response_deps,
+            )
             return final_delivery_outcome
         self._raise_if_process_shutdown()
         response_event_id = final_delivery_outcome.final_visible_event_id
-        try:
-            if final_delivery_outcome.terminal_status == "completed":
+        with self._tolerated_after_visible_delivery(response_event_id):
+            if final_delivery_outcome.completed:
                 if (
                     response_event_id is not None
                     and final_delivery_outcome.final_visible_body is not None
                     and final_delivery_outcome.delivery_kind is not None
                 ):
-                    await self.deps.response_hooks.emit_after_response(
+                    await self.deps.response_hooks._emit_after_response(
                         identity=self.identity,
                         response_text=final_delivery_outcome.final_visible_body,
                         response_event_id=response_event_id,
                         delivery_kind=final_delivery_outcome.delivery_kind,
-                        continue_on_cancelled=True,
                     )
-            else:
-                await self.deps.response_hooks.emit_cancelled_response(
+            elif (failure_reason := hook_failure_reason(final_delivery_outcome.ending)) is not None:
+                await self.deps.response_hooks._emit_cancelled_response(
                     identity=self.identity,
                     visible_response_event_id=response_event_id,
-                    failure_reason=final_delivery_outcome.failure_reason,
+                    failure_reason=failure_reason,
                 )
             self._raise_if_process_shutdown()
-        except asyncio.CancelledError as error:
-            if self.deps.process_shutdown_requested() or response_event_id is None:
-                raise
-            self._log_effects_failure_after_visible_delivery(
-                response_event_id=response_event_id,
-                error=error,
-            )
-        except Exception as error:
-            if response_event_id is None:
-                raise
-            self._log_effects_failure_after_visible_delivery(
-                response_event_id=response_event_id,
-                error=error,
-            )
         await self._apply_effects_safely(
             final_delivery_outcome=final_delivery_outcome,
-            post_response_outcome=lambda: build_post_response_outcome(final_delivery_outcome),
+            post_response_outcome=post_response_outcome,
             post_response_deps=post_response_deps,
         )
         if self.pipeline_timing is not None:
-            self.pipeline_timing.emit_summary(self.deps.logger, outcome=_response_outcome_label(final_delivery_outcome))
+            self.pipeline_timing.emit_summary(self.deps.logger, outcome=outcome_label(final_delivery_outcome))
         return final_delivery_outcome
+
+    async def _finalize_suspended(
+        self,
+        final_delivery_outcome: FinalDeliveryOutcome,
+        *,
+        post_response_outcome: ResponseOutcome,
+        post_response_deps: Callable[[], PostResponseEffectsDeps],
+    ) -> None:
+        """Finalize a reply whose run waits for approval, or whose answer is recorded but not yet acknowledged.
+
+        A run paused for approval has not finished, so nothing applies. An owed answer's run finished, so its run's
+        effects apply unless the process is stopping; effects and hooks that need a delivered completed answer skip.
+        The outbox owns the answer by then, so an effect that fails or is cancelled must not settle it again.
+        """
+        if post_response_outcome.run_succeeded and not self.deps.process_shutdown_requested():
+            try:
+                await apply_post_response_effects(final_delivery_outcome, post_response_outcome, post_response_deps())
+            except asyncio.CancelledError:
+                if self.deps.process_shutdown_requested():
+                    raise
+                self.deps.logger.warning("Post-response effects cancelled for an answer the outbox owes")
+            except Exception:
+                self.deps.logger.exception("Post-response effects failed for an answer the outbox owes")
+        if self.pipeline_timing is not None:
+            self.pipeline_timing.emit_summary(self.deps.logger, outcome=outcome_label(final_delivery_outcome))
 
     async def _apply_effects_safely(
         self,
         *,
         final_delivery_outcome: FinalDeliveryOutcome,
-        post_response_outcome: ResponseOutcome | Callable[[], ResponseOutcome],
-        post_response_deps: PostResponseEffectsDeps | Callable[[], PostResponseEffectsDeps],
+        post_response_outcome: ResponseOutcome,
+        post_response_deps: Callable[[], PostResponseEffectsDeps],
     ) -> None:
         """Apply post-response effects without masking failures before visible delivery."""
         self._raise_if_process_shutdown()
-        response_event_id = final_delivery_outcome.final_visible_event_id
-        try:
-            if callable(post_response_outcome):
-                post_response_outcome = cast("Callable[[], ResponseOutcome]", post_response_outcome)()
-            if callable(post_response_deps):
-                post_response_deps = cast("Callable[[], PostResponseEffectsDeps]", post_response_deps)()
-            await apply_post_response_effects(
-                final_delivery_outcome,
-                post_response_outcome,
-                post_response_deps,
-            )
+        with self._tolerated_after_visible_delivery(final_delivery_outcome.final_visible_event_id):
+            await apply_post_response_effects(final_delivery_outcome, post_response_outcome, post_response_deps())
             self._raise_if_process_shutdown()
+
+    @contextmanager
+    def _tolerated_after_visible_delivery(self, response_event_id: str | None) -> Iterator[None]:
+        """Log a hook or effect failure once the answer is visible; before that, or at process shutdown, it raises."""
+        try:
+            yield
         except asyncio.CancelledError as error:
             if self.deps.process_shutdown_requested() or response_event_id is None:
                 raise
-            self._log_effects_failure_after_visible_delivery(
-                response_event_id=response_event_id,
-                error=error,
-            )
+            self._log_effects_failure_after_visible_delivery(response_event_id=response_event_id, error=error)
         except Exception as error:
             if response_event_id is None:
                 raise
-            self._log_effects_failure_after_visible_delivery(
-                response_event_id=response_event_id,
-                error=error,
-            )
+            self._log_effects_failure_after_visible_delivery(response_event_id=response_event_id, error=error)

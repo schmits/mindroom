@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="firecrawl",
+    file_access=ToolFileAccess.NONE,
     display_name="Firecrawl",
     description="Web scraping and crawling tool for extracting content from websites",
     category=ToolCategory.RESEARCH,  # Web scraping tool for research
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("FIRECRAWL_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -66,7 +68,7 @@ if TYPE_CHECKING:
         ConfigField(
             name="formats",
             label="Formats",
-            type="text",
+            type="string[]",
             required=False,
             default=None,
         ),
@@ -85,13 +87,6 @@ if TYPE_CHECKING:
             default=30,
         ),
         ConfigField(
-            name="search_params",
-            label="Search Params",
-            type="text",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
             name="api_url",
             label="API URL",
             type="url",
@@ -100,7 +95,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["firecrawl-py"],
-    docs_url="https://docs.agno.com/tools/toolkits/web_scrape/firecrawl",
+    docs_url="https://docs.mindroom.chat/tools/web-scraping-and-browser/#firecrawl",
     function_names=("crawl_website", "map_website", "scrape_website", "search_web"),
 )
 def firecrawl_tools() -> type[FirecrawlTools]:

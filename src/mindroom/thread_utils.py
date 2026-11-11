@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from mindroom import authorization
-from mindroom.constants import ROUTER_AGENT_NAME
+from mindroom.constants import (
+    COPIED_MENTIONS_KEY,
+    EXACT_MENTIONS_KEY,
+    ROUTER_AGENT_NAME,
+    SKIP_MENTIONS_KEY,
+    WAKE_MENTIONED_KEY,
+)
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.matrix.mentions import resolve_mentioned_user_ids_from_text
 from mindroom.matrix.room_membership import room_membership_is_complete
 from mindroom.matrix.visible_body import visible_content_from_content
+from mindroom.requester_identity import is_human_requester_id, resolve_human_requester_alias
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,6 +28,7 @@ if TYPE_CHECKING:
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.entity_resolution import EntityIdentityRegistry
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.matrix.identity import MatrixID
 
@@ -29,6 +37,8 @@ if TYPE_CHECKING:
 # Accepts both single and double quotes (mautrix bridges use single quotes).
 # Requires @localpart:domain format to avoid feeding malformed IDs to MatrixID.parse.
 _MATRIX_PILL_RE = re.compile(r"""href=["']https://matrix\.to/#/(@[^"':]+:[^"']+)["']""")
+# A 64 KiB Matrix event holds fewer than 10,000 user IDs, so only a resolved long-text sidecar lists more.
+_MAX_MENTIONED_USER_IDS = 10_000
 
 _AgentResponseSkipReason = Literal[
     "sender_not_allowed",
@@ -50,37 +60,72 @@ class AgentResponseDecision:
     sender_visible_thread_agents: tuple[MatrixID, ...] = ()
 
 
+def should_skip_mentions(content: dict[str, Any] | None) -> bool:
+    """Return whether mentions in this message content should be ignored."""
+    if not isinstance(content, dict):
+        return False
+    if content.get(SKIP_MENTIONS_KEY):
+        return True
+
+    new_content = content.get("m.new_content")
+    return isinstance(new_content, dict) and bool(new_content.get(SKIP_MENTIONS_KEY))
+
+
 def _extract_mentioned_user_ids(
     content: dict[str, object],
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[str]:
-    """Extract mentioned user IDs from message content.
+    """Extract mentioned user IDs from message content, without managed entities when its mentions wake no agent."""
+    user_ids = _listed_or_found_user_ids(content, config, runtime_paths)
+    if content.get(WAKE_MENTIONED_KEY) is not False:
+        return user_ids
+    registry = entity_identity_registry(config, runtime_paths)
+    return [user_id for user_id in user_ids if not registry.is_managed_user_id(user_id)]
 
-    Checks ``m.mentions.user_ids`` first. When that field is absent or empty,
-    falls back to Matrix HTML pills and finally raw visible-body mention tokens.
+
+def history_mentioned_user_ids(
+    content: dict[str, Any],
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[str]:
+    """Return the user IDs a thread message counts as mentioning when a later message reads the thread's history."""
+    if not should_skip_mentions(content):
+        return _extract_mentioned_user_ids(content, config, runtime_paths)
+    # A skip-marked message mentions nobody, but a thread-move copy keeps whom its original mentioned.
+    copied = content.get(COPIED_MENTIONS_KEY)
+    if not isinstance(copied, list):
+        return []
+    return [user_id for user_id in copied[:_MAX_MENTIONED_USER_IDS] if isinstance(user_id, str)]
+
+
+def _listed_or_found_user_ids(
+    content: dict[str, object],
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> list[str]:
+    """Return the user IDs a message lists or, failing that, the ones found in its text.
+
+    Checks ``m.mentions.user_ids`` first, and takes it as the whole list when the
+    content marks it exact. Otherwise, when that field is absent or empty, falls
+    back to Matrix HTML pills and finally raw visible-body mention tokens.
     """
     mentions = content.get("m.mentions")
-    user_ids = cast("dict[str, object]", mentions).get("user_ids") if isinstance(mentions, dict) else None
-    if isinstance(user_ids, list) and user_ids:
-        return [user_id for user_id in user_ids if isinstance(user_id, str)]
+    raw_user_ids = cast("dict[str, object]", mentions).get("user_ids") if isinstance(mentions, dict) else None
+    user_ids = raw_user_ids if isinstance(raw_user_ids, list) else []
+    if user_ids or content.get(EXACT_MENTIONS_KEY) is True:
+        return [user_id for user_id in user_ids[:_MAX_MENTIONED_USER_IDS] if isinstance(user_id, str)]
 
     formatted_body = content.get("formatted_body")
     if isinstance(formatted_body, str):
         pill_user_ids = _MATRIX_PILL_RE.findall(formatted_body)
         if pill_user_ids:
-            return pill_user_ids
+            return pill_user_ids[:_MAX_MENTIONED_USER_IDS]
 
     body = content.get("body")
     if isinstance(body, str):
         return resolve_mentioned_user_ids_from_text(body, config, runtime_paths)
     return []
-
-
-def _is_bot_or_agent(sender: str, config: Config, runtime_paths: RuntimePaths) -> bool:
-    """Return True when *sender* is a MindRoom agent **or** listed in ``bot_accounts``."""
-    registry = entity_identity_registry(config, runtime_paths)
-    return registry.current_entity_name_for_user_id(sender) is not None or sender in config.bot_accounts
 
 
 def is_router_only_agent_mention(
@@ -119,15 +164,39 @@ def check_agent_mentioned(
     raw_content = event_source.get("content", {})
     content = visible_content_from_content(raw_content) if isinstance(raw_content, dict) else {}
     all_mentioned_ids = _extract_mentioned_user_ids(content, config, runtime_paths)
-    mentioned_agents = _agents_from_user_ids(all_mentioned_ids, config, runtime_paths)
+    registry = entity_identity_registry(config, runtime_paths)
+    mentioned_agents = _agents_from_user_ids(all_mentioned_ids, registry)
     am_i_mentioned = agent_id in mentioned_agents
-    non_agent_mentions = [uid for uid in all_mentioned_ids if not _is_bot_or_agent(uid, config, runtime_paths)]
+    non_agent_mentions = [
+        uid for uid in all_mentioned_ids if not registry.is_managed_user_id(uid) and uid not in config.bot_accounts
+    ]
     has_non_agent_mentions = bool(non_agent_mentions) and (
         not room_membership_is_complete(room)
         or not authorization.cached_joined_member_ids(room).isdisjoint(non_agent_mentions)
     )
 
     return mentioned_agents, am_i_mentioned, has_non_agent_mentions
+
+
+def mentions_another_participant(
+    event_source: dict,
+    agent_id: MatrixID,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    *,
+    room: nio.MatrixRoom,
+) -> bool | None:
+    """Return whom a message mentions: ``None`` nobody, ``False`` this agent, ``True`` only other agents or people."""
+    mentioned_agents, am_i_mentioned, has_non_agent_mentions = check_agent_mentioned(
+        event_source,
+        agent_id,
+        config,
+        runtime_paths,
+        room=room,
+    )
+    if am_i_mentioned:
+        return False
+    return True if mentioned_agents or has_non_agent_mentions else None
 
 
 def get_agents_in_thread(
@@ -161,13 +230,8 @@ def get_agents_in_thread(
     return agents
 
 
-def _agents_from_user_ids(
-    user_ids: list[str],
-    config: Config,
-    runtime_paths: RuntimePaths,
-) -> list[MatrixID]:
+def _agents_from_user_ids(user_ids: list[str], registry: EntityIdentityRegistry) -> list[MatrixID]:
     """Return agent MatrixIDs from a list of raw Matrix user ID strings."""
-    registry = entity_identity_registry(config, runtime_paths)
     agents: list[MatrixID] = []
     for user_id in user_ids:
         agent_name = registry.current_entity_name_for_user_id(user_id)
@@ -180,17 +244,22 @@ def has_multiple_non_agent_users_in_thread(
     thread_history: Sequence[ResolvedVisibleMessage],
     config: Config,
     runtime_paths: RuntimePaths,
+    *,
+    current_sender_id: str | None = None,
 ) -> bool:
     """Return True when more than one non-agent user has posted in the thread.
 
     Senders that are MindRoom agents or listed in ``config.bot_accounts`` are
-    excluded from the count.
+    excluded from the count. Human bridge aliases count as their canonical
+    identity, without changing the original message sender.
+    Each distinct sender is classified once: long threads repeat a few
+    senders, and classifying one is far costlier than reading a message.
     """
     non_agent_senders: set[str] = set()
-    for msg in thread_history:
-        sender = msg.sender
-        if sender and not _is_bot_or_agent(sender, config, runtime_paths):
-            non_agent_senders.add(sender)
+    senders = dict.fromkeys([current_sender_id, *(msg.sender for msg in thread_history)])
+    for sender in senders:
+        if sender and is_human_requester_id(sender, config, runtime_paths):
+            non_agent_senders.add(resolve_human_requester_alias(sender, config, runtime_paths))
             if len(non_agent_senders) > 1:
                 return True
     return False
@@ -216,7 +285,12 @@ def thread_requires_explicit_agent_targeting(
     )
     if sender_visible_responders:
         return True
-    return has_multiple_non_agent_users_in_thread(thread_history, config, runtime_paths)
+    return has_multiple_non_agent_users_in_thread(
+        thread_history,
+        config,
+        runtime_paths,
+        current_sender_id=sender_id,
+    )
 
 
 def filter_thread_agents_for_sender(
@@ -247,17 +321,17 @@ def get_all_mentioned_agents_in_thread(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> list[MatrixID]:
-    """Get all unique agent MatrixIDs that have been mentioned anywhere in the thread.
+    """Get all unique agent MatrixIDs the thread's messages count as mentioning; see ``history_mentioned_user_ids``.
 
     Preserves the order of first mention while preventing duplicates.
     """
     mentioned_agents = []
     seen_ids: set[str] = set()
+    registry = entity_identity_registry(config, runtime_paths)
 
     for msg in thread_history:
-        content = msg.content
-        user_ids = _extract_mentioned_user_ids(content, config, runtime_paths)
-        agents = _agents_from_user_ids(user_ids, config, runtime_paths)
+        user_ids = history_mentioned_user_ids(msg.content, config, runtime_paths)
+        agents = _agents_from_user_ids(user_ids, registry)
 
         for agent in agents:
             if agent.full_id not in seen_ids:

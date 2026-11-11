@@ -5,19 +5,17 @@ This directory contains utility scripts for MindRoom self-hosting.
 ## Available Scripts
 
 ### 🧪 Testing
-- **`testing/benchmark_matrix_throughput.py`** - Benchmark Matrix message throughput performance
 - **`testing/benchmark_tool_call_overhead.py`** - Benchmark synthetic tool-call bridge overhead
 - **`testing/fuzz_live_matrix.py`** - Replay concurrent Matrix mutations through disposable Tuwunel and MindRoom stacks
 
 ### 🔧 Utilities
 - **`utilities/repair_nested_sidecars.py`** - Repair an explicitly selected legacy nested-attachment edit through Matrix
+- **`utilities/create_server_emoji_room.py`** - Create the room that shares custom emoji with everyone on a homeserver
+- **`utilities/import_slack_emoji.py`** - Import a Slack workspace's custom emoji into that room
 - **`utilities/cleanup_agent_edits.sh`** - Clean up agent-edited files in Matrix database
 - **`utilities/cleanup_agent_edits_docker.sh`** - Clean up agent edits in Docker environment
 - **`utilities/cleanup_agent_edits.py`** - Python version of cleanup script with more options
 - **`utilities/forward-ports.sh`** - Forward ports from remote servers for local testing
-- **`utilities/rewrite_git_commits_ai.py`** - Rewrite git commit messages with AI
-- **`utilities/rewrite_git_history_apply.py`** - Apply git history rewrites
-- **`utilities/setup_cleanup_cron.sh`** - Setup cron job for periodic cleanup
 
 ## For SaaS Platform Scripts
 
@@ -47,23 +45,48 @@ No runtime module imports this utility, and the normal reader remains unchanged.
 Once the affected messages have been repaired and a fresh import has been verified, this utility and its tests can be removed without a runtime or schema migration.
 
 ### Clean up agent edits
+
 ```bash
-# For Docker setup
-./scripts/utilities/cleanup_agent_edits_docker.sh
+# For the local Matrix Docker stack
+POSTGRES_CONTAINER=mindroom-postgres ./scripts/utilities/cleanup_agent_edits_docker.sh --dry-run
 
 # For direct database access
 ./scripts/utilities/cleanup_agent_edits.py --dry-run
 ```
 
-### Benchmark Matrix performance
-```bash
-./scripts/testing/benchmark_matrix_throughput.py
-```
+For another Docker deployment, set `POSTGRES_CONTAINER` to its PostgreSQL container name.
 
 ### Benchmark tool-call overhead
 ```bash
 uv run python scripts/testing/benchmark_tool_call_overhead.py --iterations 1000 --warmup 100
 ```
+
+### Fuzz journal storage and ingestion
+
+```bash
+uv run pytest tests/test_event_journal_fuzz.py tests/test_durable_ingestion_decryption_fuzz.py -n 2 --no-cov --hypothesis-seed=1640 --hypothesis-show-statistics
+```
+
+These property tests run against real SQLite and PostgreSQL journals in the normal test suite.
+Hypothesis generates and shrinks action sequences; failures print the minimal sequence and a reproduction blob.
+Use the same `--hypothesis-seed` to repeat a campaign, or change it to explore another set of sequences.
+Examples use isolated principals; generated reopen actions close and reopen the actual database.
+
+The journal properties preserve the portable coverage from the retired cache fuzzer, while the live harness below checks complete agent turns:
+
+| Behavior | Generated journal checks | Live checks |
+| --- | --- | --- |
+| Edits | Edits before originals, timestamp ties, older late edits, forged authors, edits of edits, and attempted thread relocation | In-flight edits, regeneration, exact current source markers, and final response bodies |
+| Duplicate delivery | Actual repeated admission, concurrent duplicates, conflicting payloads, and replay after settlement or reopen | Repeated Matrix transactions and exact logical response attribution |
+| Redactions | Redaction before target, non-resurrection, tombstones, hidden revision debt, and server-authoritative restoration | Canonical redactions and follow-up probes proving deleted markers leave the complete model request |
+| History and isolation | Exact ordered logical messages, revision/body equality, pagination, pending receipt order, and separation of principals, rooms, and threads | Concurrent clients and threads, canonical Matrix history, and durable response ownership |
+| Restart | Exact observable journal state survives a real close and reopen | Graceful shutdown, crashes with unfinished work, outages, and recovery |
+| Encrypted input | Opaque/clear observations with the same identity, reordered delivery, provenance, and settled replay | The live workload uses unencrypted rooms; real crypto and opaque-reply recovery also have focused runtime tests |
+
+The oracle is checked by deliberately corrupting stored messages, revisions, thread placement, pending work, and tombstones and requiring failures.
+Redacting an edit that arrived before its original retains only bodyless ordering evidence, so the later original requests a refetch instead of losing an earlier surviving edit.
+The properties allow this temporary hidden state, then require complete canonical history after refetch.
+They do not recreate retired cache generations, staleness flags, or snapshot replacement operations.
 
 ### Fuzz live Matrix behavior
 ```bash
@@ -72,18 +95,23 @@ uv run python scripts/testing/fuzz_live_matrix.py --profile restart-regression
 uv run python scripts/testing/fuzz_live_matrix.py --profile short-stream-correctness
 uv run python scripts/testing/fuzz_live_matrix.py --profile sustained-stream-capacity --threads 200 --reply-timeout 180
 uv run python scripts/testing/fuzz_live_matrix.py --profile chaos --seed 42 --steps 200 --clients 4 --rooms 2
+uv run python scripts/testing/fuzz_live_matrix.py --trace tests/fixtures/matrix_fuzz/limited_sync_concurrent_branch_replay.json
 ```
 
 The `chaos` profile adds concurrent clients across multiple rooms, hot-thread traffic, in-flight edits and redactions, MindRoom restarts, Tuwunel restarts, and downtime followed by recovery.
 It settles at generated checkpoints and audits the final Matrix view against exact source events, response bodies, redaction provenance, and durable turn records in the current event journal.
 It uses the installed `mindroom-nio` dependency from `uv.lock`; no separate source checkout is required.
+The harness selects the locked Python environment with `uv`, then starts Python directly so a graceful group interrupt is delivered once, without a wrapper forwarding a second signal during shutdown.
 
 Generated fuzz and chaos traces append explicit follow-up probes for conversations with source redactions.
-The probes wait for durable tombstones, require deferred session cleanup, and check that redacted source markers are absent from the complete model request.
+The probes wait for durable tombstones and check that redacted source markers are absent from the complete model request.
 Probe operations are additional to `--steps` and appear in the saved trace.
 
 Use `--save-trace scenario.json` to save the logical workload and `--trace scenario.json` to replay it against a fresh disposable server.
 Replay preserves batches and inputs; concurrent scheduling and runtime output can differ.
+`tests/fixtures/matrix_fuzz/limited_sync_concurrent_branch.json` preserves the original captured failure trace from the retired cache recovery harness.
+Its `_replay.json` companion keeps all 57 operations, ten concurrent batches, six clients, and twelve threads, converts the logical root references, and makes the original outage and restart explicit with current chaos lifecycle operations.
+This replays the captured backlog against the event journal; it does not require a limited sync timeline or reproduce the retired cache state machine.
 Failure bundles retain the scenario, realized operation order, logs, runtime provenance, and audit evidence under `--artifact-root`.
 The `saturation` profile retains the original short-stream scenario; use `sustained-stream-capacity` for the long-running capacity gate.
 
@@ -104,11 +132,11 @@ The run fails if the child ignores the signal until the harness has to kill it, 
 - `crash_mindroom` sends SIGKILL, so nothing drains and every committed, unsettled obligation is owed to durable recovery.
   There is no shutdown verdict to check here; each interrupted source must have exact response attribution or independently proven deliberate supersession.
 
-Supersession requires an exact positive replay-guard log, a matching admitted and settled principal-scoped journal source, and its named newer same-requester/thread source anchored in completed durable generation with a canonical visible response covering its current marker.
+Supersession requires an exact positive replay-guard log, a matching admitted and settled principal-scoped journal source, and its named newer same-requester/thread source anchored in completed durable generation with a canonical visible response whose model call saw one of that source's revisions; the source-revision audit checks which revision.
 An old visible reply must retain exact durable attribution and terminal restart-interruption metadata; superseded work is counted separately from completed generation and cannot waive delivery, edit, redaction, or source-revision debt.
-Restart continuation requires one exact trusted requester-bound relay, its completed durable response and acknowledged FINAL, joined to the original settled source and terminal interruption in one consistent ownership snapshot.
-Only that continuation's exact model call may supply the original current marker from request history; earlier published output retains its own active-message marker checks.
-`ledger_recovered_sources` and `recovered_interrupted_bodies` count these outcomes separately, while `completed_final_bodies` counts completed responses and the original generation remains unchanged.
+No router message ever resumes interrupted work: replay continues an interrupted reply in that same Matrix message, and an agent reply to any event other than a required source fails the reply invariant.
+`ledger_superseded_sources` and `superseded_interrupted_bodies` count superseded outcomes separately, while `completed_final_bodies` counts completed responses and the original generation remains unchanged.
+`dropped_interrupted_regenerations` counts replies left on a regeneration a restart cut short, whose edit MindRoom then declined because a later message followed.
 
 A run whose interruptions all found an idle journal fails instead of reporting the count as coverage.
 `restarts`, `crashes`, and `interruptions_with_work_outstanding` are all in the result JSON, and the third must equal the sum of the first two.
@@ -144,8 +172,12 @@ Nothing in `.github/`, the `justfile`, or pre-commit used to run this harness, s
 The gate is now a single named command:
 
 ```bash
+docker pull ghcr.io/mindroom-ai/mindroom-tuwunel:latest
 just test-live-journal-gate
 ```
+
+Refresh the homeserver image before the gate: a cached Tuwunel older than 1.9.1 can omit quiet joined rooms from full-state sync and make the client infer false departures.
+The harness records the actual image digest in its run provenance.
 
 It runs the fuzz profile with restarts turned up and then the restart-recovery profile, and it is the check to run before merging anything that touches those paths.
 `tests/test_live_matrix_fuzz.py` is what CI runs, and it is a unit test of this harness against fakes: it proves the oracle and the invariants behave, and it boots no Docker, no homeserver, and no MindRoom.

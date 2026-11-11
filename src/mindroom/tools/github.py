@@ -1,14 +1,17 @@
-"""Tools registry for all available Agno tools.
-
-This module provides a centralized registry for all tools that can be used by agents.
-Tools are registered by string name and can be instantiated dynamically when loading agents.
-"""
+"""GitHub tool configuration."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolManagedInitArg, ToolStatus
+from mindroom.tool_system.declarations import (
+    ConfigField,
+    SetupType,
+    ToolCategory,
+    ToolFileAccess,
+    ToolManagedInitArg,
+    ToolStatus,
+)
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -17,17 +20,20 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="github",
+    file_access=ToolFileAccess.NONE,
     display_name="GitHub",
     description="Browse code and manage GitHub repositories, issues, and pull requests",
     category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.OAUTH,
+    requires_primary_runtime=True,
     auth_provider="github",
     icon="SiGithub",
     icon_color="text-gray-800",  # GitHub black
     config_fields=[
         ConfigField(
             name="access_token",
+            env=("GITHUB_ACCESS_TOKEN",),
             label="Access Token",
             type="password",
             required=False,
@@ -49,7 +55,7 @@ if TYPE_CHECKING:
         ToolManagedInitArg.WORKER_TARGET,
         ToolManagedInitArg.RUNTIME_CONFIG,
     ),
-    docs_url="https://docs.agno.com/tools/toolkits/others/github",
+    docs_url="https://docs.mindroom.chat/tools/project-management/#github",
     function_names=(
         "assign_issue",
         "close_issue",

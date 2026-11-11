@@ -50,6 +50,8 @@ class PublishableReport:
     title: str
     requested_by: str
     artifact_kind: str = _ARTIFACT_KIND_HTML_FILE
+    # Trusted root a copied static-site source is walked from through descriptors.
+    artifact_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -155,9 +157,12 @@ class ReportPublishingStore:
                 raise ReportPublishingError(msg)
             return _relative_artifact_path(source.artifact_path, self._storage_root)
         if source.artifact_kind == ARTIFACT_KIND_STATIC_SITE:
+            if source.artifact_root is None:
+                msg = "Static site publishing requires an authorized source root."
+                raise ReportPublishingError(msg)
             destination_dir = self._report_publishing_root / "artifacts" / slug
             try:
-                snapshot_static_site(source.artifact_path, destination_dir)
+                snapshot_static_site(source.artifact_root, source.artifact_path, destination_dir)
             except (OSError, StaticSiteSnapshotError) as exc:
                 raise ReportPublishingError(str(exc)) from exc
             return _relative_artifact_path(destination_dir, self._storage_root)
@@ -197,6 +202,7 @@ def _published_report_to_json(report: PublishedReport) -> dict[str, object]:
     }
 
 
+# LEGACY_COMPAT: Published report records without an artifact kind.
 # Legacy format: Published report records omitted artifact_kind and represented single HTML files.
 # Last legacy release: v2026.6.71; replacement: v2026.6.72 persisted artifact_kind for HTML and static sites.
 # Handling: Default missing kind to html_file; an existing mutation rewrites the complete current record.
@@ -230,10 +236,10 @@ def _validate_public_report_slug(value: str) -> None:
 
 
 def _public_report_url(base_url: str | None, slug: str, *, artifact_kind: str) -> str | None:
-    if base_url is None or not base_url.strip():
+    if base_url is None:
         return None
     suffix = f"/reports/public/{slug}/" if artifact_kind == ARTIFACT_KIND_STATIC_SITE else f"/reports/public/{slug}"
-    return f"{base_url.rstrip('/')}{suffix}"
+    return f"{base_url}{suffix}"
 
 
 def _relative_artifact_path(artifact_path: Path, storage_root: Path) -> str:

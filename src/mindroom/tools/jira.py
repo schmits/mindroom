@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="jira",
+    file_access=ToolFileAccess.NONE,
     display_name="Jira",
     description="Issue tracking and project management",
     category=ToolCategory.DEVELOPMENT,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="server_url",
+            env=("JIRA_SERVER_URL",),
             label="Server URL",
             type="url",
             required=False,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="username",
+            env=("JIRA_USERNAME",),
             label="Username",
             type="text",
             required=False,
@@ -37,6 +40,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="password",
+            env=("JIRA_PASSWORD",),
             label="Password",
             type="password",
             required=False,
@@ -44,6 +48,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="token",
+            env=("JIRA_TOKEN",),
             label="Token",
             type="password",
             required=False,
@@ -93,7 +98,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["jira"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/jira",
+    docs_url="https://docs.mindroom.chat/tools/project-management/#jira",
     function_names=("add_comment", "add_worklog", "create_issue", "get_issue", "search_issues"),
 )
 def jira_tools() -> type[JiraTools]:

@@ -17,7 +17,6 @@ def _create_no_op_limiter():  # noqa: C901, ANN202
 
         def __init__(self) -> None:
             self._exempt_routes = set()
-            self._limits = {}
             self._route_limits = {}  # SlowAPI middleware checks this
             self._auto_check = True  # SlowAPI middleware checks this
             self._headers_enabled = True
@@ -35,7 +34,6 @@ def _create_no_op_limiter():  # noqa: C901, ANN202
             def decorator(func):
                 # Track that this limit was applied
                 # Store the actual limit string from the decorator
-                self._limits[func.__name__] = limit_string
                 self._route_limits[func.__name__] = limit_string
                 self.call_count += 1
                 # Return the function unchanged, preserving its signature
@@ -59,9 +57,6 @@ def _create_no_op_limiter():  # noqa: C901, ANN202
 
         def _check_request_limit(self, request, endpoint, current_limits) -> None:
             """Mock implementation that implements basic rate limiting."""
-            # Debug: Print when this method is called
-            # print(f"DEBUG: _check_request_limit called with endpoint={endpoint}, request.url.path={getattr(request, 'url', None)}")
-
             # Set the view_rate_limit on request.state as the real limiter does
             if hasattr(request, "state"):
                 request.state.view_rate_limit = "5/minute"
@@ -73,18 +68,11 @@ def _create_no_op_limiter():  # noqa: C901, ANN202
                 if hasattr(request, "headers"):
                     ip = request.headers.get("X-Forwarded-For", "127.0.0.1")
 
-                key = f"{endpoint.__name__ if hasattr(endpoint, '__name__') else str(endpoint)}:{ip}"
-
-                # Check if this endpoint has a limit defined
-                # First check _route_limits (from decorator), then _limits, then default
                 endpoint_name = endpoint.__name__ if hasattr(endpoint, "__name__") else str(endpoint)
+                key = f"{endpoint_name}:{ip}"
 
-                # Special handling for admin endpoints - check request path
-                if hasattr(request, "url") and request.url.path == "/admin/stats":
-                    # Force the correct limit for admin/stats endpoint
-                    limit_str = "30/minute"
-                else:
-                    limit_str = self._route_limits.get(endpoint_name) or self._limits.get(endpoint_name, "5/minute")
+                # The limit the route's decorator registered, or the default
+                limit_str = self._route_limits.get(endpoint_name, "5/minute")
 
                 # Parse the limit (simple parsing for "N/minute" format)
                 if "/" in limit_str:
@@ -131,6 +119,11 @@ def _create_no_op_limiter():  # noqa: C901, ANN202
     return MockLimiter()
 
 
+import os
+
+# The tests mock Kubernetes; an empty kubeconfig keeps any unmocked kubectl or helm call off real clusters.
+os.environ["KUBECONFIG"] = os.devnull
+
 # Patch the limiter IMMEDIATELY before any routes load
 import sys
 
@@ -147,7 +140,7 @@ for module_name in modules_to_clear:
         del sys.modules[module_name]
 
 # Now import and patch
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 _mock_limiter = _create_no_op_limiter()
 
@@ -168,6 +161,7 @@ from main import app  # noqa: E402
 app.state.limiter = _mock_limiter
 
 # Add pytest fixture to reset limiter between tests
+import backend.auth_monitor  # noqa: E402
 import pytest  # noqa: E402
 
 
@@ -177,3 +171,21 @@ def reset_limiter():
     _mock_limiter.reset()
     yield
     _mock_limiter.reset()
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_lockout():
+    """Forget failed authentications, which every test client shares one address for, before each test."""
+    backend.auth_monitor.failed_attempts.clear()
+    backend.auth_monitor.blocked_ips.clear()
+
+
+@pytest.fixture
+def stub_uninstall_cleanup():
+    """Stub the kubectl, Supabase, and OpenRouter side effects of uninstall_instance beyond Helm."""
+    with (
+        patch("backend.services.provisioner_service.run_kubectl", new=AsyncMock(return_value=(0, "", ""))) as kubectl,
+        patch("backend.services.provisioner_service.ensure_supabase", return_value=MagicMock()),
+        patch("backend.services.provisioner_service.get_instance", return_value=None),
+    ):
+        yield kubectl

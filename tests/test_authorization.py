@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import nio
 import pytest
 
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
@@ -11,17 +12,16 @@ from mindroom.authorization import (
     ReplyMembershipPendingError,
     _ReplyAuthorizationDecision,
     _responder_reply_authorization,
-    get_effective_sender_id_for_reply_permissions,
-    is_platform_administrator,
     is_sender_allowed_for_agent_credential_management,
     is_sender_allowed_for_agent_reply_in_room,
     is_sender_allowed_for_entity_replies_in_room,
     is_sender_allowed_for_responder,
 )
 from mindroom.config.access import ResponderAccessConfig
-from mindroom.constants import ORIGINAL_SENDER_KEY, SOURCE_KIND_KEY
+from mindroom.config.main import Config
+from mindroom.requester_identity import is_platform_administrator
 from tests.access_schema_support import membership_config, membership_index, unresolved_membership_index
-from tests.conftest import runtime_paths_for
+from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
 from tests.identity_helpers import entity_ids
 
 if TYPE_CHECKING:
@@ -30,14 +30,11 @@ if TYPE_CHECKING:
 
 def _allowed(
     sender_id: str,
-    config: object,
+    config: Config,
     memberships: AgentReplyMembershipIndex,
     *,
     room_id: str = "!current:example.com",
 ) -> bool:
-    from mindroom.config.main import Config  # noqa: PLC0415
-
-    assert isinstance(config, Config)
     return is_sender_allowed_for_responder(
         sender_id,
         "talent",
@@ -155,12 +152,56 @@ def test_unresolved_grant_room_fails_closed(tmp_path: Path) -> None:
     )
 
 
-def test_internal_identity_bypasses_responder_policy(tmp_path: Path) -> None:
-    """Current runtime-owned identities must remain trusted participants."""
-    config = membership_config(tmp_path, access={"users": []})
-    sender_id = entity_ids(config, runtime_paths_for(config))["talent"].full_id
+@pytest.mark.asyncio
+async def test_other_agent_account_needs_access_while_own_account_is_admitted(tmp_path: Path) -> None:
+    """Another MindRoom account passes a responder's access like any requester, and its own account always does."""
+    config = bind_runtime_paths(
+        Config.model_validate(
+            {
+                "agents": {
+                    "talent": {"display_name": "Talent", "rooms": ["talent"]},
+                    "scout": {"display_name": "Scout"},
+                },
+            },
+        ),
+        test_runtime_paths(tmp_path),
+    )
+    ids = entity_ids(config, runtime_paths_for(config))
+    scout_id = ids["scout"].full_id
+    router_id = ids["router"].full_id
+    memberships = await membership_index(config, {"talent": {scout_id}})
 
-    assert _allowed(sender_id, config, AgentReplyMembershipIndex())
+    # The default access admits an agent account joined to one of the responder's rooms.
+    assert _allowed(scout_id, config, memberships)
+    assert not _allowed(router_id, config, memberships)
+
+    config.agents["talent"].access = ResponderAccessConfig(members_of_rooms=[])
+    assert _allowed(ids["talent"].full_id, config, memberships)
+    assert not _allowed(scout_id, config, memberships)
+
+    config.agents["talent"].access = ResponderAccessConfig(members_of_rooms=[], users=[scout_id])
+    assert _allowed(scout_id, config, memberships)
+    assert not _allowed(router_id, config, memberships)
+
+
+def test_responder_without_a_prepared_account_still_applies_its_grants(tmp_path: Path) -> None:
+    """A responder whose Matrix account is not prepared yet must apply its grants instead of failing."""
+    config = membership_config(tmp_path)
+    config.agents["late"] = config.agents["talent"].model_copy(
+        update={"access": ResponderAccessConfig(users=["@owner:example.com"])},
+    )
+    memberships = AgentReplyMembershipIndex()
+    runtime_paths = runtime_paths_for(config)
+
+    assert is_sender_allowed_for_responder("@owner:example.com", "late", None, config, runtime_paths, memberships)
+    assert not is_sender_allowed_for_responder(
+        "@outsider:example.com",
+        "late",
+        None,
+        config,
+        runtime_paths,
+        memberships,
+    )
 
 
 def test_credential_authority_is_separate_from_conversation_access(tmp_path: Path) -> None:
@@ -208,50 +249,6 @@ async def test_room_reply_check_uses_same_responder_policy(tmp_path: Path) -> No
         "!talent:example.com",
         runtime_paths_for(config),
         memberships,
-    )
-
-
-def test_effective_sender_uses_trusted_internal_relay_metadata(tmp_path: Path) -> None:
-    """A current internal sender may relay the original requester identity."""
-    config = membership_config(tmp_path)
-    runtime_paths = runtime_paths_for(config)
-    internal_sender = entity_ids(config, runtime_paths)["talent"].full_id
-    event_source = {
-        "content": {
-            ORIGINAL_SENDER_KEY: "@owner:example.com",
-            SOURCE_KIND_KEY: "trusted_internal_relay",
-        },
-    }
-
-    assert (
-        get_effective_sender_id_for_reply_permissions(
-            internal_sender,
-            event_source,
-            config,
-            runtime_paths,
-        )
-        == "@owner:example.com"
-    )
-
-
-def test_human_sender_cannot_spoof_original_requester(tmp_path: Path) -> None:
-    """Original-sender metadata from a human sender must be ignored."""
-    config = membership_config(tmp_path)
-    event_source = {
-        "content": {
-            ORIGINAL_SENDER_KEY: "@owner:example.com",
-            SOURCE_KIND_KEY: "trusted_internal_relay",
-        },
-    }
-
-    assert (
-        get_effective_sender_id_for_reply_permissions(
-            "@human:example.com",
-            event_source,
-            config,
-            runtime_paths_for(config),
-        )
-        == "@human:example.com"
     )
 
 
@@ -356,3 +353,148 @@ async def test_current_room_absence_differs_from_unknown_joined_rooms(tmp_path: 
         is _ReplyAuthorizationDecision.PENDING
     )
     assert not _allowed("@outsider:example.com", config, index, room_id="!absent:example.com")
+
+
+_NEWCOMER = "@newcomer:example.com"
+
+
+def _join_event(user_id: str) -> nio.RoomMemberEvent:
+    event = nio.RoomMemberEvent.from_dict(
+        {
+            "type": "m.room.member",
+            "event_id": f"$join-{user_id}",
+            "sender": user_id,
+            "state_key": user_id,
+            "origin_server_ts": 1,
+            "content": {"membership": "join"},
+        },
+    )
+    assert isinstance(event, nio.RoomMemberEvent)
+    return event
+
+
+def _room_seen_by_the_agent(*, newcomer_joined: bool = True) -> nio.MatrixRoom:
+    """The answering agent's own synced room, which may already show the newcomer joined."""
+    room = nio.MatrixRoom("!talent:example.com", "@talent:example.com")
+    if newcomer_joined:
+        room.add_member(_NEWCOMER, None, None)
+    return room
+
+
+def _newcomer_decision(
+    config: Config,
+    index: AgentReplyMembershipIndex,
+    *,
+    room_id: str = "!talent:example.com",
+    newcomer_joined: bool = True,
+) -> _ReplyAuthorizationDecision:
+    return _responder_reply_authorization(
+        _NEWCOMER,
+        "talent",
+        room_id,
+        config,
+        runtime_paths_for(config),
+        index,
+        observed_room=_room_seen_by_the_agent(newcomer_joined=newcomer_joined),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "access",
+    [
+        {"current_room_members": True, "members_of_rooms": []},
+        None,  # the default: members of the agent's own rooms
+    ],
+)
+async def test_newcomer_seen_joining_waits_for_the_router_to_apply_the_join(
+    tmp_path: Path,
+    access: dict[str, object] | None,
+) -> None:
+    """Bots sync independently, so a newcomer's first message can arrive before the router applies the join."""
+    config = membership_config(tmp_path, agent_rooms=["talent"], access=access)
+    paths = runtime_paths_for(config)
+    index = await membership_index(config, {"talent": set()})
+
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING
+    with pytest.raises(ReplyMembershipPendingError):
+        is_sender_allowed_for_agent_reply_in_room(
+            _NEWCOMER,
+            "talent",
+            config,
+            "!talent:example.com",
+            paths,
+            index,
+            require_resolved_membership=True,
+            observed_room=_room_seen_by_the_agent(),
+        )
+
+    index.apply_member_event(config, "!talent:example.com", _join_event(_NEWCOMER), control_user_id="@r:x")
+
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.ALLOWED
+
+
+@pytest.mark.asyncio
+async def test_a_sender_the_answering_bot_has_not_seen_join_is_denied_at_once(tmp_path: Path) -> None:
+    """Only this bot's own view of the join can defer a denial; the snapshot remains the only grant."""
+    config = membership_config(tmp_path, agent_rooms=["talent"])
+    index = await membership_index(config, {"talent": set()})
+
+    assert _newcomer_decision(config, index, newcomer_joined=False) is _ReplyAuthorizationDecision.DENIED
+
+
+@pytest.mark.asyncio
+async def test_joins_in_other_rooms_never_defer_a_denial(tmp_path: Path) -> None:
+    """A grant room elsewhere, or a room the router does not track, has no same-room join to wait for."""
+    config = membership_config(
+        tmp_path,
+        agent_rooms=["talent", "grant"],
+        access={"current_room_members": False, "members_of_rooms": ["grant"]},
+    )
+    index = await membership_index(config, {"grant": set(), "talent": set()})
+
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.DENIED
+    assert _newcomer_decision(config, index, room_id="!untracked:example.com") is _ReplyAuthorizationDecision.DENIED
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_a_join_is_bounded_and_a_later_join_waits_afresh(tmp_path: Path) -> None:
+    """A join the router never applies must not stall the room's lane, and a finished wait does not linger."""
+    config = membership_config(tmp_path, agent_rooms=["talent"])
+    now = [1_000.0]
+    index = await membership_index(config, {"talent": set()}, clock=lambda: now[0])
+
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING
+    now[0] += 14.0
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING
+    now[0] += 2.0
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.DENIED
+    now[0] += 30.0
+    other = "@other:example.com"
+    assert index.awaits_router_join(  # an unrelated wait starting now cannot hand the expired one a fresh grace
+        other,
+        "!talent:example.com",
+        frozenset({other}),
+        room_keys=["talent"],
+        current_room=False,
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+    )
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.DENIED
+
+    now[0] += 60.0  # long after: a new join of the same person gets its own wait
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING
+
+
+@pytest.mark.asyncio
+async def test_seeing_the_sender_leave_resets_their_wait(tmp_path: Path) -> None:
+    """Once this bot's roster drops the sender, their next join is a new one and waits afresh."""
+    config = membership_config(tmp_path, agent_rooms=["talent"])
+    now = [1_000.0]
+    index = await membership_index(config, {"talent": set()}, clock=lambda: now[0])
+
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING
+    now[0] += 20.0
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.DENIED
+    assert _newcomer_decision(config, index, newcomer_joined=False) is _ReplyAuthorizationDecision.DENIED
+    assert _newcomer_decision(config, index) is _ReplyAuthorizationDecision.PENDING

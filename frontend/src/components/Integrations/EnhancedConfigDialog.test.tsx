@@ -83,6 +83,38 @@ describe("EnhancedConfigDialog", () => {
     });
   });
 
+  it("shows saved boolean credentials checked and masks secret-named fields", async () => {
+    (global.fetch as any).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ credentials: { enabled: "true", api_key: "abc" } }),
+    });
+
+    render(
+      <EnhancedConfigDialog
+        open={true}
+        onClose={vi.fn()}
+        service="example"
+        displayName="Example"
+        description="Example integration"
+        configFields={[
+          { name: "enabled", label: "Enabled", type: "boolean" },
+          { name: "api_key", label: "API key", type: "text" },
+        ]}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("checkbox")).toHaveAttribute(
+        "data-state",
+        "checked",
+      );
+    });
+    expect(document.getElementById("api_key")).toHaveAttribute(
+      "type",
+      "password",
+    );
+  });
+
   it("rejects untouched required fields without defaults", async () => {
     const onClose = vi.fn();
     const onSuccess = vi.fn();
@@ -199,7 +231,22 @@ describe("EnhancedConfigDialog", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it("shows backend save error detail", async () => {
+  it.each([
+    {
+      body: "a JSON detail",
+      json: async () => ({
+        detail: "client_secret is required when client_id changes.",
+      }),
+      message: "client_secret is required when client_id changes.",
+    },
+    {
+      body: "no JSON",
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<'");
+      },
+      message: "Failed to save configuration",
+    },
+  ])("shows a save error with $body", async ({ json, message }) => {
     const onClose = vi.fn();
     const onSuccess = vi.fn();
 
@@ -208,12 +255,7 @@ describe("EnhancedConfigDialog", () => {
         ok: true,
         json: async () => ({ credentials: { api_key: "old-key" } }),
       })
-      .mockResolvedValueOnce({
-        ok: false,
-        json: async () => ({
-          detail: "client_secret is required when client_id changes.",
-        }),
-      });
+      .mockResolvedValueOnce({ ok: false, json });
 
     render(
       <EnhancedConfigDialog
@@ -249,7 +291,7 @@ describe("EnhancedConfigDialog", () => {
       expect(mockToast).toHaveBeenCalledWith(
         expect.objectContaining({
           title: "Configuration Failed",
-          description: "client_secret is required when client_id changes.",
+          description: message,
           variant: "destructive",
         }),
       );
@@ -378,4 +420,221 @@ describe("EnhancedConfigDialog", () => {
     expect(onSuccess).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });
+});
+
+describe("EnhancedConfigDialog string arrays", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (global.fetch as any).mockReset();
+  });
+
+  async function renderListConfig({
+    credentials,
+    defaultValue,
+    missingCredentials = false,
+  }: {
+    credentials: Record<string, unknown>;
+    defaultValue?: string[];
+    missingCredentials?: boolean;
+  }) {
+    (global.fetch as any)
+      .mockResolvedValueOnce({
+        ok: !missingCredentials,
+        json: async () => ({ credentials }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ status: "success" }),
+      });
+
+    render(
+      <EnhancedConfigDialog
+        open={true}
+        onClose={vi.fn()}
+        service="searxng"
+        displayName="SearXNG"
+        description="Search integration"
+        configFields={[
+          {
+            name: "engines",
+            label: "Engines",
+            type: "string[]",
+            default: defaultValue,
+          },
+        ]}
+      />,
+    );
+
+    return screen.findByRole("button", { name: "Save Configuration" });
+  }
+
+  it.each([
+    {
+      name: "populated arrays with comma-containing items",
+      stored: ["duckduckgo", "custom,engine"],
+      expected: ["duckduckgo", "custom,engine"],
+    },
+    {
+      name: "explicit empty arrays overriding populated defaults",
+      stored: [],
+      expected: [],
+    },
+  ])(
+    "round-trips $name through the credential request",
+    async ({ stored, expected }) => {
+      const save = await renderListConfig({
+        credentials: { engines: stored },
+        defaultValue: ["wikipedia"],
+      });
+
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(global.fetch).toHaveBeenCalledWith("/api/credentials/searxng", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ credentials: { engines: expected } }),
+        });
+      });
+    },
+  );
+
+  it("edits, adds, and removes individual list items before saving", async () => {
+    const save = await renderListConfig({
+      credentials: { engines: ["duckduckgo", "wikipedia"] },
+    });
+
+    fireEvent.change(screen.getByDisplayValue("duckduckgo"), {
+      target: { value: "bing" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Engines value 2" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add value" }));
+    fireEvent.change(screen.getByDisplayValue(""), {
+      target: { value: "custom,engine" },
+    });
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith("/api/credentials/searxng", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          credentials: { engines: ["bing", "custom,engine"] },
+        }),
+      });
+    });
+  });
+
+  it("saves an explicit empty array when the final item is removed", async () => {
+    const save = await renderListConfig({
+      credentials: { engines: ["duckduckgo"] },
+      defaultValue: ["wikipedia"],
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Remove Engines value 1" }),
+    );
+    fireEvent.click(save);
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith("/api/credentials/searxng", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials: { engines: [] } }),
+      });
+    });
+  });
+
+  it.each([
+    {
+      name: "populated defaults with an existing credentials document",
+      credentials: {},
+      missingCredentials: false,
+      defaultValue: ["duckduckgo", "wikipedia"],
+      expected: ["duckduckgo", "wikipedia"],
+    },
+    {
+      name: "empty defaults with an existing credentials document",
+      credentials: {},
+      missingCredentials: false,
+      defaultValue: [],
+      expected: [],
+    },
+    {
+      name: "populated defaults without an existing credentials document",
+      credentials: {},
+      missingCredentials: true,
+      defaultValue: ["duckduckgo", "wikipedia"],
+      expected: ["duckduckgo", "wikipedia"],
+    },
+    {
+      name: "empty defaults without an existing credentials document",
+      credentials: {},
+      missingCredentials: true,
+      defaultValue: [],
+      expected: [],
+    },
+  ])(
+    "preserves $name",
+    async ({ credentials, missingCredentials, defaultValue, expected }) => {
+      const save = await renderListConfig({
+        credentials,
+        missingCredentials,
+        defaultValue,
+      });
+
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(global.fetch).toHaveBeenCalledWith("/api/credentials/searxng", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ credentials: { engines: expected } }),
+        });
+      });
+    },
+  );
+
+  it.each([
+    { name: "legacy comma-separated text", stored: "duckduckgo,wikipedia" },
+    { name: "a mixed-type array", stored: ["duckduckgo", 42] },
+  ])(
+    "requires explicit replacement of $name before saving a list",
+    async ({ stored }) => {
+      const save = await renderListConfig({
+        credentials: { engines: stored },
+      });
+
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(mockToast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            title: "Validation Error",
+            variant: "destructive",
+          }),
+        );
+      });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(
+        screen.getByRole("button", { name: "Replace with empty list" }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Add value" }));
+      fireEvent.change(screen.getByDisplayValue(""), {
+        target: { value: "duckduckgo" },
+      });
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        expect(global.fetch).toHaveBeenCalledWith("/api/credentials/searxng", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ credentials: { engines: ["duckduckgo"] } }),
+        });
+      });
+    },
+  );
 });

@@ -1,289 +1,410 @@
 """Agent delegation tools for MindRoom agents.
 
-Allows an agent to delegate tasks to other configured agents via tool calls.
-The delegated agent runs independently as a one-shot agent and returns its
-response as the tool result.
+Allows an agent to start configured subagents and continue their sessions.
+Each turn runs independently and returns its response as the tool result.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import TYPE_CHECKING
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any
 
-from agno.tools import Toolkit
-
+from mindroom.agent_cli.minimal_mode_preflight import minimal_subagent_candidates
 from mindroom.agent_descriptions import describe_agent
-from mindroom.agent_run_context import append_knowledge_availability_enrichment
-from mindroom.ai import ResponseTurnContext, ai_response
-from mindroom.authorization import is_sender_allowed_for_responder
-from mindroom.knowledge.utils import resolve_agent_knowledge_access_async
-from mindroom.logging_config import get_logger
-from mindroom.tool_system.runtime_context import (
-    ToolRuntimeContext,
-    ToolRuntimeModelBinding,
-    get_detached_requester_context,
-    get_tool_runtime_context,
-    tool_runtime_context,
-)
+from mindroom.ai import run_delegated_child_response
+from mindroom.delegation.direct import run_direct_child_turn
+from mindroom.delegation.execution import delegation_call_job
+from mindroom.delegation.lifecycle import authorize_delegation, prepare_child_turn
+from mindroom.delegation.personas import list_profiles, render_profile_listing
+from mindroom.delegation.sessions import SubagentSessionError
+from mindroom.delegation.state import CONTINUE_SUBAGENT, RUN_SUBAGENT
+from mindroom.delegation.targets import resolve_follow_up_target, resolve_fresh_target
+from mindroom.delegation.workers import dedicated_worker_refusal, resource_profiles_available
+from mindroom.tool_jobs.runtime import get_background_runtime
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.invocation import current_tool_call
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import current_budget_monitor, current_execution_identity
+from mindroom.tool_system.tool_schema import closed_parameters
+from mindroom.workers.models import ScriptResourceProfileName  # noqa: TC001 - the tool schema reads it at runtime.
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from pathlib import Path
+
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.delegation.state import DelegationChild, SubagentPersona
+    from mindroom.delegation.targets import DelegationTarget
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
+    from mindroom.tool_jobs.runtime import JobSpec, ToolJobRuntime
+    from mindroom.tool_system.tool_function import ToolFunction
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
-
-logger = get_logger(__name__)
-
-MAX_DELEGATION_DEPTH = 3
 
 
 class DelegateTools(Toolkit):
-    """Tools that let an agent delegate tasks to other configured agents."""
+    """Tools that let an agent run configured agents as fresh subagents."""
 
     def __init__(
         self,
         agent_name: str,
-        delegate_to: list[str],
         runtime_paths: RuntimePaths,
         config: Config,
+        workspace_root: Path,
         execution_identity: ToolExecutionIdentity | None = None,
         delegation_depth: int = 0,
         refresh_scheduler: KnowledgeRefreshScheduler | None = None,
+        persona: SubagentPersona | None = None,
+        calls_as_jobs: bool = False,
     ) -> None:
         self._agent_name = agent_name
-        self._delegate_to = delegate_to
+        self._delegate_to = config.get_agent(agent_name).delegate_to
         self._runtime_paths = runtime_paths
         self._config = config
         self._execution_identity = execution_identity
         self._delegation_depth = delegation_depth
+        # Whether the agent's build lets these calls become jobs.
+        self._calls_as_jobs = calls_as_jobs
         self._refresh_scheduler = refresh_scheduler
+        self._minimal_targets = minimal_subagent_candidates(
+            config,
+            runtime_paths,
+            self._delegate_to,
+            execution_identity,
+        )
+        self._workspace_root = workspace_root
+        # An authored subagent's own tools, skills, and knowledge bases cap the copies it authors, on every channel.
+        self._persona = persona
+        # A caller that may run itself may also author that copy's prompt, tools, skills, knowledge, or profile.
+        self._authoring = agent_name in self._delegate_to
+        # Whether this caller may run a child in a worker of its own, and size that worker.
+        self._dedicated_workers = (
+            dedicated_worker_refusal(agent_name, config, runtime_paths, resource_profile=None) is None
+        )
+        self._resource_profiles = self._dedicated_workers and resource_profiles_available(runtime_paths)
 
         super().__init__(
             name="delegate",
             instructions=self._build_instructions(),
-            tools=[self.delegate_task],
+            tools=[self.run_subagent, self.continue_subagent],
         )
-        self.async_functions["delegate_task"].description = self._build_delegate_task_description()
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        """Describe ``run_subagent`` with this caller's targets, offering no option the caller cannot use."""
+        if function.name != RUN_SUBAGENT:
+            return function
+        hidden = {
+            *(() if self._minimal_targets else ("minimal",)),
+            *(() if self._authoring else ("system_prompt", "tools", "skills", "knowledge", "profile")),
+            *(() if self._dedicated_workers else ("dedicated_worker",)),
+            *(() if self._resource_profiles else ("resource_profile",)),
+        }
+        description = self._build_run_subagent_description()
+        if not hidden:
+            return replace(function, description=description)
+        properties = {name: value for name, value in function.parameters["properties"].items() if name not in hidden}
+        parameters = closed_parameters(self.run_subagent, {**function.parameters, "properties": properties})
+        return replace(function, description=description, parameters=parameters)
 
     def _build_instructions(self) -> str:
         """Build toolkit instructions listing available delegation targets."""
-        lines: list[str] = []
-        for target_name in self._delegate_to:
-            description = describe_agent(target_name, self._config)
-            lines.append(description)
-        return self._config.render_prompt(
+        # The caller's own entry never repeats its configured role, which an authored copy must not see.
+        tools = config_plugins(self._config, self._runtime_paths).tools
+        lines = [
+            f"{target_name}\n  - Yourself, run as a fresh copy."
+            if target_name == self._agent_name
+            else describe_agent(target_name, self._config, tools)
+            for target_name in self._delegate_to
+        ]
+        instructions = self._config.render_prompt(
             "DELEGATE_TOOLKIT_INSTRUCTIONS_TEMPLATE",
             agent_descriptions="\n\n".join(lines),
         )
+        if self._background_jobs_available():
+            instructions += "\n" + self._config.get_prompt("DELEGATE_BACKGROUND_JOB_INSTRUCTIONS")
+        return instructions
 
-    def _build_delegate_task_description(self) -> str:
-        """Build the model-facing function description with this caller's allowlist."""
-        available_targets = ", ".join(self._delegate_to)
+    def _background_jobs_available(self) -> bool:
         return (
-            "Delegate a task to one allowed agent and return its response.\n"
-            f"Allowed delegate targets for this caller: {available_targets}.\n"
-            "Do not use any other agent names.\n"
-            "Use this when you need one listed specialist agent to handle a specific subtask.\n"
-            "The delegated agent runs independently with no shared conversation history."
+            self._calls_as_jobs
+            and self._execution_identity is not None
+            and self._execution_identity.channel == "matrix"
+            and get_background_runtime(self._runtime_paths) is not None
         )
 
-    async def delegate_task(self, agent_name: str, task: str) -> str:  # noqa: PLR0911
-        """Delegate a task to one allowed agent and return its response.
+    def _build_run_subagent_description(self) -> str:
+        """Build the model-facing function description with this caller's allowlist."""
+        available_targets = ", ".join(self._delegate_to)
+        minimal_guidance = (
+            "Set minimal to true to run the child in minimal mode: a short system prompt and one Bash tool "
+            "through which the child discovers and calls its configured tools on demand. "
+            "Each child request carries far fewer tokens, at the cost of a few discovery steps. "
+            "Prefer minimal when the task is self-contained and the child's full role, instructions, and tool "
+            "descriptions are not important in its system prompt; it can still read them on demand. "
+            "Use standard mode when that context matters or the child needs tools that require approval, "
+            "which minimal children cannot use. "
+            f"Subagents that support minimal mode: {', '.join(self._minimal_targets)}.\n"
+            if self._minimal_targets
+            else ""
+        )
+        background = self._background_jobs_available()
+        background_guidance = (
+            "Managed Matrix calls accept background_after: null waits, zero returns a Job ID immediately, "
+            "and a positive number is how many seconds to wait before the child continues in the background. "
+            "A newer message you answer releases the wait while the child keeps working. "
+            if background
+            else ""
+        )
+        return (
+            "Run one allowed configured agent as a fresh subagent and wait for its result.\n"
+            f"Allowed subagents for this caller: {available_targets}.\n"
+            "Use only these agent names. Include all relevant context, constraints, and expected output in task; "
+            "the child does not inherit this conversation. It keeps its configured tools, workspace, and memory.\n"
+            "Selecting your own name starts a fresh copy of yourself, if listed. "
+            "Omit agent_name or pass null to select yourself; the same allowlist applies. "
+            f"{background_guidance}"
+            "Set model to a configured model name to override the child's model for this session. "
+            f"Available models: {', '.join(sorted(self._config.models))}. "
+            "Omit model or pass null to use the child's normal thread, room, or configured model. "
+            f"{'This' if background else 'The caller waits; this'} does not create a Matrix thread. "
+            "Use continue_subagent with the returned subagent_id for follow-ups in the same child session; "
+            "follow-ups keep the child's model and mode.\n"
+            f"{minimal_guidance}"
+            f"{self._dedicated_worker_guidance()}"
+            f"{self._authoring_guidance()}"
+            "In Matrix, approval-required child tools pause for the user's approval before continuing. "
+            "Returns the child's answer, stable subagent ID, and an audit reference scoped to the child agent."
+        )
+
+    def _dedicated_worker_guidance(self) -> str:
+        if not self._dedicated_workers:
+            return ""
+        profiles = (
+            "Set resource_profile to small, standard, or large to size that worker; omit it for the normal worker size. "
+            if self._resource_profiles
+            else ""
+        )
+        return (
+            "Set dedicated_worker to true to run the child's shell, file, python, and other worker tools in a new "
+            "worker of its own instead of its normal worker, which it shares with you or with its agent's other "
+            "subagents, so parallel or heavy children do not compete for one worker. It sees the same workspace; its "
+            "first worker call waits for the new worker to start, and packages installed into the normal worker's "
+            "environment are not there. "
+            f"{profiles}Follow-ups keep the child's worker while it exists; once it has been idle for the worker idle "
+            "timeout, a follow-up starts a new one with the same workspace and nothing installed outside it.\n"
+        )
+
+    def _authoring_guidance(self) -> str:
+        if not self._authoring:
+            return ""
+        minimal = " or minimal=true" if self._agent_name in self._minimal_targets else ""
+        return (
+            "To author a fresh copy of yourself, pass system_prompt, which replaces your role and instructions, "
+            "and optionally tools, a subset of your toolkit names or toolkit.function entries; skills, a subset of "
+            "your skill names; and knowledge, a subset of your knowledge base IDs to search. Omit tools to keep all "
+            "of yours; a copy that lists tools gets only the skills and knowledge bases it lists, while one without "
+            "tools keeps all of yours unless it lists some. The child keeps your workspace, credentials, and "
+            "approval rules, sees that prompt instead of your configured role and instructions, and gets only those "
+            "tools, skills, and knowledge bases. "
+            "Or pass profile to run a saved subagents/<name>.md file from your workspace: YAML frontmatter with "
+            "description and optional tools, skills, knowledge, model, and mode, then the system prompt as the body. "
+            f"An explicit model{minimal} overrides the profile. "
+            "Follow-ups keep the subagent's prompt even if its profile later changes.\n"
+            f"{self._profile_listing()}"
+        )
+
+    def _profile_listing(self) -> str:
+        listing = render_profile_listing(list_profiles(self._workspace_root))
+        return f"Saved profiles:\n{listing}\n" if listing else ""
+
+    async def run_subagent(
+        self,
+        task: str,
+        agent_name: str | None = None,
+        model: str | None = None,
+        minimal: bool = False,
+        system_prompt: str | None = None,
+        tools: list[str] | None = None,
+        skills: list[str] | None = None,
+        knowledge: list[str] | None = None,
+        profile: str | None = None,
+        dedicated_worker: bool = False,
+        resource_profile: ScriptResourceProfileName | None = None,
+    ) -> str:
+        """Run a fresh subagent and wait for its response and audit reference.
 
         The runtime-generated tool description lists caller-specific allowed
-        targets and model guidance.
+        targets, model guidance, and subagents that support minimal mode.
 
         Args:
-            agent_name: Name of the agent to delegate to (must be one of your configured targets).
-            task: The task description or prompt to send to the agent.
+            task: Self-contained task with relevant context, constraints, and expected output.
+            agent_name: Allowed subagent name; omitted or null selects yourself, if allowed.
+            model: Configured model name from models; omitted or null uses normal model selection.
+            minimal: True runs the child in token-efficient minimal mode, only for subagents listed as supporting it.
+            system_prompt: Prompt for a fresh copy of yourself, replacing your role and instructions; omit to use the configured prompt.
+            tools: Your toolkit names or toolkit.function entries the copy may use; omit to keep all of yours.
+            skills: Your skill names the copy may use; omitted keeps all of yours only when tools is omitted too.
+            knowledge: Your knowledge base IDs the copy may search; omitted keeps all of yours only when tools is omitted too.
+            profile: Name of a subagents/<name>.md profile in your workspace; excludes system_prompt, tools, skills, and knowledge.
+            dedicated_worker: True runs the child's worker tools in a new worker of its own, for parallel or heavy children.
+            resource_profile: CPU and memory size of that worker, small, standard, or large; omit for the normal size.
 
         Returns:
             The delegated agent's response, or an error message if delegation failed.
 
         """
-        if not task or not task.strip():
-            return "Cannot delegate an empty task. Please provide a task description."
-
-        if agent_name not in self._delegate_to:
-            available = ", ".join(self._delegate_to)
-            return (
-                f"Cannot delegate to '{agent_name}'. Available agents: {available}. "
-                f"Run agents_list to inspect can_delegate flags."
-            )
-
-        runtime_context = get_tool_runtime_context()
-        detached_context = get_detached_requester_context()
-        if runtime_context is not None:
-            active_config = runtime_context.current_config
-            requester_id = runtime_context.requester_id
-            authorization_room_id = runtime_context.room_id
-            membership_index = runtime_context.require_agent_reply_memberships()
-        elif (
-            detached_context is not None
-            and self._execution_identity is not None
-            and self._execution_identity.channel == "openai_compat"
-            and self._execution_identity.requester_id == detached_context.requester_id
-            and self._runtime_paths == detached_context.runtime_paths
-        ):
-            active_config = detached_context.config_provider()
-            requester_id = detached_context.requester_id
-            authorization_room_id = None
-            membership_index = detached_context.agent_reply_memberships
-        else:
-            return f"Cannot delegate to '{agent_name}': requester authorization is unavailable."
-        if active_config is None or agent_name not in active_config.agents:
-            return f"Cannot delegate to '{agent_name}': that agent is not allowed to reply to you."
-        caller_config = active_config.agents.get(self._agent_name)
-        caller_allows_target = caller_config is not None and agent_name in caller_config.delegate_to
-        if not caller_allows_target or not is_sender_allowed_for_responder(
-            requester_id,
-            agent_name,
-            authorization_room_id,
-            active_config,
-            self._runtime_paths,
-            membership_index,
-        ):
-            reason = (
-                "it is no longer an allowed target"
-                if not caller_allows_target
-                else "that agent is not allowed to reply to you"
-            )
-            return f"Cannot delegate to '{agent_name}': {reason}."
-
-        try:
-            session_id = f"delegate:{self._agent_name}:{agent_name}:{uuid4()}"
-            execution_identity = (
-                replace(self._execution_identity, agent_name=agent_name, session_id=session_id)
-                if self._execution_identity is not None
-                else None
-            )
-
-            knowledge_resolution = await resolve_agent_knowledge_access_async(
-                agent_name,
-                active_config,
-                self._runtime_paths,
-                refresh_scheduler=self._refresh_scheduler,
-                execution_identity=execution_identity,
-            )
-            transient_enrichment_items = append_knowledge_availability_enrichment(
-                (),
-                knowledge_resolution.unavailable,
-            )
-            logger.info(
-                "Delegating task",
-                from_agent=self._agent_name,
-                to_agent=agent_name,
-                requester_id=requester_id,
-                depth=self._delegation_depth + 1,
-                task_preview=task[:100],
-            )
-            room_id = _resolve_delegated_room_id(
-                runtime_context=runtime_context,
-                execution_identity=execution_identity,
-            )
-            thread_id = _resolve_delegated_thread_id(
-                runtime_context=runtime_context,
-                execution_identity=execution_identity,
-            )
-            active_model_name = active_config.resolve_runtime_model(
-                entity_name=agent_name,
-                room_id=room_id,
-                thread_id=thread_id,
-                runtime_paths=self._runtime_paths,
-            ).model_name
-            delegated_runtime_context = self._build_delegated_runtime_context(
-                agent_name=agent_name,
-                session_id=session_id,
-                runtime_context=runtime_context,
-                active_model_name=active_model_name,
-            )
-            delegated_correlation_id = (
-                delegated_runtime_context.correlation_id if delegated_runtime_context is not None else None
-            )
-            turn_ctx = ResponseTurnContext(
-                entity_label=agent_name,
-                session_id=session_id,
-                run_id=None,
-                correlation_id=delegated_correlation_id or uuid4().hex,
-                reply_to_event_id=None,
-                room_id=room_id,
-                thread_id=thread_id,
-                requester_id=execution_identity.requester_id if execution_identity is not None else None,
-                matrix_run_metadata=None,
-                active_model_name=active_model_name,
-                transient_enrichment_items=tuple(transient_enrichment_items),
-            )
-            with tool_runtime_context(delegated_runtime_context):
-                response = await ai_response(
-                    turn_ctx,
-                    prompt=task,
-                    runtime_paths=self._runtime_paths,
-                    config=active_config,
-                    knowledge=knowledge_resolution.knowledge,
-                    include_interactive_questions=False,
-                    include_openai_compat_guidance=(
-                        execution_identity is not None and execution_identity.channel == "openai_compat"
-                    ),
-                    tool_function_filter=(
-                        runtime_context.tool_function_filter if runtime_context is not None else None
-                    ),
-                    execution_identity=execution_identity,
-                    delegation_depth=self._delegation_depth + 1,
-                    refresh_scheduler=self._refresh_scheduler,
-                    attempt_model_runtime=ToolRuntimeModelBinding(),
-                )
-        except Exception as e:
-            logger.exception(
-                "Delegation failed",
-                from_agent=self._agent_name,
-                to_agent=agent_name,
-                error=str(e),
-            )
-            return f"Delegation to '{agent_name}' failed: {e}"
-        else:
-            return response or "Agent completed the task but returned no content."
-
-    def _build_delegated_runtime_context(
-        self,
-        *,
-        agent_name: str,
-        session_id: str,
-        runtime_context: ToolRuntimeContext | None,
-        active_model_name: str,
-    ) -> ToolRuntimeContext | None:
-        """Return the child tool runtime context for one delegated run."""
-        if runtime_context is None:
-            return None
-        return replace(
-            runtime_context,
-            agent_name=agent_name,
-            active_model_name=active_model_name,
-            target=replace(runtime_context.target, session_id=session_id),
+        return await self._run_direct(
+            RUN_SUBAGENT,
+            {
+                "task": task,
+                "agent_name": agent_name,
+                "model": model,
+                "minimal": minimal,
+                "system_prompt": system_prompt,
+                "tools": tools,
+                "skills": skills,
+                "knowledge": knowledge,
+                "profile": profile,
+                "dedicated_worker": dedicated_worker,
+                "resource_profile": resource_profile,
+            },
         )
 
+    def _caller_identity(self) -> ToolExecutionIdentity:
+        """Return who delegates: the running call's identity, for execution, ownership, and audit."""
+        identity = current_execution_identity()
+        if identity is None:
+            msg = "Delegation requires a caller execution identity"
+            raise RuntimeError(msg)
+        return identity
 
-def _resolve_delegated_room_id(
-    *,
-    runtime_context: ToolRuntimeContext | None,
-    execution_identity: ToolExecutionIdentity | None,
-) -> str | None:
-    """Resolve the room context that should apply to a delegated child run."""
-    if runtime_context is not None:
-        return runtime_context.room_id
-    if execution_identity is not None:
-        return execution_identity.room_id
-    return None
+    async def continue_subagent(self, subagent_id: str, message: str) -> str:
+        """Send a follow-up to an existing subagent and wait for its answer.
 
+        Reuses the child's conversation history, tools, workspace, and memory.
+        Use after its previous turn returns; finish pending approvals first.
+        The ID belongs to this caller and conversation, including after restart.
+        Current allowed-subagent and requester permissions still apply.
+        Each follow-up gets a separate audit record and returns the same subagent ID.
 
-def _resolve_delegated_thread_id(
-    *,
-    runtime_context: ToolRuntimeContext | None,
-    execution_identity: ToolExecutionIdentity | None,
-) -> str | None:
-    """Resolve the thread context that should apply to a delegated child run."""
-    if runtime_context is not None:
-        return runtime_context.resolved_thread_id
-    if execution_identity is not None:
-        return execution_identity.resolved_thread_id
-    return None
+        Args:
+            subagent_id: Exact Subagent ID returned by run_subagent or continue_subagent.
+            message: Follow-up instructions or question for that child.
+
+        Returns:
+            The child's answer, stable subagent ID, and this turn's audit reference, or an error.
+
+        """
+        return await self._run_direct(CONTINUE_SUBAGENT, {"subagent_id": subagent_id, "message": message})
+
+    async def managed_job(
+        self,
+        function_name: str,
+        arguments: dict[str, Any],
+        *,
+        job_id: str,
+        runtime: ToolJobRuntime,
+    ) -> JobSpec | str:
+        """Prepare the child a managed call of ``function_name`` runs as ``runtime``'s job ``job_id``, or say why not.
+
+        The child's turn starts only once the job is admitted; the job starts and settles the child it is known by.
+        """
+        prepared = await self._prepare(function_name, arguments)
+        if isinstance(prepared, str):
+            return prepared
+        child, config, parent_run_id = prepared
+        return delegation_call_job(
+            child,
+            job_id=job_id,
+            runtime=runtime,
+            owner=self._caller_identity(),
+            parent_run_id=parent_run_id,
+            tool_name=function_name,
+            arguments=arguments,
+            run_child=run_delegated_child_response,
+            config=config,
+            runtime_paths=self._runtime_paths,
+            refresh_scheduler=self._refresh_scheduler,
+        )
+
+    async def _target(self, function_name: str, arguments: Mapping[str, object]) -> DelegationTarget | str:
+        """Resolve the child a call of ``function_name`` starts or continues, or return why it cannot."""
+        if function_name == CONTINUE_SUBAGENT:
+            return await resolve_follow_up_target(
+                arguments,
+                owner=self._caller_identity(),
+                config=self._config,
+                runtime_paths=self._runtime_paths,
+                depth=self._delegation_depth,
+            )
+        return resolve_fresh_target(
+            arguments,
+            caller_name=self._agent_name,
+            config=self._config,
+            runtime_paths=self._runtime_paths,
+            depth=self._delegation_depth,
+            workspace_root=lambda: self._workspace_root,
+            cap=self._persona,
+        )
+
+    async def _prepare(
+        self,
+        function_name: str,
+        arguments: Mapping[str, object],
+    ) -> tuple[DelegationChild, Config, str | None] | str:
+        """Resolve and authorize one call's child and prepare its turn: the child, its live config, and parent run."""
+        target = await self._target(function_name, arguments)
+        if isinstance(target, str):
+            return target
+        config = authorize_delegation(
+            self._agent_name,
+            target.agent_name,
+            target.task,
+            config=self._config,
+            runtime_paths=self._runtime_paths,
+            execution_identity=self._execution_identity,
+            depth=self._delegation_depth,
+            model=target.model,
+        )
+        if isinstance(config, str):
+            return config
+        # The parent's run and tool call are the framework's, never the model's arguments.
+        parent = current_tool_call()
+        child = prepare_child_turn(
+            self._agent_name,
+            target.agent_name,
+            target.task,
+            owner=self._caller_identity(),
+            config=config,
+            runtime_paths=self._runtime_paths,
+            depth=self._delegation_depth,
+            budget_monitor=current_budget_monitor(),
+            model=target.model,
+            agent_mode=target.agent_mode,
+            previous=target.previous_child,
+            parent_tool_call_id=(parent.context.call_id or "") if parent is not None else "",
+            persona=target.persona,
+            dedicated_worker=target.dedicated_worker,
+            worker_resource_profile=target.resource_profile,
+        )
+        return child, config, parent.context.run_id if parent is not None else None
+
+    async def _run_direct(self, function_name: str, arguments: Mapping[str, object]) -> str:
+        """Run one call's child inside this call, settled by the shared lifecycle owner."""
+        prepared = await self._prepare(function_name, arguments)
+        if isinstance(prepared, str):
+            return prepared
+        child, config, parent_run_id = prepared
+        try:
+            result = await run_direct_child_turn(
+                child,
+                owner=self._caller_identity(),
+                parent_run_id=parent_run_id,
+                config=config,
+                runtime_paths=self._runtime_paths,
+                refresh_scheduler=self._refresh_scheduler,
+            )
+        except SubagentSessionError as error:
+            return str(error)
+        # The stable child record reference follows the child's answer.
+        return f"{result.text}\n\n{result.receipt}" if result.receipt else result.text

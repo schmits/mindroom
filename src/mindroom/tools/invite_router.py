@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,13 +13,15 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="invite_router",
+    file_access=ToolFileAccess.NONE,
     display_name="Invite Router",
     description="Invite the MindRoom router to the current Matrix room",
+    docs_url="https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing",
     category=ToolCategory.COMMUNICATION,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
+    requires_primary_runtime=True,
     requires_room_context=True,
-    dependencies=["agno"],
     function_names=("invite_router",),
 )
 def invite_router_tools() -> type[InviteRouterTools]:

@@ -4,12 +4,11 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import BinaryIO
 from unittest.mock import MagicMock
 
 import nio
 import pytest
-from agno.models.response import ToolExecution
-from agno.run.agent import ToolCallCompletedEvent, ToolCallStartedEvent
 
 from mindroom.config.models import DefaultsConfig
 from mindroom.constants import (
@@ -19,12 +18,16 @@ from mindroom.constants import (
     RuntimePaths,
     resolve_runtime_paths,
 )
-from mindroom.matrix.client import edit_message_result, send_message_result
+from mindroom.llm.events import ToolCompleted, ToolStarted
+from mindroom.llm.runs import ToolExecution
+from mindroom.matrix.client_delivery import edit_message_result, send_message_result
 from mindroom.matrix.large_messages import (
     _NORMAL_MESSAGE_LIMIT,
-    _oversized_nonterminal_streaming_edit_sent_at,
+    calculate_event_size,
     prepare_large_message,
+    should_send_oversized_nonterminal_streaming_edit,
 )
+from mindroom.matrix.message_builder import markdown_to_html
 from mindroom.message_target import MessageTarget
 from mindroom.streaming import (
     ReplacementStreamingResponse,
@@ -33,12 +36,14 @@ from mindroom.streaming import (
     send_streaming_response,
 )
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, StructuredStreamChunk, ToolTraceEntry
+from tests.conftest import push_stream_chunk
+from tests.streaming_helpers import reply_hooks
 
 
 class MockClient:
     """Mock Matrix client for testing."""
 
-    def __init__(self, should_upload_succeed: bool = True) -> None:
+    def __init__(self) -> None:
         room = MagicMock()
         room.encrypted = False
         self.rooms = {
@@ -46,8 +51,7 @@ class MockClient:
             "!test:room": room,
         }
         self.messages_sent = []
-        self.uploads: list[dict] = []
-        self.should_upload_succeed = should_upload_succeed
+        self.uploads: list[BinaryIO] = []
         self.olm = None
         self.device_id = "DEVICE"
 
@@ -58,31 +62,17 @@ class MockClient:
         content: dict,
         *,
         ignore_unverified_devices: bool = False,
-    ) -> MagicMock:
+    ) -> nio.RoomSendResponse:
         """Mock sending a message."""
         assert message_type == "m.room.message"
         assert ignore_unverified_devices is True
         self.messages_sent.append(("send", room_id, content))
+        return nio.RoomSendResponse(f"$event_{len(self.messages_sent)}", room_id)
 
-        # Create a mock that passes isinstance check
-        response = MagicMock(spec=nio.RoomSendResponse)
-        response.event_id = f"$event_{len(self.messages_sent)}"
-        return response
-
-    async def upload(self, **kwargs) -> tuple:  # noqa: ANN003
-        """Mock file upload - returns tuple like nio."""
-        if not self.should_upload_succeed:
-            msg = "Upload failed"
-            raise Exception(msg)  # noqa: TRY002
-
-        # Capture the uploaded data for test inspection
-        data_provider = kwargs.get("data_provider")
-        data = data_provider(None, None) if data_provider else None
-        self.uploads.append({"data": data, **{k: v for k, v in kwargs.items() if k != "data_provider"}})
-
-        # Create a mock UploadResponse
-        response = nio.UploadResponse.from_dict({"content_uri": f"mxc://server/file_{len(self.messages_sent)}"})
-        return response, None  # nio returns (response, encryption_dict)
+    async def upload(self, **kwargs) -> tuple[nio.UploadResponse, None]:  # noqa: ANN003
+        """Capture the uploaded bytes and return a nio-style upload result."""
+        self.uploads.append(kwargs["data_provider"](None, None))
+        return nio.UploadResponse(f"mxc://server/file_{len(self.messages_sent)}"), None
 
 
 class MockConfig:
@@ -96,6 +86,16 @@ class MockConfig:
 def _runtime_paths() -> RuntimePaths:
     """Create an explicit runtime context for streaming tests."""
     return resolve_runtime_paths(config_path=Path("config.yaml"), process_env={})
+
+
+def _streaming_response(target: MessageTarget | None = None) -> StreamingResponse:
+    """Build a streaming response with fresh configuration and reply hooks."""
+    return StreamingResponse(
+        target=target or MessageTarget.resolve("!test:room", None, None),
+        config=MockConfig(),
+        runtime_paths=_runtime_paths(),
+        **reply_hooks(),
+    )
 
 
 # ============================================================================
@@ -203,7 +203,7 @@ async def test_large_edit_preserves_mindroom_metadata_in_both_payload_layers() -
         assert sent_content[key] == value
         assert sent_content["m.new_content"][key] == value
 
-    uploaded_payload = json.loads(client.uploads[0]["data"].read())
+    uploaded_payload = json.loads(client.uploads[0].read())
     for key, value in extra_content.items():
         assert uploaded_payload["m.new_content"][key] == value
 
@@ -248,16 +248,10 @@ async def test_threaded_edit_strips_nested_relations_from_replacement_payload() 
 async def test_streaming_initial_message_under_limit() -> None:
     """Test streaming with initial message under limit."""
     client = MockClient()
-    config = MockConfig()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    streaming = _streaming_response()
 
     # Small initial content
-    await streaming.update_content("Hello streaming world", client)
+    await push_stream_chunk(streaming, "Hello streaming world", client)
 
     # Should trigger initial send
     assert len(client.messages_sent) == 1
@@ -270,20 +264,14 @@ async def test_streaming_initial_message_under_limit() -> None:
 async def test_streaming_initial_message_over_limit() -> None:
     """Test streaming with initial message over limit."""
     client = MockClient()
-    config = MockConfig()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    streaming = _streaming_response()
 
     # Large initial content (60KB - over normal limit)
     large_text = "a" * 60000
     streaming.accumulated_text = large_text
     streaming.last_update = float("-inf")  # Force immediate send
 
-    await streaming._send_or_edit_message(client, is_final=True)
+    await streaming.finalize(client)
 
     # Should have sent with large message handling
     assert len(client.messages_sent) == 1
@@ -297,18 +285,12 @@ async def test_streaming_initial_message_over_limit() -> None:
 async def test_streaming_edit_grows_over_limit() -> None:
     """Test streaming where edit grows beyond limit."""
     client = MockClient()
-    config = MockConfig()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    streaming = _streaming_response()
 
     # Start with small message
     streaming.accumulated_text = "Small start"
     streaming.last_update = float("-inf")
-    await streaming._send_or_edit_message(client, is_final=False)
+    await streaming._send_or_edit_message(client)
 
     # Should have an event ID now
     assert streaming.event_id is not None
@@ -319,7 +301,7 @@ async def test_streaming_edit_grows_over_limit() -> None:
     streaming.accumulated_text = large_text
 
     # This should trigger edit with large message handling
-    await streaming._send_or_edit_message(client, is_final=True)
+    await streaming.finalize(client)
 
     # Should have sent an edit
     assert len(client.messages_sent) == 2
@@ -335,17 +317,21 @@ async def test_streaming_edit_grows_over_limit() -> None:
 @pytest.mark.asyncio
 async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test streaming with multiple edits as message grows."""
-    _oversized_nonterminal_streaming_edit_sent_at.clear()
-    monotonic_values = iter([100.0, 106.0, 112.0])
-    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: next(monotonic_values))
-    client = MockClient()
-    config = MockConfig()
+    now = {"value": 100.0}
+    monkeypatch.setattr("mindroom.matrix.large_messages.monotonic", lambda: now["value"])
+    cadence_edits: list[dict[str, object]] = []
 
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    def recording_cadence(*, room_id: str, original_event_id: str, edit_content: dict[str, object]) -> bool:
+        cadence_edits.append(edit_content)
+        return should_send_oversized_nonterminal_streaming_edit(
+            room_id=room_id,
+            original_event_id=original_event_id,
+            edit_content=edit_content,
+        )
+
+    monkeypatch.setattr("mindroom.streaming.should_send_oversized_nonterminal_streaming_edit", recording_cadence)
+    client = MockClient()
+    streaming = _streaming_response()
 
     # Simulate progressive growth
     sizes = [
@@ -358,9 +344,14 @@ async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPa
     for label, size in sizes:
         streaming.accumulated_text = "x" * size
         streaming.last_update = float("-inf")
-        is_final = label == "Larger"
-
-        await streaming._send_or_edit_message(client, is_final=is_final)
+        if label == "Larger":
+            await streaming.finalize(client)
+        else:
+            await streaming._send_or_edit_message(client)
+        if cadence_edits:
+            # Wait out the interval the latest in-progress edit reserved; every
+            # oversized edit exceeds 27 KB, so it always outlasts the 5 s floor.
+            now["value"] += calculate_event_size(cadence_edits[-1]) / 4096
 
         # After first, should have event_id
         if label != "Initial":
@@ -387,20 +378,14 @@ async def test_streaming_multiple_edits_with_growth(monkeypatch: pytest.MonkeyPa
 async def test_streaming_with_thread_context() -> None:
     """Test that streaming preserves thread context with large messages."""
     client = MockClient()
-    config = MockConfig()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", "$thread_root", "$reply_to"),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    streaming = _streaming_response(MessageTarget.resolve("!test:room", "$thread_root", "$reply_to"))
 
     # Large message
     large_text = "t" * 60000
     streaming.accumulated_text = large_text
     streaming.last_update = float("-inf")
 
-    await streaming._send_or_edit_message(client, is_final=True)
+    await streaming.finalize(client)
 
     sent_content = client.messages_sent[0][2]
 
@@ -431,7 +416,7 @@ async def test_message_exactly_at_limit() -> None:
     text = "e" * text_size
     content = {"body": text, "msgtype": "m.text"}
 
-    result = await prepare_large_message(client, "!room:server", content)
+    result = await prepare_large_message(client, "!room:server", content, room_encrypted=False)
 
     # Should pass through unchanged (just under limit)
     assert result == content
@@ -453,7 +438,7 @@ async def test_message_with_formatted_body_no_tools() -> None:
         "format": "org.matrix.custom.html",
     }
 
-    result = await prepare_large_message(client, "!room:server", content)
+    result = await prepare_large_message(client, "!room:server", content, room_encrypted=False)
 
     # Should be an m.file message with truncated preview
     assert result["msgtype"] == "m.file"
@@ -462,10 +447,10 @@ async def test_message_with_formatted_body_no_tools() -> None:
 
     assert result["info"]["mimetype"] == "application/json"
     assert result["filename"] == "message-content.json"
-    assert "format" not in result
-    assert "formatted_body" not in result
+    assert result["format"] == "org.matrix.custom.html"
+    assert result["formatted_body"] == markdown_to_html(result["body"])
 
-    uploaded_data = client.uploads[0]["data"]
+    uploaded_data = client.uploads[0]
     uploaded_payload = json.loads(uploaded_data.read().decode("utf-8"))
     assert uploaded_payload["formatted_body"] == large_html
     assert uploaded_payload["format"] == "org.matrix.custom.html"
@@ -489,16 +474,16 @@ async def test_large_message_with_plain_tool_markers_uploads_full_content_json()
         _TOOL_TRACE_KEY: {"version": 2, "events": [{"type": "tool_call_started", "tool_name": "web_search"}]},
     }
 
-    result = await prepare_large_message(client, "!room:server", content)
+    result = await prepare_large_message(client, "!room:server", content, room_encrypted=False)
 
     assert result["msgtype"] == "m.file"
     assert result["info"]["mimetype"] == "application/json"
-    assert "format" not in result
-    assert "formatted_body" not in result
+    assert result["formatted_body"] == markdown_to_html(result["body"])
+    assert "🔧 <code>web_search</code> [1]" in result["formatted_body"]
     assert _TOOL_TRACE_KEY not in result
 
     # Uploaded sidecar should preserve full original content.
-    uploaded_data = client.uploads[0]["data"]
+    uploaded_data = client.uploads[0]
     uploaded_payload = json.loads(uploaded_data.read().decode("utf-8"))
     assert uploaded_payload["formatted_body"] == formatted_body
     assert uploaded_payload[_TOOL_TRACE_KEY]["events"][0]["tool_name"] == "web_search"
@@ -521,7 +506,7 @@ async def test_large_message_preview_uses_generic_truncation_with_plain_markers(
         "msgtype": "m.text",
     }
 
-    result = await prepare_large_message(client, "!room:server", content)
+    result = await prepare_large_message(client, "!room:server", content, room_encrypted=False)
 
     assert result["msgtype"] == "m.file"
 
@@ -538,13 +523,7 @@ async def test_large_message_preview_uses_generic_truncation_with_plain_markers(
 async def test_streaming_finalize() -> None:
     """Test that streaming finalize properly handles large messages."""
     client = MockClient()
-    config = MockConfig()
-
-    streaming = StreamingResponse(
-        target=MessageTarget.resolve("!test:room", None, None),
-        config=config,
-        runtime_paths=_runtime_paths(),
-    )
+    streaming = _streaming_response()
 
     # Large content
     streaming.accumulated_text = "g" * 60000
@@ -578,6 +557,7 @@ async def test_structured_stream_chunk_adds_tool_trace_metadata() -> None:
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
+        **reply_hooks(),
     )
 
     event_id = outcome.last_physical_stream_event_id
@@ -608,6 +588,7 @@ async def test_streaming_with_extra_content_metadata() -> None:
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
         extra_content=extra_content,
+        **reply_hooks(),
     )
 
     event_id = outcome.last_physical_stream_event_id
@@ -639,6 +620,7 @@ async def test_structured_stream_chunk_does_not_drop_trace_on_stale_snapshot() -
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
+        **reply_hooks(),
     )
 
     event_id = outcome.last_physical_stream_event_id
@@ -650,15 +632,17 @@ async def test_structured_stream_chunk_does_not_drop_trace_on_stale_snapshot() -
 
 @pytest.mark.asyncio
 async def test_replacement_streaming_preserves_text_on_tool_completion() -> None:
-    """ToolCallCompletedEvent through ReplacementStreamingResponse must not wipe accumulated_text."""
+    """A completed tool event through ReplacementStreamingResponse must not wipe accumulated_text."""
     client = MockClient()
     config = MockConfig()
 
-    tool = ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}, result="ok")
+    tool = ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}, result="ok")
 
     async def stream() -> AsyncIterator[StreamInputChunk]:
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}))
-        yield ToolCallCompletedEvent(tool=tool, content="ok")
+        yield ToolStarted(
+            call=ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}).call,
+        )
+        yield ToolCompleted(call=tool.call)
 
     outcome = await send_streaming_response(
         client=client,
@@ -667,6 +651,7 @@ async def test_replacement_streaming_preserves_text_on_tool_completion() -> None
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
+        **reply_hooks(),
     )
 
     event_id = outcome.last_physical_stream_event_id
@@ -686,7 +671,9 @@ async def test_replacement_streaming_tool_start_preserves_prior_visible_text() -
 
     async def stream() -> AsyncIterator[StreamInputChunk]:
         yield "hello"
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}))
+        yield ToolStarted(
+            call=ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}).call,
+        )
 
     outcome = await send_streaming_response(
         client=client,
@@ -695,6 +682,7 @@ async def test_replacement_streaming_tool_start_preserves_prior_visible_text() -
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
+        **reply_hooks(),
     )
     accumulated = outcome.canonical_final_body_candidate or outcome.rendered_body or ""
 
@@ -713,13 +701,15 @@ async def test_replacement_streaming_preserves_visible_tool_marker_across_snapsh
     client = MockClient()
     config = MockConfig()
 
-    tool = ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}, result="ok")
+    tool = ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}, result="ok")
 
     async def stream() -> AsyncIterator[StreamInputChunk]:
         yield "hello"
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}))
+        yield ToolStarted(
+            call=ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}).call,
+        )
         yield "hello world"
-        yield ToolCallCompletedEvent(tool=tool, content="ok")
+        yield ToolCompleted(call=tool.call)
 
     outcome = await send_streaming_response(
         client=client,
@@ -728,6 +718,7 @@ async def test_replacement_streaming_preserves_visible_tool_marker_across_snapsh
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         streaming_cls=ReplacementStreamingResponse,
+        **reply_hooks(),
     )
     accumulated = outcome.canonical_final_body_candidate or outcome.rendered_body or ""
 
@@ -749,9 +740,11 @@ async def test_hidden_tool_calls_coalesce_placeholder_spacing() -> None:
     config = MockConfig()
 
     async def stream() -> AsyncIterator[StreamInputChunk]:
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="first_tool", tool_args={}))
+        yield ToolStarted(call=ToolExecution(tool_call_id="call-first_tool", tool_name="first_tool", tool_args={}).call)
         await asyncio.sleep(0)
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="second_tool", tool_args={}))
+        yield ToolStarted(
+            call=ToolExecution(tool_call_id="call-second_tool", tool_name="second_tool", tool_args={}).call,
+        )
         await asyncio.sleep(0)
         yield "Done"
 
@@ -762,6 +755,7 @@ async def test_hidden_tool_calls_coalesce_placeholder_spacing() -> None:
         runtime_paths=_runtime_paths(),
         response_stream=stream(),
         show_tool_calls=False,
+        **reply_hooks(),
     )
 
     event_id = outcome.last_physical_stream_event_id

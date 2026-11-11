@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="discord",
+    file_access=ToolFileAccess.NONE,
     display_name="Discord",
     description="Tool for interacting with Discord channels and servers",
     category=ToolCategory.COMMUNICATION,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="bot_token",
+            env=("DISCORD_BOT_TOKEN",),
             label="Bot Token",
             type="password",
             required=False,
@@ -72,7 +74,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["requests"],
-    docs_url="https://docs.agno.com/tools/toolkits/social/discord",
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#discord",
     function_names=(
         "delete_message",
         "get_channel_info",

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.runtime_env_policy import AWS_ENV_BY_KEY
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="redshift",
+    file_access=ToolFileAccess.UNCONFINED,
     display_name="Amazon Redshift",
     description="Query Amazon Redshift data warehouse - list tables, run SQL, and export results",
     category=ToolCategory.DEVELOPMENT,
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="host",
+            env=("REDSHIFT_HOST",),
             label="Host",
             type="url",
             required=True,
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="database",
+            env=("REDSHIFT_DATABASE",),
             label="Database",
             type="text",
             required=True,
@@ -67,6 +71,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="cluster_identifier",
+            env=("REDSHIFT_CLUSTER_IDENTIFIER",),
             label="Cluster Identifier",
             type="text",
             required=False,
@@ -75,6 +80,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="region",
+            env=(AWS_ENV_BY_KEY["region"], AWS_ENV_BY_KEY["default_region"]),
             label="Region",
             type="text",
             required=False,
@@ -83,6 +89,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="db_user",
+            env=("REDSHIFT_DB_USER",),
             label="DB User",
             type="text",
             required=False,
@@ -91,6 +98,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="access_key_id",
+            env=(AWS_ENV_BY_KEY["access_key"],),
             label="Access Key ID",
             type="password",
             required=False,
@@ -98,6 +106,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="secret_access_key",
+            env=(AWS_ENV_BY_KEY["secret_key"],),
             label="Secret Access Key",
             type="password",
             required=False,
@@ -105,6 +114,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="session_token",
+            env=(AWS_ENV_BY_KEY["session_token"],),
             label="Session Token",
             type="password",
             required=False,
@@ -112,6 +122,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="profile",
+            env=(AWS_ENV_BY_KEY["profile"],),
             label="AWS Profile",
             type="text",
             required=False,
@@ -133,7 +144,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["redshift-connector"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/redshift",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#redshift",
     function_names=(
         "describe_table",
         "export_table_to_path",

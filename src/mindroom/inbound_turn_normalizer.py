@@ -7,9 +7,9 @@ from collections.abc import Sequence  # noqa: TC003
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from mindroom.attachment_ids import merge_attachment_ids
-from mindroom.attachment_media import attachment_records_to_media, resolve_scoped_attachments
-from mindroom.attachments import (
+from mindroom.attachments.ids import merge_attachment_ids
+from mindroom.attachments.media import attachment_records_to_media, resolve_scoped_attachments
+from mindroom.attachments.storage import (
     format_attachments_prompt,
     format_voice_transcript_attachment_guidance,
     parse_attachment_ids_from_thread_history,
@@ -35,16 +35,16 @@ from mindroom.matrix.message_content import is_v2_sidecar_text_preview
 from mindroom.media_inputs import MediaInputs
 from mindroom.runtime_protocols import SupportsClientConfigMemberships  # noqa: TC001
 from mindroom.timing import emit_elapsed_timing
-from mindroom.voice_handler import prepare_raw_voice_fallback_message, prepare_voice_message
+from mindroom.voice.handler import prepare_raw_voice_fallback_message, prepare_voice_message
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     import nio
     import structlog
-    from agno.media import Image
 
     from mindroom.constants import RuntimePaths
+    from mindroom.llm.media import Image
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 
 
@@ -189,7 +189,7 @@ class InboundTurnNormalizer:
                         },
                     },
                     server_timestamp=request.event.server_timestamp,
-                    source_kind_override=VOICE_SOURCE_KIND,
+                    payload_trusted=True,
                 ),
             )
 
@@ -222,7 +222,7 @@ class InboundTurnNormalizer:
                     server_timestamp=request.event.server_timestamp
                     if isinstance(request.event.server_timestamp, int)
                     else None,
-                    source_kind_override=VOICE_SOURCE_KIND,
+                    payload_trusted=True,
                 ),
             )
 
@@ -360,6 +360,7 @@ class InboundTurnNormalizer:
                 self.deps.storage_path,
                 room_id=request.room_id,
                 thread_id=request.thread_id,
+                thread_history=request.thread_history,
             )
             if request.thread_id
             else []

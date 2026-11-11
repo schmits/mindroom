@@ -1,0 +1,63 @@
+"""The record each tool call leaves before it runs, which a reply a restart interrupted reads back."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Iterator, Mapping
+
+
+class _ToolCallRecorder(Protocol):
+    """Records tool calls where the work that made them keeps its durable state."""
+
+    async def started(self, tool_name: str, args: Mapping[str, object]) -> str | None:
+        """Record a call before the tool runs; return its id, or ``None`` when nothing records it.
+
+        Raises ``asyncio.CancelledError`` when the work the call belongs to was stopped or ended, so the tool never runs.
+        """
+        ...
+
+    async def finished(self, call_id: str, tool_name: str, args: Mapping[str, object], result: object) -> None:
+        """Record how a call ended; never raises, since the call already ran.
+
+        ``result`` is what the call returned, a failed ``ToolOutcome`` when it answered its own failure, or the
+        exception it raised.
+        """
+        ...
+
+
+_recorder: ContextVar[_ToolCallRecorder | None] = ContextVar("mindroom_tool_call_recorder", default=None)
+
+
+def tool_call_recorder() -> _ToolCallRecorder | None:
+    """Return the recorder of the work the current task runs tools for, if any."""
+    return _recorder.get()
+
+
+@contextmanager
+def recording_tool_calls(recorder: _ToolCallRecorder | None) -> Iterator[None]:
+    """Record every tool call made in this context, child tasks included; ``None`` records none of them."""
+    token = _recorder.set(recorder)
+    try:
+        yield
+    finally:
+        _recorder.reset(token)
+
+
+async def record_call(tool_name: str, args: Mapping[str, object]) -> Callable[[object], Awaitable[None]]:
+    """Record a call whose tool then runs outside this work's recording, as a background job does; return its finish.
+
+    The work's record then names the call, and, as for any recorded call, a Stop committed first raises
+    ``asyncio.CancelledError`` here so the call never starts.
+    """
+    recorder = _recorder.get()
+    record_id = None if recorder is None else await recorder.started(tool_name, args)
+
+    async def finished(result: object) -> None:
+        if recorder is not None and record_id is not None:
+            await recorder.finished(record_id, tool_name, args, result)
+
+    return finished

@@ -10,30 +10,33 @@ from unittest.mock import AsyncMock, patch
 import nio
 import pytest
 
-from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.bot_runtime_view import BotRuntimeState
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME, VISIBLE_ROUTER_VOICE_ECHO_KEY
 from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_recovery_context import turn_dispatch_recovery_scope
 from mindroom.entity_resolution import entity_identity_registry
+from mindroom.event_journal import turn_rows
 from mindroom.logging_config import get_logger
 from mindroom.message_target import MessageTarget
-from mindroom.visible_voice_echo import (
+from mindroom.turn_record import SourceVisibleEcho
+from mindroom.voice.visible_voice_echo import (
     VisibleVoiceEchoDeps,
     VisibleVoiceEchoLifecycle,
     VisibleVoiceEchoRequest,
 )
 from tests.access_schema_support import with_current_room_member_access, with_responder_access
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
+from tests.runtime_fakes import ready_runtime
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.delivery_gateway import DeliveryGateway, EditTextRequest, SendTextRequest
+    from mindroom.event_journal import TurnRecordStore
     from mindroom.ingress_validation import IngressValidator
-    from mindroom.runtime_protocols import OrchestratorRuntime
     from mindroom.turn_store import TurnStore
+    from tests.runtime_fakes import ReadyRuntime
 
 _ROOM_ID = "!voice:localhost"
 _REQUESTER_ID = "@alice:localhost"
@@ -64,14 +67,17 @@ class _EchoTurnStore:
 
     visible_event_ids: dict[str, str] = field(default_factory=dict)
 
-    def visible_echo_for_source(self, source_event_id: str) -> str | None:
-        return self.visible_event_ids.get(source_event_id)
+    async def visible_echo(self, source_event_id: str) -> SourceVisibleEcho | None:
+        event_id = self.visible_event_ids.get(source_event_id)
+        return None if event_id is None else SourceVisibleEcho(event_id)
 
-    async def record_visible_echo(self, source_event_id: str, echo_event_id: str) -> None:
+    async def read(self, operation: object, source_event_id: str) -> SourceVisibleEcho | None:
+        """Answer the router's own turn rows, as ``TurnRecordStore.read`` of ``turn_rows.visible_echo`` does."""
+        assert operation is turn_rows.visible_echo
+        return await self.visible_echo(source_event_id)
+
+    async def record_visible_echo(self, room_id: str, source_event_id: str, echo_event_id: str) -> None:  # noqa: ARG002
         self.visible_event_ids[source_event_id] = echo_event_id
-
-    def finalized_visible_echo(self, source_event_id: str) -> None:  # noqa: ARG002
-        return None
 
     async def record_finalized_visible_echo(
         self,
@@ -89,28 +95,17 @@ class _RouterIngress:
 
     router_user_id: str
 
-    def managed_entity_name_for_sender(self, sender_id: str, *, include_router: bool = True) -> str | None:
-        if include_router and sender_id == self.router_user_id:
+    def managed_entity_name_for_sender(self, sender_id: str) -> str | None:
+        if sender_id == self.router_user_id:
             return ROUTER_AGENT_NAME
         return None
-
-
-@dataclass(frozen=True)
-class _RouterReadiness:
-    """Expose whether the router runtime completed its first sync."""
-
-    ready: bool
-
-    def entity_first_sync_complete(self, entity_name: str) -> bool | None:
-        assert entity_name == ROUTER_AGENT_NAME
-        return self.ready
 
 
 @dataclass(frozen=True)
 class _EchoHarness:
     """Router and responder lifecycles sharing one process-global barrier registry."""
 
-    config: Config
+    orchestrator: ReadyRuntime
     runtime: BotRuntimeState
     router: VisibleVoiceEchoLifecycle
     responder: VisibleVoiceEchoLifecycle
@@ -134,22 +129,14 @@ def _echo_harness(
         test_runtime_paths(tmp_path),
     )
     runtime_paths = runtime_paths_for(config)
-    runtime = BotRuntimeState(
-        client=None,
-        config=config,
-        runtime_paths=runtime_paths,
-        agent_reply_memberships=AgentReplyMembershipIndex(),
-        enable_streaming=True,
-        orchestrator=cast("OrchestratorRuntime", _RouterReadiness(router_ready)),
-    )
+    orchestrator = ready_runtime(config, runtime_paths)
+    if not router_ready:
+        orchestrator.not_ready.add(ROUTER_AGENT_NAME)
+    runtime = BotRuntimeState(orchestrator=orchestrator)
     router_user_id = entity_identity_registry(config, runtime_paths).current_id(ROUTER_AGENT_NAME).full_id
     ingress = _RouterIngress(router_user_id)
     gateway = _RecordingEchoGateway()
     turn_store = _EchoTurnStore()
-
-    async def wait_for_admission_or_shutdown() -> bool:
-        await runtime.response_admission_gate.wait_until_open()
-        return True
 
     def lifecycle(agent_name: str) -> VisibleVoiceEchoLifecycle:
         return VisibleVoiceEchoLifecycle(
@@ -159,8 +146,8 @@ def _echo_harness(
                 agent_name=agent_name,
                 delivery_gateway=cast("DeliveryGateway", gateway),
                 turn_store=cast("TurnStore", turn_store),
+                router_turn_records=cast("TurnRecordStore", turn_store),
                 ingress=cast("IngressValidator", ingress),
-                wait_for_admission_or_shutdown=wait_for_admission_or_shutdown,
             ),
         )
 
@@ -168,7 +155,7 @@ def _echo_harness(
     room.add_member(router_user_id, router_user_id, None)
     room.add_member(_REQUESTER_ID, _REQUESTER_ID, None)
     return _EchoHarness(
-        config=config,
+        orchestrator=orchestrator,
         runtime=runtime,
         router=lifecycle(ROUTER_AGENT_NAME),
         responder=lifecycle("home"),
@@ -241,12 +228,12 @@ async def test_visible_echo_waits_for_reload_and_rechecks_authorization(tmp_path
     await asyncio.sleep(0)
     assert not harness.gateway.send_started.is_set()
 
-    replacement_config = harness.config.model_copy(deep=True)
+    replacement_config = harness.orchestrator.config.model_copy(deep=True)
     with_responder_access(replacement_config, ROUTER_AGENT_NAME, users=[])
-    harness.runtime.config = replacement_config
+    harness.orchestrator.config = replacement_config
     admission_gate.reopen()
-    await harness.router.finish(handle, _normalized_event(source_event_id))
-
+    assert await harness.router.finish(handle, _normalized_event(source_event_id)) is True
+    assert await _await_responder(harness, source_event_id) is True
     assert not harness.gateway.send_started.is_set()
 
 
@@ -262,7 +249,7 @@ async def test_recovery_adopts_untracked_marked_echo_before_sending(tmp_path: Pa
     with (
         turn_dispatch_recovery_scope(active=True),
         patch(
-            "mindroom.visible_voice_echo.find_response_event_ids_via_room_messages",
+            "mindroom.voice.visible_voice_echo.find_response_event_ids_via_room_messages",
             new_callable=AsyncMock,
             return_value=frozenset({"$orphaned-echo"}),
         ) as find_echo,
@@ -276,7 +263,7 @@ async def test_recovery_adopts_untracked_marked_echo_before_sending(tmp_path: Pa
     send_text.assert_not_awaited()
     edit_text.assert_awaited_once()
     assert edit_text.await_args.args[0].event_id == "$orphaned-echo"
-    assert harness.router.deps.turn_store.visible_echo_for_source(source_event_id) == "$orphaned-echo"
+    assert await harness.router.deps.turn_store.visible_echo(source_event_id) == SourceVisibleEcho("$orphaned-echo")
     response_filter = find_echo.await_args.kwargs["response_source_filter"]
     assert response_filter({"content": {VISIBLE_ROUTER_VOICE_ECHO_KEY: True}})
     assert not response_filter({"content": {}})
@@ -291,10 +278,14 @@ async def test_unclaimed_expected_echo_fails_closed_after_grace(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_responder_skips_barrier_when_visible_echo_is_disabled(tmp_path: Path) -> None:
-    """A disabled echo must not add ordering delay."""
+async def test_responder_skips_barrier_when_visible_echo_is_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disabled echo must not add ordering delay or require a journal lookup."""
     harness = _echo_harness(tmp_path)
-    harness.config.voice.visible_router_echo = False
+    harness.orchestrator.config.voice.visible_router_echo = False
+    monkeypatch.setattr(_EchoTurnStore, "read", AsyncMock(side_effect=RuntimeError("Journal unavailable")))
 
     assert await _await_responder(harness, "$voice-disabled") is True
 
@@ -337,14 +328,14 @@ async def test_abandoned_router_lifecycle_releases_responder(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_router_canonical_turn_does_not_wait_on_its_own_echo(tmp_path: Path) -> None:
-    """Gating the router on a failed best-effort echo would suppress canonical dispatch."""
+async def test_router_required_initial_echo_failure_is_not_ready(tmp_path: Path) -> None:
+    """The router must retain its publication obligation when no echo exists."""
     harness = _echo_harness(tmp_path)
     source_event_id = "$voice-router"
     harness.gateway.send_result = None
     handle = harness.router.start(_request(source_event_id))
     assert handle is not None
-    await harness.router.finish(handle, _normalized_event(source_event_id))
+    assert await harness.router.finish(handle, _normalized_event(source_event_id)) is False
 
     assert (
         await harness.router.await_publication(
@@ -352,7 +343,7 @@ async def test_router_canonical_turn_does_not_wait_on_its_own_echo(tmp_path: Pat
             source_event_id=source_event_id,
             requester_user_id=_REQUESTER_ID,
         )
-        is True
+        is False
     )
 
 
@@ -432,7 +423,7 @@ async def test_claimed_echo_stays_ordered_after_config_disable(tmp_path: Path) -
     source_event_id = "$voice-config-toggle"
     handle = harness.router.start(_request(source_event_id))
     assert handle is not None
-    harness.config.voice.visible_router_echo = False
+    harness.orchestrator.config.voice.visible_router_echo = False
     harness.gateway.block_send = True
 
     responder_wait = asyncio.create_task(_await_responder(harness, source_event_id))
@@ -444,3 +435,40 @@ async def test_claimed_echo_stays_ordered_after_config_disable(tmp_path: Path) -
     harness.gateway.release_send.set()
     await finish
     assert await asyncio.wait_for(responder_wait, timeout=1) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_raises", [False, True])
+async def test_failed_edit_of_durable_placeholder_still_releases_responders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit_raises: bool,
+) -> None:
+    """A preexisting echo remains published when replay cannot finalize its text."""
+    harness = _echo_harness(tmp_path)
+    source_event_id = "$voice-edit-failed"
+    await harness.router.deps.turn_store.record_visible_echo(_ROOM_ID, source_event_id, "$existing-echo")
+    edit = AsyncMock(side_effect=RuntimeError("Edit unavailable")) if edit_raises else AsyncMock(return_value=False)
+    monkeypatch.setattr(harness.gateway, "edit_text", edit)
+    handle = harness.router.start(_request(source_event_id))
+    assert await harness.router.finish(handle, _normalized_event(source_event_id)) is True
+    assert await _await_responder(harness, source_event_id) is True
+    assert not harness.gateway.send_started.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", ["disabled", "absent", "not_ready"])
+async def test_failed_claim_stops_blocking_when_echo_is_unavailable(tmp_path: Path, unavailable: str) -> None:
+    """A failed claim must not retain an echo requirement after its router becomes unavailable."""
+    harness = _echo_harness(tmp_path)
+    source_event_id = "$voice-disabled-after-failure"
+    harness.gateway.send_result = None
+    handle = harness.router.start(_request(source_event_id))
+    assert await harness.router.finish(handle, _normalized_event(source_event_id)) is False
+    if unavailable == "disabled":
+        harness.orchestrator.config.voice.visible_router_echo = False
+    elif unavailable == "absent":
+        harness.room.remove_member(cast("_RouterIngress", harness.router.deps.ingress).router_user_id)
+    else:
+        harness.orchestrator.not_ready.add(ROUTER_AGENT_NAME)
+    assert await _await_responder(harness, source_event_id) is True

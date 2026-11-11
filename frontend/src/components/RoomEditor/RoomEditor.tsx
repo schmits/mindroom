@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
 import { useConfigStore } from "@/store/configStore";
+import { SchemaSection } from "@/components/SchemaForm";
 import { useSwipeBack } from "@/hooks/useSwipeBack";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -10,6 +10,7 @@ import {
   FieldGroup,
 } from "@/components/shared";
 import { Checkbox } from "@/components/ui/checkbox";
+import type { Room } from "@/types/config";
 import {
   Select,
   SelectContent,
@@ -17,6 +18,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+
+/** RoomConfig keys this editor renders by hand; More settings shows the rest. */
+const ROOM_EDITOR_FIELDS = ["display_name", "description"] as const;
 
 export function RoomEditor() {
   const {
@@ -30,10 +34,10 @@ export function RoomEditor() {
     isDirty,
     isLoading,
     selectRoom,
+    updateConfigValue,
   } = useConfigStore();
 
   const selectedRoom = rooms.find((r) => r.id === selectedRoomId);
-  const [localRoom, setLocalRoom] = useState(selectedRoom);
 
   // Enable swipe back on mobile
   useSwipeBack({
@@ -41,29 +45,14 @@ export function RoomEditor() {
     enabled: !!selectedRoomId && window.innerWidth < 1024,
   });
 
-  useEffect(() => {
-    setLocalRoom(selectedRoom);
-  }, [selectedRoom]);
-
-  if (!selectedRoom || !localRoom) {
+  if (!selectedRoom) {
     return (
       <EditorPanelEmptyState icon={Home} message="Select a room to edit" />
     );
   }
 
-  const handleFieldChange = (field: string, value: any) => {
-    setLocalRoom({ ...localRoom, [field]: value });
+  const handleFieldChange = <K extends keyof Room>(field: K, value: Room[K]) =>
     updateRoom(selectedRoom.id, { [field]: value });
-  };
-
-  const handleAgentToggle = (agentId: string, checked: boolean) => {
-    const newAgents = checked
-      ? [...localRoom.agents, agentId]
-      : localRoom.agents.filter((id) => id !== agentId);
-
-    setLocalRoom({ ...localRoom, agents: newAgents });
-    updateRoom(selectedRoom.id, { agents: newAgents });
-  };
 
   const handleDelete = () => {
     if (confirm("Are you sure you want to delete this room?")) {
@@ -91,7 +80,7 @@ export function RoomEditor() {
       >
         <Input
           id="display-name"
-          value={localRoom.display_name}
+          value={selectedRoom.display_name}
           onChange={(e) => handleFieldChange("display_name", e.target.value)}
           placeholder="Room name"
         />
@@ -105,7 +94,7 @@ export function RoomEditor() {
       >
         <Textarea
           id="description"
-          value={localRoom.description || ""}
+          value={selectedRoom.description || ""}
           onChange={(e) => handleFieldChange("description", e.target.value)}
           placeholder="Describe this room's purpose..."
           rows={3}
@@ -119,11 +108,13 @@ export function RoomEditor() {
         htmlFor="room-model"
       >
         <Select
-          value={localRoom.model || "default_model"}
-          onValueChange={(value) => {
-            const newValue = value === "default_model" ? undefined : value;
-            handleFieldChange("model", newValue);
-          }}
+          value={selectedRoom.model || "default_model"}
+          onValueChange={(value) =>
+            handleFieldChange(
+              "model",
+              value === "default_model" ? undefined : value,
+            )
+          }
         >
           <SelectTrigger id="room-model">
             <SelectValue placeholder="Select a model" />
@@ -153,13 +144,18 @@ export function RoomEditor() {
             agents.map((agent) => (
               <div
                 key={agent.id}
-                className="flex items-center space-x-3 p-3 sm:p-2 rounded-lg hover:bg-muted/50"
+                className="flex items-center space-x-3 p-3 sm:p-2 rounded-lg hover:bg-secondary"
               >
                 <Checkbox
                   id={`agent-${agent.id}`}
-                  checked={localRoom.agents.includes(agent.id)}
+                  checked={selectedRoom.agents.includes(agent.id)}
                   onCheckedChange={(checked) =>
-                    handleAgentToggle(agent.id, checked as boolean)
+                    handleFieldChange(
+                      "agents",
+                      checked
+                        ? [...selectedRoom.agents, agent.id]
+                        : selectedRoom.agents.filter((id) => id !== agent.id),
+                    )
                   }
                   className="h-5 w-5 sm:h-4 sm:w-4"
                 />
@@ -184,6 +180,17 @@ export function RoomEditor() {
           )}
         </div>
       </FieldGroup>
+
+      <SchemaSection
+        title="More settings"
+        definition="RoomConfig"
+        value={config?.rooms?.[selectedRoom.id]}
+        path={["rooms", selectedRoom.id]}
+        exclude={ROOM_EDITOR_FIELDS}
+        onFieldChange={(key, next) =>
+          updateConfigValue(["rooms", selectedRoom.id, key], next)
+        }
+      />
     </EditorPanel>
   );
 }

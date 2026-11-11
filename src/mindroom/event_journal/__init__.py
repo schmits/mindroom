@@ -7,25 +7,38 @@ Three facts live here, each with exactly one owner:
 - what MindRoom intends to send and whether it landed (the outbox).
 """
 
-from mindroom.history_recovery import (
+from mindroom.event_journal.history_recovery import (
     HistoryRecoveryOutcome,
     HistoryRecoveryState,
     RoomHistoryRecovery,
 )
 from mindroom.interactive_models import InteractiveSelection
 
-from .approval_card_state import ApprovalCardReservation, ApprovalDecisionMetadata, RecordedApprovalDecision
-from .approval_continuations import (
+from .approval_calls import (
+    DEFAULT_ROUTER_MANAGED_ROOM_REASON,
+    JOB_ENDED_REASON,
+    REPLY_STOPPED_REASON,
     ApprovalCall,
-    ApprovalContinuation,
     ApprovalDecision,
+    BackgroundApprovalDecision,
+    CallKey,
+    DecisionStatus,
+    approval_arguments_digest,
+    tool_job_run_id,
+)
+from .approval_cards import (
+    TIMEOUT_REASON,
+    ApprovalCardReservation,
+    ApprovalCardView,
+    ApprovalDecisionMetadata,
+    RecordedApprovalDecision,
+)
+from .approval_continuations import (
+    ApprovalAdvance,
+    ApprovalContinuation,
+    ApprovalFailure,
     ApprovalMemoryTurn,
 )
-from .approvals import (
-    StoredApprovalCard,
-    UnreadableApprovalCard,
-)
-from .background_approvals import BackgroundApprovalDecision
 from .identity import decode_thread_id, delivery_transaction_id, encode_thread_id
 from .journal import validate_ingestion_batch_admission
 from .models import (
@@ -40,6 +53,7 @@ from .models import (
     DepartureSource,
     EventClass,
     EventKind,
+    FinalAnswerEnqueue,
     HydrationCoverage,
     HydrationPolicy,
     InboundEvent,
@@ -54,22 +68,33 @@ from .models import (
     JournalEvent,
     MatrixDelivery,
     PendingPage,
+    PermanentDeliveryFailure,
     RefreshRequest,
     RoomMembershipPosition,
+    RoomPage,
     SemanticConsumer,
-    TerminalTurnWrite,
     UnreadableMatrixDelivery,
     VisibleMessage,
 )
 from .outbox import matrix_delivery_payload
 from .projection import ProjectedEvent, replacement_target, thread_root, visible_content
-from .store import EventJournalStore, PrincipalStore, TurnRecordStore
+from .scheduled_approvals import (
+    SCHEDULED_APPROVAL_WINDOW_NS,
+    ScheduledApprovalArmState,
+    ScheduledCall,
+    ScheduledCallBinding,
+    ScheduledCallClaim,
+    ScheduledCallOutcome,
+    ScheduledCallRefusal,
+    scheduled_call_run_id,
+)
+from .store import EventJournalStore, PrincipalStore, ToolJobStore
+from .tool_jobs import SavedToolJob, ToolJobExistsError, ToolJobOwnershipLostError
+from .turn_rows import TurnRecordStore
 from .views import (
-    AdmissionView,
     ApprovalDeliveryView,
     ConversationReadView,
     DispatchView,
-    HistoryRecoveryRecordView,
     HydrationView,
     MatrixDeliveryView,
     PendingTurnView,
@@ -78,21 +103,30 @@ from .views import (
 )
 
 __all__ = [
+    "DEFAULT_ROUTER_MANAGED_ROOM_REASON",
+    "JOB_ENDED_REASON",
+    "REPLY_STOPPED_REASON",
+    "SCHEDULED_APPROVAL_WINDOW_NS",
+    "TIMEOUT_REASON",
     "TURN_BACKED_KINDS",
     "AdmissionFacts",
     "AdmissionResult",
-    "AdmissionView",
+    "ApprovalAdvance",
     "ApprovalCall",
     "ApprovalCardReservation",
+    "ApprovalCardView",
     "ApprovalContinuation",
     "ApprovalDecision",
     "ApprovalDecisionMetadata",
     "ApprovalDeliveryView",
+    "ApprovalFailure",
     "ApprovalMemoryTurn",
     "BackgroundApprovalDecision",
+    "CallKey",
     "ConversationCursor",
     "ConversationPage",
     "ConversationReadView",
+    "DecisionStatus",
     "DeliveryAcknowledgement",
     "DeliveryProjectionPendingError",
     "DeliveryStage",
@@ -101,8 +135,8 @@ __all__ = [
     "EventClass",
     "EventJournalStore",
     "EventKind",
+    "FinalAnswerEnqueue",
     "HistoryRecoveryOutcome",
-    "HistoryRecoveryRecordView",
     "HistoryRecoveryState",
     "HydrationCoverage",
     "HydrationPolicy",
@@ -122,6 +156,7 @@ __all__ = [
     "MatrixDeliveryView",
     "PendingPage",
     "PendingTurnView",
+    "PermanentDeliveryFailure",
     "PrincipalStore",
     "ProjectedEvent",
     "RecordedApprovalDecision",
@@ -130,19 +165,30 @@ __all__ = [
     "ReplayView",
     "RoomHistoryRecovery",
     "RoomMembershipPosition",
+    "RoomPage",
+    "SavedToolJob",
+    "ScheduledApprovalArmState",
+    "ScheduledCall",
+    "ScheduledCallBinding",
+    "ScheduledCallClaim",
+    "ScheduledCallOutcome",
+    "ScheduledCallRefusal",
     "SemanticConsumer",
-    "StoredApprovalCard",
-    "TerminalTurnWrite",
+    "ToolJobExistsError",
+    "ToolJobOwnershipLostError",
+    "ToolJobStore",
     "TurnRecordStore",
-    "UnreadableApprovalCard",
     "UnreadableMatrixDelivery",
     "VisibleMessage",
+    "approval_arguments_digest",
     "decode_thread_id",
     "delivery_transaction_id",
     "encode_thread_id",
     "matrix_delivery_payload",
     "replacement_target",
+    "scheduled_call_run_id",
     "thread_root",
+    "tool_job_run_id",
     "validate_ingestion_batch_admission",
     "visible_content",
 ]

@@ -11,6 +11,7 @@ from mindroom.dispatch_source import (
     HOOK_DISPATCH_SOURCE_KIND,
     HOOK_SOURCE_KIND,
     SCHEDULED_SOURCE_KIND,
+    SILENT_SCHEDULE_SOURCE_KIND,
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
 )
 
@@ -34,6 +35,8 @@ class TurnIntent(StrEnum):
     HOOK_MESSAGE = "hook_message"
     HOOK_DISPATCH = HOOK_DISPATCH_SOURCE_KIND
     TRUSTED_INTERNAL_RELAY = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
+    # A new reply about background jobs that ended and that no reply collected.
+    JOB_FOLLOW_UP = "job_follow_up"
 
 
 class TurnTrust(StrEnum):
@@ -57,6 +60,8 @@ class TurnOrigin:
     intent: TurnIntent
     source_kind: str
     trust: TurnTrust
+    # Whether the sender's message runs for a requester other than itself, so the sender stays its author.
+    acts_for_requester: bool = False
 
     @property
     def may_dispatch_without_mention(self) -> bool:
@@ -69,9 +74,22 @@ class TurnOrigin:
         }
 
     @property
+    def acting_sender_id(self) -> str | None:
+        """Return the managed sender of a reply it wrote for this turn's human requester, if it is one."""
+        if self.intent == TurnIntent.MANAGED_MESSAGE and self.requester_kind == SenderKind.USER:
+            return self.transport_sender_id
+        return None
+
+    @property
+    def speaker_id(self) -> str | None:
+        """Return the sender the model reads as the message's author when that is not the requester."""
+        return self.transport_sender_id if self.acts_for_requester else self.acting_sender_id
+
+    @property
     def blocks_unmentioned_managed_sender(self) -> bool:
         """Return whether an unmentioned managed sender should be treated as chatter."""
-        return self.requester_kind == SenderKind.MANAGED_ENTITY and not self.may_dispatch_without_mention
+        managed_sender = self.requester_kind == SenderKind.MANAGED_ENTITY or self.acting_sender_id is not None
+        return managed_sender and not self.may_dispatch_without_mention
 
     @property
     def may_answer_interactive_prompt(self) -> bool:
@@ -97,6 +115,7 @@ def classify_turn_origin(
     source_kind: str,
     original_sender: str | None,
     trusted_user_relay: bool,
+    acts_for_requester: bool = False,
 ) -> TurnOrigin:
     """Return the canonical origin policy for one inbound turn."""
     sender_kind = SenderKind.MANAGED_ENTITY if sender_entity_name is not None else SenderKind.USER
@@ -121,6 +140,7 @@ def classify_turn_origin(
         ),
         source_kind=source_kind,
         trust=trust,
+        acts_for_requester=acts_for_requester,
     )
 
 
@@ -162,16 +182,18 @@ def requester_id_from_trusted_original_sender(
     *,
     original_sender: str | None,
     original_sender_entity_name: str | None,
-    original_sender_is_human: bool,
+    original_sender_is_access_checked: bool,
     source_kind: str | None,
-    sender_trusts_original_sender: bool,
 ) -> str | None:
-    """Return original-sender metadata that may act as the dispatch requester."""
-    if not sender_trusts_original_sender or not original_sender:
+    """Return trusted original-sender metadata that may act as the dispatch requester.
+
+    A relayed human or configured bot account stays the requester, so access applies to it, not the relaying entity.
+    """
+    if not original_sender:
         return None
-    if original_sender_is_human:
+    if original_sender_is_access_checked:
         return original_sender
-    if original_sender_entity_name is not None and source_kind == SCHEDULED_SOURCE_KIND:
+    if original_sender_entity_name is not None and source_kind in {SCHEDULED_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND}:
         return original_sender
     return None
 
@@ -202,7 +224,7 @@ def _turn_intent(
             intent = TurnIntent.ROUTER_HANDOFF
         else:
             intent = TurnIntent.TRUSTED_INTERNAL_RELAY
-    elif source_kind == SCHEDULED_SOURCE_KIND:
+    elif source_kind in {SCHEDULED_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND}:
         intent = TurnIntent.SCHEDULED_FIRE
     elif source_kind == EXTERNAL_TRIGGER_SOURCE_KIND:
         intent = TurnIntent.EXTERNAL_TRIGGER

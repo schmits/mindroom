@@ -13,8 +13,10 @@ import asyncio
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
+from mindroom.background_tasks import SupervisedLoop
 from mindroom.logging_config import get_logger
-from mindroom.private_instance_identity import private_instances_for_agent
+from mindroom.private_storage.private_instance_identity import private_instances_for_agent
+from mindroom.requester_identity import is_access_checked_requester_id
 from mindroom.runtime_shutdown import gather_shutdown_phase
 from mindroom.thread_export.models import ThreadExportRoom, ThreadExportSource, ThreadExportTarget
 from mindroom.thread_export.projected_history import export_conversation_reader
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 
     import nio
 
+    from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.config.agent import AgentThreadExportConfig
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -78,6 +81,7 @@ class WorkspaceThreadExportDeps:
     config_provider: Callable[[], Config | None]
     bot_provider: Callable[[str], _ThreadExportBot | None]
     response_admission_gate: ResponseAdmissionGate
+    agent_reply_memberships: AgentReplyMembershipIndex
     debounce_seconds: float = _DEBOUNCE_SECONDS
 
 
@@ -89,41 +93,46 @@ class WorkspaceThreadExportRunner:
     which the loop idles on its event.
     """
 
+    name = "thread_exports"
+
     def __init__(self, deps: WorkspaceThreadExportDeps) -> None:
         self._deps = deps
         self._pending_room_ids: set[str] = set()
         self._full_pass_pending = False
         self._wakeup = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
+        self._loop = SupervisedLoop("thread_export_workspace_sync", self._run)
         self._manual_exports: set[asyncio.Task[object]] = set()
 
-    def start(self) -> None:
-        """Start the loop once; later calls are no-ops."""
-        if self._task is None:
-            self._task = asyncio.create_task(self._run(), name="thread_export_workspace_sync")
+    async def sync(self, config: Config) -> None:  # noqa: ARG002 - each pass reads the active config
+        """Start the loop, and reconcile every workspace against a changed config right away.
+
+        The first sync, from startup maintenance, finds the startup pass already queued once bots ran, so only later syncs queue one.
+        """
+        if self._loop.running:
+            self.queue_full_pass()
+        self._loop.start()
 
     async def stop(self) -> None:
         """Cancel and drain every export before its borrowed runtime closes."""
-        task = self._task
-        self._task = None
+        # The loop stops first, so no administrative export can start after the snapshot below.
+        _, cancellation = await gather_shutdown_phase(self._loop.stop())
         tasks = tuple(self._manual_exports)
-        if task is not None:
-            tasks = (*tasks, task)
         for task in tasks:
             task.cancel()
-        _, cancellation = await gather_shutdown_phase(*tasks)
+        _, export_cancellation = await gather_shutdown_phase(*tasks)
+        cancellation = cancellation or export_cancellation
         if cancellation is not None:
             raise cancellation
 
     async def prepare_runtime_replacement(self) -> None:
         """Drain old readers and queue a fresh pass behind closed replacement admission."""
-        was_running = self._task is not None
+        was_running = self._loop.running
         try:
             await self.stop()
         finally:
             if was_running:
                 self.queue_full_pass()
-                self.start()
+                self._loop.start()
 
     async def export_once(
         self,
@@ -135,7 +144,7 @@ class WorkspaceThreadExportRunner:
     ) -> ThreadExportStats:
         """Run an administrative export while holding runtime replacement admission."""
         gate = self._deps.response_admission_gate
-        if self._task is None or self._task.done() or not gate.admit():
+        if not self._loop.running or not gate.admit():
             msg = "MindRoom must be running and ready to export threads; retry after startup or reload"
             raise RuntimeError(msg)
         task = asyncio.current_task()
@@ -152,7 +161,14 @@ class WorkspaceThreadExportRunner:
                 if bot is None or not bot.running or bot.client is None:
                     msg = f"No running Matrix owner for {group.entity_name}; retry after startup or reload"
                     raise RuntimeError(msg)
-                return _source_for_bot(bot, group.rooms, None, config)
+                return _source_for_bot(
+                    bot,
+                    group.rooms,
+                    None,
+                    config,
+                    entity_name=group.entity_name,
+                    membership_index=self._deps.agent_reply_memberships,
+                )
 
             return await export_threads_once(
                 config=config,
@@ -283,7 +299,16 @@ class WorkspaceThreadExportRunner:
                 state_rooms,
             )
             rooms = [room for room in rooms if full_pass or room.room_id in room_ids]
-            sources.append(_source_for_bot(bot, tuple(rooms), agent_targets, config))
+            sources.append(
+                _source_for_bot(
+                    bot,
+                    tuple(rooms),
+                    agent_targets,
+                    config,
+                    entity_name=agent_name,
+                    membership_index=self._deps.agent_reply_memberships,
+                ),
+            )
         stats = await export_threads_to_sources(
             config=config,
             runtime_paths=runtime_paths,
@@ -324,6 +349,9 @@ def _source_for_bot(
     rooms: tuple[ThreadExportRoom, ...],
     targets: tuple[ThreadExportTarget, ...] | None,
     config: Config,
+    *,
+    entity_name: str,
+    membership_index: AgentReplyMembershipIndex,
 ) -> ThreadExportSource:
     """Read ``rooms`` through one running bot's client and projection view."""
     client = bot.client
@@ -337,6 +365,8 @@ def _source_for_bot(
             self_sender=bot.matrix_id.full_id,
         ),
         rooms=rooms,
+        entity_name=entity_name,
+        membership_index=membership_index,
         target_output_dirs=None if targets is None else tuple(target.output_dir for target in targets),
     )
 
@@ -428,10 +458,10 @@ def _private_targets(
     agent_user_id: str,
     options: AgentThreadExportConfig,
 ) -> list[ThreadExportTarget]:
-    """Return one owner-scoped target per private instance whose core identity checks out.
+    """Return one owner-scoped target per private instance whose primary-recorded owner checks out.
 
-    An instance without a valid owner gets its export tree cleared instead: nothing can
-    run as that instance, so nothing should keep reading conversations there.
+    An instance without one gets its export tree cleared instead: until the primary
+    materializes it for its requester, nothing should keep reading conversations there.
     """
     private = config.agents[agent_name].private
     assert private is not None
@@ -445,13 +475,20 @@ def _private_targets(
                 instance_root=str(instance.state_root),
             )
             continue
-        if instance.requester_id is None:
-            logger.warning(
-                "Clearing exports of private instance without valid core identity",
-                agent_name=agent_name,
-                instance_root=str(instance.state_root),
-            )
-            _clear_export_tree(runtime_paths, output_dir)
+        if instance.requester_id is None or not is_access_checked_requester_id(
+            instance.requester_id,
+            config,
+            runtime_paths,
+        ):
+            # Instances from before owner records moved below tracking/ wait here for their requester's next turn,
+            # and an instance one of MindRoom's own accounts came to own never gets one.
+            # Every pass clears them again, so only a pass that removed something logs.
+            if _clear_export_tree(runtime_paths, output_dir):
+                logger.info(
+                    "Clearing exports of private instance until the primary records its owner",
+                    agent_name=agent_name,
+                    instance_root=str(instance.state_root),
+                )
             continue
         required_member_user_ids = (instance.requester_id,)
         if options.private_room_scope == "owner_and_agent":
@@ -484,17 +521,16 @@ def _private_export_dir(
         )
     except ValueError:
         return None
-    if workspace is None:
-        return None
     return workspace.lexical_root / _WORKSPACE_EXPORT_DIRNAME
 
 
-def _clear_export_tree(runtime_paths: RuntimePaths, output_dir: Path) -> None:
-    """Remove one exporter-owned tree; a root without the ownership marker is left alone."""
+def _clear_export_tree(runtime_paths: RuntimePaths, output_dir: Path) -> bool:
+    """Remove one exporter-owned tree and return whether anything was removed; markerless roots are left alone."""
     try:
-        clear_thread_export_root(output_dir, trusted_root=runtime_paths.storage_root)
+        return clear_thread_export_root(output_dir, trusted_root=runtime_paths.storage_root)
     except (OSError, RuntimeError):
         logger.warning("Skipping unsafe thread export cleanup", output_dir=str(output_dir))
+        return False
 
 
 def _clear_disabled_agent_exports(

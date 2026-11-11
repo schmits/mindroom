@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="brightdata",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("get_screenshot",),
     display_name="BrightData",
     description="Web scraping, search engine queries, screenshots, and structured data extraction",
     category=ToolCategory.RESEARCH,
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("BRIGHT_DATA_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -65,6 +68,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="serp_zone",
+            env=("BRIGHT_DATA_SERP_ZONE",),
             label="Serp Zone",
             type="text",
             required=False,
@@ -72,6 +76,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="web_unlocker_zone",
+            env=("BRIGHT_DATA_WEB_UNLOCKER_ZONE",),
             label="Web Unlocker Zone",
             type="text",
             required=False,
@@ -93,7 +98,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["requests"],
-    docs_url="https://docs.agno.com/tools/toolkits/web_scrape/brightdata",
+    docs_url="https://docs.mindroom.chat/tools/web-scraping-and-browser/#brightdata",
     function_names=("get_screenshot", "scrape_as_markdown", "search_engine", "web_data_feed"),
 )
 def brightdata_tools() -> type[BrightDataTools]:

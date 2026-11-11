@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="thread_summary",
+    file_access=ToolFileAccess.NONE,
     display_name="Thread Summary",
     description="Write or update a summary of a conversation thread",
     category=ToolCategory.COMMUNICATION,
@@ -21,8 +22,7 @@ if TYPE_CHECKING:
     requires_room_context=True,
     icon="MessageCircleMore",
     icon_color="text-cyan-500",
-    dependencies=["agno"],
-    docs_url="https://github.com/mindroom-ai/mindroom",
+    docs_url="https://docs.mindroom.chat/tools/matrix-and-attachments/#thread_summary",
     function_names=("set_thread_summary",),
 )
 def register_thread_summary_tools() -> type[ThreadSummaryTools]:

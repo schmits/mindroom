@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="telegram",
+    file_access=ToolFileAccess.NONE,
     display_name="Telegram",
     description="Send messages and media, manage messages, and read chat details via a Telegram bot",
     category=ToolCategory.COMMUNICATION,
@@ -23,12 +24,14 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="chat_id",
+            env=("TELEGRAM_CHAT_ID",),
             label="Chat ID",
             type="text",
             required=True,
         ),
         ConfigField(
             name="token",
+            env=("TELEGRAM_TOKEN",),
             label="Token",
             type="password",
             required=False,
@@ -148,8 +151,8 @@ if TYPE_CHECKING:
             default=False,
         ),
     ],
-    dependencies=["httpx"],
-    docs_url="https://core.telegram.org/bots/api",
+    dependencies=["pytelegrambotapi"],
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#telegram",
     function_names=(
         "delete_message",
         "edit_message",

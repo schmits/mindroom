@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Protocol, cast
+import asyncio
+import socket
+from contextlib import asynccontextmanager, contextmanager
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, cast
 
+import uvicorn
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
+from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
+from mindroom.api.agent_cli import bind_agent_cli_registry
+from mindroom.api.agent_cli import router as agent_cli_router
+from mindroom.background_tasks import run_coroutine_until_complete
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
+from mindroom.json_utils import has_only_finite_numbers
+from mindroom.logging_config import get_logger
 from mindroom.script_runs.broker import (
     ScriptBrokerAuthenticationError,
     ScriptCallPreparationPendingError,
@@ -22,16 +34,33 @@ from mindroom.script_runs.store import (
     ScriptRunNotFoundError,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
+
+    from starlette.types import ASGIApp
+
+    from mindroom.agent_cli.session import TurnToolRegistry
+    from mindroom.constants import RuntimePaths
+
 __all__ = [
+    "SCRIPT_GATEWAY_PORT_ENV",
     "ScriptCallReceiptResponse",
     "ScriptToolCallRequestModel",
     "bind_script_tool_broker",
     "get_script_call",
+    "listener_port",
     "router",
+    "serve_listener",
+    "serve_script_gateway_listener",
     "submit_script_call",
 ]
 
+logger = get_logger(__name__)
+
 _MAX_REQUEST_BYTES = 64 * 1024
+SCRIPT_GATEWAY_PORT_ENV = "MINDROOM_SCRIPT_GATEWAY_PORT"
+# Matches the primary API's shutdown grace; Uvicorn cancels listener requests still open after it.
+_LISTENER_SHUTDOWN_GRACE_SECONDS = 5
 
 
 class _ScriptGatewayBroker(Protocol):
@@ -65,6 +94,16 @@ class ScriptToolCallRequestModel(BaseModel):
     toolkit_name: str = Field(min_length=1, max_length=128)
     function_name: str = Field(min_length=1, max_length=128)
     arguments: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("arguments")
+    @classmethod
+    def _reject_non_finite_numbers(cls, arguments: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        # Pydantic's JSON parser accepts NaN, Infinity, and overflowing numbers such as 1e400,
+        # which the broker's strict-JSON call digest cannot encode.
+        if not has_only_finite_numbers(arguments):
+            # A custom error, unlike a ValueError, carries no exception object that the 422 body cannot render.
+            raise PydanticCustomError("finite_number", "Arguments must contain only finite numbers")  # noqa: EM101
+        return arguments
 
     def to_domain(self) -> ScriptToolCallRequest:
         """Build the token-free domain request authenticated only from the header."""
@@ -137,15 +176,14 @@ async def _bounded_payload(request: Request) -> ScriptToolCallRequestModel:
         if declared_bytes > _MAX_REQUEST_BYTES:
             raise HTTPException(status_code=413, detail="Script call request is too large.")
 
-    body = bytearray()
-    async for chunk in request.stream():
-        body.extend(chunk)
-        if len(body) > _MAX_REQUEST_BYTES:
-            raise HTTPException(status_code=413, detail="Script call request is too large.")
     try:
-        return ScriptToolCallRequestModel.model_validate_json(bytes(body))
+        body = await collect_bounded_bytes(request.stream(), max_bytes=_MAX_REQUEST_BYTES)
+    except ByteLimitExceededError as exc:
+        raise HTTPException(status_code=413, detail="Script call request is too large.") from exc
+    try:
+        return ScriptToolCallRequestModel.model_validate_json(body)
     except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors(include_url=False)) from exc
+        raise HTTPException(status_code=422, detail=exc.errors(include_url=False, include_input=False)) from exc
 
 
 def _unavailable() -> HTTPException:
@@ -194,3 +232,120 @@ async def get_script_call(
     except ScriptCallPreparationPendingError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return ScriptCallReceiptResponse.from_domain(receipt)
+
+
+class _ListenerServer(uvicorn.Server):
+    """Uvicorn server that leaves process signals to the primary API server it runs beside."""
+
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self.stop_requested = False
+
+    @contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        """Install no handlers; the primary server owns shutdown signals."""
+        yield
+
+    async def on_tick(self, counter: int) -> bool:
+        """End the main loop once the owner leaves, always through Uvicorn's shutdown.
+
+        Uvicorn skips its shutdown, leaving the listener serving, when `should_exit` is already set as startup ends.
+        """
+        return self.stop_requested or await super().on_tick(counter)
+
+
+class _UnloggedHTTPProtocol(AutoHTTPProtocol):  # ty: ignore[unsupported-base] - Uvicorn's HTTP protocol for this install
+    """Uvicorn's HTTP protocol, writing no access log for its listener alone.
+
+    Uvicorn's own ``access_log=False`` empties the process-wide access logger, so the API's access log would stop too.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.access_log = False
+
+
+def listener_port(runtime_paths: RuntimePaths, env_name: str) -> int | None:
+    """Return the TCP port ``env_name`` sets, None while it is unset, or raise ``ValueError`` for any other value."""
+    raw_port = (runtime_paths.env_value(env_name) or "").strip()
+    if not raw_port:
+        return None
+    try:
+        port = int(raw_port)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        msg = f"{env_name} must be a TCP port from 1 to 65535."
+        raise ValueError(msg)
+    return port
+
+
+@asynccontextmanager
+async def serve_listener(
+    app: ASGIApp,
+    *,
+    name: str,
+    host: str,
+    port: int,
+    log_level: str,
+    ws: Literal["none", "websockets-sansio"],
+    access_log: bool,
+) -> AsyncIterator[None]:
+    """Serve ``app`` on ``port`` beside the primary API server, as the listener ``name``, until the caller leaves."""
+    server = _ListenerServer(
+        uvicorn.Config(
+            app,
+            lifespan="off",
+            log_level=log_level.lower(),
+            http="auto" if access_log else _UnloggedHTTPProtocol,
+            ws=ws,
+            timeout_graceful_shutdown=_LISTENER_SHUTDOWN_GRACE_SECONDS,
+        ),
+    )
+    listener = socket.create_server((host, port), family=socket.AF_INET6 if ":" in host else socket.AF_INET)
+    serve_task = asyncio.create_task(server.serve(sockets=[listener]), name=name)
+    logger.info(f"{name}_started", host=host, port=port)
+    try:
+        yield
+    finally:
+        server.stop_requested = True
+        # Uvicorn's shutdown closes the listener, then cancels requests still open after the grace period,
+        # so owner cancellation must not interrupt it.
+        await run_coroutine_until_complete(asyncio.wait({serve_task}))
+    serve_task.result()
+
+
+@asynccontextmanager
+async def serve_script_gateway_listener(
+    runtime_paths: RuntimePaths,
+    *,
+    host: str,
+    broker: _ScriptGatewayBroker | None,
+    log_level: str,
+    agent_cli_registry: TurnToolRegistry | None,
+) -> AsyncIterator[None]:
+    """Serve only worker-facing capability routes on `MINDROOM_SCRIPT_GATEWAY_PORT` while the primary API runs.
+
+    The listener's app contains nothing but the script gateway and Agent CLI
+    routers, both authenticated by short-lived capabilities, so a network path
+    that reaches only this port cannot reach any other primary API route.
+    """
+    port = listener_port(runtime_paths, SCRIPT_GATEWAY_PORT_ENV)
+    if port is None:
+        yield
+        return
+    gateway_app = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+    gateway_app.include_router(router)
+    gateway_app.include_router(agent_cli_router)
+    bind_script_tool_broker(gateway_app, broker)
+    bind_agent_cli_registry(gateway_app, agent_cli_registry)
+    async with serve_listener(
+        gateway_app,
+        name="script_gateway_listener",
+        host=host,
+        port=port,
+        log_level=log_level,
+        ws="none",
+        access_log=True,
+    ):
+        yield

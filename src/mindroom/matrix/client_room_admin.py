@@ -3,26 +3,38 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, MutableMapping
+from collections.abc import Callable, Iterable, MutableMapping
 from enum import StrEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
+import aiohttp
 import nio
 
 from mindroom.logging_config import get_logger
-from mindroom.matrix.event_types import CALL_MEMBER_EVENT_TYPE
-from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_state_event
+from mindroom.matrix.event_types import (
+    AUTO_APPROVE_WINDOWS_EVENT_TYPE,
+    BACKGROUND_JOBS_EVENT_TYPE,
+    CALL_MEMBER_EVENT_TYPE,
+    MINDROOM_ACCOUNTS_EVENT_TYPE,
+    MINDROOM_SERVER_EVENT_TYPE,
+)
+from mindroom.matrix.joined_members import read_joined_members
+from mindroom.matrix.room_power import ROOM_ADMIN_POWER_LEVEL, has_privileged_creators, user_power_level
+from mindroom.matrix.room_reconciliation import RoomStateSnapshot, read_room_creators, read_state_event
+from mindroom.matrix.state import resolve_room_id
 from mindroom.thread_tags import THREAD_TAGS_EVENT_TYPE
 
 if TYPE_CHECKING:
     from mindroom.config.matrix import RoomDirectoryVisibility, RoomJoinRule
+    from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
 
 _POWER_LEVELS_EVENT_TYPE = "m.room.power_levels"
 _ROOM_ENCRYPTION_EVENT_TYPE = "m.room.encryption"
 _ROOM_ENCRYPTION_CONTENT = {"algorithm": "m.megolm.v1.aes-sha2"}
-_ROOM_ADMIN_POWER_LEVEL = 100
 _DEFAULT_STATE_EVENT_POWER_LEVEL = 50
 _DEFAULT_USER_POWER_LEVEL = 0
 _POWER_USER_POWER_LEVEL = 50
@@ -30,6 +42,13 @@ _POWER_USER_POWER_LEVEL = 50
 _MANAGED_ROOM_EVENT_POWER_LEVELS = {
     THREAD_TAGS_EVENT_TYPE: 0,
     CALL_MEMBER_EVENT_TYPE: 0,
+    # Matrix lets a user write a state key that starts with @ only when it is that user's own ID.
+    BACKGROUND_JOBS_EVENT_TYPE: 0,
+    MINDROOM_SERVER_EVENT_TYPE: 0,
+    # The router publishes the room's !auto_approve windows and MindRoom accounts; in a personal room an agent created
+    # it has no power.
+    AUTO_APPROVE_WINDOWS_EVENT_TYPE: 0,
+    MINDROOM_ACCOUNTS_EVENT_TYPE: 0,
 }
 _TERMINAL_ROOM_JOIN_ERROR_CODES = frozenset(
     {
@@ -53,14 +72,54 @@ async def invite_to_room(
     client: nio.AsyncClient,
     room_id: str,
     user_id: str,
+    *,
+    reason: str | None = None,
 ) -> bool:
-    """Invite a user to a room."""
-    response = await client.room_invite(room_id, user_id)
+    """Invite a user to a room, with a ``reason`` the invitee reads before deciding to join."""
+    if reason is None:
+        response = await client.room_invite(room_id, user_id)
+    else:
+        # nio's room_invite sends no reason.
+        response = await client._send(
+            nio.RoomInviteResponse,
+            "POST",
+            nio.Api._build_path(["rooms", room_id, "invite"], {"access_token": client.access_token}),
+            nio.Api.to_json({"user_id": user_id, "reason": reason}),
+        )
     if isinstance(response, nio.RoomInviteResponse):
         logger.info("matrix_room_invited", room_id=room_id, user_id=user_id)
         return True
     logger.error("matrix_room_invite_failed", room_id=room_id, user_id=user_id, error=str(response))
     return False
+
+
+async def kick_from_room(client: nio.AsyncClient, room_id: str, user_id: str) -> bool:
+    """Remove a user from a room, which also withdraws a pending invitation."""
+    response = await client.room_kick(room_id, user_id)
+    if isinstance(response, nio.RoomKickResponse):
+        logger.info("matrix_room_kicked", room_id=room_id, user_id=user_id)
+        return True
+    logger.error("matrix_room_kick_failed", room_id=room_id, user_id=user_id, error=str(response))
+    return False
+
+
+async def admin_join_room_user(client: nio.AsyncClient, room_id: str, user_id: str) -> bool:
+    """Join one user through the Synapse-compatible admin API without changing invites."""
+    if not client.access_token:
+        return False
+    path = f"/_synapse/admin/v1/join/{quote(room_id, safe='')}"
+    response = await client.send(
+        "POST",
+        path,
+        data=json.dumps({"user_id": user_id}),
+        headers={
+            "Authorization": f"Bearer {client.access_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    succeeded = 200 <= response.status < 300
+    response.release()
+    return succeeded
 
 
 def _create_room_initial_state(
@@ -69,8 +128,12 @@ def _create_room_initial_state(
     admin_users: list[str] | None,
     *,
     encrypted: bool,
+    creators: frozenset[str],
 ) -> list[dict[str, Any]]:
-    """Build the initial state events for one managed room creation."""
+    """Build the initial state events for one managed room creation.
+
+    ``creators`` are the users the new room's version gives unlimited power, which it forbids listing.
+    """
     power_level_content: dict[str, Any] = {
         "users_default": _DEFAULT_USER_POWER_LEVEL,
         "state_default": _DEFAULT_STATE_EVENT_POWER_LEVEL,
@@ -80,9 +143,10 @@ def _create_room_initial_state(
     if power_users:
         users.update(dict.fromkeys(power_users, _POWER_USER_POWER_LEVEL))
     if admin_users:
-        users.update(dict.fromkeys(admin_users, _ROOM_ADMIN_POWER_LEVEL))
+        users.update(dict.fromkeys(admin_users, ROOM_ADMIN_POWER_LEVEL))
     if client.user_id:
-        users[client.user_id] = _ROOM_ADMIN_POWER_LEVEL
+        users[client.user_id] = ROOM_ADMIN_POWER_LEVEL
+    users = {user_id: level for user_id, level in users.items() if user_id not in creators}
     if users:
         power_level_content["users"] = users
     initial_state: list[dict[str, Any]] = [{"type": _POWER_LEVELS_EVENT_TYPE, "content": power_level_content}]
@@ -91,6 +155,32 @@ def _create_room_initial_state(
             {"type": _ROOM_ENCRYPTION_EVENT_TYPE, "state_key": "", "content": dict(_ROOM_ENCRYPTION_CONTENT)},
         )
     return initial_state
+
+
+async def _new_room_version(client: nio.AsyncClient) -> str | None:
+    """Return the room version the homeserver creates rooms with, or None when it does not say."""
+    if not client.access_token:
+        return None
+    try:
+        response = await client.send(
+            "GET",
+            "/_matrix/client/v3/capabilities",
+            headers={"Authorization": f"Bearer {client.access_token}"},
+        )
+        try:
+            if response.status != HTTPStatus.OK:
+                return None
+            payload = await response.json()
+        finally:
+            response.release()
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        # Creation then leaves the version to the server, as it did before capabilities were read.
+        logger.warning("matrix_capabilities_unreadable", exc_info=True)
+        return None
+    capabilities = payload.get("capabilities") if isinstance(payload, dict) else None
+    room_versions = capabilities.get("m.room_versions") if isinstance(capabilities, dict) else None
+    default = room_versions.get("default") if isinstance(room_versions, dict) else None
+    return default if isinstance(default, str) else None
 
 
 async def create_room(
@@ -102,6 +192,7 @@ async def create_room(
     admin_users: list[str] | None = None,
     *,
     encrypted: bool = False,
+    initial_state: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Create a new Matrix room."""
     room_config: dict[str, Any] = {"name": name}
@@ -109,7 +200,22 @@ async def create_room(
         room_config["alias"] = alias
     if topic:
         room_config["topic"] = topic
-    room_config["initial_state"] = _create_room_initial_state(client, power_users, admin_users, encrypted=encrypted)
+    # Pin the version the initial power levels are built for, so the server cannot pick another.
+    room_version = await _new_room_version(client)
+    creators = frozenset()
+    if room_version is not None:
+        room_config["room_version"] = room_version
+        if has_privileged_creators(room_version) and client.user_id:
+            creators = frozenset({client.user_id})
+    room_config["initial_state"] = _create_room_initial_state(
+        client,
+        power_users,
+        admin_users,
+        encrypted=encrypted,
+        creators=creators,
+    )
+    if initial_state:
+        room_config["initial_state"].extend(initial_state)
 
     response = await client.room_create(**room_config)
     if isinstance(response, nio.RoomCreateResponse):
@@ -184,12 +290,13 @@ def _with_event_power_level(
     return next_content
 
 
-async def ensure_managed_room_power_levels(
+async def ensure_managed_room_power_levels(  # noqa: PLR0911 - each unsafe Matrix state is a separate fail-closed exit
     client: nio.AsyncClient,
     room_id: str,
     admin_user_ids: Iterable[str] = (),
     *,
     snapshot: RoomStateSnapshot | None = None,
+    creators: frozenset[str] | None = None,
 ) -> bool:
     """Reconcile managed-room power levels with one read-modify-write.
 
@@ -212,12 +319,16 @@ async def ensure_managed_room_power_levels(
         )
         return False
     current_content = current_response.content
+    if creators is None:
+        creators = await read_room_creators(client, room_id, snapshot=snapshot)
+    if creators is None:
+        return False
 
     desired_content = current_content
     for event_type, power_level in _MANAGED_ROOM_EVENT_POWER_LEVELS.items():
         desired_content = _with_event_power_level(desired_content, event_type, power_level)
     concrete_admin_ids = {user_id for user_id in admin_user_ids if user_id}
-    desired_content = _with_room_admin_power_levels(desired_content, concrete_admin_ids)
+    desired_content = _with_room_admin_power_levels(desired_content, concrete_admin_ids, creators)
     if desired_content == current_content:
         logger.debug(
             "Managed room power levels already configured",
@@ -229,7 +340,8 @@ async def ensure_managed_room_power_levels(
     if snapshot is not None:
         # Topics and other policy operations may have awaited since this snapshot.
         # A required read-modify-write must preserve current grants, not restore old ones.
-        return await ensure_managed_room_power_levels(client, room_id, concrete_admin_ids)
+        # The create event is immutable, so the snapshot's creators stay current.
+        return await ensure_managed_room_power_levels(client, room_id, concrete_admin_ids, creators=creators)
 
     response = await client.room_put_state(
         room_id=room_id,
@@ -257,31 +369,24 @@ async def ensure_managed_room_power_levels(
 def _with_room_admin_power_levels(
     power_levels_content: dict[str, Any],
     user_ids: Iterable[str],
+    creators: frozenset[str],
 ) -> dict[str, Any]:
-    """Return power-level content with users promoted while preserving existing admins."""
+    """Return power-level content with users promoted while preserving existing admins.
+
+    Privileged creators already have unlimited power, and listing them would be rejected.
+    """
     next_content = dict(power_levels_content)
     existing_users = power_levels_content.get("users")
     next_users = dict(existing_users) if isinstance(existing_users, dict) else {}
-    for user_id in sorted(set(user_ids)):
+    for user_id in sorted(set(user_ids) - creators):
         current_level = next_users.get(user_id)
-        if not isinstance(current_level, int) or current_level < _ROOM_ADMIN_POWER_LEVEL:
-            next_users[user_id] = _ROOM_ADMIN_POWER_LEVEL
+        if not isinstance(current_level, int) or current_level < ROOM_ADMIN_POWER_LEVEL:
+            next_users[user_id] = ROOM_ADMIN_POWER_LEVEL
     next_content["users"] = next_users
     return next_content
 
 
-def _room_power_level_for_user(power_levels_content: dict[str, Any], user_id: str) -> int:
-    """Return one user's current room power level from power-level state content."""
-    users = power_levels_content.get("users")
-    if isinstance(users, dict):
-        user_level = users.get(user_id)
-        if isinstance(user_level, int):
-            return user_level
-    users_default = power_levels_content.get("users_default")
-    return users_default if isinstance(users_default, int) else _DEFAULT_USER_POWER_LEVEL
-
-
-async def room_admin_power_user(
+async def room_admin_power_user(  # noqa: PLR0911 - each unsafe Matrix state is a separate fail-closed exit
     client: nio.AsyncClient,
     room_id: str,
     user_ids: Iterable[str],
@@ -314,20 +419,29 @@ async def room_admin_power_user(
         )
         return None
 
+    # Room version 12 never lists its creators, whose power is unlimited; they are read only for a user who
+    # lacks listed admin power, and in candidate order, so the first qualifying user is still the one returned.
+    creators: frozenset[str] | None = None
     for user_id in concrete_user_ids:
-        if _room_power_level_for_user(current_response.content, user_id) >= _ROOM_ADMIN_POWER_LEVEL:
+        if user_power_level(current_response.content, user_id) >= ROOM_ADMIN_POWER_LEVEL:
+            return user_id
+        if creators is None:
+            creators = await read_room_creators(client, room_id) or frozenset()
+        if user_id in creators:
             return user_id
     return None
 
 
-async def ensure_room_admin_power_levels(
+async def ensure_room_admin_power_levels(  # noqa: PLR0911 - each unsafe Matrix state is a separate fail-closed exit
     client: nio.AsyncClient,
     room_id: str,
     user_ids: Iterable[str],
     *,
     snapshot: RoomStateSnapshot | None = None,
+    write_allowed: Callable[[], bool] | None = None,
+    creators: frozenset[str] | None = None,
 ) -> bool:
-    """Grant Matrix room admin power to users without revoking existing admins."""
+    """Grant Matrix room admin power while respecting a caller's live write authority."""
     concrete_user_ids = {user_id for user_id in user_ids if user_id}
     if not concrete_user_ids:
         return True
@@ -345,18 +459,31 @@ async def ensure_room_admin_power_levels(
         )
         return False
     current_content = current_response.content
-    desired_content = _with_room_admin_power_levels(current_content, concrete_user_ids)
+    if creators is None:
+        creators = await read_room_creators(client, room_id, snapshot=snapshot)
+    if creators is None:
+        return False
+    desired_content = _with_room_admin_power_levels(current_content, concrete_user_ids, creators)
     if desired_content == current_content:
         logger.debug(
             "Room admins already have sufficient power",
             room_id=room_id,
             user_ids=sorted(concrete_user_ids),
-            power_level=_ROOM_ADMIN_POWER_LEVEL,
+            power_level=ROOM_ADMIN_POWER_LEVEL,
         )
         return True
 
     if snapshot is not None:
-        return await ensure_room_admin_power_levels(client, room_id, concrete_user_ids)
+        return await ensure_room_admin_power_levels(
+            client,
+            room_id,
+            concrete_user_ids,
+            write_allowed=write_allowed,
+            creators=creators,
+        )
+
+    if write_allowed is not None and not write_allowed():
+        return False
 
     response = await client.room_put_state(
         room_id=room_id,
@@ -368,7 +495,7 @@ async def ensure_room_admin_power_levels(
             "Updated room power levels for admins",
             room_id=room_id,
             user_ids=sorted(concrete_user_ids),
-            power_level=_ROOM_ADMIN_POWER_LEVEL,
+            power_level=ROOM_ADMIN_POWER_LEVEL,
         )
         return True
 
@@ -663,12 +790,46 @@ async def join_room(client: nio.AsyncClient, room_id: str) -> RoomJoinOutcome:
     return outcome
 
 
+async def resolve_room_reference(
+    client: nio.AsyncClient,
+    room_ref: str,
+    runtime_paths: RuntimePaths,
+) -> str | nio.RoomResolveAliasError | None:
+    """Return the room ID a room ID, room key, or alias names, or the homeserver's answer to an alias it cannot resolve.
+
+    Rooms MindRoom created resolve from its own record, because any account may repoint an alias.
+    Any other alias resolves through the room directory, and a room key with no recorded room names no room yet.
+    """
+    room_id = resolve_room_id(room_ref, runtime_paths)
+    if room_id.startswith("!"):
+        return room_id
+    if not room_id.startswith("#"):
+        return None
+    response = await client.room_resolve_alias(room_id)
+    return response.room_id if isinstance(response, nio.RoomResolveAliasResponse) else response
+
+
 async def get_room_members(client: nio.AsyncClient, room_id: str) -> set[str] | None:
     """Get the current members of a room, or ``None`` when the fetch fails."""
-    response = await client.joined_members(room_id)
+    try:
+        response = await read_joined_members(client, room_id)
+    except nio.LocalProtocolError as error:
+        # The durable client refuses a member list, as one that concurrent membership changes kept making stale.
+        logger.warning("matrix_room_members_fetch_failed", room_id=room_id, error=str(error))
+        return None
     if isinstance(response, nio.JoinedMembersResponse):
         return {member.user_id for member in response.members}
     logger.warning("matrix_room_members_fetch_failed", room_id=room_id, error=str(response))
+    return None
+
+
+async def get_room_membership(client: nio.AsyncClient, room_id: str, user_id: str) -> str | None:
+    """Return a user's membership of a room from its state, such as ``invite`` or ``leave``, or ``None`` if unreadable."""
+    response = await client.room_get_state_event(room_id, "m.room.member", user_id)
+    if isinstance(response, nio.RoomGetStateEventResponse):
+        membership = response.content.get("membership")
+        return membership if isinstance(membership, str) else None
+    logger.warning("matrix_room_membership_fetch_failed", room_id=room_id, user_id=user_id, error=str(response))
     return None
 
 
@@ -723,6 +884,7 @@ async def leave_room(client: nio.AsyncClient, room_id: str) -> bool:
 __all__ = [
     "RoomJoinOutcome",
     "add_room_to_space",
+    "admin_join_room_user",
     "create_room",
     "create_space",
     "ensure_managed_room_power_levels",
@@ -733,10 +895,13 @@ __all__ = [
     "ensure_room_name",
     "get_joined_rooms",
     "get_room_members",
+    "get_room_membership",
     "get_room_name",
     "invite_to_room",
     "join_room",
+    "kick_from_room",
     "leave_room",
+    "resolve_room_reference",
     "room_admin_power_user",
     "room_encryption_enabled",
 ]

@@ -11,15 +11,24 @@ import pytest
 from agno.tools import Toolkit
 
 import mindroom.agents as agents_module
-from mindroom.agents import apply_tool_approval_capability, create_agent
+from mindroom.agents import create_agent
+from mindroom.approval.tool_approval import evaluate_tool_approval, tool_may_require_approval
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, RouterConfig
 from mindroom.custom_tools.invite_router import InviteRouterTools
-from mindroom.history.prompt_tokens import _prompt_tool_surface_for_tools
+from mindroom.llm.messages import stable_serialize
+from mindroom.matrix.personal_room_store import (
+    PersonalRoomAdoption,
+    PersonalRoomRecord,
+    personal_room_record_path,
+    write_personal_room,
+)
 from mindroom.message_target import MessageTarget
-from mindroom.tool_approval import evaluate_tool_approval, tool_may_require_approval
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.tool_function import ToolGate
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import (
@@ -29,6 +38,9 @@ from tests.conftest import (
     runtime_paths_for,
     test_runtime_paths,
 )
+from tests.fakes.token_counter import quarter_tokens
+from tests.tool_approval_helpers import gated_functions
+from tests.turn_model_helpers import turn_model
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,6 +75,7 @@ def _tool_context(
                 else {}
             ),
             router=RouterConfig(model="default", accept_invites=accept_invites),
+            models={"default": ModelConfig(provider="openai", id="gpt-6-astra")},
         ),
         test_runtime_paths(tmp_path),
     )
@@ -115,20 +128,26 @@ def test_matrix_agents_get_zero_argument_invite_router_in_standard_tool_environm
         config,
         runtime_paths_for(config),
         execution_identity=identity,
-        session_id=identity.session_id,
+        knowledge=None,
+        model=turn_model(config, runtime_paths_for(config), "code"),
+        plugins=config_plugins(config, runtime_paths_for(config)),
     )
 
-    toolkit = next(tool for tool in agent.tools if tool.name == "invite_router")
-    function = toolkit.get_async_functions()["invite_router"]
-    function.process_entrypoint(strict=False)
-    prompt_surface = _prompt_tool_surface_for_tools([toolkit])
+    [toolkit] = [toolkit for toolkit in agent.spec.toolkits if toolkit.name == "invite_router"]
+    [function] = toolkit.functions
+    properties = dict(function.parameters["properties"])
+    # Like every eligible function of an agent, it also takes the optional argument that saves its output to a file.
+    assert properties.pop(OUTPUT_PATH_ARGUMENT)["default"] is None
+    own_parameters = {**function.parameters, "properties": properties}
+    definition = {"name": function.name, "description": function.description, "parameters": own_parameters}
+    definition_tokens = quarter_tokens(stable_serialize([definition]))
 
-    assert function.parameters["properties"] == {}
+    assert properties == {}
     assert function.parameters.get("required", []) == []
-    assert prompt_surface.definition_tokens <= 36
-    assert prompt_surface.tool_instructions == ()
-    assert "## Tool Execution Environment" in agent.role
-    assert "`invite_router`" in agent.role
+    assert definition_tokens <= 36
+    assert toolkit.instructions is None
+    assert "## Tool Execution Environment" in agent.prompt.role
+    assert "`invite_router`" in agent.prompt.role
 
 
 def test_matrix_runtime_ignores_authored_invite_router_function_filters(tmp_path: Path) -> None:
@@ -162,11 +181,13 @@ def test_matrix_runtime_ignores_authored_invite_router_function_filters(tmp_path
         config,
         runtime_paths_for(config),
         execution_identity=identity,
-        session_id=identity.session_id,
+        knowledge=None,
+        model=turn_model(config, runtime_paths_for(config), "code"),
+        plugins=config_plugins(config, runtime_paths_for(config)),
     )
 
-    toolkit = next(tool for tool in agent.tools if tool.name == "invite_router")
-    assert set(toolkit.get_async_functions()) == {"invite_router"}
+    [toolkit] = [toolkit for toolkit in agent.spec.toolkits if toolkit.name == "invite_router"]
+    assert {function.name for function in toolkit.functions} == {"invite_router"}
 
 
 def test_invite_router_stays_hidden_without_matrix_room_context(tmp_path: Path) -> None:
@@ -193,10 +214,12 @@ def test_invite_router_stays_hidden_without_matrix_room_context(tmp_path: Path) 
         config,
         runtime_paths_for(config),
         execution_identity=identity,
-        session_id=identity.session_id,
+        knowledge=None,
+        model=turn_model(config, runtime_paths_for(config), "code"),
+        plugins=config_plugins(config, runtime_paths_for(config)),
     )
 
-    assert "invite_router" not in {tool.name for tool in agent.tools}
+    assert "invite_router" not in {toolkit.name for toolkit in agent.spec.toolkits}
 
 
 def test_matrix_agents_reject_local_invite_router_function_collisions(
@@ -250,7 +273,9 @@ def test_matrix_agents_reject_local_invite_router_function_collisions(
             config,
             runtime_paths_for(config),
             execution_identity=identity,
-            session_id=identity.session_id,
+            knowledge=None,
+            model=turn_model(config, runtime_paths_for(config), "code"),
+            plugins=config_plugins(config, runtime_paths_for(config)),
         )
 
 
@@ -450,19 +475,14 @@ async def test_invite_router_cannot_require_router_backed_approval(tmp_path: Pat
     config = bind_runtime_paths(
         Config(
             agents={"code": AgentConfig(display_name="Code", role="Write code")},
+            models={"default": ModelConfig(provider="openai", id="gpt-6-astra")},
             tool_approval={"default": "require_approval"},
         ),
         test_runtime_paths(tmp_path),
     )
 
-    toolkit = apply_tool_approval_capability(
-        InviteRouterTools(),
-        config,
-        supports_native_tool_approval=True,
-        registered_tool_name="invite_router",
-    )
-    assert toolkit is not None
-    assert toolkit.get_async_functions()["invite_router"].requires_confirmation is not True
+    functions = gated_functions(InviteRouterTools(), config, registered_tool_name="invite_router")
+    assert functions["invite_router"].gate is None
 
 
 @pytest.mark.asyncio
@@ -471,6 +491,7 @@ async def test_same_named_external_function_does_not_bypass_approval(tmp_path: P
     config = bind_runtime_paths(
         Config(
             agents={"code": AgentConfig(display_name="Code", role="Write code")},
+            models={"default": ModelConfig(provider="openai", id="gpt-6-astra")},
             tool_approval={"default": "require_approval"},
         ),
         test_runtime_paths(tmp_path),
@@ -479,15 +500,13 @@ async def test_same_named_external_function_does_not_bypass_approval(tmp_path: P
     def invite_router() -> str:
         return "external"
 
-    toolkit = apply_tool_approval_capability(
+    functions = gated_functions(
         Toolkit(name="invite_router", tools=[invite_router]),
         config,
-        supports_native_tool_approval=True,
         registered_tool_name="external",
     )
 
-    assert toolkit is not None
-    assert toolkit.get_functions()["invite_router"].requires_confirmation is True
+    assert functions["invite_router"].gate is ToolGate.POLICY
     assert tool_may_require_approval(config, "invite_router")
     requires_approval, _ = await evaluate_tool_approval(
         config,
@@ -495,8 +514,28 @@ async def test_same_named_external_function_does_not_bypass_approval(tmp_path: P
         "invite_router",
         {},
         "code",
+        None,
     )
     assert requires_approval
+
+
+def test_a_function_named_after_its_registered_tool_stays_gated(tmp_path: Path) -> None:
+    """Only the reserved recovery function skips approval rules, not any function its own registered tool offers."""
+    config = bind_runtime_paths(
+        Config(
+            agents={"code": AgentConfig(display_name="Code", role="Write code")},
+            models={"default": ModelConfig(provider="openai", id="gpt-6-astra")},
+            tool_approval={"default": "require_approval"},
+        ),
+        test_runtime_paths(tmp_path),
+    )
+
+    def lookup() -> str:
+        return "found"
+
+    functions = gated_functions(Toolkit(name="lookup", tools=[lookup]), config)
+
+    assert functions["lookup"].gate is ToolGate.POLICY
 
 
 @pytest.mark.asyncio
@@ -514,3 +553,54 @@ async def test_invite_router_reports_matrix_invite_failure(tmp_path: Path) -> No
         result = await InviteRouterTools().invite_router()
 
     assert result == "Error: Router invite failed; current agent may lack invite permission."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner", ["code", "helper"])
+@pytest.mark.parametrize("router_admitted_by", [None, "router_user_id", "additional_user_ids"])
+async def test_invite_router_refuses_an_adopted_personal_room_that_does_not_admit_the_router(
+    tmp_path: Path,
+    owner: str,
+    router_admitted_by: str | None,
+) -> None:
+    """The room's guest check would remove the router again, so inviting it would only start a loop."""
+    context, client = _tool_context(tmp_path)
+    router_id = "@mindroom_router:localhost"
+    write_personal_room(
+        personal_room_record_path(context.runtime_paths, owner, "@alice:localhost"),
+        PersonalRoomRecord(
+            user_id="@alice:localhost",
+            alias="#personal:localhost",
+            source_room_id="!lobby:localhost",
+            room_id="!project:localhost",
+            adoption=PersonalRoomAdoption(
+                creator_user_id="@alice:localhost",
+                agent_user_id=f"@mindroom_{owner}:localhost",
+                router_user_id=router_id if router_admitted_by == "router_user_id" else None,
+                # Another agent's room admits the calling agent explicitly.
+                additional_user_ids=[
+                    *(["@mindroom_code:localhost"] if owner != "code" else []),
+                    *([router_id] if router_admitted_by == "additional_user_ids" else []),
+                ],
+            ),
+        ),
+    )
+    client.room_get_state_event.side_effect = [
+        nio.RoomGetStateEventError("Not found", status_code="M_NOT_FOUND", room_id="!project:localhost"),
+        nio.RoomGetStateEventResponse(
+            content={"membership": "join"},
+            event_type="m.room.member",
+            state_key=router_id,
+            room_id="!project:localhost",
+        ),
+    ]
+    client.room_invite.return_value = nio.RoomInviteResponse()
+
+    with tool_runtime_context(context):
+        result = await InviteRouterTools().invite_router()
+
+    if router_admitted_by is None:
+        assert result.startswith("Error: This adopted personal room does not admit the router")
+        client.room_invite.assert_not_awaited()
+    else:
+        assert result == "Router joined."

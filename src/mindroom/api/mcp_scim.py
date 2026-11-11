@@ -7,11 +7,16 @@ import json
 import re
 from datetime import UTC, datetime
 from functools import partial
+from traceback import walk_tb
 from typing import TYPE_CHECKING, Any, Never, Protocol
 
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
+from mindroom.json_utils import object_with_unique_keys
+from mindroom.llm.media import canonical_mime_type
+from mindroom.logging_config import get_logger
 from mindroom.mcp_gateway.accounts import (
     AccountConflictError,
     AccountNotFoundError,
@@ -26,10 +31,21 @@ if TYPE_CHECKING:
 
     from mindroom.mcp_gateway.accounts import GatewayAccounts
 
+logger = get_logger(__name__)
 _BASE = "/mcp/scim/v2"
 _CORE = "urn:ietf:params:scim:schemas:core:2.0:"
 _MESSAGES = "urn:ietf:params:scim:api:messages:2.0:"
 _USER_SCHEMA = _CORE + "User"
+_ENTERPRISE_USER_SCHEMA = "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User"
+# Only these public identifiers may be included in schema diagnostics.
+_DIAGNOSTIC_SCHEMAS = frozenset(
+    {
+        _USER_SCHEMA,
+        _MESSAGES + "PatchOp",
+        "urn:scim:schemas:core:1.0",
+        _ENTERPRISE_USER_SCHEMA,
+    },
+)
 _HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
 _MAX_BODY = 65_536
 _FILTER = re.compile(r'\s*(userName|emails\.value|id)\s+eq\s+("(?:[^"\\]|\\.)*")\s*', re.IGNORECASE)
@@ -115,36 +131,44 @@ def _list(resources: list[dict[str, Any]], *, total: int | None = None, start: i
     }
 
 
-def _object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise AccountValidationError
-        result[key] = value
-    return result
-
-
 def _reject_constant(_value: str) -> Never:
     raise AccountValidationError
 
 
 async def _body(request: Request, schema: str) -> dict[str, Any]:
-    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() not in {
-        "application/json",
-        "application/scim+json",
-    }:
+    if canonical_mime_type(request.headers.get("content-type")) not in {"application/json", "application/scim+json"}:
         raise _ScimError(415, "Use application/scim+json.")
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > _MAX_BODY:
-            raise _ScimError(413, "Request body exceeds the supported limit.", "tooLarge")
-        body.extend(chunk)
     try:
-        value = json.loads(body.decode("utf-8"), object_pairs_hook=_object, parse_constant=_reject_constant)
+        body = await collect_bounded_bytes(request.stream(), max_bytes=_MAX_BODY)
+    except ByteLimitExceededError as exc:
+        raise _ScimError(413, "Request body exceeds the supported limit.", "tooLarge") from exc
+    try:
+        value = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=object_with_unique_keys,
+            parse_constant=_reject_constant,
+        )
         fields = canonical_fields(value)
     except (ValueError, RecursionError) as error:
         raise AccountValidationError from error
-    if fields.get("schemas") != [schema]:
+    schemas = fields.get("schemas")
+    accepted_schemas = [[schema]]
+    if schema == _USER_SCHEMA:
+        # Account validation retains only supported core fields, never extension data.
+        accepted_schemas.extend([[schema, _ENTERPRISE_USER_SCHEMA], [_ENTERPRISE_USER_SCHEMA, schema]])
+    if schemas not in accepted_schemas:
+        entries = schemas if isinstance(schemas, list) else [schemas] if "schemas" in fields else []
+        strings = [entry for entry in entries if isinstance(entry, str)]
+        logger.warning(
+            "SCIM schema validation failed",
+            method=request.method,
+            expected_schema=schema,
+            schemas_type=type(schemas).__name__ if "schemas" in fields else "missing",
+            schemas_count=len(schemas) if isinstance(schemas, list) else None,
+            recognized_schemas=sorted(_DIAGNOSTIC_SCHEMAS.intersection(strings)),
+            unknown_schema_count=sum(entry not in _DIAGNOSTIC_SCHEMAS for entry in strings),
+            non_string_schema_count=len(entries) - len(strings),
+        )
         raise AccountValidationError
     return fields
 
@@ -419,7 +443,12 @@ def scim_routes(runtime_for_request: Callable[[Request], _ScimRuntime]) -> list[
             return _error(_ScimError(409, "The userName already exists.", "uniqueness"))
         except AccountNotFoundError:
             return _error(_ScimError(404, "Account not found."))
-        except AccountValidationError:
+        except AccountValidationError as error:
+            logger.warning(
+                "SCIM account validation failed",
+                method=request.method,
+                validation_frames=[f"{frame.f_code.co_name}:{line}" for frame, line in walk_tb(error.__traceback__)],
+            )
             return _error(_ScimError(400, "Invalid or missing supported account attributes.", "invalidValue"))
         except _ScimError as error:
             return _error(error)

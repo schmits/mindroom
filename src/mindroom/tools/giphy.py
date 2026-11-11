@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="giphy",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("search_gifs",),
     display_name="Giphy",
     description="GIF search and integration",
     category=ToolCategory.DEVELOPMENT,
@@ -23,6 +25,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("GIPHY_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -51,7 +54,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["httpx"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/giphy",
+    docs_url="https://docs.mindroom.chat/tools/media-and-content/#giphy",
     function_names=("search_gifs",),
 )
 def giphy_tools() -> type[GiphyTools]:

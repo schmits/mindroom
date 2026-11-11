@@ -2,20 +2,46 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import logging.config
+import os
+import socket
+import subprocess
 import sys
+import threading
+import time
 import warnings
 from typing import TYPE_CHECKING, NoReturn
 
+import aiohttp
+import httpx
+import nio
 import pytest
+import uvicorn
+from agno.utils import log as agno_log
+from fastapi import FastAPI, WebSocket
+from mem0 import AsyncMemory
 
+from mindroom import logging_config
 from mindroom.constants import RuntimePaths
-from mindroom.logging_config import bound_log_context, get_logger, setup_logging
+from mindroom.logging_config import (
+    bound_log_context,
+    configure_default_logging,
+    current_log_file,
+    get_logger,
+    setup_logging,
+    setup_subprocess_logging,
+    subprocess_logging_env,
+)
 from mindroom.message_target import MessageTarget
+from tests.conftest import SETTLE_TIMEOUT_SECONDS
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
+    from typing import TextIO
 
 
 def _runtime_paths(tmp_path: Path) -> RuntimePaths:
@@ -44,6 +70,16 @@ def _raise_value_error() -> NoReturn:
 
 def _raise_secret_value_error() -> NoReturn:
     msg = "api_key=api-secret"
+    raise ValueError(msg)
+
+
+# No redaction rule recognizes this value, so only omitting frame locals keeps it out of logs.
+_FRAME_LOCAL_CREDENTIAL = "frame-local-credential"
+
+
+def _raise_with_credential_in_frame(extra_header: str) -> NoReturn:
+    git_env = {"GIT_CONFIG_VALUE_0": extra_header}
+    msg = f"git failed with {', '.join(git_env)} configured"
     raise ValueError(msg)
 
 
@@ -185,6 +221,31 @@ def test_setup_logging_json_mode_includes_logger_for_foreign_logger(
     assert "timestamp" in payload
 
 
+def test_setup_logging_drops_mem0_advice_to_leave_chroma_and_keeps_other_mem0_warnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mem0 advises leaving Chroma each time a memory is built, which MindRoom does per memory operation."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+
+    AsyncMemory.from_config(
+        {
+            "embedder": {"provider": "openai", "config": {"api_key": "sk-test"}},
+            "llm": {"provider": "openai", "config": {"api_key": "sk-test"}},
+            "vector_store": {"provider": "chroma", "config": {"collection_name": "memories", "path": str(tmp_path)}},
+            "history_db_path": str(tmp_path / "history.db"),
+        },
+    )
+    logging.getLogger("mem0.memory.main").warning("Another Mem0 warning")
+
+    events = [json.loads(line)["event"] for line in capsys.readouterr().err.strip().splitlines()]
+    assert "Another Mem0 warning" in events
+    assert not [event for event in events if "keyword search" in event]
+
+
 def test_setup_logging_logger_level_overrides_allow_selective_debug(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -291,6 +352,66 @@ def test_setup_logging_json_mode_foreign_logger_inherits_bound_log_context(
     assert payload["thread_id"] == "$thread:example.org"
 
 
+@pytest.mark.parametrize("log_format", ["json", "text"])
+@pytest.mark.parametrize("foreign_logger", [False, True])
+@pytest.mark.asyncio
+async def test_logging_preserves_nio_errors_with_real_transport_and_redacts_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    log_format: str,
+    foreign_logger: bool,
+) -> None:
+    """Live transport objects must not erase diagnostics or leak their credentials."""
+
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        body = json.dumps(
+            {"errcode": "M_FORBIDDEN", "error": "synthetic denial; api_key=synthetic-message-secret"},
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n"
+            b"Set-Cookie: session=synthetic-transport-secret\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body,
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", log_format)
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    async with server, aiohttp.ClientSession() as session:
+        url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/synthetic"
+        async with session.get(url, headers={"Authorization": "Bearer synthetic-request-secret"}) as transport:
+            response = nio.RoomSendError.from_dict(await transport.json(), room_id="!room:example.test")
+            response.transport_response = transport
+            logger_name = "tests.logging.transport"
+            if foreign_logger:
+                logging.getLogger(logger_name).warning("matrix_operation_failed", extra={"response": response})
+            else:
+                get_logger(logger_name).warning("matrix_operation_failed", response=response)
+
+    output = capsys.readouterr().err
+    assert "matrix_operation_failed" in output
+    assert logger_name in output
+    assert "warning" in output
+    assert "M_FORBIDDEN" in output
+    assert "synthetic denial" in output
+    assert "[redaction failed]" not in output
+    for secret in ("synthetic-message-secret", "synthetic-transport-secret", "synthetic-request-secret"):
+        assert secret not in output
+    if log_format == "json":
+        payload = json.loads(output.strip().splitlines()[-1])
+        assert payload["event"] == "matrix_operation_failed"
+        assert payload["level"] == "warning"
+        assert payload["logger"] == logger_name
+        assert payload["response"]["status_code"] == "M_FORBIDDEN"
+        assert payload["response"]["message"] == "synthetic denial; api_key=***redacted***"
+    assert response.transport_response is transport
+
+
 def test_setup_logging_text_mode_does_not_emit_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -310,6 +431,48 @@ def test_setup_logging_text_mode_does_not_emit_json(
         json.loads(line)
 
 
+@pytest.mark.parametrize(
+    ("is_terminal", "no_color", "console_colors"),
+    [(False, None, False), (True, None, True), (True, "", True), (True, "1", False)],
+)
+def test_log_colors_follow_output_and_no_color_without_coloring_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    is_terminal: bool,
+    no_color: str | None,
+    console_colors: bool,
+) -> None:
+    """Only interactive output without NO_COLOR may contain terminal styling."""
+    monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
+    if no_color is None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    else:
+        monkeypatch.setenv("NO_COLOR", no_color)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
+    runtime_paths = _runtime_paths(tmp_path)
+    setup_logging(runtime_paths=runtime_paths)
+    capsys.readouterr()
+
+    get_logger("tests.logging").info("structured_event", sample_count=12)
+    logging.getLogger("nio.client.async_client").warning("Timed out, sleeping for 60s")
+    try:
+        _raise_value_error()
+    except ValueError:
+        get_logger("tests.logging").exception("exception_event")
+
+    console = capsys.readouterr().err
+    logging.shutdown()
+    saved = next((runtime_paths.storage_root / "logs").glob("mindroom_*.log")).read_text()
+    for output in (console, saved):
+        assert "structured_event" in output
+        assert "Timed out, sleeping for 60s" in output
+        assert "ValueError" in output
+        assert "boom" in output
+    assert ("\x1b[" in console) is console_colors
+    assert "\x1b" not in saved
+
+
 @pytest.mark.parametrize("is_terminal", [False, True])
 def test_setup_logging_text_mode_redacts_exception_tracebacks_without_pretty_exception_warning(
     tmp_path: Path,
@@ -319,6 +482,7 @@ def test_setup_logging_text_mode_redacts_exception_tracebacks_without_pretty_exc
 ) -> None:
     """Text tracebacks suit their output stream without leaking exception secrets."""
     monkeypatch.delenv("MINDROOM_LOG_FORMAT", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
     setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
     capsys.readouterr()
@@ -407,3 +571,522 @@ def test_setup_logging_json_mode_renders_exception_field_for_exc_info_tuple(
     assert payload["event"] == "test_exception_tuple"
     assert isinstance(payload["exception"], str)
     assert "ValueError: boom" in payload["exception"]
+
+
+@pytest.mark.parametrize(
+    ("renderer", "is_terminal"),
+    [("json", False), ("text", False), ("text", True), ("default", False)],
+    ids=["json", "text", "colored", "default"],
+)
+def test_logged_tracebacks_omit_frame_locals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    renderer: str,
+    is_terminal: bool,
+) -> None:
+    """Every renderer keeps the traceback without printing the locals of its frames."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", renderer)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: is_terminal)
+    if renderer == "default":
+        configure_default_logging()
+    else:
+        setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+
+    try:
+        _raise_with_credential_in_frame(_FRAME_LOCAL_CREDENTIAL)
+    except ValueError:
+        get_logger("tests.logging").exception("test_exception")
+
+    captured = capsys.readouterr()
+    output = captured.out if renderer == "default" else captured.err
+
+    assert "_raise_with_credential_in_frame" in output
+    assert "git failed with GIT_CONFIG_VALUE_0 configured" in output
+    assert _FRAME_LOCAL_CREDENTIAL not in output
+
+
+def test_knowledge_refresh_subprocess_failure_omits_frame_locals() -> None:
+    """The refresh child's failure traceback omits frame locals, and the failure it reports carries none either."""
+    request = {"base_id": "docs", "config_data": {"GIT_CONFIG_VALUE_0": _FRAME_LOCAL_CREDENTIAL}}
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "mindroom.knowledge.refresh_entrypoint"],
+        input=json.dumps(request).encode(),
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+    stderr = completed.stderr.decode()
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["error"] == "Knowledge refresh subprocess request is missing config_path"
+    assert "Knowledge refresh subprocess failed" in stderr
+    assert _FRAME_LOCAL_CREDENTIAL not in stderr
+    assert "Traceback (most recent call last):" in stderr
+    assert "_load_subprocess_refresh_request" in stderr
+    assert "missing config_path" in stderr
+
+
+def _stderr_records(stderr: bytes) -> list[dict[str, object]]:
+    return [json.loads(line) for line in stderr.decode().splitlines()]
+
+
+@pytest.mark.parametrize("level", ["INFO", "WARNING"])
+def test_agno_records_follow_configured_format_and_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    level: str,
+) -> None:
+    """Agno's own loggers render through the configured handler instead of printing plain text at INFO."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level=level, runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+
+    agno_log.agent_logger.info("Upserting 2 documents")
+    agno_log.agent_logger.warning("Skipping one document")
+
+    records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    expected = [("Upserting 2 documents", "info")] if level == "INFO" else []
+    expected.append(("Skipping one document", "warning"))
+    assert [(record["event"], record["level"]) for record in records] == expected
+    assert {record["logger"] for record in records} == {"agno"}
+
+
+@pytest.mark.parametrize(
+    ("level", "logger_levels", "expected"),
+    [
+        # The default nio:WARNING override lowers the handler threshold below ERROR.
+        ("ERROR", "", ["agno_error"]),
+        ("WARNING", "httpx:DEBUG", ["agno_warning", "agno_error"]),
+        ("WARNING", "agno:DEBUG", ["agno_info", "agno_warning", "agno_error"]),
+    ],
+)
+def test_agno_records_keep_the_resolved_level_after_agno_resets_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    level: str,
+    logger_levels: str,
+    expected: list[str],
+) -> None:
+    """Agno's per-run level resets and lower overrides for other loggers do not let Agno records through."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    monkeypatch.setenv("MINDROOM_LOGGER_LEVELS", logger_levels)
+    # A later setup replaces the earlier level instead of stacking on top of it.
+    setup_logging(level="CRITICAL", runtime_paths=_runtime_paths(tmp_path))
+    setup_logging(level=level, runtime_paths=_runtime_paths(tmp_path))
+    capsys.readouterr()
+
+    # Agno's own Agent, Team, and Workflow runs reset its loggers to INFO this way.
+    agno_log.set_log_level_to_info()
+    agno_log.agent_logger.info("agno_info")
+    agno_log.agent_logger.warning("agno_warning")
+    agno_log.agent_logger.error("agno_error")
+
+    records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [record["event"] for record in records] == expected
+
+
+def test_subprocess_logging_matches_parent_format_and_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child configured from the parent's env logs JSON to stderr at the parent's level, Agno included."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="WARNING", runtime_paths=_runtime_paths(tmp_path))
+    child = """
+from agno.utils.log import log_info, log_warning
+from mindroom.logging_config import get_logger, setup_subprocess_logging
+
+setup_subprocess_logging()
+logger = get_logger("tests.child")
+logger.debug("child_debug")
+logger.info("child_info")
+logger.warning("child_warning")
+log_info("Found 3 documents")
+log_warning("Skipping a knowledge file above the read cap")
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        env={**os.environ, **subprocess_logging_env()},
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+
+    assert completed.stdout == b""
+    records = _stderr_records(completed.stderr)
+    assert [(record["event"], record["level"], record["logger"]) for record in records] == [
+        ("child_warning", "warning", "tests.child"),
+        ("Skipping a knowledge file above the read cap", "warning", "agno"),
+    ]
+    assert all("timestamp" in record for record in records)
+
+
+def test_knowledge_refresh_subprocess_logs_like_its_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refresh child entrypoint logs like its parent, keeping stdout for the result it reports."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "mindroom.knowledge.refresh_entrypoint"],
+        input=json.dumps({"base_id": "docs"}).encode(),
+        env={**os.environ, **subprocess_logging_env()},
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["error"] == "Knowledge refresh subprocess request is missing config_data"
+    failed, finished = _stderr_records(completed.stderr)
+    assert failed["event"] == "Knowledge refresh subprocess failed"
+    assert failed["level"] == "error"
+    assert "missing config_data" in str(failed["exception"])
+    assert (finished["event"], finished["level"]) == ("Knowledge refresh subprocess completed", "info")
+
+
+def test_subprocess_logging_appends_to_the_parent_log_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child given the parent's log file appends its records there, next to the parent's."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    log_file = current_log_file()
+    assert log_file is not None
+    assert log_file.parent.name == "logs"
+    get_logger("tests.parent").info("parent_event")
+
+    setup_subprocess_logging(log_file=log_file)
+    get_logger("tests.child").info("child_event")
+    logging.shutdown()
+
+    events = [json.loads(line)["event"] for line in log_file.read_text().splitlines()]
+    assert "parent_event" in events
+    assert events[-1] == "child_event"
+
+
+class _StallingLogStream:
+    """A log file stream whose writes wait while `writable` is clear, like a network file system that stalls."""
+
+    def __init__(self, stream: TextIO) -> None:
+        self._stream = stream
+        self.writable = threading.Event()
+        self.writable.set()
+        self.stalled = threading.Event()
+
+    def write(self, text: str) -> int:
+        if not self.writable.is_set():
+            self.stalled.set()
+            self.writable.wait()
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+@pytest.fixture
+def stalling_log_files(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[_StallingLogStream]]:
+    """Open log files behind streams the test can stall, and free any stall the test leaves behind."""
+    streams: list[_StallingLogStream] = []
+    open_file = logging.FileHandler._open
+
+    def open_stalling(handler: logging.FileHandler) -> _StallingLogStream:
+        stream = _StallingLogStream(open_file(handler))
+        streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(logging.FileHandler, "_open", open_stalling)
+    yield streams
+    for stream in streams:
+        stream.writable.set()
+
+
+def _wait_for_log_lines(log_file: Path, count: int) -> None:
+    deadline = time.monotonic() + SETTLE_TIMEOUT_SECONDS
+    while len(log_file.read_text().splitlines()) < count:
+        assert time.monotonic() < deadline, f"log file never reached {count} lines"
+        time.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_stalled_log_file_write_leaves_the_event_loop_and_stderr_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stalling_log_files: list[_StallingLogStream],
+) -> None:
+    """A log file write that hangs neither blocks the event loop nor delays stderr, and the file catches up in order."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    log_file = current_log_file()
+    assert log_file is not None
+    [log_stream] = stalling_log_files
+    log_stream.writable.clear()
+    # A write on the logging thread would hold the loop until this timer frees it.
+    unstall = threading.Timer(10, log_stream.writable.set)
+    unstall.start()
+    try:
+        started = time.monotonic()
+        for index in range(3):
+            get_logger("tests.logging").info("logged_during_stall", index=index)
+            await asyncio.sleep(0)
+        loop_lag = time.monotonic() - started
+        assert loop_lag < 1
+        assert log_stream.stalled.wait(SETTLE_TIMEOUT_SECONDS)
+        assert not log_stream.writable.is_set()
+        console = capsys.readouterr().err
+    finally:
+        unstall.cancel()
+        log_stream.writable.set()
+    logging.shutdown()
+
+    records = [json.loads(line) for line in console.splitlines()]
+    assert [(record["event"], record.get("index")) for record in records] == [
+        ("Logging initialized", None),
+        ("logged_during_stall", 0),
+        ("logged_during_stall", 1),
+        ("logged_during_stall", 2),
+    ]
+    assert log_file.read_text() == console
+
+
+def test_stalled_log_file_notes_the_records_it_dropped_past_its_queue_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stalling_log_files: list[_StallingLogStream],
+) -> None:
+    """From the queue limit until the writer catches up, records skip the file; a note then says how many."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    log_file = current_log_file()
+    assert log_file is not None
+    [log_stream] = stalling_log_files
+    logger = get_logger("tests.logging")
+
+    def log_during_stall(first_index: int) -> None:
+        """Log seven records: one stalls in the write, two fill the queue, and four are dropped."""
+        monkeypatch.setattr(logging_config, "_MAX_QUEUED_LOG_FILE_RECORDS", 2)
+        log_stream.writable.clear()
+        log_stream.stalled.clear()
+        try:
+            logger.info("logged_during_stall", index=first_index)
+            assert log_stream.stalled.wait(SETTLE_TIMEOUT_SECONDS)
+            for index in range(first_index + 1, first_index + 6):
+                logger.info("logged_during_stall", index=index)
+            # Room below the cap does not resume the file until the writer has caught up.
+            monkeypatch.setattr(logging_config, "_MAX_QUEUED_LOG_FILE_RECORDS", 10)
+            logger.info("logged_during_stall", index=first_index + 6)
+        finally:
+            log_stream.writable.set()
+
+    _wait_for_log_lines(log_file, 1)
+    log_during_stall(0)
+    _wait_for_log_lines(log_file, 4)
+    with bound_log_context(room_id="!room:example.org"):
+        logger.info("logged_after_stall")
+    _wait_for_log_lines(log_file, 6)
+    log_during_stall(7)
+    logging.shutdown()
+
+    records = [json.loads(line) for line in log_file.read_text().splitlines()]
+    note = ("Log file dropped records while its writes were stalled", None, 4)
+    assert [(record["event"], record.get("index"), record.get("dropped_records")) for record in records] == [
+        ("Logging initialized", None, None),
+        ("logged_during_stall", 0, None),
+        ("logged_during_stall", 1, None),
+        ("logged_during_stall", 2, None),
+        note,
+        ("logged_after_stall", None, None),
+        ("logged_during_stall", 7, None),
+        ("logged_during_stall", 8, None),
+        ("logged_during_stall", 9, None),
+        note,
+    ]
+    assert records[5]["room_id"] == "!room:example.org"
+    assert {(record["logger"], record["level"], "room_id" in record) for record in (records[4], records[9])} == {
+        ("mindroom.logging_config", "warning", False),
+    }
+
+
+def test_log_file_keeps_its_records_after_another_logging_config(tmp_path: Path) -> None:
+    """A later `dictConfig`, like the one uvicorn runs for the API server, leaves the file receiving records to exit."""
+    child = """
+import logging.config
+import sys
+from pathlib import Path
+
+from mindroom.constants import RuntimePaths
+from mindroom.logging_config import get_logger, setup_logging
+
+root = Path(sys.argv[1])
+setup_logging(
+    runtime_paths=RuntimePaths(
+        config_path=root / "config.yaml",
+        config_dir=root,
+        env_path=root / ".env",
+        storage_root=root / "mindroom_data",
+    ),
+)
+logging.config.dictConfig({"version": 1, "disable_existing_loggers": False})
+for index in range(1000):
+    get_logger("tests.child").info("logged_after_another_config", index=index)
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", child, str(tmp_path)],
+        env={**os.environ, "MINDROOM_LOG_FORMAT": "json"},
+        capture_output=True,
+        check=True,
+        timeout=60,
+    )
+
+    [log_file] = (tmp_path / "mindroom_data" / "logs").glob("mindroom_*.log")
+    records = [json.loads(line) for line in log_file.read_text().splitlines()]
+    assert [record["event"] for record in records] == ["Logging initialized"] + ["logged_after_another_config"] * 1000
+    assert [record["index"] for record in records[1:]] == list(range(1000))
+
+
+def test_log_file_writer_survives_a_failed_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A reopen that fails once, as a stalled network file system can, loses that record but not later ones."""
+    monkeypatch.setenv("MINDROOM_LOG_FORMAT", "json")
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    log_file = current_log_file()
+    assert log_file is not None
+    # Closes the log file, which the writer reopens for the next record.
+    logging.config.dictConfig({"version": 1, "disable_existing_loggers": False})
+    open_file = logging.FileHandler._open
+    failed_opens: list[str] = []
+
+    def open_failing_once(handler: logging.FileHandler) -> TextIO:
+        if not failed_opens:
+            failed_opens.append(handler.baseFilename)
+            msg = "Stale file handle"
+            raise OSError(msg)
+        return open_file(handler)
+
+    monkeypatch.setattr(logging.FileHandler, "_open", open_failing_once)
+    logger = get_logger("tests.logging")
+    logger.info("lost_to_failed_reopen")
+    logger.info("logged_after_failed_reopen")
+    for handler in logging.getLogger().handlers:
+        handler.close()
+
+    assert failed_opens == [str(log_file)]
+    assert "Stale file handle" in capsys.readouterr().err
+    events = [json.loads(line)["event"] for line in log_file.read_text().splitlines()]
+    assert events == ["Logging initialized", "logged_after_failed_reopen"]
+
+
+@pytest.mark.asyncio
+async def test_api_request_logs_record_paths_without_their_query(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The API's request lines name each path, but leave out a query such as an OAuth callback's code."""
+    setup_logging(level="INFO", runtime_paths=_runtime_paths(tmp_path))
+    app = FastAPI()
+
+    @app.get("/api/oauth/{provider_id}/callback")
+    async def callback(provider_id: str) -> str:
+        return provider_id
+
+    @app.get("/api/health")
+    async def health() -> str:
+        return "ok"
+
+    @app.websocket("/api/stream")
+    async def stream(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.close()
+
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    # Built after `setup_logging`, as for `mindroom run`, so uvicorn's own logging config is the last one applied.
+    server = uvicorn.Server(uvicorn.Config(app, log_level="info", ws="websockets-sansio"))
+    serving = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        # The socket already listens, so requests wait in its backlog until the server starts accepting.
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as client:
+            callback_response = await client.get(
+                "/api/oauth/google_drive/callback",
+                params={"code": "authorization-code-value", "state": "state-value"},
+            )
+            health_response = await client.get("/api/health")
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(f"ws://127.0.0.1:{port}/api/stream?token=websocket-token-value") as websocket,
+        ):
+            await websocket.receive()
+    finally:
+        server.should_exit = True
+        await serving
+
+    assert (callback_response.status_code, health_response.status_code) == (200, 200)
+    captured = capsys.readouterr()
+    request_log = captured.out + captured.err
+    assert '"GET /api/oauth/google_drive/callback HTTP/1.1" 200' in request_log
+    assert '"GET /api/health HTTP/1.1" 200' in request_log
+    assert '"WebSocket /api/stream" [accepted]' in request_log
+    for secret in ("authorization-code-value", "state-value", "websocket-token-value"):
+        assert secret not in request_log
+
+
+@pytest.mark.parametrize("ws", ["websockets-sansio", "websockets"])
+@pytest.mark.asyncio
+async def test_debug_logs_leave_out_websocket_headers_and_frames(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    ws: str,
+) -> None:
+    """At DEBUG, a WebSocket's handshake headers and frame contents stay out of the logs; its other records stay."""
+    setup_logging(level="DEBUG", runtime_paths=_runtime_paths(tmp_path))
+    app = FastAPI()
+
+    @app.websocket("/api/stream")
+    async def stream(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.receive_text()
+        await websocket.send_text("reply-value")
+        await websocket.close()
+
+    listener = socket.create_server(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="debug", ws=ws))
+    serving = asyncio.create_task(server.serve(sockets=[listener]))
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.ws_connect(
+                f"ws://127.0.0.1:{port}/api/stream?token=query-value",
+                headers={"Authorization": "Bearer authorization-value", "Cookie": "session=cookie-value"},
+            ) as websocket,
+        ):
+            await websocket.send_str("frame-value")
+            assert (await websocket.receive()).data == "reply-value"
+    finally:
+        server.should_exit = True
+        await serving
+
+    captured = capsys.readouterr()
+    debug_log = captured.out + captured.err
+    assert '"WebSocket /api/stream" [accepted]' in debug_log
+    assert "= connection is OPEN" in debug_log
+    for secret in ("query-value", "authorization-value", "cookie-value", "frame-value", "reply-value"):
+        assert secret not in debug_log

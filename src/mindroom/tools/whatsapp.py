@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="whatsapp",
+    file_access=ToolFileAccess.NONE,
     display_name="WhatsApp Business",
     description="Send text and template messages via WhatsApp Business API",
     category=ToolCategory.COMMUNICATION,
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
         # Authentication/Connection parameters first
         ConfigField(
             name="access_token",
+            env=("WHATSAPP_ACCESS_TOKEN",),
             label="Access Token",
             type="password",
             required=False,
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="phone_number_id",
+            env=("WHATSAPP_PHONE_NUMBER_ID",),
             label="Phone Number ID",
             type="text",
             required=False,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="version",
+            env=("WHATSAPP_VERSION",),
             label="API Version",
             type="text",
             required=False,
@@ -49,6 +53,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="recipient_waid",
+            env=("WHATSAPP_RECIPIENT_WAID",),
             label="Default Recipient WhatsApp ID",
             type="text",
             required=False,
@@ -138,7 +143,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["httpx"],
-    docs_url="https://docs.agno.com/tools/toolkits/social/whatsapp",
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#whatsapp",
     function_names=(
         "send_document",
         "send_image",

@@ -2,107 +2,69 @@
 @import "./styles/animations.css";
 @import "tailwindcss";
 @config "../tailwind.config.js";
-
-@layer utilities {
-  .glass {
-    @apply backdrop-blur-xl bg-white/70 border border-white/20;
-  }
-  .glass-subtle {
-    @apply backdrop-blur-md bg-white/50 border border-white/10;
-  }
-  .glass-card {
-    @apply backdrop-blur-xl bg-white/60 border border-white/20 shadow-xl;
-  }
-  .dark .glass {
-    @apply bg-stone-900/70 border-white/10;
-  }
-  .dark .glass-subtle {
-    @apply bg-stone-900/50 border-white/5;
-  }
-  .dark .glass-card {
-    @apply bg-stone-900/60 border-white/10;
-  }
-  .gradient-mesh {
-    background-image:
-      radial-gradient(
-        at 27% 37%,
-        hsla(35, 90%, 48%, 0.25) 0px,
-        transparent 50%
-      ),
-      radial-gradient(at 97% 21%, hsla(30, 50%, 60%, 0.2) 0px, transparent 50%),
-      radial-gradient(at 52% 99%, hsla(35, 90%, 48%, 0.15) 0px, transparent 50%);
-  }
-  .gradient-mesh-dark {
-    background-image:
-      radial-gradient(
-        at 27% 37%,
-        hsla(35, 90%, 48%, 0.15) 0px,
-        transparent 50%
-      ),
-      radial-gradient(
-        at 97% 21%,
-        hsla(30, 50%, 60%, 0.12) 0px,
-        transparent 50%
-      ),
-      radial-gradient(at 52% 99%, hsla(35, 90%, 48%, 0.1) 0px, transparent 50%);
-  }
-}
+/* Tool cards color their icons with the `icon_color` classes named in tool metadata. */
+@source "../../src/mindroom/tools_metadata.json";
 
 @layer base {
   :root {
-    /* Light mode - warm, minimal palette */
-    --background: 30 20% 98%; /* Very light warm gray */
-    --foreground: 25 25% 15%; /* Dark warm gray */
-    --card: 30 20% 100%; /* Pure white with hint of warmth */
-    --card-foreground: 25 25% 15%;
-    --popover: 30 20% 100%;
-    --popover-foreground: 25 25% 15%;
-    --primary: 35 90% 48%; /* Warm amber/orange */
-    --primary-foreground: 30 20% 98%;
-    --secondary: 30 15% 92%; /* Light warm gray */
-    --secondary-foreground: 25 25% 15%;
-    --muted: 30 10% 88%; /* Muted warm gray */
-    --muted-foreground: 25 15% 40%;
-    --accent: 35 90% 48%; /* Same as primary for consistency */
-    --accent-foreground: 30 20% 98%;
-    --destructive: 0 72% 51%; /* Warm red */
-    --destructive-foreground: 30 20% 98%;
-    --border: 30 15% 90%; /* Subtle warm gray border */
-    --input: 30 15% 90%;
-    --ring: 35 90% 48%;
+    --background: 252 29% 97%;
+    --foreground: 247 33% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 247 33% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 247 33% 16%;
+    --primary: 253 56% 55%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 248 29% 95%;
+    --secondary-foreground: 247 33% 16%;
+    --muted: 248 29% 95%;
+    --muted-foreground: 247 12% 42%;
+    --accent: 244 100% 97%;
+    --accent-foreground: 255 53% 46%;
+    --destructive: 3 72% 40%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 251 22% 90%;
+    --input: 251 18% 77%;
+    --ring: 253 56% 55%;
+    --active: 250 20% 92%;
     --radius: 0.5rem;
   }
 
   .dark {
-    /* Dark mode - warm, minimal palette */
-    --background: 25 15% 10%; /* Very dark warm gray */
-    --foreground: 30 15% 88%; /* Light warm gray */
-    --card: 25 12% 14%; /* Slightly lighter warm gray */
-    --card-foreground: 30 15% 88%;
-    --popover: 25 12% 14%;
-    --popover-foreground: 30 15% 88%;
-    --primary: 35 90% 48%; /* Same warm amber/orange */
-    --primary-foreground: 25 15% 10%;
-    --secondary: 25 10% 20%; /* Dark warm gray */
-    --secondary-foreground: 30 15% 88%;
-    --muted: 25 8% 25%; /* Muted dark warm gray */
-    --muted-foreground: 30 10% 65%;
-    --accent: 35 90% 48%; /* Same as primary for consistency */
-    --accent-foreground: 25 15% 10%;
-    --destructive: 0 62% 45%; /* Warm red for dark mode */
-    --destructive-foreground: 30 15% 88%;
-    --border: 25 10% 22%; /* Subtle dark warm gray border */
-    --input: 25 10% 22%;
-    --ring: 35 90% 48%;
+    --background: 250 8% 8%;
+    --foreground: 250 20% 95%;
+    --card: 250 7% 11%;
+    --card-foreground: 250 20% 95%;
+    --popover: 250 7% 13%;
+    --popover-foreground: 250 20% 95%;
+    --primary: 247 100% 83%;
+    --primary-foreground: 250 10% 10%;
+    --secondary: 250 6% 16%;
+    --secondary-foreground: 250 20% 95%;
+    --muted: 250 6% 16%;
+    --muted-foreground: 250 6% 68%;
+    --accent: 250 18% 19%;
+    --accent-foreground: 247 100% 87%;
+    --destructive: 3 84% 72%;
+    --destructive-foreground: 250 10% 10%;
+    --border: 250 6% 19%;
+    --input: 250 6% 30%;
+    --ring: 247 100% 83%;
+    --active: 250 6% 19%;
   }
-}
 
-@layer base {
   * {
     @apply border-border;
   }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
   body {
-    @apply bg-background text-foreground font-sans antialiased;
+    @apply bg-background font-sans text-foreground antialiased;
     font-feature-settings:
       "kern" 1,
       "liga" 1,
@@ -112,29 +74,26 @@
     text-rendering: optimizeLegibility;
   }
 
-  /* Typography improvements */
   h1,
   h2,
   h3,
   h4,
   h5,
   h6 {
-    @apply tracking-tight font-semibold;
+    @apply font-semibold tracking-tight;
   }
 
   p {
     @apply leading-relaxed;
   }
 
-  /* Smoother animations */
-  * {
-    @apply transition-colors duration-200;
+  ::selection {
+    background: hsl(var(--primary) / 0.28);
   }
 
-  /* Custom scrollbar styling */
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
   }
 
   ::-webkit-scrollbar-track {
@@ -142,59 +101,119 @@
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-gray-300/50 rounded-full;
     border: 2px solid transparent;
+    border-radius: 999px;
+    background: hsl(var(--muted-foreground) / 0.28);
     background-clip: padding-box;
   }
 
-  ::-webkit-scrollbar-thumb:hover {
-    @apply bg-gray-400/70;
-  }
-
-  .dark ::-webkit-scrollbar-thumb {
-    @apply bg-stone-700/50;
-  }
-
-  .dark ::-webkit-scrollbar-thumb:hover {
-    @apply bg-stone-600/70;
-  }
-
-  /* Firefox scrollbar styling */
   * {
+    scrollbar-color: hsl(var(--muted-foreground) / 0.28) transparent;
     scrollbar-width: thin;
-    scrollbar-color: rgba(156, 163, 175, 0.5) transparent;
+  }
+}
+
+@layer components {
+  /* Surfaces are solid and separated by a border; only overlays cast a shadow. */
+  .glass-panel {
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
   }
 
-  .dark * {
-    scrollbar-color: rgba(68, 64, 60, 0.5) transparent;
+  /* A panel inside a panel is a section of it, not another raised card. */
+  .glass-panel .glass-panel {
+    background: transparent;
   }
 
-  /* Mobile optimizations */
-  @media (max-width: 768px) {
-    /* Improve scrolling performance on mobile */
-    * {
-      -webkit-overflow-scrolling: touch;
-    }
+  .glass-control,
+  .glass-input {
+    border: 1px solid hsl(var(--input));
+    border-radius: var(--radius);
+    background: hsl(var(--card));
+    transition:
+      background-color 150ms ease,
+      border-color 150ms ease,
+      color 150ms ease;
+  }
 
-    /* Prevent text selection on interactive elements */
-    button,
-    .cursor-pointer {
-      -webkit-user-select: none;
-      user-select: none;
-      -webkit-tap-highlight-color: transparent;
-    }
+  .glass-control:hover {
+    background: hsl(var(--secondary));
+  }
 
-    /* Ensure inputs zoom properly on iOS */
-    input,
-    textarea,
-    select {
-      font-size: 16px;
-    }
+  .glass-input:hover:not(:disabled):not([readonly]) {
+    border-color: hsl(var(--muted-foreground) / 0.55);
+  }
 
-    /* Hide scrollbars on mobile for cleaner look */
-    ::-webkit-scrollbar {
-      width: 0px;
-      height: 0px;
-    }
+  .glass-overlay {
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--popover));
+    box-shadow:
+      0 18px 44px -14px hsl(247 33% 16% / 0.28),
+      0 2px 6px hsl(247 33% 16% / 0.06);
+  }
+
+  .dark .glass-overlay {
+    box-shadow: 0 18px 44px -14px hsl(0 0% 0% / 0.7);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (forced-colors: active) {
+  nav [aria-current="page"],
+  .workspace-surface [aria-pressed="true"] {
+    outline: 1px solid Highlight;
+    outline-offset: -2px;
+  }
+
+  nav a:focus-visible,
+  .workspace-surface [role="button"]:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .glass-panel,
+  .glass-control,
+  .glass-overlay,
+  .glass-input {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    box-shadow: none;
+  }
+}
+
+@media (max-width: 767px) {
+  button,
+  .cursor-pointer {
+    -webkit-tap-highlight-color: transparent;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 1023px) {
+  .rooms-layout .glass-panel {
+    height: auto;
+    overflow: visible;
+  }
+
+  .rooms-layout .overflow-y-auto {
+    max-height: none;
+    overflow-y: visible;
   }
 }

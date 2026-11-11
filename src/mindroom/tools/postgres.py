@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="postgres",
+    file_access=ToolFileAccess.UNCONFINED,
     display_name="PostgreSQL",
     description="Query PostgreSQL databases - list tables, describe schemas, run SQL queries, and export data",
     category=ToolCategory.DEVELOPMENT,
@@ -21,14 +22,6 @@ if TYPE_CHECKING:
     icon="SiPostgresql",
     icon_color="text-blue-700",
     config_fields=[
-        ConfigField(
-            name="connection",
-            label="Connection",
-            type="text",
-            required=False,
-            default=None,
-            description="Programmatic only: pass an existing psycopg connection object (not usable from UI).",
-        ),
         ConfigField(
             name="host",
             label="Host",
@@ -73,7 +66,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["psycopg"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/postgres",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#postgres",
     function_names=(
         "describe_table",
         "export_table_to_path",

@@ -5,6 +5,9 @@ from typing import Any
 from unittest.mock import patch
 
 from backend.services import instances_data
+from backend.utils import paging
+
+from tests.fake_supabase import FakeQuery, FakeSupabase
 
 
 @dataclass
@@ -63,12 +66,12 @@ class StubSupabase:
 
 
 class FailingSupabase:
-    """Stub Supabase client whose queries always raise."""
+    """Stub Supabase client whose updates always raise."""
 
     def table(self, name: str) -> "FailingSupabase":  # noqa: ARG002
         return self
 
-    def __getattr__(self, name: str) -> Any:
+    def update(self, fields: dict[str, Any]) -> "FailingSupabase":  # noqa: ARG002
         msg = "supabase unavailable"
         raise RuntimeError(msg)
 
@@ -103,7 +106,7 @@ class TestGetOwnedInstance:
         assert instances_data.get_owned_instance(sb, 123, "acc-1") == ROW_A
         assert sb.calls == [
             ("table", "instances"),
-            ("select", "id,instance_id,subscription_id,account_id"),
+            ("select", "id,instance_id,subscription_id,account_id,lifecycle_stopped_at"),
             ("eq", ("instance_id", "123")),
             ("eq", ("account_id", "acc-1")),
             ("limit", 1),
@@ -131,18 +134,25 @@ class TestGetInstancesForAccount:
 
 
 class TestListInstances:
-    def test_selects_all_columns_by_default(self):
-        sb = StubSupabase([ROW_A, ROW_B])
-        assert instances_data.list_instances(sb) == [ROW_A, ROW_B]
-        assert ("select", "*") in sb.calls
+    def test_pages_past_the_row_limit_in_instance_order(self):
+        rows = [{"instance_id": n, "status": "running"} for n in (3, 1, 5, 2, 4)]
+        with patch.object(paging, "_PAGE_SIZE", 2):
+            listed = instances_data.list_instances(FakeSupabase({"instances": rows}), columns="instance_id")
+        assert [row["instance_id"] for row in listed] == [1, 2, 3, 4, 5]
 
-    def test_selects_column_subset(self):
-        sb = StubSupabase([{"status": "running"}])
-        assert instances_data.list_instances(sb, columns="status") == [{"status": "running"}]
-        assert ("select", "status") in sb.calls
+    def test_keeps_paging_past_a_page_shorter_than_requested(self):
+        rows = [{"instance_id": n} for n in range(1, 6)]
+        read_range = FakeQuery.range
+        # The server may cap a page below the requested size, so only an empty page ends the listing.
+        with (
+            patch.object(paging, "_PAGE_SIZE", 3),
+            patch.object(FakeQuery, "range", lambda query, start, end: read_range(query, start, min(end, start + 1))),
+        ):
+            listed = instances_data.list_instances(FakeSupabase({"instances": rows}))
+        assert [row["instance_id"] for row in listed] == [1, 2, 3, 4, 5]
 
-    def test_returns_empty_list_when_data_is_none(self):
-        assert instances_data.list_instances(StubSupabase(None)) == []
+    def test_returns_empty_list_when_table_is_empty(self):
+        assert instances_data.list_instances(FakeSupabase({})) == []
 
 
 class TestCreateInstance:
@@ -174,6 +184,13 @@ class TestUpdateInstance:
 
     def test_returns_empty_list_when_no_rows_matched(self):
         assert instances_data.update_instance(StubSupabase([]), "123", {"status": "error"}) == []
+
+    def test_expected_status_updates_only_a_row_still_in_that_status(self):
+        sb = StubSupabase([ROW_A])
+        instances_data.update_instance(sb, "123", {"status": "provisioning"}, expected_status="deprovisioned")
+        update_payload = next(payload for call, payload in sb.calls if call == "update")
+        assert update_payload["status"] == "provisioning"
+        assert ("eq", ("status", "deprovisioned")) in sb.calls
 
 
 class TestUpdateInstanceStatus:

@@ -6,6 +6,7 @@ import pytest
 
 from mindroom.matrix.message_builder import markdown_to_html
 from mindroom.tool_system.events import ensure_visible_tool_marker_spacing
+from tests.cpu_budget_helpers import cpu_budget
 
 # --- Core bug fix: tables without blank lines ---
 
@@ -37,6 +38,16 @@ def test_table_after_heading() -> None:
     html = markdown_to_html("## Results\n| K | V |\n| - | - |\n| a | b |")
     assert "<table>" in html
     assert "<h2>" in html
+
+
+def test_quoted_table_renders_at_every_streamed_prefix() -> None:
+    """A streamed quoted table cut off on a bare quote marker renders instead of raising IndexError."""
+    quoted_table = "> | A | B |\n> | - | - |\n> | 1 | 2 |\n>\n> after"
+    for end in range(1, len(quoted_table) + 1):
+        assert markdown_to_html(quoted_table[:end]).startswith("<blockquote>")
+    html = markdown_to_html("> | A | B |\n> | - | - |\n> | 1 | 2 |\n>")
+    assert "<td>1</td>" in html
+    assert html.endswith("</table>\n</blockquote>\n")
 
 
 # --- nl2br replacement (breaks: True) ---
@@ -216,6 +227,27 @@ def test_unsupported_tags_escaped() -> None:
     assert "<tool>" not in html
 
 
+def test_tag_followed_by_long_whitespace_renders_within_a_cpu_budget() -> None:
+    """A line opening a tag and trailing off into whitespace classifies in linear time."""
+    for line in ("<a" + " " * 1_000, "<a" + " " * 60_000, "<a" + " " * 60_000 + "x"):
+        with cpu_budget(0.5):
+            html = markdown_to_html(f"Title\n\n{line}\n<custom   x>\n")
+        assert "&lt;a" in html
+        assert "&lt;custom   x&gt;" in html
+
+
+def test_many_tag_openers_before_a_closing_bracket_render_within_a_cpu_budget() -> None:
+    """Tag openers closed by a later ``>`` on the same line are classified in linear time."""
+    openers = "<a" * 32_000
+    for text, expected in (
+        (f"<div {openers}>x", "<div>x"),
+        (f'hello <span title="{openers}">x</span>', "<p>hello <span>x</span></p>\n"),
+    ):
+        with cpu_budget(0.5):
+            html = markdown_to_html(text)
+        assert html == expected
+
+
 def test_supported_tags_pass_through() -> None:
     """Known Matrix tags are preserved."""
     html = markdown_to_html("<code>example</code>")
@@ -346,6 +378,37 @@ def test_unsafe_raw_html_attributes_are_stripped() -> None:
     assert 'alt="safe"' in html
     assert 'src="javascript:alert(1)"' not in html
     assert "onerror=" not in html
+
+
+@pytest.mark.parametrize(
+    ("markdown", "expected"),
+    [
+        ("[open](obsidian://open?vault=notes)", '<p><a href="obsidian://open?vault=notes">open</a></p>\n'),
+        (
+            "[open](readdlespark://bl=QTpqb2huQGV4YW1wbGUuY29tO0lEOjxhYmNAeC5jb20+)",
+            '<p><a href="readdlespark://bl=QTpqb2huQGV4YW1wbGUuY29tO0lEOjxhYmNAeC5jb20+">open</a></p>\n',
+        ),
+        ("[open](OBSIDIAN://open)", '<p><a href="OBSIDIAN://open">open</a></p>\n'),
+        ('<a href="&#111;bsidian://open">open</a>', '<p><a href="obsidian://open">open</a></p>\n'),
+        ('<a href=" readdlespark://bl=abc ">open</a>', '<p><a href="readdlespark://bl=abc">open</a></p>\n'),
+    ],
+)
+def test_app_links_keep_their_href(markdown: str, expected: str) -> None:
+    """Links to the apps MindRoom Chat opens by default stay clickable."""
+    assert markdown_to_html(markdown) == expected
+
+
+@pytest.mark.parametrize(
+    ("markdown", "expected"),
+    [
+        ("[open](someapp://x)", "<p><a>open</a></p>\n"),
+        ("![x](readdlespark://bl=abc)", '<p><img alt="x"></p>\n'),
+        ('<img src="obsidian://open" alt="x">', '<img alt="x">'),
+    ],
+)
+def test_other_app_urls_are_dropped(markdown: str, expected: str) -> None:
+    """Unknown schemes lose their link, and app schemes never become image sources."""
+    assert markdown_to_html(markdown) == expected
 
 
 def test_data_uri_attributes_are_stripped() -> None:

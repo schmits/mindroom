@@ -9,7 +9,7 @@ import signal
 import sqlite3
 import subprocess
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO, StringIO
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, Mock, patch
@@ -17,45 +17,75 @@ from unittest.mock import AsyncMock, Mock, patch
 import nio
 import pytest
 import structlog
-from agno.run.base import RunStatus
 
 from mindroom.ai_run_metadata import build_ai_run_metadata_content
 from mindroom.cli import main as cli_main
 from mindroom.config.main import Config
 from mindroom.constants import AI_RUN_METADATA_KEY
-from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps
-from mindroom.conversation_state_writer import ConversationStateWriter
 from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_replay_guard import has_newer_unresponded_in_thread, has_newer_unresponded_journal_thread_event
-from mindroom.event_journal import DeliveryStage, EventClass, EventJournalStore, EventKind, InboundEvent
-from mindroom.handled_turns import HandledTurnLedger
+from mindroom.event_journal import (
+    DeliveryStage,
+    EventClass,
+    EventJournalStore,
+    EventKind,
+    InboundEvent,
+    journal,
+    turn_rows,
+)
 from mindroom.journal_dispatch import JournalCallbacks, JournalDispatcher
+from mindroom.llm.runs import RunStatus
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.message_builder import build_matrix_edit_content
-from mindroom.tool_system.runtime_context import ToolRuntimeSupport
 from mindroom.turn_record import RevisionReplay, TurnRecord
-from mindroom.turn_store import TurnStore, TurnStoreDeps
 from scripts.testing import fuzz_live_matrix as live_fuzz
+from tests.conftest import make_ingress_facts
+from tests.journal_helpers import admit_room_event
+from tests.test_live_matrix_fuzz import _write_ledger
+from tests.test_turn_store import _redact
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
     from pathlib import Path
 
     from mindroom.event_journal import PrincipalStore
+    from mindroom.event_journal.backend import Transaction
 
 
-def _redaction_observer_store() -> TurnStore:
-    """Expose typed owner dependencies while isolating the original mutation boundary."""
-    resolver_deps = Mock(spec=ConversationResolverDeps)
-    resolver_deps.matrix_id = MatrixID.parse("@general:example")
-    deps = Mock(spec=TurnStoreDeps)
-    deps.agent_name = "general"
-    deps.resolver = ConversationResolver(resolver_deps)
-    store = object.__new__(TurnStore)
-    store.deps = deps
-    store._ledger = Mock(spec=HandledTurnLedger)
-    store._ledger.all_turn_records.return_value = ()
-    return store
+_TURN_TABLES = ("turn_revisions", "turn_aliases", "turn_sources", "turns")
+
+
+def _forget_turns(transaction: Transaction, event_ids: tuple[str, ...]) -> None:
+    """Delete every stored turn one of these events is a source of, as if it was never written."""
+    keys = {
+        str(row["turn_key"])
+        for event_id in event_ids
+        for row in transaction.fetchall(
+            "SELECT turn_key FROM turn_sources WHERE agent_name = 'general' AND event_id = ?",
+            (event_id,),
+        )
+    }
+    for key in keys:
+        for table in _TURN_TABLES:
+            transaction.execute(f"DELETE FROM {table} WHERE agent_name = 'general' AND turn_key = ?", (key,))  # noqa: S608
+
+
+async def _put_turn(journal_store: EventJournalStore, record: TurnRecord) -> None:
+    """Store one turn exactly as given, in place of any turn its sources had."""
+
+    def put(transaction: Transaction) -> None:
+        _forget_turns(transaction, record.source_event_ids)
+        turn_rows.insert_turn(transaction, "general", record, room_id="!room:example", updated_at=1.0)
+
+    await journal_store.backend.write(put)
+
+
+def _turn_sql(event_id: str, change: str) -> str:
+    """Return SQL that changes the stored turn ``event_id`` is a source of."""
+    return (
+        f"{change} WHERE agent_name = 'general' AND turn_key = "  # noqa: S608
+        f"(SELECT turn_key FROM turn_sources WHERE agent_name = 'general' AND event_id = '{event_id}')"
+    )
 
 
 @dataclass
@@ -90,10 +120,14 @@ async def _observe_guard_decision(
         event,
         server_timestamp=event["origin_server_ts"],
     )
+
+    async def is_handled(sources: Collection[str]) -> frozenset[str]:
+        return frozenset(sources) & handled
+
     if use_history:
-        skipped = has_newer_unresponded_in_thread(
+        skipped = await has_newer_unresponded_in_thread(
             prepared,
-            event["sender"],
+            (event["sender"], None),
             [
                 ResolvedVisibleMessage(
                     newer["sender"],
@@ -107,24 +141,23 @@ async def _observe_guard_decision(
                 for newer in history
             ],
             may_be_superseded_by_newer_requester_turn=True,
-            requester_user_id_for_event=lambda sender, _: sender,
-            is_visible_router_voice_echo=lambda *_: False,
-            sender_is_trusted_for_ingress_metadata=lambda _: False,
-            is_handled=lambda source: source in handled,
+            pending_turns=principal,
+            classify=lambda sender, _source: make_ingress_facts(sender),
+            is_handled=is_handled,
+            for_another_participant=AsyncMock(return_value=False),
             logger=logger,
         )
     else:
         skipped = await has_newer_unresponded_journal_thread_event(
             room_id=event["room_id"],
             event=prepared,
-            requester_user_id=event["sender"],
+            run_identity=(event["sender"], None),
             thread_id="$root",
             may_be_superseded_by_newer_requester_turn=True,
             pending_turns=principal,
-            requester_user_id_for_event=lambda sender, _: sender,
-            is_visible_router_voice_echo=lambda *_: False,
-            sender_is_trusted_for_ingress_metadata=lambda _: False,
-            is_handled=lambda source: source in handled,
+            classify=lambda sender, _source: make_ingress_facts(sender),
+            is_handled=is_handled,
+            for_another_participant=AsyncMock(return_value=False),
             logger=logger,
         )
     assert skipped
@@ -204,11 +237,7 @@ async def _supersession_case(
     new = TurnRecord.create(("$new",), response_event_id="$new-reply", completed=True)
     records = ([old] if old_record else []) + ([] if interrupt_settlement else [new])
     for record in records:
-        await journal.turn_records("general").upsert(
-            index_event_ids=record.indexed_event_ids,
-            anchor_event_id=record.anchor_event_id,
-            record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-        )
+        await _put_turn(journal, record)
     responses = [] if interrupt_settlement else [("$new", "$new-reply", 2, "completed")]
     if visible_old:
         responses.append(("$old", "$old-reply", 1, "error"))
@@ -262,7 +291,6 @@ async def _supersession_case(
     )
     client.paginate_room = AsyncMock(side_effect=lambda _: list(events.values()))
     oracle.observed_markers_for = auditor.observed_markers_for
-    oracle.source_current_markers = {"$old": "MRK[src=op:1;rev=orig]", "$new": "MRK[src=op:2;rev=orig]"}
     return _SupersessionCase(journal, oracle, auditor, events)
 
 
@@ -293,6 +321,66 @@ async def test_supersession_uses_real_settled_journal_owner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("live_poll", [False, True])
+@pytest.mark.parametrize("redacted_source", ["$old", "$new"])
+@pytest.mark.parametrize("defect", [None, "missing_guard", "incomplete_anchor"])
+async def test_supersession_survives_later_source_redaction(
+    tmp_path: Path,
+    live_poll: bool,
+    redacted_source: str,
+    defect: str | None,
+) -> None:
+    """A later tombstone cannot erase proven supersession or excuse missing proof."""
+    case = await _supersession_case(tmp_path, visible_old=False, old_record=False, plain_reply=True)
+    try:
+        case.oracle.refresh_ledger_attributions(min_interval=0)
+        assert case.oracle.unsettled_required_sources() == []
+        source = case.events[redacted_source]
+        sent = live_fuzz._SentRecord(
+            redacted_source,
+            "!room:example",
+            "m.room.message",
+            sender=source["sender"],
+            content=source["content"],
+        )
+        source["content"] = {}
+        source["unsigned"] = {"redacted_because": {"event_id": "$redaction"}}
+        await _redact(case.journal, redacted_source, "!room:example", agent_name="general")
+        if defect == "missing_guard":
+            assert case.oracle.log_path is not None
+            case.oracle.log_path.write_text("")
+        elif defect == "incomplete_anchor":
+            # Turn writes never take completion back; deliberately corrupt the stored proof.
+            await case.journal.backend.write(
+                lambda tx: tx.execute(_turn_sql("$new", "UPDATE turns SET completed = FALSE")),
+            )
+        case.oracle.sent_records = [sent]
+        case.oracle.canonical_events = {event_id: dict(event) for event_id, event in case.events.items()}
+        if live_poll:
+            case.oracle.refresh_ledger_attributions(min_interval=0)
+            assert ("$old" in case.oracle.supersession_proofs) is (defect is None)
+            assert ("$old" in case.oracle.unsettled_required_sources()) is (defect is not None)
+        elif defect is None:
+            result = await case.auditor.audit(
+                room_ids=("!room:example",),
+                sent_records=[sent],
+                redacted_targets={redacted_source: "$redaction"},
+            )
+            assert result["ledger_superseded_sources"] == 1
+            assert result["completed_final_bodies"] == 1
+        else:
+            with pytest.raises(AssertionError):
+                await case.auditor.audit(
+                    room_ids=("!room:example",),
+                    sent_records=[sent],
+                    redacted_targets={redacted_source: "$redaction"},
+                )
+        assert "$old" not in case.oracle.optional_sources
+    finally:
+        await case.journal.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "defect",
     [
@@ -315,7 +403,6 @@ async def test_supersession_uses_real_settled_journal_owner(
         "streaming_anchor",
         "wrong_anchor_marker",
         "malformed_ledger",
-        "conflicting_ledger",
         "partial_journal",
         "unacknowledged_final",
         "pending_edit",
@@ -323,17 +410,15 @@ async def test_supersession_uses_real_settled_journal_owner(
         "canonical_streaming_old",
         "missing_old_attribution",
         "duplicate_reply",
-        "unrelated_recovery",
-        "duplicate_relay",
+        "router_relay_answer",
         "wrong_old_marker",
-        "pending_cleanup",
         "wrong_log_thread",
         "truncated_log",
         "unproved_owned_source",
         "misplaced_final",
     ],
 )
-async def test_supersession_rejects_missing_or_foreign_ownership(tmp_path: Path, defect: str) -> None:  # noqa: C901, PLR0912, PLR0915
+async def test_supersession_rejects_missing_or_foreign_ownership(tmp_path: Path, defect: str) -> None:  # noqa: C901, PLR0912
     """Each missing proof fact must leave the old generation or its independent debt failing."""
     case = await _supersession_case(tmp_path, visible_old=True)
     ledger = tmp_path / "event_journal.db"
@@ -355,7 +440,7 @@ async def test_supersession_rejects_missing_or_foreign_ownership(tmp_path: Path,
             "wrong_log_source": log.replace("$old", "$elsewhere"),
             "wrong_log_newer": log.replace("$new", "$elsewhere"),
             "embedded_log": "message_body='" + log + "'",
-            "malformed_log": log.replace("skipped_event_id", "skipped_event"),
+            "malformed_log": log.replace("older_event_id", "older_event"),
             "wrong_log_thread": log.replace("$root", "$elsewhere"),
             "truncated_log": log.rstrip("\n"),
         }[defect]
@@ -368,35 +453,20 @@ async def test_supersession_rejects_missing_or_foreign_ownership(tmp_path: Path,
         "wrong_requester": "UPDATE journal_events SET sender='@other:example' WHERE event_id='$new'",
         "wrong_room": "UPDATE journal_events SET room_id='!other:example' WHERE event_id='$new'",
         "wrong_timestamp": "UPDATE journal_events SET origin_server_ts=9 WHERE event_id='$new'",
-        "no_anchor": "DELETE FROM turn_records WHERE index_event_id='$new'",
-        "malformed_ledger": "UPDATE turn_records SET record_json='broken' WHERE index_event_id='$old'",
+        "malformed_ledger": _turn_sql("$old", "UPDATE turns SET history_scope_json = '{'"),
+        "unfinished_anchor": _turn_sql("$new", "UPDATE turns SET completed = FALSE"),
         "partial_journal": "DROP TABLE journal_events",
-        "missing_old_attribution": "DELETE FROM turn_records WHERE index_event_id='$old'",
     }
     if defect in updates:
         with closing(sqlite3.connect(ledger)) as database:
             database.execute(updates[defect])
             database.commit()
-    if defect in {"unfinished_anchor", "conflicting_ledger", "pending_cleanup", "unproved_owned_source"}:
-        records = live_fuzz.read_ledger_records(ledger, include_incomplete=True)
-        record = records["$old" if defect in {"pending_cleanup", "unproved_owned_source"} else "$new"]
-        raw = live_fuzz.TurnRecordCodec._to_ledger_record(record)
-        if defect == "unfinished_anchor":
-            raw["completed"] = False
-        elif defect == "pending_cleanup":
-            raw["revision_replay"] = {
-                "$edit": RevisionReplay("$old", 100, redacted=True, cleanup_pending=True).to_record(),
-            }
-        elif defect == "unproved_owned_source":
-            raw["source_event_ids"] = ["$old", "$unproved"]
-        else:
-            raw["source_event_ids"] = ["$new", "$old"]
-        with closing(sqlite3.connect(ledger)) as database:
-            database.execute(
-                "UPDATE turn_records SET record_json=? WHERE index_event_id=?",
-                (json.dumps(raw), record.anchor_event_id),
-            )
-            database.commit()
+    if defect in {"no_anchor", "missing_old_attribution"}:
+        forgotten = "$new" if defect == "no_anchor" else "$old"
+        await case.journal.backend.write(lambda tx: _forget_turns(tx, (forgotten,)))
+    if defect == "unproved_owned_source":
+        record = live_fuzz.read_ledger_records(ledger, include_incomplete=True)["$old"]
+        await _put_turn(case.journal, replace(record, source_event_ids=("$old", "$unproved"), turn_key=None))
     if defect in {"unacknowledged_final", "misplaced_final"}:
         await case.journal.principal("general@@agent:example").enqueue_matrix_delivery(
             delivery_id="$old",
@@ -423,33 +493,31 @@ async def test_supersession_rejects_missing_or_foreign_ownership(tmp_path: Path,
         case.auditor.pending_edit_markers = {"$old": {"$edit": "new revision"}}
     if defect == "duplicate_reply":
         case.events["$duplicate"] = {**case.events["$old-reply"], "event_id": "$duplicate"}
-    if defect in {"unrelated_recovery", "duplicate_relay"}:
-        case.oracle.internal_relay_senders = frozenset({"@router:example"})
-        for relay in ("$relay", "$duplicate-relay") if defect == "duplicate_relay" else ("$relay",):
-            case.events[relay] = {
-                **case.events["$old-reply"],
-                "event_id": relay,
-                "sender": "@router:example",
-                "content": {
-                    "msgtype": "m.text",
-                    "body": live_fuzz.AUTO_RESUME_MESSAGE,
-                    live_fuzz.SOURCE_KIND_KEY: live_fuzz.TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
-                    "m.relates_to": {
-                        "rel_type": "m.thread",
-                        "event_id": "$root",
-                        "m.in_reply_to": {"event_id": "$old-reply"},
-                    },
+    if defect == "router_relay_answer":
+        # No router message continues interrupted work, so an agent answer to one is a wrong reply.
+        case.events["$relay"] = {
+            **case.events["$old-reply"],
+            "event_id": "$relay",
+            "sender": "@router:example",
+            "content": {
+                "msgtype": "m.text",
+                "body": "@general continue",
+                "m.relates_to": {
+                    "rel_type": "m.thread",
+                    "event_id": "$root",
+                    "m.in_reply_to": {"event_id": "$old-reply"},
                 },
-            }
-        case.events["$unrelated"] = {
+            },
+        }
+        case.events["$relay-answer"] = {
             **case.events["$new-reply"],
-            "event_id": "$unrelated",
+            "event_id": "$relay-answer",
             "content": {
                 **case.events["$new-reply"]["content"],
                 "m.relates_to": {
                     "rel_type": "m.thread",
                     "event_id": "$root",
-                    "m.in_reply_to": {"event_id": "$other-relay"},
+                    "m.in_reply_to": {"event_id": "$relay"},
                 },
             },
         }
@@ -465,11 +533,7 @@ async def test_supersession_keeps_completed_old_generation(tmp_path: Path) -> No
     """A completed old response remains completed generation despite an earlier skip observation."""
     case = await _supersession_case(tmp_path, visible_old=True)
     record = TurnRecord.create(("$old",), response_event_id="$old-reply", completed=True)
-    await case.journal.turn_records("general").upsert(
-        index_event_ids=record.indexed_event_ids,
-        anchor_event_id=record.anchor_event_id,
-        record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-    )
+    await _put_turn(case.journal, record)
     case.events["$old-reply"]["content"]["body"] = "LIVE-FUZZ call=1 END call=1"
     case.events["$old-reply"]["content"][live_fuzz.STREAM_STATUS_KEY] = "completed"
     try:
@@ -487,6 +551,7 @@ def _blocking_supersession_final(case: _SupersessionCase) -> dict[str, Any]:
         "msgtype": "m.text",
         "body": "LIVE-FUZZ call=2 END call=2",
         **build_ai_run_metadata_content(
+            prices={},
             config=Config(models={}),
             model_name="default",
             run_id="run-new",
@@ -494,6 +559,7 @@ def _blocking_supersession_final(case: _SupersessionCase) -> dict[str, Any]:
             status=RunStatus.completed,
             model=live_fuzz.MODEL_ID,
             model_provider="openai",
+            tool_count=0,
         ),
     }
     final = {
@@ -679,10 +745,66 @@ async def test_supersession_cannot_borrow_blocking_terminal_metadata(
 
 
 @pytest.mark.asyncio
+async def test_ledger_refresh_settles_edit_debts_before_the_next_proof(tmp_path: Path) -> None:
+    """Edit debts settle on every ledger refresh, so a reply wait can unblock a supersession whose anchor was edited."""
+    case = await _supersession_case(tmp_path, visible_old=False, old_record=False)
+    seen: list[dict[str, Any]] = []
+    case.oracle.after_ledger_refresh = lambda: seen.append(dict(case.oracle.supersession_proofs))
+    case.oracle.canonical_events = {event_id: dict(event) for event_id, event in case.events.items()}
+    try:
+        case.oracle.refresh_ledger_attributions(min_interval=0)
+        assert len(seen) == 1
+    finally:
+        await case.journal.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["declined", "edit_unsettled", "old_answered"])
+async def test_settled_edit_of_superseded_source_is_a_declined_no_op(tmp_path: Path, variant: str) -> None:
+    """MindRoom settles an edit of a message a newer one followed without regenerating anything, so it owes nothing."""
+    case = await _supersession_case(tmp_path, visible_old=False, old_record=variant == "old_answered")
+    principal = case.journal.principal("general@@agent:example")
+    edit = {
+        **case.events["$old"],
+        "event_id": "$edit",
+        "origin_server_ts": 25,
+        "content": {
+            "msgtype": "m.text",
+            "body": "* edit",
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$old"},
+        },
+    }
+    await principal.admit(
+        InboundEvent(
+            "$edit",
+            "!room:example",
+            "$root",
+            EventKind.MESSAGE,
+            EventClass.ACTIONABLE,
+            "@user:example",
+            25,
+            edit,
+        ),
+    )
+    if variant != "edit_unsettled":
+        await principal.settle_many(("$edit",))
+    case.oracle.pending_edit_markers = {"$old": {"$edit": "MRK[src=op:1;rev=edit:3]"}}
+    case.oracle.canonical_events = {event_id: dict(event) for event_id, event in case.events.items()}
+    try:
+        case.oracle.refresh_ledger_attributions(min_interval=0)
+        # An older message's edit is declined whether MindRoom answered that message or superseded it.
+        assert ("$old" in case.oracle.declined_edit_sources) is (variant != "edit_unsettled")
+        # A declined edit owes nothing, so it no longer blocks proof that MindRoom superseded the message.
+        assert ("$old" in case.oracle.supersession_proofs) is (variant != "edit_unsettled")
+    finally:
+        await case.journal.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("live_poll", [False, True])
 @pytest.mark.parametrize(
     "defect",
-    ["unacknowledged_final", "pending_edit", "wrong_marker", "unfinished_turn", "pending_cleanup", "wrong_source"],
+    ["unacknowledged_final", "pending_edit", "wrong_marker", "unfinished_turn", "wrong_source"],
 )
 async def test_supersession_blocking_terminal_keeps_independent_ownership_checks(
     tmp_path: Path,
@@ -715,21 +837,10 @@ async def test_supersession_blocking_terminal_keeps_independent_ownership_checks
             ("$new",),
             response_event_id="$new-reply",
             completed=defect != "unfinished_turn",
-            revision_replay={"$edit": RevisionReplay("$new", 100, redacted=True, cleanup_pending=True).to_record()}
-            if defect == "pending_cleanup"
-            else None,
         )
-        await case.journal.turn_records("general").forget(index_event_ids=("$new",))
-        await case.journal.turn_records("general").upsert(
-            index_event_ids=record.indexed_event_ids,
-            anchor_event_id=record.anchor_event_id,
-            record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-        )
+        await _put_turn(case.journal, record)
         stored = live_fuzz.read_ledger_records(tmp_path / "event_journal.db", include_incomplete=True)["$new"]
         assert stored.completed is (defect != "unfinished_turn")
-        if defect == "pending_cleanup":
-            assert stored.revision_replay is not None
-            assert stored.revision_replay["$edit"].cleanup_pending
     try:
         await _assert_terminal_supersession(case, live_poll=live_poll, accepted=False)
     finally:
@@ -740,15 +851,13 @@ async def test_supersession_blocking_terminal_keeps_independent_ownership_checks
 @pytest.mark.parametrize("live_poll", [False, True])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("cleanup_kind", ["revision", "source"])
-@pytest.mark.parametrize("pending", [False, True])
-async def test_supersession_completed_anchor_requires_settled_cleanup(
+async def test_supersession_completed_anchor_accepts_redaction_tombstones(
     tmp_path: Path,
     live_poll: bool,
     streaming: bool,
     cleanup_kind: str,
-    pending: bool,
 ) -> None:
-    """Both terminal forms need an anchor free of authoritative revision and source cleanup debt."""
+    """Both terminal forms accept an anchor that carries a revision or source tombstone."""
     case = await _supersession_case(tmp_path, visible_old=False, old_record=False)
     final = _blocking_supersession_final(case)
     if streaming:
@@ -758,28 +867,20 @@ async def test_supersession_completed_anchor_requires_settled_cleanup(
         response_event_id="$new-reply",
         completed=True,
         discovery_event_ids=("$removed",) if cleanup_kind == "source" else (),
-        redacted_source_event_ids=("$removed",) if cleanup_kind == "source" else (),
-        pending_redaction_cleanup_event_ids=("$removed",) if pending and cleanup_kind == "source" else (),
-        revision_replay={"$edit": RevisionReplay("$new", 100, redacted=True, cleanup_pending=pending).to_record()}
-        if cleanup_kind == "revision"
-        else None,
+        revision_replay={"$edit": RevisionReplay("$new", 100)} if cleanup_kind == "revision" else None,
     )
-    store = case.journal.turn_records("general")
-    await store.forget(index_event_ids=("$new",))
-    await store.upsert(
-        index_event_ids=record.indexed_event_ids,
-        anchor_event_id=record.anchor_event_id,
-        record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-    )
+    await _put_turn(case.journal, record)
+    deleted = "$edit" if cleanup_kind == "revision" else "$removed"
+    await _redact(case.journal, deleted, "!room:example", agent_name="general")
     stored = live_fuzz.read_ledger_records(tmp_path / "event_journal.db", include_incomplete=True)["$new"]
     assert stored.completed
     if cleanup_kind == "revision":
         assert stored.revision_replay is not None
-        assert stored.revision_replay["$edit"].cleanup_pending is pending
+        assert "$edit" in stored.revision_replay
     else:
-        assert stored.pending_redaction_cleanup_event_ids == (("$removed",) if pending else ())
+        assert stored.discovery_event_ids == ("$removed",)
     try:
-        await _assert_terminal_supersession(case, live_poll=live_poll, accepted=not pending)
+        await _assert_terminal_supersession(case, live_poll=live_poll, accepted=True)
     finally:
         await case.journal.close()
 
@@ -844,7 +945,6 @@ async def test_supersession_terminal_edit_must_belong_to_response_room(tmp_path:
     }
     original["content"][live_fuzz.STREAM_STATUS_KEY] = "streaming"
     original["content"]["body"] = "LIVE-FUZZ call=1 END call=1"
-    case.auditor.source_current_markers = dict(case.oracle.source_current_markers)
     try:
         case.auditor._observe_supersession(case.events)
         assert ("$old" in case.auditor.supersession_proofs) is not foreign_room
@@ -902,11 +1002,7 @@ async def _complete_supersession_source(case: _SupersessionCase, source: str, ca
     """Complete a fixture source through actual journal/turn owners and simulated Matrix delivery."""
     response_id = f"{source}-reply"
     record = TurnRecord.create((source,), response_event_id=response_id, completed=True)
-    await case.journal.turn_records("general").upsert(
-        index_event_ids=record.indexed_event_ids,
-        anchor_event_id=record.anchor_event_id,
-        record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-    )
+    await _put_turn(case.journal, record)
     await case.journal.principal("general@@agent:example").settle_many((source,))
     case.events[response_id] = {
         **case.events[source],
@@ -975,17 +1071,7 @@ async def _add_redacted_completed_source(
     case.oracle.expect("op:3", "$redacted", thread=1)
     await _complete_supersession_source(case, "$redacted", 3)
     case.events["$redacted-reply"]["content"]["m.relates_to"]["event_id"] = "$ancestor"
-    tombstone = TurnRecord.create(
-        ("$redacted",),
-        redacted_source_event_ids=("$redacted",),
-        response_event_id="$redacted-reply",
-        completed=True,
-    )
-    await case.journal.turn_records("general").upsert(
-        index_event_ids=tombstone.indexed_event_ids,
-        anchor_event_id=tombstone.anchor_event_id,
-        record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(tombstone)),
-    )
+    await _redact(case.journal, "$redacted", "!room:example", agent_name="general")
     redacted = {"$redacted": "$redaction"}
     if ancestry == "multi_hop":
         redacted["$bridge"] = "$bridge-redaction"
@@ -1088,7 +1174,6 @@ async def test_supersession_live_runner_retains_records_added_after_construction
     runner.oracle.ledger_path = case.oracle.ledger_path
     runner.oracle.expected_body_for = case.oracle.expected_body_for
     runner.oracle.observed_markers_for = case.oracle.observed_markers_for
-    runner.source_current_markers.update(case.oracle.source_current_markers)
     for source, logical in case.oracle.expected_sources.items():
         runner.oracle.expect(logical, source, thread=case.oracle.source_threads[source])
     for event in case.events.values():
@@ -1244,7 +1329,7 @@ async def test_supersession_retry_candidates_do_not_promote_invalid_observations
     invalid_record = {
         "unknown_successor": positive.replace("$new", "$foreign"),
         "wrong_thread": positive.replace("$root", "$foreign"),
-        "malformed": positive.replace("skipped_event_id", "skipped_event"),
+        "malformed": positive.replace("older_event_id", "older_event"),
     }[invalid]
     case.oracle.log_path.write_text((positive if valid_candidate else "") + invalid_record)
     try:
@@ -1286,24 +1371,17 @@ async def test_supersession_forward_chain_requires_every_exact_link(tmp_path: Pa
     middle = TurnRecord.create(("$new",), response_event_id="$new-reply", completed=False)
     last = TurnRecord.create(("$last",), response_event_id="$last-reply", completed=True)
     # Replace the fixture's completed successor with the crash-time unfinished owner.
-    # Production correctly refuses to downgrade completion through upsert.
-    with closing(sqlite3.connect(tmp_path / "event_journal.db")) as database:
-        database.execute("DELETE FROM turn_records WHERE index_event_id='$new'")
-        database.commit()
+    # Turn writes never take completion back, so the stored turn is replaced outright.
     for record in (middle, last):
-        await case.journal.turn_records("general").upsert(
-            index_event_ids=record.indexed_event_ids,
-            anchor_event_id=record.anchor_event_id,
-            record_json=json.dumps(live_fuzz.TurnRecordCodec._to_ledger_record(record)),
-        )
+        await _put_turn(case.journal, record)
     output = StringIO()
     logger = structlog.wrap_logger(
         structlog.PrintLogger(file=output),
         processors=[structlog.dev.ConsoleRenderer(colors=True)],
     ).bind(agent="general", logger="mindroom.bot")
-    assert has_newer_unresponded_in_thread(
+    assert await has_newer_unresponded_in_thread(
         PreparedIngress("@user:example", "$new", "new", case.events["$new"], server_timestamp=20),
-        "@user:example",
+        ("@user:example", None),
         [
             ResolvedVisibleMessage(
                 "@user:example",
@@ -1316,10 +1394,10 @@ async def test_supersession_forward_chain_requires_every_exact_link(tmp_path: Pa
             ),
         ],
         may_be_superseded_by_newer_requester_turn=True,
-        requester_user_id_for_event=lambda sender, _: sender,
-        is_visible_router_voice_echo=lambda *_: False,
-        sender_is_trusted_for_ingress_metadata=lambda _: False,
-        is_handled=lambda _: False,
+        pending_turns=principal,
+        classify=lambda sender, _source: make_ingress_facts(sender),
+        is_handled=AsyncMock(return_value=frozenset()),
+        for_another_participant=AsyncMock(return_value=False),
         logger=cast("structlog.stdlib.BoundLogger", logger),
     )
     await JournalDispatcher(
@@ -1359,34 +1437,59 @@ async def test_supersession_forward_chain_requires_every_exact_link(tmp_path: Pa
         await case.journal.close()
 
 
+async def _observer_journal(tmp_path: Path) -> Path:
+    """Return a journal in which the agent's login has state in the room, as its first sync leaves it."""
+    path = tmp_path / "journal.db"
+    journal_store = EventJournalStore.open_sqlite(path)
+    try:
+        await admit_room_event(journal_store.principal("general@@general:example"), "!room:example", "$edit")
+    finally:
+        await journal_store.close()
+    return path
+
+
+def _redact_through_observer(path: Path) -> None:
+    """Run the agent-wide redaction write for ``$edit`` in one committed transaction, as admission runs it."""
+    with closing(sqlite3.connect(path)) as connection:
+        journal.redact_for_agent(
+            live_fuzz.JournalSqlTransaction(connection),
+            "general",
+            room_id="!room:example",
+            event_id="$edit",
+            receipt_order=0,
+        )
+        connection.commit()
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["return", "error", "cancel", "append_failure", "missing_file"])
+@pytest.mark.parametrize("outcome", ["return", "error", "append_failure", "missing_file"])
 async def test_runtime_redaction_observer_records_before_original(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     outcome: str,
 ) -> None:
     """Real installed wrapper records synchronously and preserves the original boundary."""
+    database = await _observer_journal(tmp_path)
     path = tmp_path / "entries.jsonl"
     path.touch()
-    store = _redaction_observer_store()
-    monkeypatch.setattr(TurnStore, "is_revision_redacted", lambda _self, _target: False)
     calls: list[str] = []
     error = RuntimeError("original mutation failed")
-    cancelled = asyncio.CancelledError("original cancelled")
-    result = TurnRecord.create(("$edit",), completed=False)
 
-    async def original(self: TurnStore, target: str) -> TurnRecord:
-        assert self is store
-        assert json.loads(path.read_text())["target_event_id"] == target
-        calls.append(target)
+    def original(
+        _transaction: Transaction,
+        agent_name: str,
+        *,
+        room_id: str,
+        event_id: str,
+        receipt_order: int,
+    ) -> None:
+        assert (agent_name, room_id, receipt_order) == ("general", "!room:example", 0)
+        assert json.loads(path.read_text())["target_event_id"] == event_id
+        calls.append(event_id)
         if outcome == "error":
             raise error
-        if outcome == "cancel":
-            raise cancelled
-        return result
 
-    monkeypatch.setattr(TurnStore, "mark_source_redacted", original)
+    monkeypatch.setattr(journal, "redact_for_agent", original)
     monkeypatch.setattr(live_fuzz.time, "monotonic_ns", lambda: 123)
     live_fuzz._install_runtime_redaction_observer(path)
     if outcome in {"append_failure", "missing_file"}:
@@ -1394,11 +1497,15 @@ async def test_runtime_redaction_observer_records_before_original(
         if outcome == "append_failure":
             path.mkdir()
         with pytest.raises(SystemExit, match="redaction observation"):
-            store.mark_source_redacted("$edit").close()
+            _redact_through_observer(database)
         assert not calls
         return
-    operation = store.mark_source_redacted("$edit")
-    assert not calls
+    if outcome == "error":
+        with pytest.raises(RuntimeError) as caught:
+            _redact_through_observer(database)
+        assert caught.value is error
+    else:
+        _redact_through_observer(database)
     assert json.loads(path.read_text()) == {
         "agent_name": "general",
         "principal_id": "general@@general:example",
@@ -1406,43 +1513,33 @@ async def test_runtime_redaction_observer_records_before_original(
         "monotonic_ns": 123,
         "already_redacted": False,
     }
-    if outcome in {"error", "cancel"}:
-        with pytest.raises(type(error if outcome == "error" else cancelled)) as caught:
-            await operation
-        assert caught.value is (error if outcome == "error" else cancelled)
-    else:
-        assert await operation is result
     assert calls == ["$edit"]
 
 
-def test_real_runtime_child_installs_observer_across_generations(
+@pytest.mark.asyncio
+async def test_real_runtime_child_installs_observer_across_generations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Child attests installation only after installing; restart retains prior entries and model calls."""
+    database = await _observer_journal(tmp_path)
     path = tmp_path / "entries.jsonl"
     path.touch()
     attestation = tmp_path / "attestation.json"
-    store = _redaction_observer_store()
-    generation = 0
-
-    async def original(self: TurnStore, target: str) -> None:
-        assert self is store
-        assert target == "$edit"
+    original = journal.redact_for_agent
 
     def app() -> None:
-        assert TurnStore.mark_source_redacted is not original
+        assert journal.redact_for_agent is not original
         assert json.loads(attestation.read_text())["runtime_redaction_observer"]["path"] == str(path)
-        asyncio.run(store.mark_source_redacted("$edit"))
+        _redact_through_observer(database)
 
     monkeypatch.setattr(cli_main, "app", app)
     monkeypatch.setattr(live_fuzz.sys, "argv", ["harness"])
-    monkeypatch.setattr(TurnStore, "is_revision_redacted", lambda _self, _target: generation == 2)
     live_fuzz._ModelHandler.reset_observations()
     monkeypatch.setattr(live_fuzz.time, "monotonic_ns", lambda: 100)
     live_fuzz._ModelHandler._record_observation(90, frozenset({"marker"}))
     for generation in (1, 2):
-        monkeypatch.setattr(TurnStore, "mark_source_redacted", original)
+        monkeypatch.setattr(journal, "redact_for_agent", original)
         monkeypatch.setattr(live_fuzz.time, "monotonic_ns", lambda generation=generation: generation * 200)
         live_fuzz._run_mindroom_runtime_child(attestation, path, ["run"])
     entries = [json.loads(line) for line in path.read_text().splitlines()]
@@ -1454,37 +1551,25 @@ def test_real_runtime_child_installs_observer_across_generations(
 
 
 @pytest.mark.asyncio
-async def test_runtime_redaction_observer_rejects_recovered_revision_without_physical_tombstone(
+async def test_runtime_redaction_observer_gives_no_cutoff_to_an_event_already_redacted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    journal_store: EventJournalStore,
 ) -> None:
-    """A durably invalidated owner revision cannot gain a later cutoff from its first callback."""
-    store = TurnStore(
-        TurnStoreDeps(
-            agent_name="general",
-            turn_records=journal_store.turn_records("general"),
-            redacted_event_ids=journal_store.principal("agent@alice").redacted_event_ids,
-            legacy_responses_file=None,
-            state_writer=Mock(spec=ConversationStateWriter),
-            resolver=_redaction_observer_store().deps.resolver,
-            tool_runtime=Mock(spec=ToolRuntimeSupport),
-        ),
-    )
-    await store.warm()
-    await store.record_turn(
-        TurnRecord.create(
-            ("$source",),
-            completed=True,
-            revision_replay={"$edit": RevisionReplay("$source", 100, redacted=True)},
-        ),
-    )
-    assert not store.is_revision_redacted("$edit")
+    """An event the agent recorded redacted earlier, such as by an upgrade, gains no later cutoff from a replay."""
+    database = await _observer_journal(tmp_path)
+    with closing(sqlite3.connect(database)) as connection:
+        turn_rows.record_redaction(
+            live_fuzz.JournalSqlTransaction(connection),
+            "general",
+            room_id="!room:example",
+            event_id="$edit",
+        )
+        connection.commit()
     path = tmp_path / "entries.jsonl"
     path.touch()
-    monkeypatch.setattr(TurnStore, "mark_source_redacted", TurnStore.mark_source_redacted)
+    monkeypatch.setattr(journal, "redact_for_agent", journal.redact_for_agent)
     live_fuzz._install_runtime_redaction_observer(path)
-    await store.mark_source_redacted("$edit")
+    _redact_through_observer(database)
     assert json.loads(path.read_text())["already_redacted"] is True
     assert live_fuzz._runtime_redaction_cutoff(path, "general@@general:example", "$edit") is None
 
@@ -1693,20 +1778,18 @@ async def test_bundled_final_edit_retains_timestamp_against_older_standalone_edi
 
 
 @pytest.mark.parametrize("sources", [("$source",), ("$source", "$live")])
-def test_completed_turn_preserves_lazy_redaction_cleanup(
+def test_completed_turn_decodes_its_redaction_tombstone(
     tmp_path: Path,
     sources: tuple[str, ...],
 ) -> None:
-    """A durable tombstone may defer session cleanup until the next response."""
-    record = live_fuzz.TurnRecord.create(
-        source_event_ids=sources,
-        response_event_id="$reply",
-        completed=True,
-        redacted_source_event_ids=("$source",),
-        pending_redaction_cleanup_event_ids=("$source",),
-    )
-    rows = {"$source": live_fuzz.TurnRecordCodec._to_ledger_record(record)}
-    assert live_fuzz._decode_ledger_rows(tmp_path / "event_journal.db", rows, strict=True) == {"$source": record}
+    """A completed turn reads back under the strict ledger reader beside its source's durable redaction."""
+    ledger = tmp_path / "event_journal.db"
+    record = TurnRecord.create(source_event_ids=sources, response_event_id="$reply", completed=True)
+    _write_ledger(ledger, {"$source": record}, redacted=("$source",))
+    records = live_fuzz.read_ledger_records(ledger, strict=True)
+    assert set(records) == set(sources)
+    assert records["$source"].source_event_ids == sources
+    assert records["$source"].completed
 
 
 def test_generated_cleanup_probes_are_serialized_and_replay_verbatim() -> None:
@@ -1762,6 +1845,43 @@ def test_saved_trace_loading_never_adds_cleanup_operations(tmp_path: Path) -> No
     assert trace.read_bytes() == saved
 
 
+@pytest.mark.parametrize("seen_only_deleted", [True, False])
+def test_cleanup_probe_owes_no_tombstone_for_a_source_mindroom_only_saw_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+    seen_only_deleted: bool,
+) -> None:
+    """A source redacted before MindRoom read it never started a turn, so the probe has nothing to clean up."""
+    probe = live_fuzz._source_marker("op:1", live_fuzz.ORIGINAL_REVISION)
+    oracle = Mock(spec=live_fuzz.ExactReplyOracle)
+    oracle.expected_sources = {"$old": "root:0", "$probe": "op:1"}
+    oracle.saw_only_deleted.return_value = seen_only_deleted
+    oracle.source_tombstoned.return_value = False
+    monkeypatch.setattr(live_fuzz._ModelHandler, "observations_snapshot", lambda: {2: [probe]})
+    auditor = live_fuzz.FinalStateAuditor(
+        Mock(spec=live_fuzz.LiveMatrixClient),
+        oracle,
+        agent_id="@agent:test",
+        expected_body_for=lambda _: "unused",
+        cleanup_probes={"$probe": ("$old",)},
+        full_request_markers_for=lambda _call: frozenset({probe}),
+    )
+    records = {"$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply")}
+    events = {
+        "$reply": {
+            "event_id": "$reply",
+            "sender": "@agent:test",
+            "type": "m.room.message",
+            "content": {"body": "LIVE-FUZZ call=2 END call=2"},
+        },
+    }
+    if seen_only_deleted:
+        auditor._assert_redaction_cleanup_probes(events, records, redacted_targets={"$old": "$redaction"})
+        oracle.saw_only_deleted.assert_called_with("$old", "$redaction")
+    else:
+        with pytest.raises(AssertionError, match="no durable redaction of \\$old"):
+            auditor._assert_redaction_cleanup_probes(events, records, redacted_targets={"$old": "$redaction"})
+
+
 def test_cleanup_probe_rejects_contaminated_attempt_before_clean_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed first request leaking removed history cannot hide behind a clean retry."""
     old = live_fuzz._source_marker("root:0", live_fuzz.ORIGINAL_REVISION)
@@ -1777,10 +1897,8 @@ def test_cleanup_probe_rejects_contaminated_attempt_before_clean_retry(monkeypat
         cleanup_probes={"$probe": ("$old",)},
         full_request_markers_for=lambda call: frozenset({later, old} if call == 9 else {later}),
     )
-    records = {
-        "$old": live_fuzz.TurnRecord.create(source_event_ids=("$old",), redacted_source_event_ids=("$old",)),
-        "$probe": live_fuzz.TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply"),
-    }
+    oracle.source_tombstoned.side_effect = {"$old"}.__contains__
+    records = {"$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply")}
     events = {
         "$reply": {
             "event_id": "$reply",
@@ -1794,13 +1912,11 @@ def test_cleanup_probe_rejects_contaminated_attempt_before_clean_retry(monkeypat
 
 
 @pytest.mark.parametrize("evidence", ["current", "visible", "none"])
-@pytest.mark.parametrize("pending", [False, True])
-def test_ordinary_edit_cleanup_requires_acknowledgement_for_any_call(
+def test_ordinary_edit_cleanup_checks_any_call(
     monkeypatch: pytest.MonkeyPatch,
     evidence: str,
-    pending: bool,
 ) -> None:
-    """Actual edit-cleanup requests require monotonic acknowledgement even without a terminal reply."""
+    """Actual edit-cleanup requests are checked even without a terminal reply."""
     removed = live_fuzz._source_marker("root:0", "edit:0")
     later = live_fuzz._source_marker("op:1", live_fuzz.ORIGINAL_REVISION)
     oracle = Mock(spec=live_fuzz.ExactReplyOracle)
@@ -1819,15 +1935,15 @@ def test_ordinary_edit_cleanup_requires_acknowledgement_for_any_call(
         source_revision_markers={"$root": {"$edit": removed}},
         full_request_markers_for=lambda _: frozenset({later}),
     )
+    oracle.source_tombstoned.side_effect = {"$edit", "$probe"}.__contains__
     records = {
-        "$root": live_fuzz.TurnRecord.create(
+        "$root": TurnRecord.create(
             source_event_ids=("$root",),
-            revision_replay={"$edit": RevisionReplay("$root", 100, redacted=True, cleanup_pending=pending)},
+            revision_replay={"$edit": RevisionReplay("$root", 100)},
         ),
-        "$probe": live_fuzz.TurnRecord.create(
+        "$probe": TurnRecord.create(
             source_event_ids=("$probe",),
             completed=False,
-            redacted_source_event_ids=("$probe",),
             response_event_id="$reply" if evidence == "visible" else None,
         ),
     }
@@ -1839,25 +1955,19 @@ def test_ordinary_edit_cleanup_requires_acknowledgement_for_any_call(
             "content": {"body": "LIVE-FUZZ call=7 END call=7"},
         },
     }
-    if pending and evidence != "none":
-        with pytest.raises(AssertionError, match="pending or missing tombstone cleanup"):
-            auditor._assert_redaction_cleanup_probes(events, records)
-    else:
-        result = auditor._assert_redaction_cleanup_probes(events, records)
-        assert result["redaction_cleanup_uncovered_sources"] == int(evidence == "none")
-        assert result["redaction_cleanup_checked_calls"] == int(evidence != "none")
+    result = auditor._assert_redaction_cleanup_probes(events, records)
+    assert result["redaction_cleanup_uncovered_sources"] == int(evidence == "none")
+    assert result["redaction_cleanup_checked_calls"] == int(evidence != "none")
 
 
 @pytest.mark.parametrize("dedicated", [False, True])
-@pytest.mark.parametrize("pending", [False, True])
 @pytest.mark.parametrize("contaminated", [False, True])
-def test_original_source_cleanup_distinguishes_ordinary_calls_from_dedicated_probes(
+def test_original_source_cleanup_checks_ordinary_calls_and_dedicated_probes(
     monkeypatch: pytest.MonkeyPatch,
     dedicated: bool,
-    pending: bool,
     contaminated: bool,
 ) -> None:
-    """Repeated source callbacks may re-arm final debt; actual inputs and dedicated probes stay strict."""
+    """Actual model inputs must not carry the redacted source, for ordinary calls and dedicated probes alike."""
     removed = live_fuzz._source_marker("root:0", live_fuzz.ORIGINAL_REVISION)
     later = live_fuzz._source_marker("op:1", live_fuzz.ORIGINAL_REVISION)
     oracle = Mock(spec=live_fuzz.ExactReplyOracle)
@@ -1873,14 +1983,8 @@ def test_original_source_cleanup_distinguishes_ordinary_calls_from_dedicated_pro
         observed_cleanup_probes=targets,
         full_request_markers_for=lambda _: frozenset({later, removed} if contaminated else {later}),
     )
-    records = {
-        "$root": live_fuzz.TurnRecord.create(
-            source_event_ids=("$root",),
-            redacted_source_event_ids=("$root",),
-            pending_redaction_cleanup_event_ids=("$root",) if pending else (),
-        ),
-        "$probe": live_fuzz.TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply"),
-    }
+    oracle.source_tombstoned.side_effect = {"$root"}.__contains__
+    records = {"$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply")}
     events = {
         "$reply": {
             "event_id": "$reply",
@@ -1889,10 +1993,7 @@ def test_original_source_cleanup_distinguishes_ordinary_calls_from_dedicated_pro
             "content": {"body": "LIVE-FUZZ call=7 END call=7"},
         },
     }
-    if dedicated and pending:
-        with pytest.raises(AssertionError, match="pending or missing tombstone cleanup"):
-            auditor._assert_redaction_cleanup_probes(events, records)
-    elif contaminated:
+    if contaminated:
         with pytest.raises(AssertionError, match="redacted history"):
             auditor._assert_redaction_cleanup_probes(events, records)
     else:
@@ -1916,14 +2017,9 @@ def test_ordinary_cleanup_checks_visible_call_even_when_redacted_owner_is_incomp
         observed_cleanup_probes={"$probe": ("$old",)},
         full_request_markers_for=lambda _: frozenset({later, old}),
     )
+    oracle.source_tombstoned.side_effect = {"$old", "$probe"}.__contains__
     records = {
-        "$old": live_fuzz.TurnRecord.create(source_event_ids=("$old",), redacted_source_event_ids=("$old",)),
-        "$probe": live_fuzz.TurnRecord.create(
-            source_event_ids=("$probe",),
-            response_event_id="$reply",
-            completed=False,
-            redacted_source_event_ids=("$probe",),
-        ),
+        "$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply", completed=False),
     }
     events = {
         "$reply": {
@@ -1937,7 +2033,7 @@ def test_ordinary_cleanup_checks_visible_call_even_when_redacted_owner_is_incomp
         auditor._assert_redaction_cleanup_probes(events, records)
 
 
-@pytest.mark.parametrize("failure", [None, "history", "pending", "missing", "source", "original_only"])
+@pytest.mark.parametrize("failure", [None, "history", "missing", "original_only"])
 def test_edit_cleanup_probe_forbids_only_removed_revision(failure: str | None) -> None:
     """Edit cleanup must be exact; original and surviving revision history stay legal."""
     oracle = Mock(spec=live_fuzz.ExactReplyOracle)
@@ -1957,23 +2053,16 @@ def test_edit_cleanup_probe_forbids_only_removed_revision(failure: str | None) -
         source_revision_markers={"$root": {"$a": removed, "$b": surviving}},
         full_request_markers_for=lambda _: frozenset(observed),
     )
+    redacted = {"missing": set(), "original_only": {"$root"}}.get(failure or "", {"$a", "$unrelated"})
+    oracle.source_tombstoned.side_effect = redacted.__contains__
     records = {
-        "$root": live_fuzz.TurnRecord.create(
+        "$root": TurnRecord.create(
             source_event_ids=("$root",),
-            redacted_source_event_ids=("$root",) if failure == "original_only" else (),
             revision_replay={}
             if failure in {"missing", "original_only"}
-            else {
-                "$a": RevisionReplay(
-                    "$wrong" if failure == "source" else "$root",
-                    100,
-                    redacted=True,
-                    cleanup_pending=failure == "pending",
-                ),
-                "$unrelated": RevisionReplay("$root", 200, redacted=True, cleanup_pending=True),
-            },
+            else {"$a": RevisionReplay("$root", 100), "$unrelated": RevisionReplay("$root", 200)},
         ),
-        "$probe": live_fuzz.TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply"),
+        "$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply"),
     }
     events = {
         "$reply": {
@@ -2018,10 +2107,7 @@ async def test_saved_later_message_qualifies_only_after_observed_tombstone(
         reads += 1
 
     async def send(operation: live_fuzz.LiveOperation, *_args: object) -> str:
-        runner.oracle._ledger_records["$root"] = live_fuzz.TurnRecord.create(
-            source_event_ids=("$root",),
-            revision_replay={"$a": RevisionReplay("$root", 100, redacted=True, cleanup_pending=True)},
-        )
+        runner.oracle._ledger_redactions = frozenset({"$a"})
         return f"$later-{operation.operation_id}"
 
     monkeypatch.setattr(runner.oracle, "refresh_ledger_attributions", refresh)
@@ -2117,10 +2203,10 @@ def test_cleanup_probe_rejects_unredacted_or_unknown_sources(bad_source: str) ->
 
 @pytest.mark.parametrize(
     "failure",
-    ["pending", "history", "edit_history", "missing_observation", "unrelated_pending", "edited_probe", None],
+    ["history", "edit_history", "missing_observation", "edited_probe", None],
 )
-def test_cleanup_probe_requires_session_cleanup_and_absent_full_request_markers(failure: str | None) -> None:
-    """A clean current turn alone cannot hide stale historical input or deferred cleanup."""
+def test_cleanup_probe_requires_absent_full_request_markers(failure: str | None) -> None:
+    """A clean current turn alone cannot hide stale historical input."""
     oracle = Mock(spec=live_fuzz.ExactReplyOracle)
     oracle.expected_sources = {"$source": "root:0", "$probe": "op:1"}
     old_marker = live_fuzz._source_marker("root:0", live_fuzz.ORIGINAL_REVISION)
@@ -2145,22 +2231,11 @@ def test_cleanup_probe_requires_session_cleanup_and_absent_full_request_markers(
         source_current_markers={"$probe": new_marker},
         full_request_markers_for=lambda _: frozenset(observed),
     )
+    oracle.source_tombstoned.side_effect = {"$source"}.__contains__
     records = {
-        "$source": live_fuzz.TurnRecord.create(
-            source_event_ids=("$source",),
-            completed=True,
-            redacted_source_event_ids=("$source",),
-            pending_redaction_cleanup_event_ids=("$source",) if failure == "pending" else (),
-        ),
-        "$probe": live_fuzz.TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply", completed=True),
+        "$source": TurnRecord.create(source_event_ids=("$source",), completed=True),
+        "$probe": TurnRecord.create(source_event_ids=("$probe",), response_event_id="$reply", completed=True),
     }
-    if failure == "unrelated_pending":
-        records["$source"] = live_fuzz.TurnRecord.create(
-            source_event_ids=("$source", "$later"),
-            completed=True,
-            redacted_source_event_ids=("$source", "$later"),
-            pending_redaction_cleanup_event_ids=("$later",),
-        )
     events = {
         "$reply": {
             "event_id": "$reply",
@@ -2169,7 +2244,7 @@ def test_cleanup_probe_requires_session_cleanup_and_absent_full_request_markers(
             "content": {"body": "LIVE-FUZZ call=1 END call=1"},
         },
     }
-    if failure in {None, "unrelated_pending", "edited_probe"}:
+    if failure in {None, "edited_probe"}:
         auditor._assert_redaction_cleanup_probes(events, records)
     else:
         with pytest.raises(AssertionError, match="redaction cleanup probe"):
@@ -2233,24 +2308,14 @@ async def test_fuzz_cleanup_probe_waits_for_durable_tombstone_before_send(
     runner._pending_source_tombstones.add(target)
     if edit_target:
         runner.source_revision_markers["$old"]["$edit"] = live_fuzz._source_marker("root:0", "edit:0")
-    tombstone = live_fuzz.TurnRecord.create(
-        source_event_ids=("$old",),
-        completed=True,
-        redacted_source_event_ids=("$old",),
-        pending_redaction_cleanup_event_ids=("$old",),
-        revision_replay={"$edit": RevisionReplay("$old", 100, redacted=True, cleanup_pending=True)}
-        if edit_target
-        else {},
-    )
     pumps = 0
 
     async def pump(**_kwargs: object) -> None:
         nonlocal pumps
         pumps += 1
-        runner.oracle._ledger_records["$old"] = (
-            live_fuzz.TurnRecord.create(source_event_ids=("$old",), redacted_source_event_ids=("$old",))
-            if edit_target and pumps == 1
-            else tombstone
+        runner.oracle._ledger_records["$old"] = TurnRecord.create(source_event_ids=("$old",), completed=True)
+        runner.oracle._ledger_redactions = frozenset(
+            {"$old"} if not edit_target or pumps == 1 else {"$old", "$edit"},
         )
 
     async def send(*_args: object) -> str:

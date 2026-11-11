@@ -2,10 +2,15 @@
 # Tools auto-install their dependencies at runtime via tool_dependencies.py.
 # Good target for sandbox runners where image size matters.
 FROM ghcr.io/astral-sh/uv:latest AS uv
-FROM oven/bun:1 AS bun
+FROM mirror.gcr.io/oven/bun:1 AS bun
+
+# SQLite library the final stage links instead of Debian's (see build-sqlite.sh)
+FROM mirror.gcr.io/library/python:3.13-slim AS sqlite
+COPY local/instances/deploy/build-sqlite.sh /tmp/build-sqlite.sh
+RUN sh /tmp/build-sqlite.sh
 
 # Builder stage with uv for dependencies
-FROM public.ecr.aws/docker/library/python:3.13-slim AS builder
+FROM mirror.gcr.io/library/python:3.13-slim AS builder
 # Copy uv from the uv image
 COPY --from=uv /uv /uvx /bin/
 # Copy bun for explicit frontend builds in the builder stage
@@ -30,6 +35,7 @@ COPY src /app/src
 COPY avatars /app/avatars
 COPY skills /app/skills
 COPY frontend /app/frontend
+COPY assets/logo/logo-mark-animated.svgz /app/assets/logo/logo-mark-animated.svgz
 
 # Install the project itself (base only, no extras)
 # Opt into the editable-install frontend build so the final image has
@@ -47,7 +53,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && rm -rf frontend/node_modules
 
 # Final production stage
-FROM public.ecr.aws/docker/library/python:3.13-slim AS final
+FROM mirror.gcr.io/library/python:3.13-slim AS final
 # Copy uv for runtime (needed for auto-installing tool extras)
 COPY --from=uv /uv /uvx /bin/
 
@@ -66,6 +72,10 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y bash bzip2 curl git git-lfs jq nano procps ripgrep tini tmux unzip \
     && printf 'set-option -g exit-empty off\n' > /etc/tmux.conf \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Debian's SQLite deletes files that journals planted beside a database name; 3.53.3 and later do not.
+COPY --from=sqlite /sqlite/ /
+RUN ldconfig && python3 -c "import sqlite3; assert sqlite3.sqlite_version_info >= (3, 53, 3), sqlite3.sqlite_version"
 
 # Create non-root user before copying files
 RUN useradd -u 1000 -U -m mindroom

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="neo4j",
+    file_access=ToolFileAccess.NONE,
     display_name="Neo4j",
     description="Query Neo4j graph databases - list labels, relationships, get schema, and run Cypher queries",
     category=ToolCategory.DEVELOPMENT,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="uri",
+            env=("NEO4J_URI",),
             label="URI",
             type="url",
             required=False,
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="user",
+            env=("NEO4J_USERNAME",),
             label="Username",
             type="text",
             required=True,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="password",
+            env=("NEO4J_PASSWORD",),
             label="Password",
             type="password",
             required=True,
@@ -90,7 +94,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["neo4j"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/neo4j",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#neo4j",
     function_names=("get_schema", "list_labels", "list_relationship_types", "run_cypher_query"),
 )
 def neo4j_tools() -> type[Neo4jTools]:

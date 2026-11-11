@@ -13,24 +13,38 @@ noticed.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
-from mindroom.history_recovery import (
+from mindroom.event_journal.history_recovery import (
     HistoryRecoveryOutcome,
     HistoryRecoveryState,
     RoomHistoryRecovery,
 )
 from mindroom.logging_config import get_logger
 
-from . import approvals, membership_hooks
-from .identity import decode_thread_id, encode_thread_id
+from . import (
+    approval_cards,
+    approval_continuations,
+    interactive_questions,
+    membership_hooks,
+    outbox,
+    reads,
+    replies,
+    reply_messages,
+    turn_rows,
+)
+from .identity import agent_of_principal, decode_thread_id, encode_thread_id
+from .membership_state import claim_membership_epoch
 from .models import (
     TURN_BACKED_KINDS,
     AdmissionFacts,
     AdmissionResult,
+    DeliveryProjectionPendingError,
+    DeliveryStage,
     DepartureSource,
     EventClass,
     EventKind,
@@ -44,10 +58,11 @@ from .models import (
     IngestionRecordDisposition,
     JournalEvent,
     PendingPage,
+    ResponseRecoveryState,
     RoomMembershipPosition,
     SemanticConsumer,
 )
-from .projection import ProjectedEvent, is_tombstoned, project
+from .projection import ProjectedEvent, is_redacted, project, scrub_redacted_projection
 from .schema import PENDING_STATE, SETTLED_STATE
 
 if TYPE_CHECKING:
@@ -70,6 +85,8 @@ _EVENT_JOURNAL_COLUMNS = """
 # Successful repair is hidden from callers but retained as the revision carrier,
 # so a later gap cannot reuse the identity of an old in-flight walk.
 _REPAIRED_RECOVERY_STATE = "repaired"
+_TURN_BACKED_KIND_VALUES = tuple(sorted(kind.value for kind in TURN_BACKED_KINDS))
+_TURN_BACKED_KIND_PLACEHOLDERS = ", ".join("?" for _ in _TURN_BACKED_KIND_VALUES)
 _MATRIX_MEMBERSHIPS = frozenset({"ban", "invite", "join", "knock", "leave"})
 
 
@@ -214,18 +231,14 @@ def _admit_suppressed_semantic_identity(
     event: InboundEvent,
 ) -> None:
     """Retain a settled identity for turn work fenced out of this tenure."""
-    result = admit(
+    result = _admit(
         transaction,
         principal_id,
         replace(event, event_class=EventClass.CONTEXT_ONLY),
         None,
     )
-    if result is AdmissionResult.ADMITTED:
-        return
     if result is AdmissionResult.DUPLICATE:
         _require_matching_semantic_event(transaction, principal_id, event)
-        return
-    raise IngestionBatchIntegrityError
 
 
 def _apply_semantic_ingestion_disposition(
@@ -239,19 +252,18 @@ def _apply_semantic_ingestion_disposition(
     if event.kind in TURN_BACKED_KINDS and state.departure_fenced:
         _admit_suppressed_semantic_identity(transaction, principal_id, event)
         return False
-    semantic_result = admit(transaction, principal_id, event, projected)
+    semantic_result = _admit(transaction, principal_id, event, projected)
     if semantic_result is AdmissionResult.DUPLICATE:
         retained = _require_matching_semantic_event(transaction, principal_id, event)
         if retained["kind"] == EventKind.OPAQUE_HISTORY and projected is not None:
-            _project_admitted_event(
+            _project_with_redactions(
                 transaction,
                 principal_id,
                 projected,
                 receipt_order=int(retained["receipt_order"]),
                 membership_epoch=state.membership_epoch,
+                settle_redacted_arrival=True,
             )
-    elif semantic_result is not AdmissionResult.ADMITTED:
-        raise IngestionBatchIntegrityError
     if event.kind is EventKind.ROOM_LIFECYCLE and event.event_class is EventClass.CONTEXT_ONLY:
         content = cast("Mapping[str, object]", event.source["content"])
         if content.get("membership") == "join":
@@ -318,14 +330,7 @@ def _apply_ingestion_disposition(
         return False
 
     if disposition is IngestionRecordDisposition.HISTORY_LOSS:
-        room_id = cast("str", admission.room_id)
-        state = _claim_membership_state(transaction, principal_id, room_id)
-        _record_room_history_recovery_locked(
-            transaction,
-            principal_id,
-            room_id,
-            state,
-        )
+        _record_room_history_recovery(transaction, principal_id, cast("str", admission.room_id))
         return False
 
     return _apply_semantic_ingestion_disposition(
@@ -340,8 +345,6 @@ def admit_ingestion_batch(
     transaction: Transaction,
     principal_id: str,
     admission: IngestionBatchAdmission,
-    *,
-    snapshot: Callable[[Transaction, str, InboundEvent], None],
 ) -> AdmissionFacts:
     """Commit semantic effects and the consumer's acceptance in one transaction."""
     validate_ingestion_batch_admission(admission)
@@ -366,7 +369,7 @@ def admit_ingestion_batch(
     for record in admission.records:
         semantic_new = _apply_ingestion_disposition(transaction, principal_id, record)
         if semantic_new and record.event is not None:
-            snapshot(transaction, principal_id, record.event)
+            _snapshot_interactive_source(transaction, principal_id, record.event)
         facts.append(AdmissionFacts(True, semantic_new))
     return AdmissionFacts(True, any(f.semantic_event_new for f in facts), tuple(facts))
 
@@ -432,14 +435,13 @@ def room_history_recovery(
     return None if row is None else _room_history_recovery_from_row(room_id, row)
 
 
-def _record_room_history_recovery_locked(
+def _record_room_history_recovery(
     transaction: Transaction,
     principal_id: str,
     room_id: str,
-    state: _MembershipState,
 ) -> RoomHistoryRecovery | None:
-    """Record one gap after the caller has locked its membership state."""
-    if state.departure_fenced:
+    """Record one unknown gap while serialized with membership fencing; None once the room's departure is fenced."""
+    if _claim_membership_state(transaction, principal_id, room_id).departure_fenced:
         return None
     row = transaction.fetchone(
         """
@@ -461,22 +463,7 @@ def _record_room_history_recovery_locked(
     return _room_history_recovery_from_row(room_id, row)
 
 
-def record_room_history_recovery(
-    transaction: Transaction,
-    principal_id: str,
-    room_id: str,
-) -> RoomHistoryRecovery | None:
-    """Record one unknown gap while serialized with membership fencing."""
-    state = _claim_membership_state(transaction, principal_id, room_id)
-    return _record_room_history_recovery_locked(
-        transaction,
-        principal_id,
-        room_id,
-        state,
-    )
-
-
-def claim_room_history_recovery(
+def _claim_room_history_recovery(
     transaction: Transaction,
     principal_id: str,
     recovery: RoomHistoryRecovery,
@@ -500,7 +487,7 @@ def claim_room_history_recovery(
     return row is not None
 
 
-def settle_room_history_recovery(
+def _settle_claimed_room_history_recovery(
     transaction: Transaction,
     principal_id: str,
     recovery: RoomHistoryRecovery,
@@ -533,6 +520,113 @@ def settle_room_history_recovery(
     return HistoryRecoveryOutcome.TRUNCATED
 
 
+def install_room_history_recovery_chunk(
+    transaction: Transaction,
+    principal_id: str,
+    recovery: RoomHistoryRecovery,
+    *,
+    events: tuple[ProjectedEvent, ...],
+    expected_membership_epoch: int,
+) -> bool:
+    """Project one chunk only while its membership and exact recovery stand."""
+    if not _claim_recovery(transaction, principal_id, recovery, expected_membership_epoch=expected_membership_epoch):
+        return False
+    _project_walked(transaction, principal_id, events, membership_epoch=expected_membership_epoch)
+    return True
+
+
+def settle_room_history_recovery(
+    transaction: Transaction,
+    principal_id: str,
+    recovery: RoomHistoryRecovery,
+    *,
+    exhausted_server: bool,
+    unreadable: bool,
+    attempted_policy_rank: int,
+    expected_membership_epoch: int,
+) -> HistoryRecoveryOutcome:
+    """Publish a recovery and settle its exact obligation in one transaction."""
+    if not _claim_recovery(transaction, principal_id, recovery, expected_membership_epoch=expected_membership_epoch):
+        return HistoryRecoveryOutcome.SUPERSEDED
+    if exhausted_server and unreadable:
+        # Repairing unmasks every marker the gap retracted, and one from before
+        # the gap cannot vouch for an event this walk could not read: it may be
+        # a reply in that very thread. A truncated obligation already withholds
+        # their completeness.
+        reads.revoke_room_hydration(transaction, principal_id, room_id=recovery.room_id)
+    reads.publish_conversation_hydration(
+        transaction,
+        principal_id,
+        room_id=recovery.room_id,
+        thread_id=None,
+        complete=exhausted_server and not unreadable,
+        attempted_policy_rank=attempted_policy_rank,
+        membership_epoch=expected_membership_epoch,
+    )
+    return _settle_claimed_room_history_recovery(
+        transaction,
+        principal_id,
+        recovery,
+        exhausted_server=exhausted_server,
+        attempted_policy_rank=attempted_policy_rank,
+    )
+
+
+def install_hydration_chunk(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    events: tuple[ProjectedEvent, ...],
+    expected_membership_epoch: int,
+) -> bool:
+    """Project one chunk only while its membership epoch is current."""
+    if not claim_membership_epoch(
+        transaction,
+        principal_id,
+        room_id=room_id,
+        expected_membership_epoch=expected_membership_epoch,
+    ):
+        return False
+    _project_walked(transaction, principal_id, events, membership_epoch=expected_membership_epoch)
+    return True
+
+
+def _claim_recovery(
+    transaction: Transaction,
+    principal_id: str,
+    recovery: RoomHistoryRecovery,
+    *,
+    expected_membership_epoch: int,
+) -> bool:
+    """Lock the room's membership epoch, then the exact recovery, so a write that superseded either wins."""
+    return claim_membership_epoch(
+        transaction,
+        principal_id,
+        room_id=recovery.room_id,
+        expected_membership_epoch=expected_membership_epoch,
+    ) and _claim_room_history_recovery(transaction, principal_id, recovery)
+
+
+def _project_walked(
+    transaction: Transaction,
+    principal_id: str,
+    events: tuple[ProjectedEvent, ...],
+    *,
+    membership_epoch: int,
+) -> None:
+    """Project events a history walk read, which settle no redacted arrival and take no receipt order."""
+    for event in events:
+        _project_with_redactions(
+            transaction,
+            principal_id,
+            event,
+            receipt_order=0,
+            membership_epoch=membership_epoch,
+            settle_redacted_arrival=False,
+        )
+
+
 def current_membership_epoch(
     transaction: Transaction,
     principal_id: str,
@@ -544,33 +638,6 @@ def current_membership_epoch(
         (principal_id, room_id),
     )
     return 0 if row is None else int(row["membership_epoch"])
-
-
-def membership_position(
-    transaction: Transaction,
-    principal_id: str,
-    room_id: str,
-) -> RoomMembershipPosition:
-    """Return the journal tenure that owns this room's events and deliveries."""
-    row = transaction.fetchone(
-        "SELECT membership_epoch, departure_fenced FROM room_membership WHERE principal_id = ? AND room_id = ?",
-        (principal_id, room_id),
-    )
-    if row is None:
-        return RoomMembershipPosition("leave", 0)
-    membership_epoch = row["membership_epoch"]
-    departure_fenced = row["departure_fenced"]
-    if (
-        type(membership_epoch) is not int
-        or membership_epoch < 0
-        or type(departure_fenced) is not int
-        or departure_fenced not in (0, 1)
-    ):
-        raise IngestionBatchIntegrityError
-    return RoomMembershipPosition(
-        "leave" if departure_fenced else "join",
-        membership_epoch,
-    )
 
 
 def ingestion_membership_position(
@@ -595,7 +662,7 @@ def _advance_membership_epoch(
     transaction: Transaction,
     principal_id: str,
     room_id: str,
-) -> int:
+) -> None:
     """Invalidate everything derived for a room the bot has left and rejoined.
 
     Rejoining can expose a different slice of history than the bot saw before,
@@ -626,7 +693,6 @@ def _advance_membership_epoch(
         "conversation_hydration",
         "visible_messages",
         "unresolved_edits",
-        "redaction_tombstones",
         "room_history_recovery",
     ):
         transaction.execute(
@@ -651,20 +717,20 @@ def _advance_membership_epoch(
     # retain decision. That durable identity is the property this table exists
     # for.
     # A terminal acknowledgement may have committed just before a crash that
-    # prevented its approval-domain row from being retired. Preserve the click
-    # tombstone before either side of the cross-principal relationship is
-    # fenced or deleted below.
-    approvals.retire_completed_cards_for_departure(
+    # prevented its card from being retired. Retire it before either side of
+    # the cross-principal relationship is fenced or deleted below.
+    approval_cards.retire_completed_for_departure(
         transaction,
         principal_id,
         room_id=room_id,
     )
-    approvals.fail_continuations_for_departed_card_owner(
+    approval_cards.deny_for_departed_card_owner(
         transaction,
         principal_id,
         room_id=room_id,
         reason="Approval transport left the room.",
     )
+    reply_messages.depart_room(transaction, principal_id, room_id, now_ns=time.time_ns())
     transaction.execute(
         """
         UPDATE matrix_delivery_outbox AS delivery SET retired = 1
@@ -673,14 +739,15 @@ def _advance_membership_epoch(
               SELECT 1 FROM approval_cards AS cards
               WHERE cards.principal_id = delivery.principal_id
                 AND cards.delivery_id = delivery.delivery_id
+                AND cards.kind = 'request'
           )
         """,
         (principal_id, room_id),
     )
     # Approval cards are authored by the router principal, while the paused
-    # run belongs to the responding entity principal. Preserve the router's
-    # terminal Matrix edit debt before this fence removes the continuation.
-    approvals.expire_cards_for_departed_continuations(
+    # run belongs to the responding entity principal. Decide its calls and keep
+    # the router's terminal Matrix edit debt before this fence removes it.
+    approval_cards.expire_for_departed_responder(
         transaction,
         principal_id,
         room_id=room_id,
@@ -688,24 +755,17 @@ def _advance_membership_epoch(
     )
     # A paused run owns exactly the source rows this fence is about to settle.
     # Delete the aggregate first so no durable continuation survives with no
-    # runnable source. Its call and source rows cascade.
-    transaction.execute(
-        """
-        DELETE FROM approval_continuations
+    # runnable source. Its calls go with it unless a live card still shows them,
+    # and the conversation it held is free from this commit.
+    for departed in transaction.fetchall(
+        f"""
+        SELECT approval_id FROM approval_continuations
         WHERE principal_id = ?
-          AND EXISTS (
-              SELECT 1
-              FROM approval_continuation_sources AS sources
-              JOIN journal_events AS events
-                ON events.principal_id = sources.principal_id
-               AND events.event_id = sources.event_id
-              WHERE sources.principal_id = approval_continuations.principal_id
-                AND sources.approval_id = approval_continuations.approval_id
-                AND events.room_id = ?
-          )
-        """,
+          AND {approval_continuations.holds_source_in_room("approval_continuations")}
+        """,  # noqa: S608 - a fixed SQL fragment, not input
         (principal_id, room_id),
-    )
+    ):
+        approval_continuations.delete(transaction, principal_id, approval_id=str(departed["approval_id"]))
     # Turn-backed work still pending from the membership that just ended can
     # never finish. Its answer would have to be enqueued, and enqueue refuses
     # any turn whose admitted epoch is not the room's current one -- correctly,
@@ -724,15 +784,13 @@ def _advance_membership_epoch(
     # the redacted request from durable turn and session state -- and sweeping
     # it up here would drop that work silently and let the redacted content
     # survive in later context.
-    turn_backed = tuple(sorted(kind.value for kind in TURN_BACKED_KINDS))
-    kind_placeholders = ", ".join("?" for _ in turn_backed)
     transaction.execute(
         f"""
         UPDATE journal_events
         SET state = ?, source_json = '', semantic_consumer = NULL
         WHERE principal_id = ? AND room_id = ? AND state = 'pending'
           AND (
-            kind IN ({kind_placeholders})
+            kind IN ({_TURN_BACKED_KIND_PLACEHOLDERS})
             OR (kind = ? AND semantic_consumer = ?)
           )
         """,  # noqa: S608 - placeholders are generated, values are still bound
@@ -740,12 +798,11 @@ def _advance_membership_epoch(
             SETTLED_STATE,
             principal_id,
             room_id,
-            *turn_backed,
+            *_TURN_BACKED_KIND_VALUES,
             EventKind.REACTION.value,
             SemanticConsumer.INTERACTIVE_REACTION.value,
         ),
     )
-    return epoch
 
 
 @dataclass(frozen=True, slots=True)
@@ -791,7 +848,7 @@ def _claim_membership_state(
     )
 
 
-def admit(
+def _admit(
     transaction: Transaction,
     principal_id: str,
     event: InboundEvent,
@@ -836,67 +893,188 @@ def admit(
     if row is None:
         return AdmissionResult.DUPLICATE
     if projected is not None:
-        _project_admitted_event(
+        _project_with_redactions(
             transaction,
             principal_id,
             projected,
             receipt_order=int(row["receipt_order"]),
             membership_epoch=epoch,
+            settle_redacted_arrival=True,
         )
     return AdmissionResult.ADMITTED
 
 
-def _project_admitted_event(
+def admit_snapshotting_source(
+    transaction: Transaction,
+    principal_id: str,
+    event: InboundEvent,
+    projected: ProjectedEvent | None,
+) -> AdmissionResult:
+    """Admit one event as ``_admit`` does, then freeze it as an interactive source once its visible target is durable.
+
+    Batch admission snapshots only the actionable events it admits, after their disposition, so it calls ``_admit``.
+    """
+    result = _admit(transaction, principal_id, event, projected)
+    if result is AdmissionResult.ADMITTED:
+        _snapshot_interactive_source(transaction, principal_id, event)
+    return result
+
+
+def _snapshot_interactive_source(
+    transaction: Transaction,
+    principal_id: str,
+    event: InboundEvent,
+) -> None:
+    """Freeze an interactive source only after its visible target is durable."""
+    if interactive_questions.snapshot_source_candidate(
+        transaction,
+        principal_id,
+        event,
+    ) and outbox.has_attempted_unacknowledged_prompt_delivery(
+        transaction,
+        principal_id,
+        room_id=event.room_id,
+        membership_epoch=current_membership_epoch(transaction, principal_id, event.room_id),
+    ):
+        msg = f"Matrix delivery projection is pending in room {event.room_id!r}"
+        raise DeliveryProjectionPendingError(msg)
+
+
+def _project_with_redactions(
     transaction: Transaction,
     principal_id: str,
     projected: ProjectedEvent,
     *,
     receipt_order: int,
     membership_epoch: int,
+    settle_redacted_arrival: bool,
 ) -> None:
-    """Project readable content and retire any source its redaction tombstones."""
-    tombstoned_event_id = project(
+    """Project one event and apply the redaction authority it reports, in this transaction.
+
+    A redaction is recorded once for the principal's agent and applied to every
+    login of it. An event that arrives already redacted ends the replies that
+    lost their last source to it, and with ``settle_redacted_arrival`` its own
+    pending row retires, as admission does for the event it just admitted.
+    """
+    redacted_event_id = project(
         transaction,
         principal_id,
         projected,
         receipt_order=receipt_order,
         membership_epoch=membership_epoch,
     )
-    if tombstoned_event_id is not None:
-        _settle_tombstoned_turn_source(
+    if redacted_event_id is None:
+        return
+    if projected.redacts_event_id is not None:
+        redact_for_agent(
+            transaction,
+            agent_of_principal(principal_id),
+            room_id=projected.room_id,
+            event_id=redacted_event_id,
+            receipt_order=receipt_order,
+        )
+        return
+    if settle_redacted_arrival:
+        _settle_redacted_turn_source(
             transaction,
             principal_id,
             room_id=projected.room_id,
-            event_id=tombstoned_event_id,
+            event_id=redacted_event_id,
+        )
+    replies.end_replies_of_deleted_source(
+        transaction,
+        principal_id,
+        room_id=projected.room_id,
+        event_id=redacted_event_id,
+    )
+
+
+def redact_for_agent(
+    transaction: Transaction,
+    agent_name: str,
+    *,
+    room_id: str,
+    event_id: str,
+    receipt_order: int,
+) -> None:
+    """Record one redaction for every Matrix login of an agent and apply its effects to each, in one transaction.
+
+    The deletion is agent-scoped, as turn truth is: the agent's turn rows lose
+    the event's plaintext, and every principal of the agent that has state in
+    the room loses it from its projection, retires a pending turn row of it,
+    and ends the replies that lost every source to it, exactly as the
+    principal that observed the redaction does. An earlier login the agent
+    returns to would otherwise still read the deleted text. Another agent's
+    rows are never touched, and reads stay principal-scoped: sharing the
+    deletion fact shares no content.
+    """
+    turn_rows.record_redaction(transaction, agent_name, room_id=room_id, event_id=event_id)
+    for principal_id in _principals_of_agent(transaction, agent_name, room_id=room_id):
+        scrub_redacted_projection(
+            transaction,
+            principal_id,
+            room_id=room_id,
+            event_id=event_id,
+            receipt_order=receipt_order,
+        )
+        _settle_redacted_turn_source(transaction, principal_id, room_id=room_id, event_id=event_id)
+        replies.end_replies_of_deleted_source(
+            transaction,
+            principal_id,
+            room_id=room_id,
+            event_id=event_id,
         )
 
 
-def _settle_tombstoned_turn_source(
+def _principals_of_agent(transaction: Transaction, agent_name: str, *, room_id: str) -> tuple[str, ...]:
+    """Return every Matrix login of one agent that has membership state in ``room_id``.
+
+    A principal is stored as ``agent@mxid`` and agent names hold no ``@``, so the
+    prefix names the agent exactly; it is compared here rather than with
+    ``LIKE``, which SQLite matches case-insensitively.
+    """
+    rows = transaction.fetchall(
+        "SELECT principal_id FROM room_membership WHERE room_id = ? ORDER BY principal_id/*bytes*/",
+        (room_id,),
+    )
+    return tuple(
+        principal_id for row in rows if agent_of_principal(principal_id := str(row["principal_id"])) == agent_name
+    )
+
+
+def _settle_redacted_turn_source(
     transaction: Transaction,
     principal_id: str,
     *,
     room_id: str,
     event_id: str,
 ) -> None:
-    """Retire tombstoned turn ingress unless a durable continuation owns it.
+    """Retire redacted turn ingress unless a durable continuation owns it.
 
     Approval continuations dispatch before event-kind ingress, so preserving
     one cannot replay its source through a message or media callback.
     """
-    kinds = tuple(sorted(kind.value for kind in TURN_BACKED_KINDS))
-    kind_placeholders = ", ".join("?" for _ in kinds)
     transaction.execute(
         f"""
         UPDATE journal_events
         SET state = ?, source_json = '', semantic_consumer = NULL
         WHERE principal_id = ? AND room_id = ? AND event_id = ? AND state = ?
-          AND kind IN ({kind_placeholders})
+          AND kind IN ({_TURN_BACKED_KIND_PLACEHOLDERS})
           AND NOT EXISTS (
-              SELECT 1 FROM approval_continuation_sources
-              WHERE principal_id = ? AND event_id = ?
+              SELECT 1 FROM {approval_continuations.HELD_SOURCES}
+              WHERE held_source.principal_id = ? AND held_source.event_id = ?
           )
         """,  # noqa: S608 - placeholders are generated, values are still bound
-        (SETTLED_STATE, principal_id, room_id, event_id, PENDING_STATE, *kinds, principal_id, event_id),
+        (
+            SETTLED_STATE,
+            principal_id,
+            room_id,
+            event_id,
+            PENDING_STATE,
+            *_TURN_BACKED_KIND_VALUES,
+            principal_id,
+            event_id,
+        ),
     )
 
 
@@ -970,34 +1148,9 @@ def pending(
     page says which of those happened rather than leaving the caller to infer
     it from a length: ``reached_end`` is the only statement that there is
     nothing behind this page, and ``resume_after`` is where the next pass
-    starts, counted in rows looked at rather than events returned.
-    """
-    return _pending_page(
-        transaction,
-        principal_id,
-        limit=limit,
-        room_id=room_id,
-        after_receipt_order=after_receipt_order,
-        runtime_generation=runtime_generation,
-    )
-
-
-def _pending_page(
-    transaction: Transaction,
-    principal_id: str,
-    *,
-    limit: int,
-    after_receipt_order: int | None,
-    room_id: str | None = None,
-    kind: EventKind | None = None,
-    runtime_generation: str = "unmanaged",
-) -> PendingPage:
-    """Return whatever decoded from one page of at most ``limit`` raw rows.
-
-    One query, one page. Reading further because too few rows decoded is how a
-    corrupt prefix turned a bounded read into a scan of the whole pending
-    table, so the bound is on the rows the query may return and nothing here
-    goes back for more.
+    starts, counted in rows looked at rather than events returned. One query, one page: reading further because too
+    few rows decoded is how a corrupt prefix turned a bounded read into a scan of the whole pending table, so the bound
+    is on the rows the query may return and nothing here goes back for more.
     """
     rows = _pending_rows(
         transaction,
@@ -1005,7 +1158,6 @@ def _pending_page(
         limit=limit,
         room_id=room_id,
         after_receipt_order=after_receipt_order,
-        kind=kind,
         runtime_generation=runtime_generation,
     )
     events = _decode_rows(rows)
@@ -1028,46 +1180,45 @@ def _pending_rows(
     *,
     limit: int,
     after_receipt_order: int | None,
-    room_id: str | None = None,
-    kind: EventKind | None = None,
-    runtime_generation: str = "unmanaged",
+    room_id: str | None,
+    runtime_generation: str,
 ) -> tuple[Row, ...]:
     """Return one raw page of pending rows, in receipt order."""
     cursor_clause = "" if after_receipt_order is None else " AND receipt_order > ?"
     cursor_params: tuple[object, ...] = () if after_receipt_order is None else (after_receipt_order,)
     room_clause = "" if room_id is None else " AND events.room_id = ?"
     room_params: tuple[object, ...] = () if room_id is None else (room_id,)
-    kind_clause = "" if kind is None else " AND kind = ?"
-    kind_params: tuple[object, ...] = () if kind is None else (kind.value,)
-    continuation_joins = """
-        LEFT JOIN approval_continuation_sources AS approval_sources
-          ON approval_sources.principal_id = events.principal_id
-         AND approval_sources.event_id = events.event_id
-        LEFT JOIN approval_continuations AS continuations
-         ON continuations.principal_id = approval_sources.principal_id
-         AND continuations.approval_id = approval_sources.approval_id
+    continuation_joins = f"""
+        LEFT JOIN ({approval_continuations.HELD_SOURCES})
+          ON held_source.principal_id = events.principal_id
+         AND held_source.event_id = events.event_id
+        LEFT JOIN reply_spans AS claim_span
+          ON claim_span.principal_id = continuations.principal_id
+         AND claim_span.span_id = continuations.claim_span_id
     """
+    # A claim this instance's span holds keeps its sources until that span's
+    # FINAL exists; one an older instance left goes to recovery.
     continuation_clause = """
           AND (
-            approval_sources.approval_id IS NULL
+            continuations.approval_id IS NULL
             OR (
-              approval_sources.source_ordinal = 0
+              held_source.ordinal = 0
               AND (
-                continuations.state IN ('ready', 'failing')
+                continuations.state = 'failing'
                 OR (
                   continuations.state = 'waiting'
                   AND continuations.runtime_generation IS NOT NULL
                   AND continuations.runtime_generation <> ?
                 )
                 OR (
-                  continuations.state = 'claimed'
+                  continuations.state = 'ready'
                   AND (
-                    continuations.runtime_generation IS NULL
-                    OR continuations.runtime_generation <> ?
+                    continuations.claim_span_id IS NULL
+                    OR claim_span.bot_generation <> ?
                     OR EXISTS (
                       SELECT 1 FROM matrix_delivery_outbox AS approval_final
                       WHERE approval_final.principal_id = events.principal_id
-                        AND approval_final.delivery_id = events.event_id
+                        AND approval_final.delivery_id = claim_span.delivery_id
                         AND approval_final.stage = 'final'
                     )
                   )
@@ -1082,11 +1233,11 @@ def _pending_rows(
         SELECT {_EVENT_JOURNAL_COLUMNS} FROM journal_events AS events
         {continuation_joins}
         WHERE events.principal_id = ? AND events.state = 'pending'
-          {continuation_clause}{kind_clause}{room_clause}{cursor_clause}
+          {continuation_clause}{room_clause}{cursor_clause}
         ORDER BY events.receipt_order
         LIMIT ?
         """,  # noqa: S608 - a fixed column list and fixed clauses, not input
-        (principal_id, *continuation_params, *kind_params, *room_params, *cursor_params, limit),
+        (principal_id, *continuation_params, *room_params, *cursor_params, limit),
     )
 
 
@@ -1111,7 +1262,7 @@ def pending_thread_events_after(
 
     Restricting it to ``TURN_BACKED_KINDS`` is the same argument one step
     further: pending means unfinished, not *will answer*. Thread membership is
-    derived from content for every kind alike -- ``inbound_event`` calls
+    derived from content for every kind alike -- ``_inbound_event`` calls
     ``thread_root`` regardless of kind -- so a reaction, an approval, or an
     ``m.room.encrypted`` event this bot could not decrypt can all sit pending
     in a thread under the requester's own sender. An interactive reaction can
@@ -1125,14 +1276,12 @@ def pending_thread_events_after(
     by their timestamps, and treating either as proof that the other is stale
     would drop a message on a coin flip.
     """
-    kinds = tuple(sorted(kind.value for kind in TURN_BACKED_KINDS))
-    kind_placeholders = ", ".join("?" for _ in kinds)
     rows = transaction.fetchall(
         f"""
         SELECT {_JOURNAL_COLUMNS} FROM journal_events
         WHERE principal_id = ? AND state = 'pending'
           AND room_id = ? AND thread_id = ?
-          AND kind IN ({kind_placeholders})
+          AND kind IN ({_TURN_BACKED_KIND_PLACEHOLDERS})
           AND origin_server_ts > ? AND event_id <> ?
         ORDER BY origin_server_ts, receipt_order
         LIMIT ?
@@ -1141,7 +1290,7 @@ def pending_thread_events_after(
             principal_id,
             room_id,
             encode_thread_id(thread_id),
-            *kinds,
+            *_TURN_BACKED_KIND_VALUES,
             after_origin_server_ts,
             excluding_event_id,
             limit,
@@ -1188,65 +1337,37 @@ def is_pending(transaction: Transaction, principal_id: str, event_id: str) -> bo
     return row is not None
 
 
-def source_has_redaction_handoff(
+def pending_among(transaction: Transaction, principal_id: str, event_ids: tuple[str, ...]) -> frozenset[str]:
+    """Return which of these events still owe semantic work."""
+    rows = turn_rows.fetch_in(
+        transaction,
+        "SELECT event_id FROM journal_events WHERE principal_id = ? AND state = 'pending' AND event_id IN ({in})",
+        (principal_id,),
+        event_ids,
+    )
+    return frozenset(str(row["event_id"]) for row in rows)
+
+
+def _source_has_redaction_handoff(
     transaction: Transaction,
     principal_id: str,
     event_id: str,
     captured: TurnRecord,
-    current: TurnRecord | None,
-    redaction_target: Callable[[JournalEvent], str | None],
 ) -> bool:
-    """Prove exact replayable cleanup or its already-durable monotonic result."""
+    """Prove the settled source was redacted in its own room, which is the turn's redaction authority.
+
+    Session history needs no handoff: each response removes history derived from redacted events.
+    """
     source = transaction.fetchone(
         "SELECT room_id FROM journal_events WHERE principal_id = ? AND event_id = ? AND state = 'settled'",
         (principal_id, event_id),
     )
-    if source is None or not is_tombstoned(transaction, principal_id, source["room_id"], event_id):
+    if source is None or not is_redacted(transaction, principal_id, source["room_id"], event_id):
         return False
-    if captured.conversation_target is not None and captured.conversation_target.room_id != source["room_id"]:
-        return False
-    # A callback can recover the marker, but cannot recover lost session cleanup context.
-    if any(
-        expected is not None and (current is None or expected != actual)
-        for expected, actual in (
-            (captured.conversation_target, current.conversation_target if current else None),
-            (captured.history_scope, current.history_scope if current else None),
-            (captured.requester_id, current.requester_id if current else None),
-        )
-    ):
-        return False
-    if current is not None and event_id in current.redacted_source_event_ids:
-        if current.conversation_target is not None and current.conversation_target.room_id != source["room_id"]:
-            return False
-        # An absent cleanup marker is the existing acknowledgement after cleanup;
-        # late registration rearms it monotonically. A pending marker needs its scope.
-        return event_id not in current.pending_redaction_cleanup_event_ids or (
-            current.conversation_target is not None
-            and current.history_scope is not None
-            and current.requester_id is not None
-        )
-    return _has_pending_redaction(transaction, principal_id, source["room_id"], event_id, redaction_target)
+    return captured.conversation_target is None or captured.conversation_target.room_id == source["room_id"]
 
 
-def _has_pending_redaction(
-    transaction: Transaction,
-    principal_id: str,
-    room_id: str,
-    event_id: str,
-    redaction_target: Callable[[JournalEvent], str | None],
-) -> bool:
-    """Read callback ownership and decode it within the source's recovery transaction."""
-    callbacks = transaction.fetchall(
-        f"""
-        SELECT {_JOURNAL_COLUMNS} FROM journal_events
-        WHERE principal_id = ? AND room_id = ? AND state = 'pending' AND kind = ?
-        """,  # noqa: S608 - fixed columns, bound values
-        (principal_id, room_id, EventKind.REDACTION.value),
-    )
-    return any(redaction_target(callback) == event_id for callback in _decode_rows(callbacks))
-
-
-def sources_settled_by_departure(
+def _sources_settled_by_departure(
     transaction: Transaction,
     principal_id: str,
     event_ids: tuple[str, ...],
@@ -1268,7 +1389,44 @@ def sources_settled_by_departure(
     )
 
 
-def settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
+def response_recovery_state(
+    transaction: Transaction,
+    principal_id: str,
+    turn_record: TurnRecord,
+) -> ResponseRecoveryState:
+    """Return one response's durable handoff: its sources, turn records, FINAL delivery, and reply."""
+    source_event_ids = turn_record.source_event_ids
+    turn_id = turn_record.anchor_event_id
+    pending = tuple(is_pending(transaction, principal_id, event_id) for event_id in source_event_ids)
+    delivery = (
+        None
+        if turn_id is None
+        else outbox.load(
+            transaction,
+            principal_id,
+            delivery_id=turn_id,
+            stage=DeliveryStage.FINAL,
+        )
+    )
+    agent_name = agent_of_principal(principal_id)
+    return ResponseRecoveryState(
+        pending_sources=pending,
+        redacted_sources=tuple(
+            not source_pending and _source_has_redaction_handoff(transaction, principal_id, event_id, turn_record)
+            for event_id, source_pending in zip(source_event_ids, pending, strict=True)
+        ),
+        turn_records=tuple(
+            turn_rows.get_turn_record(transaction, agent_name, event_id) for event_id in turn_record.indexed_event_ids
+        ),
+        final_delivery=delivery,
+        sources_settled_by_departure=(
+            not any(pending) and _sources_settled_by_departure(transaction, principal_id, source_event_ids)
+        ),
+        reply=reply_messages.for_sources(transaction, principal_id, source_event_ids),
+    )
+
+
+def _settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
     """Mark one event's semantic work terminal and release its replay payload.
 
     The payload is cleared rather than the row deleted: the row is the proof
@@ -1297,7 +1455,13 @@ def settle(transaction: Transaction, principal_id: str, event_id: str) -> None:
 def settle_many(transaction: Transaction, principal_id: str, event_ids: tuple[str, ...]) -> None:
     """Settle several events that one terminal turn accounted for."""
     for event_id in event_ids:
-        settle(transaction, principal_id, event_id)
+        _settle(transaction, principal_id, event_id)
+
+
+def settle_turn_sources(transaction: Transaction, principal_id: str, event_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Settle a terminal turn's sources, ending the replies left waiting to replay them; return those replies."""
+    settle_many(transaction, principal_id, event_ids)
+    return replies.drop_replays(transaction, principal_id, event_ids, now_ns=time.time_ns())
 
 
 def unsettled_event_ids(transaction: Transaction, principal_id: str) -> frozenset[str]:
@@ -1307,30 +1471,6 @@ def unsettled_event_ids(transaction: Transaction, principal_id: str) -> frozense
         (principal_id,),
     )
     return frozenset(row["event_id"] for row in rows)
-
-
-def pending_of_kind(
-    transaction: Transaction,
-    principal_id: str,
-    kind: EventKind,
-    *,
-    limit: int,
-    after_receipt_order: int | None = None,
-) -> PendingPage:
-    """Return pending events of one kind, in receipt order.
-
-    Pages the same way ``pending`` does, so a caller that needs every one of
-    them can walk to the end and know when it got there -- and can tell that a
-    row it walked past was one it could not read, which is the difference
-    between an enumeration that is complete and one that only looks it.
-    """
-    return _pending_page(
-        transaction,
-        principal_id,
-        limit=limit,
-        after_receipt_order=after_receipt_order,
-        kind=kind,
-    )
 
 
 def claim_semantic_consumer(
@@ -1362,7 +1502,7 @@ def claim_semantic_consumer(
         and EventKind(row["kind"]) is EventKind.REACTION
         and int(row["membership_epoch"]) != current_membership_epoch(transaction, principal_id, row["room_id"])
     ):
-        settle(transaction, principal_id, event_id)
+        _settle(transaction, principal_id, event_id)
         return None
     return claimed
 

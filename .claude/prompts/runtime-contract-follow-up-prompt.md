@@ -6,8 +6,8 @@ Use this prompt when delegating the next runtime-architecture follow-up PR after
 You are doing a follow-up architecture refactor, not a bug fix.
 
 Read first:
-- CLAUDE.md
-- docs/dev/runtime-path-architecture-refactor-prompt.md
+- AGENTS.md
+- docs/dev/2026-03-14-runtime-path-architecture-refactor-prompt.md
 
 Goal:
 Collapse the remaining split between `Config` and `RuntimePaths`.
@@ -68,7 +68,7 @@ Scope for this PR:
   - `src/mindroom/matrix/users.py`
   - `src/mindroom/matrix/mentions.py`
   - `src/mindroom/avatar_generation.py`
-  - `src/mindroom/voice_handler.py`
+  - `src/mindroom/voice/handler.py`
   - `src/mindroom/thread_utils.py`
   - any directly related config helpers
 

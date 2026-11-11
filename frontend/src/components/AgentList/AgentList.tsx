@@ -1,3 +1,4 @@
+import { EntityAvatar } from "@/components/shared/EntityAvatar";
 import { useConfigStore } from "@/store/configStore";
 import type { Agent } from "@/types/config";
 import { Bot, MapPin } from "lucide-react";
@@ -5,14 +6,7 @@ import { pluralize } from "@/lib/utils";
 import { ListPanel, ListItem } from "@/components/shared/ListPanel";
 import { ItemCard, ItemCardBadge } from "@/components/shared/ItemCard";
 
-// Extend Agent type to be compatible with ListItem
-interface AgentListItem extends ListItem {
-  role: string;
-  tools: string[];
-  rooms: string[];
-  // Add index signature to be compatible with ListItem
-  [key: string]: any;
-}
+type AgentListItem = Agent & ListItem;
 
 export function AgentList() {
   const { agents, selectedAgentId, selectAgent, createAgent } =
@@ -34,18 +28,21 @@ export function AgentList() {
     const badges: ItemCardBadge[] = [
       {
         content: pluralize(agent.tools.length, "tool"),
-        variant: "secondary" as const,
+        variant: "secondary",
         icon: Bot,
       },
       {
         content: pluralize(agent.rooms.length, "room"),
-        variant: "secondary" as const,
+        variant: "secondary",
         icon: MapPin,
       },
     ];
 
     return (
       <ItemCard
+        leading={
+          <EntityAvatar kind="agent" id={agent.id} name={agent.display_name} />
+        }
         id={agent.id}
         title={agent.display_name}
         description={agent.role}
@@ -62,7 +59,6 @@ export function AgentList() {
       icon={Bot}
       items={agents as AgentListItem[]}
       selectedId={selectedAgentId || undefined}
-      onItemSelect={selectAgent}
       onCreateItem={handleCreateAgent}
       renderItem={renderAgent}
       showSearch={true}

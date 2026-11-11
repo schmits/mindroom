@@ -1,6 +1,5 @@
 """Instance management routes."""
 
-import json
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -8,10 +7,9 @@ from typing import Annotated, Any
 
 from backend.config import logger
 from backend.deps import ensure_supabase, limiter, verify_user
-from backend.entitlements import assert_instance_entitlement
-from backend.k8s import check_deployment_exists, instance_deployment_ref, run_kubectl
+from backend.entitlements import assert_instance_entitlement, parse_timestamp
 from backend.models import ActionResult, InstancesResponse, ProvisionResponse
-from backend.services import instances_data, provisioner_service
+from backend.services import instance_lifecycle, instances_data, provisioner_service
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 
 router = APIRouter()
@@ -22,87 +20,20 @@ InstanceAction = Callable[[int], Awaitable[dict[str, Any]]]
 
 
 async def _background_sync_instance_status(instance_id: str) -> None:
-    """Background task to sync a single instance's Kubernetes status."""
+    """Background task: record one instance's Kubernetes status unless a sync of it is already running."""
     if instance_id in _syncing_instances:
-        return  # Already syncing
+        return
 
     _syncing_instances.add(instance_id)
-    start = time.perf_counter()
-
     try:
         sb = ensure_supabase()
-
-        # Get current status from DB
         instance_row = instances_data.get_instance(sb, instance_id, columns="status")
         if instance_row is None:
             logger.warning("Background sync: instance %s not found in database, skipping sync", instance_id)
             return
-        current_status = instance_row.get("status")
-
-        # Check if deployment exists
-        k8s_start = time.perf_counter()
-        exists = await check_deployment_exists(instance_id)
-
-        if exists:
-            # Inspect deployment status to understand readiness
-            code, out, err = await run_kubectl(
-                ["get", instance_deployment_ref(instance_id), "-o=json"], namespace="mindroom-instances"
-            )
-            if code == 0 and out:
-                try:
-                    deployment = json.loads(out)
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse deployment JSON for instance %s: %s", instance_id, out[:120])
-                    deployment = out.strip()
-
-                if isinstance(deployment, (int, float)) or (isinstance(deployment, str) and deployment.isdigit()):
-                    replicas = int(deployment)
-                    actual_status = "stopped" if replicas == 0 else "running"
-                elif not deployment:
-                    actual_status = "provisioning"
-                else:
-                    spec = deployment.get("spec", {}) or {}
-                    status = deployment.get("status", {}) or {}
-                    desired_replicas = int(spec.get("replicas") or 0)
-                    ready_replicas = int(status.get("readyReplicas") or 0)
-                    available_replicas = int(status.get("availableReplicas") or 0)
-                    updated_replicas = int(status.get("updatedReplicas") or 0)
-
-                    if desired_replicas == 0:
-                        actual_status = "stopped"
-                    elif min(ready_replicas, available_replicas, updated_replicas) >= desired_replicas:
-                        actual_status = "running"
-                    else:
-                        actual_status = "provisioning"
-            else:
-                logger.warning(
-                    "kubectl get deployment failed for instance %s: %s",
-                    instance_id,
-                    err.strip() if err else out.strip(),
-                )
-                # Fall back to assuming deployment exists but is still provisioning
-                actual_status = "provisioning"
-        elif current_status in ["deprovisioned", "provisioning"]:
-            # Keep current status if it makes sense
-            actual_status = current_status
-        else:
-            actual_status = "error"
-
-        # Update database
-        now = datetime.now(UTC).isoformat()
-        instances_data.update_instance(
-            sb, instance_id, {"status": actual_status, "kubernetes_synced_at": now, "updated_at": now}
-        )
-
-        total_time = (time.perf_counter() - start) * 1000
-        k8s_time = (time.perf_counter() - k8s_start) * 1000
-        logger.info(
-            "Background K8s sync for instance %s: status=%s, K8s calls %.2fms, total %.2fms",
-            instance_id,
-            actual_status,
-            k8s_time,
-            total_time,
-        )
+        await provisioner_service.sync_instance_status(sb, instance_id, instance_row["status"])
+    except Exception:
+        logger.exception("Background K8s sync failed for instance %s", instance_id)
     finally:
         _syncing_instances.discard(instance_id)
 
@@ -121,48 +52,28 @@ async def list_user_instances(
     instances = instances_data.get_instances_for_account(sb, account_id)
     db_time = (time.perf_counter() - db_start) * 1000
 
+    # A row whose Kubernetes status is missing or older than 30 seconds is refreshed in the background.
+    stale_threshold = datetime.now(UTC) - timedelta(seconds=30)
     enhanced_instances: list[dict[str, Any]] = []
     for instance in instances:
         status = instance.get("status")
+        synced_at = instance.get("kubernetes_synced_at")
         hint: str | None = None
-
         if status == "provisioning":
             hint = (
                 "Provisioning in progress. First boot can take several minutes while "
                 "containers pull images and TLS certificates issue."
             )
-        elif status == "restarting":
-            hint = "Restarting MindRoom pods; the workspace will be available again shortly."
-        elif status == "running" and not instance.get("kubernetes_synced_at"):
+        elif status == "running" and not synced_at:
             hint = "Running (awaiting initial Kubernetes health check)."
-
         enhanced_instances.append({**instance, "status_hint": hint})
 
-    # Check if any instance needs a background sync (older than 30 seconds)
-    stale_threshold = datetime.now(UTC) - timedelta(seconds=30)
-    for instance in enhanced_instances:
-        instance_id = instance.get("instance_id")
-        if not instance_id:
-            continue
-
-        # Skip if already being synced
-        if str(instance_id) in _syncing_instances:
-            continue
-
-        # Check if kubernetes_synced_at is missing or stale
-        synced_at = instance.get("kubernetes_synced_at")
-        if not synced_at:
-            needs_sync = True
-        else:
-            # Parse ISO timestamp (handle both Z and +00:00 formats)
-            if synced_at.endswith("Z"):
-                synced_at = synced_at[:-1] + "+00:00"
-            synced_time = datetime.fromisoformat(synced_at)
-            needs_sync = synced_time < stale_threshold
-
-        if needs_sync:
+        instance_id = str(instance["instance_id"])
+        synced_time = parse_timestamp(synced_at)
+        stale = synced_time is None or synced_time < stale_threshold
+        if stale and instance_id not in _syncing_instances:
             logger.info("Instance %s has stale K8s status, scheduling background sync", instance_id)
-            background_tasks.add_task(_background_sync_instance_status, str(instance_id))
+            background_tasks.add_task(_background_sync_instance_status, instance_id)
 
     # Log cache effectiveness
     total_time = (time.perf_counter() - start) * 1000
@@ -170,6 +81,21 @@ async def list_user_instances(
 
     # Return cached data immediately
     return {"instances": enhanced_instances}
+
+
+_PENDING_DELETION_DETAIL = "This account is pending deletion and cannot run instances"
+
+
+def _existing_instance_response(existing: dict[str, Any], message: str, *, success: bool = True) -> dict[str, Any]:
+    """Return provision-route metadata for an instance that already exists."""
+    return {
+        "success": success,
+        "message": message,
+        "customer_id": existing.get("instance_id") or existing.get("subdomain") or "",
+        "frontend_url": existing.get("frontend_url") or existing.get("instance_url"),
+        "api_url": existing.get("backend_url") or existing.get("api_url"),
+        "matrix_url": existing.get("matrix_server_url") or existing.get("matrix_url"),
+    }
 
 
 @router.post("/my/instances/provision", response_model=ProvisionResponse)
@@ -186,7 +112,11 @@ async def provision_user_instance(
     sub_result = sb.table("subscriptions").select("*").eq("account_id", account_id).execute()
     if not sub_result.data:
         raise HTTPException(status_code=404, detail="No subscription found")
-    subscription = sub_result.data[0]
+    provisioner_service.refuse_pending_deletion(sb, account_id, _PENDING_DELETION_DETAIL)
+    # Provisioning mints a platform-paid OpenRouter key, so a Stripe-billed status is confirmed with Stripe first.
+    subscription = await instance_lifecycle.verified_subscription(sb, sub_result.data[0]["id"])
+    if subscription is None:
+        raise HTTPException(status_code=404, detail="No subscription found")
     assert_instance_entitlement(subscription, "provision")
 
     inst_result = (
@@ -198,6 +128,16 @@ async def provision_user_instance(
     )
     if inst_result.data:
         existing = inst_result.data[0]
+
+        # An instance stopped or torn down because the subscription lapsed returns through the lifecycle owner.
+        if existing.get("lifecycle_stopped_at"):
+            await instance_lifecycle.reconcile_subscription_instances(subscription["id"])
+            existing = instances_data.get_instance(sb, existing["instance_id"]) or existing
+            if existing.get("lifecycle_stopped_at"):
+                return _existing_instance_response(
+                    existing, "Instance restart failed and will be retried automatically", success=False
+                )
+            return _existing_instance_response(existing, "Instance restarted")
 
         # If instance is deprovisioned, reprovision it
         if existing.get("status") == "deprovisioned":
@@ -213,6 +153,7 @@ async def provision_user_instance(
                     "instance_id": existing["instance_id"],  # Reuse the same instance ID
                 },
                 background_tasks=background_tasks,
+                expected_status="deprovisioned",
             )
 
         # Otherwise return existing instance metadata
@@ -221,14 +162,7 @@ async def provision_user_instance(
         logger.info(
             "Instance already exists for user %s with status %s, returning existing metadata", account_id, status
         )
-        return {
-            "success": True,
-            "message": message,
-            "customer_id": existing.get("instance_id") or existing.get("subdomain") or "",
-            "frontend_url": existing.get("frontend_url") or existing.get("instance_url"),
-            "api_url": existing.get("backend_url") or existing.get("api_url"),
-            "matrix_url": existing.get("matrix_server_url") or existing.get("matrix_url"),
-        }
+        return _existing_instance_response(existing, message)
 
     return await provisioner_service.provision_instance(
         sb,
@@ -257,6 +191,18 @@ async def _verify_instance_ownership_and_run(
         if not sub_result.data:
             raise HTTPException(status_code=404, detail="Subscription not found")
         assert_instance_entitlement(sub_result.data[0], "run")
+        provisioner_service.refuse_pending_deletion(sb, user["account_id"], _PENDING_DELETION_DETAIL)
+        if instance.get("lifecycle_stopped_at"):
+            # Resuming also re-enables the OpenRouter key and clears the teardown schedule.
+            summary = await instance_lifecycle.reconcile_subscription_instances(instance["subscription_id"])
+            if summary.errors:
+                raise HTTPException(status_code=500, detail=f"Failed to resume instance: {summary.errors[0]}")
+            # Reconciliation may have found the stored active status stale and kept the hold.
+            sub_result = sb.table("subscriptions").select("*").eq("id", instance["subscription_id"]).limit(1).execute()
+            assert_instance_entitlement(sub_result.data[0], "run")
+            refreshed = instances_data.get_owned_instance(sb, instance_id, user["account_id"])
+            if refreshed is None or refreshed.get("lifecycle_stopped_at"):
+                raise HTTPException(status_code=409, detail="Instance is stopped for an inactive subscription")
 
     return await instance_action(instance_id)
 
@@ -267,11 +213,16 @@ async def start_user_instance(
     request: Request,  # noqa: ARG001
     instance_id: int,
     user: Annotated[dict, Depends(verify_user)],
+    background_tasks: BackgroundTasks,
 ) -> dict[str, Any]:
     """Start user's instance."""
-    return await _verify_instance_ownership_and_run(
+    result = await _verify_instance_ownership_and_run(
         instance_id, user, provisioner_service.start_instance, require_active_subscription=True
     )
+    # A stopped instance keeps its old deployment and loses only a key its tier does not include, so once it runs
+    # the lifecycle redeploys it with what its tier pays for.
+    background_tasks.add_task(instance_lifecycle.reconcile_account_instances, user["account_id"])
+    return result
 
 
 @router.post("/my/instances/{instance_id}/stop", response_model=ActionResult)

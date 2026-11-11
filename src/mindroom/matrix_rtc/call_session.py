@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Protocol
 import aiohttp
 import nio
 
+from mindroom.background_tasks import wait_for_future_until_complete
 from mindroom.logging_config import get_logger
 from mindroom.matrix_rtc.events import (
     CALL_MEMBER_EVENT_TYPE,
@@ -45,7 +46,6 @@ _MEMBERSHIP_REFRESH_RETRY_MS = 60 * 1000
 #: the last delay, delivery waits for the next membership change instead of
 #: polling the homeserver forever for a device that may never come online.
 _KEY_DISTRIBUTION_RETRY_DELAYS_S = (1.0, 5.0, 30.0)
-_E2EE_READY_TIMEOUT_S = 15.0
 
 _MATRIX_NETWORK_ERRORS = (nio.exceptions.ProtocolError, OSError, aiohttp.ClientError)
 
@@ -72,6 +72,10 @@ class VoiceBridgeLike(Protocol):
 
     def set_participant_identities(self, participant_identities: frozenset[str]) -> None:
         """Restrict media input and output to the current Matrix call roster."""
+        ...
+
+    def vacate_roster(self) -> None:
+        """Keep the last roster's media after the Matrix roster emptied, ending once it leaves the SFU."""
         ...
 
     async def connect(self, grant: SfuGrant) -> None:
@@ -114,7 +118,8 @@ class CallSessionDeps:
     bridge: VoiceBridgeLike
     key_transport: _FrameKeyTransportLike
     fetch_grant: Callable[[], Coroutine[None, None, SfuGrant]]
-    agent_options: CallVoiceAgentOptions
+    #: Prepares the voice agent while the session joins the call's media.
+    prepare_agent: Callable[[], Coroutine[None, None, CallVoiceAgentOptions]]
     livekit_service_url: str
     start_is_allowed: Callable[[], bool]
     clock_ms: Callable[[], int] = lambda: int(time.time() * 1000)
@@ -143,10 +148,11 @@ class CallSession:
     _key_distribution_retry_scheduled: bool = field(default=False, init=False)
     _key_distribution_wakeup_scheduled: bool = field(default=False, init=False)
     _key_retry_attempt: int = field(default=0, init=False)
-    _devices_with_received_key: set[str] = field(default_factory=set, init=False)
-    _inbound_key_roster_generation: int = field(default=0, init=False)
     _undelivered_key_device_ids: frozenset[str] = field(default_factory=frozenset, init=False)
     _reported_failure_codes: set[str] = field(default_factory=set, init=False)
+    _preparing_agent: asyncio.Task[CallVoiceAgentOptions] | None = field(default=None, init=False)
+    #: When each start step finished, in ``time.monotonic()`` seconds.
+    start_stages: dict[str, float] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         """Initialize the frame-key manager from the client identity."""
@@ -157,19 +163,42 @@ class CallSession:
         )
 
     @property
+    def members(self) -> tuple[CallMember, ...]:
+        """Return the Matrix call roster this session last applied."""
+        return tuple(self._members)
+
+    @property
     def _local_identity(self) -> str:
         """Our LiveKit participant identity (``user_id:device_id``)."""
         client = self.deps.client
         return f"{client.user_id}:{required_device_id(client)}"
 
     async def start(self, members: list[CallMember]) -> None:
-        """Join the call: connect media, publish membership, distribute keys."""
+        """Join the call: connect media, publish membership, distribute keys, then start the voice agent.
+
+        The voice agent is prepared while the media steps, which hold most of a join's wait, run.
+        """
         self._members = members
-        self._inbound_key_roster_generation += 1
-        roster_generation = self._inbound_key_roster_generation
         self._sync_bridge_participants()
+        stages = self.start_stages
+
+        def prepared(task: asyncio.Task[CallVoiceAgentOptions]) -> None:
+            stages["agent_prepared"] = time.monotonic()
+            # A join that fails in a media step never awaits the preparation, so take its failure here.
+            if not task.cancelled():
+                task.exception()
+
+        preparing: asyncio.Task[CallVoiceAgentOptions] | None = None
         try:
+            # A caller whose access went while the service was discovered gets no agent built.
+            self._require_start_allowed()
+            preparing = self._preparing_agent = asyncio.create_task(
+                self.deps.prepare_agent(),
+                name=f"matrix_rtc_prepare_agent_{self.room_id}",
+            )
+            preparing.add_done_callback(prepared)
             grant = await self.deps.fetch_grant()
+            stages["sfu_granted"] = time.monotonic()
             self._require_start_allowed()
             try:
                 await self.deps.bridge.connect(grant)
@@ -178,43 +207,68 @@ class CallSession:
                 # manager's join guard handles them as an ordinary failed join.
                 msg = f"LiveKit SFU connect failed: {error}"
                 raise CallJoinError(msg) from error
+            stages["sfu_connected"] = time.monotonic()
             self._require_start_allowed()
             await self._publish_membership(initial=True)
+            stages["membership_published"] = time.monotonic()
             self._require_start_allowed()
             if self.e2ee_enabled:
                 await self._distribute_keys()
+                stages["keys_sent"] = time.monotonic()
                 self._require_start_allowed()
-                self._spawn(
-                    self._report_missing_inbound_key_after_timeout(roster_generation),
-                )
             self._spawn(self._membership_refresh_loop())
+            # Shielded: a cancelled start leaves the media at once instead of after an agent build drains.
+            options = await asyncio.shield(preparing)
             self._require_start_allowed()
             try:
-                await self.deps.bridge.start_agent(self.deps.agent_options)
+                await self.deps.bridge.start_agent(options)
             except Exception as error:
                 if isinstance(error, CallJoinError):
                     raise
                 msg = f"Voice agent start failed: {error}"
                 raise CallJoinError(msg) from error
+            stages["agent_started"] = time.monotonic()
             self._require_start_allowed()
-        except BaseException:
-            await self.stop()
+        except BaseException as error:
+            await self._end_failed_start(error, preparing)
             raise
         logger.info("call_joined", room_id=self.room_id, identity=self._local_identity)
 
+    async def _end_failed_start(
+        self,
+        error: BaseException,
+        preparing: asyncio.Task[CallVoiceAgentOptions] | None,
+    ) -> None:
+        """Leave the media first, then wait out the agent preparation, whose failure decides the outcome."""
+        if preparing is not None:
+            preparing.cancel()
+        try:
+            await self.stop()
+        finally:
+            if preparing is not None:
+                # The real agent build finishes before it takes a cancellation, and none may outlive the start.
+                # Awaited directly, so a cancellation arriving now still finds the wait running.
+                await wait_for_future_until_complete(asyncio.gather(preparing, return_exceptions=True))
+        if not isinstance(error, Exception) or isinstance(error, CallStartRevokedError) or preparing is None:
+            return
+        failure = None if preparing.cancelled() else preparing.exception()
+        if failure is not None and failure is not error:
+            # An agent that cannot start is skipped, whatever media step failed after its preparation did.
+            raise failure
+
     def _require_start_allowed(self) -> None:
-        """Abort before the next call-start side effect when ownership was revoked."""
+        """Abort before the next call-start side effect when ownership was revoked or the agent's preparation failed."""
         if not self.deps.start_is_allowed():
             raise CallStartRevokedError
+        preparing = self._preparing_agent
+        if preparing is not None and preparing.done():
+            # Raises the preparation's failure, so a call whose agent cannot start publishes nothing more.
+            preparing.result()
 
     async def on_members_changed(self, members: list[CallMember]) -> None:
         """React to remote membership changes (key rotation/sharing)."""
         if self._stopped:
             return
-        self._inbound_key_roster_generation += 1
-        roster_generation = self._inbound_key_roster_generation
-        active_device_ids = {member.device_id for member in members}
-        self._devices_with_received_key.intersection_update(active_device_ids)
         self._members = members
         self._sync_bridge_participants()
         if not self.e2ee_enabled:
@@ -222,10 +276,11 @@ class CallSession:
         # A roster change is a fresh delivery opportunity: restart the backoff.
         self._key_retry_attempt = 0
         await self._distribute_keys()
-        if self._missing_inbound_key_device_ids():
-            self._spawn(
-                self._report_missing_inbound_key_after_timeout(roster_generation),
-            )
+
+    def vacate_roster(self) -> None:
+        """Keep this roster's media and frame keys while the caller's lapsed membership returns."""
+        if not self._stopped:
+            self.deps.bridge.vacate_roster()
 
     def on_key_received(self, received: ReceivedFrameKey) -> bool:
         """Install a current participant's frame key and report roster admission."""
@@ -248,7 +303,6 @@ class CallSession:
         )
         if inbound is None:
             return True
-        self._devices_with_received_key.add(received.claimed_device_id)
         self.deps.bridge.set_frame_key(inbound.participant_identity, inbound.key, inbound.key_index)
         logger.info(
             "call_frame_key_installed",
@@ -329,8 +383,9 @@ class CallSession:
                     targets=list(distribution.targets),
                 )
             self._key_manager.mark_distributed(distribution, tuple(delivered))
+            delivered_members = set(delivered)
             undelivered_device_ids = frozenset(
-                target.device_id for target in distribution.targets if target not in delivered
+                target.device_id for target in distribution.targets if target not in delivered_members
             )
             if not undelivered_device_ids:
                 self._key_retry_attempt = 0
@@ -385,28 +440,6 @@ class CallSession:
             except _MATRIX_NETWORK_ERRORS as error:
                 logger.warning("call_key_distribution_error", room_id=self.room_id, error=str(error))
                 self._schedule_key_distribution_retry()
-
-    async def _report_missing_inbound_key_after_timeout(self, roster_generation: int) -> None:
-        """Explain the otherwise-silent case where the agent cannot decrypt the caller."""
-        await asyncio.sleep(_E2EE_READY_TIMEOUT_S)
-        if self._stopped or roster_generation != self._inbound_key_roster_generation:
-            return
-        missing_device_ids = self._missing_inbound_key_device_ids()
-        if not missing_device_ids:
-            return
-        target_devices = ", ".join(sorted(missing_device_ids))
-        self._report_failure_once(
-            "inbound_encryption_key_missing",
-            "Encrypted call setup error: MindRoom has not received a usable media encryption key from your "
-            f"Matrix device ({target_devices}), so the agent cannot decrypt or hear your microphone audio. "
-            "Leave and rejoin the call after the client has fully synced. If it repeats, restart the Matrix "
-            "client and have the server operator inspect encrypted to-device events, the device's Olm session, "
-            "and its signed one-time-key supply.",
-        )
-
-    def _missing_inbound_key_device_ids(self) -> frozenset[str]:
-        """Return active remote devices whose media key is still unavailable."""
-        return frozenset(member.device_id for member in self._members) - self._devices_with_received_key
 
     def _report_failure_once(self, code: str, message: str) -> None:
         """Coalesce one actionable room notice per failure mode."""

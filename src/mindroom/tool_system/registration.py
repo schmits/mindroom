@@ -5,24 +5,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mindroom.tool_system.declarations import (
+    ApprovalAlias,
     ConfigField,
     SetupType,
     ToolAuthoredOverrideValidator,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolMetadata,
     ToolStatus,
 )
-from mindroom.tool_system.registry_state import (
-    PLUGIN_MODULE_PREFIX,
-    PLUGIN_REGISTRATION_SCOPE,
-    register_builtin_tool_metadata,
-    register_plugin_tool_metadata,
-)
+from mindroom.tool_system.registry import register_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 
 def register_tool_with_metadata(
@@ -34,8 +31,12 @@ def register_tool_with_metadata(
     status: ToolStatus = ToolStatus.AVAILABLE,
     setup_type: SetupType = SetupType.NONE,
     default_execution_target: ToolExecutionTarget = ToolExecutionTarget.PRIMARY,
+    requires_primary_runtime: bool = False,
     consumes_workspace_paths: bool = False,
+    file_access: ToolFileAccess,
+    executes_code: bool = False,
     requires_room_context: bool = False,
+    requires_conversation: bool = False,
     icon: str | None = None,
     icon_color: str | None = None,
     config_fields: list[ConfigField] | None = None,
@@ -47,6 +48,9 @@ def register_tool_with_metadata(
     docs_url: str | None = None,
     helper_text: str | None = None,
     function_names: tuple[str, ...] = (),
+    workspace_writers: tuple[str, ...] = (),
+    approval_aliases: Mapping[str, ApprovalAlias] | None = None,
+    worker_inert_agent_functions: tuple[str, ...] = (),
     managed_init_args: tuple[ToolManagedInitArg, ...] = (),
     supports_toolkit_filters: bool = True,
 ) -> Callable[[Callable[[], type]], Callable[[], type]]:
@@ -70,8 +74,12 @@ def register_tool_with_metadata(
             status=status,
             setup_type=setup_type,
             default_execution_target=default_execution_target,
+            requires_primary_runtime=requires_primary_runtime,
             consumes_workspace_paths=consumes_workspace_paths,
+            file_access=file_access,
+            executes_code=executes_code,
             requires_room_context=requires_room_context,
+            requires_conversation=requires_conversation,
             icon=icon,
             icon_color=icon_color,
             config_fields=config_fields,
@@ -83,25 +91,20 @@ def register_tool_with_metadata(
             docs_url=docs_url,
             helper_text=helper_text,
             function_names=function_names,
+            workspace_writers=workspace_writers,
+            approval_aliases=dict(approval_aliases or {}),
+            worker_inert_agent_functions=worker_inert_agent_functions,
             managed_init_args=managed_init_args,
             supports_toolkit_filters=supports_toolkit_filters,
             factory=factory,
         )
-
-        validation_owner_module_name = getattr(
-            PLUGIN_REGISTRATION_SCOPE,
-            "owner_module_name",
-            None,
-        )
-        if validation_owner_module_name is not None:
-            register_plugin_tool_metadata(validation_owner_module_name, metadata)
-        elif factory.__module__.startswith(PLUGIN_MODULE_PREFIX):
-            register_plugin_tool_metadata(factory.__module__, metadata)
-        else:
-            register_builtin_tool_metadata(metadata)
+        register_tool(metadata)
         return factory
 
     return decorator
+
+
+register_builtin_tool_metadata = register_tool
 
 
 __all__ = ["register_builtin_tool_metadata", "register_tool_with_metadata"]

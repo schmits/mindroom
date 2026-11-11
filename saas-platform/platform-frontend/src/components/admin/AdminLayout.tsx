@@ -7,8 +7,8 @@ import {
   CreditCard,
   Server,
   FileText,
-  BarChart3,
   Home,
+  Hourglass,
   LogOut
 } from 'lucide-react'
 
@@ -17,8 +17,8 @@ const navItems = [
   { name: 'Accounts', href: '/admin/accounts', icon: Users },
   { name: 'Subscriptions', href: '/admin/subscriptions', icon: CreditCard },
   { name: 'Instances', href: '/admin/instances', icon: Server },
+  { name: 'Lifecycle', href: '/admin/lifecycle', icon: Hourglass },
   { name: 'Audit Logs', href: '/admin/audit-logs', icon: FileText },
-  { name: 'Usage Metrics', href: '/admin/usage', icon: BarChart3 },
 ]
 
 export function AdminLayout({ children }: { children: React.ReactNode }) {
@@ -44,7 +44,7 @@ export function AdminLayout({ children }: { children: React.ReactNode }) {
                 href={item.href}
                 className={`flex items-center px-6 py-3 text-sm font-medium transition-colors ${
                   isActive
-                    ? 'bg-orange-50 dark:bg-orange-900/20 text-orange-600 dark:text-orange-400 border-r-4 border-orange-600 dark:border-orange-400'
+                    ? 'bg-brand-50 dark:bg-brand-900/20 text-brand-700 dark:text-brand-400 border-r-4 border-brand-700 dark:border-brand-400'
                     : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-gray-100'
                 }`}
               >

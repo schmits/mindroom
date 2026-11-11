@@ -11,12 +11,17 @@ from starlette.routing import Route
 
 from mindroom.api.auth import require_connections_user, require_same_origin
 from mindroom.api.config_lifecycle import app_state, rebind_current_request_snapshot
-from mindroom.api.connection_agents import CONNECTIONS_HEADERS, resolve_connection_user
-from mindroom.api.mcp_identity import resolve_gateway_browser_owner
+from mindroom.api.connection_agents import (
+    CONNECTIONS_HEADERS,
+    SHARED_CREDENTIALS_GATEWAY_MESSAGE,
+    resolve_connection_user,
+)
+from mindroom.api.mcp_identity import resolve_gateway_connections_owner
 from mindroom.mcp_gateway.selection import SelectionAccessDeniedError
 from mindroom.mcp_gateway.server import read_gateway_body
 from mindroom.mcp_gateway.store import GatewayOAuthCapacityError
-from mindroom.tool_system.catalog import resolved_tool_metadata_for_runtime
+from mindroom.tool_system.agent_tools import resolve_agent_tools
+from mindroom.tool_system.plugins import config_plugins
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -67,22 +72,18 @@ def _available_choices(
     previous: AgentSelections | None = None,
 ) -> AgentSelections:
     """Hide stale choices and discard them on save without accepting new unavailable tools."""
-    metadata = (
-        resolved_tool_metadata_for_runtime(context.runtime_paths, context.config, tolerate_plugin_load_errors=True)
-        if any(choices.values())
-        else {}
-    )
+    registry = config_plugins(context.config, context.runtime_paths).tools
     result: AgentSelections = {}
     for name, tools in choices.items():
-        if name not in context.agent_names:
+        if name not in context.gateway_agent_names:
             continue
         if tools is None:
             result[name] = None
             continue
         available = {
             tool
-            for tool in context.config.resolve_entity(name).available_tools
-            if tool in metadata and not metadata[tool].requires_room_context
+            for tool in resolve_agent_tools(context.config, name, registry).tool_names
+            if registry.entries[tool].mcp_available
         }
         previous_tools = previous.get(name, ()) if previous is not None else None
         if previous_tools is not None and set(tools) - available - set(previous_tools):
@@ -107,12 +108,17 @@ async def _handle_selection(
     if request.query_params:
         raise HTTPException(400, "Selection target overrides are not accepted")
     choices = await _selection_choices(request, runtime.origin) if request.method == "POST" else None
-    owner = await resolve_gateway_browser_owner(request, user, runtime.provider)
+    owner = await resolve_gateway_connections_owner(request, user, runtime.provider)
+    if owner is None:
+        return JSONResponse(
+            {"enabled": False, "agents": {}, "unavailable_reason": "account_required"},
+            headers=CONNECTIONS_HEADERS,
+        )
     context = resolve_connection_user(
         rebind_current_request_snapshot(request),
         owner.authenticated_user_id,
         account_id=owner.account_id,
-        membership_index=app_state(request.app).agent_reply_memberships,
+        membership_index=app_state(request.app).runtime.agent_reply_memberships,
     )
     runtime_for_request(request)
     defaults = (context.personal_agent_name,) if context.personal_agent_name is not None else ()
@@ -122,6 +128,8 @@ async def _handle_selection(
     else:
         if any(name not in context.agent_names for name in choices):
             raise HTTPException(404, "Agent is not available")
+        if any(name not in context.gateway_agent_names for name in choices):
+            raise HTTPException(403, SHARED_CREDENTIALS_GATEWAY_MESSAGE)
         selected = _available_choices(choices, context, previous=saved)
         try:
             selected = await runtime.selections.set(context.owner, selected)

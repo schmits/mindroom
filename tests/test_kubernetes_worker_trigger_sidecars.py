@@ -11,10 +11,12 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 import yaml
 
+from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.workers.backend import WorkerBackendError
 from mindroom.workers.backends.kubernetes_config import KubernetesWorkerBackendConfig
 from mindroom.workers.backends.kubernetes_resources import KubernetesResourceManager
+from mindroom.workers.runtime import build_worker_launch_config
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -59,9 +61,6 @@ def _worker_config(
         storage_pvc_name="mindroom-storage",
         storage_mount_path="/app/worker",
         storage_subpath_prefix="workers",
-        config_map_name="mindroom-config",
-        config_key="config.yaml",
-        config_path="/app/config.yaml",
         idle_timeout_seconds=60.0,
         ready_timeout_seconds=5.0,
         name_prefix="mindroom-worker",
@@ -76,7 +75,6 @@ def _worker_config(
         enable_service_links=False,
         auth_secret_name=None,
         reconcile_pod_templates=True,
-        agent_vault=None,
         extra_containers=extra_containers,
         extra_volumes=extra_volumes,
     )
@@ -93,16 +91,13 @@ def _pod_template(
         config=_worker_config(extra_containers=extra_containers, extra_volumes=extra_volumes),
         auth_token=_TEST_AUTH_TOKEN,
         storage_root=tmp_path / "storage",
-        tool_validation_snapshot={},
-        config_snapshot={},
-        worker_grantable_credentials=frozenset(),
     )
     return manager._pod_template(
         worker_key="v1:tenant-123:shared:general",
         worker_id="mindroom-worker-test",
         state_subpath="workers/test",
-        startup_manifest_path="/app/worker/workers/test/.mindroom-startup.json",
         startup_manifest_hash="startup-hash",
+        launch=build_worker_launch_config(Config(), tool_validation_snapshot={}),
         private_agent_names=None,
     )
 

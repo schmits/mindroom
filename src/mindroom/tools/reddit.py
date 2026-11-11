@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="reddit",
+    file_access=ToolFileAccess.NONE,
     display_name="Reddit",
     description="Social media platform for browsing, posting, and interacting with Reddit communities",
     category=ToolCategory.SOCIAL,
@@ -22,14 +23,8 @@ if TYPE_CHECKING:
     icon_color="text-orange-500",  # Reddit's signature orange color
     config_fields=[
         ConfigField(
-            name="reddit_instance",
-            label="Reddit Instance",
-            type="text",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
             name="client_id",
+            env=("REDDIT_CLIENT_ID",),
             label="Client ID",
             type="text",
             required=False,
@@ -37,6 +32,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="client_secret",
+            env=("REDDIT_CLIENT_SECRET",),
             label="Client Secret",
             type="password",
             required=False,
@@ -44,6 +40,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="user_agent",
+            env=("REDDIT_USER_AGENT",),
             label="User Agent",
             type="text",
             required=False,
@@ -51,6 +48,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="username",
+            env=("REDDIT_USERNAME",),
             label="Username",
             type="text",
             required=False,
@@ -58,6 +56,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="password",
+            env=("REDDIT_PASSWORD",),
             label="Password",
             type="password",
             required=False,
@@ -69,11 +68,11 @@ if TYPE_CHECKING:
             type="string[]",
             required=False,
             default=None,
-            description="Restrict tool calls to these subreddits (case-insensitive)",
+            description="Restrict posts and replies to these subreddits (case-insensitive); reads are unaffected",
         ),
     ],
     dependencies=["praw"],
-    docs_url=None,
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#reddit",
     function_names=(
         "create_post",
         "get_subreddit_info",

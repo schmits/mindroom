@@ -10,8 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mindroom.config.main import Config
-from mindroom.scheduling import CronSchedule, ScheduledTaskRecord, ScheduledWorkflow, _run_cron_task
+from mindroom.scheduling.tasks import CronSchedule, ScheduledTaskRecord, ScheduledWorkflow
 from tests.conftest import test_runtime_paths as runtime_paths
+from tests.scheduling_helpers import joined_member_state, run_cron_task
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -23,9 +24,11 @@ async def test_cancel_mid_wait_cron_task(tmp_path: Path) -> None:
     client = AsyncMock()
     client.homeserver = "https://example.org"
     client.user_id = "@router:example.org"
+    client.room_get_state_event.side_effect = joined_member_state
     config = Config()
 
     workflow = ScheduledWorkflow(
+        created_by="@user:server",
         schedule_type="cron",
         cron_schedule=CronSchedule(minute="*", hour="*", day="*", month="*", weekday="*"),
         message="Msg",
@@ -48,15 +51,14 @@ async def test_cancel_mid_wait_cron_task(tmp_path: Path) -> None:
         await asyncio.Event().wait()
 
     with (
-        patch("mindroom.scheduling.asyncio.sleep", new=wait_until_cancelled),
-        patch("mindroom.scheduling.get_scheduled_task", new=AsyncMock(return_value=pending_record)),
+        patch("mindroom.scheduling.tasks.asyncio.sleep", new=wait_until_cancelled),
+        patch("mindroom.scheduling.runtime.get_scheduled_task", new=AsyncMock(return_value=pending_record)),
     ):
         task = asyncio.create_task(
-            _run_cron_task(
+            run_cron_task(
                 client,
                 "tid",
                 workflow,
-                {},
                 config,
                 runtime_paths(tmp_path),
                 MagicMock(),

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="webex",
+    file_access=ToolFileAccess.NONE,
     display_name="Webex",
     description="Video conferencing and messaging platform for teams",
     category=ToolCategory.COMMUNICATION,
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="access_token",
+            env=("WEBEX_ACCESS_TOKEN",),
             label="Access Token",
             type="password",
             required=False,
@@ -51,7 +53,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["webexpythonsdk"],
-    docs_url="https://docs.agno.com/tools/toolkits/social/webex",
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#webex",
     function_names=("list_rooms", "send_message"),
 )
 def webex_tools() -> type[WebexTools]:

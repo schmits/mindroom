@@ -1,8 +1,11 @@
+import { PlausibleAnalytics } from '@/components/PlausibleAnalytics'
+
 export default function PrivacyPage() {
   return (
     <main className="max-w-3xl px-6 py-12 mx-auto space-y-6">
+      <PlausibleAnalytics />
       <header className="space-y-2">
-        <p className="text-sm text-muted-foreground">Last reviewed: August 14, 2026</p>
+        <p className="text-sm text-muted-foreground">Last reviewed: October 11, 2026</p>
         <h1 className="text-3xl font-semibold">MindRoom Privacy Notice</h1>
         <p className="text-base text-muted-foreground">
           This hosted control-plane notice supplements the canonical MindRoom privacy policy.
@@ -12,7 +15,7 @@ export default function PrivacyPage() {
         <h2 className="text-xl font-semibold">Information We Collect</h2>
         <p>
           We process account profile and status data, subscriptions and payments, hosted instance records,
-          usage metrics, audit events, and consent choices needed to operate the service.
+          audit events, and consent choices needed to operate the service.
         </p>
       </section>
       <section className="space-y-3">
@@ -26,7 +29,7 @@ export default function PrivacyPage() {
         <h2 className="text-xl font-semibold">Retention</h2>
         <p>
           Hosted cleanup schedules soft-deleted application accounts for removal after a seven-day grace
-          period, ordinary audit logs after 90 days, and usage metrics after 365 days. Some security and
+          period, and ordinary audit logs after 90 days. Some security and
           deletion audit events are excluded from ordinary audit cleanup.
         </p>
       </section>
@@ -35,6 +38,9 @@ export default function PrivacyPage() {
         <p>
           The hosted control plane uses Supabase for database and authentication services and Stripe for
           payment processing. Matrix homeserver and installation operators have their own data boundaries.
+          Public pages of this site, not the signed-in dashboard, count page views, link clicks, downloads, and
+          form submissions (never their contents) with a self-hosted instance of Plausible Analytics, which sets
+          no cookies and reports only aggregate statistics.
         </p>
       </section>
       <section className="space-y-3">

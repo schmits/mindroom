@@ -87,12 +87,9 @@ export default function AccountsPage() {
 
   return (
     <div>
-      <div className="mb-8 flex justify-between items-center">
-        <div>
-          <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Accounts</h1>
-          <p className="text-gray-600 dark:text-gray-400 mt-2">Manage user accounts and permissions</p>
-        </div>
-        <Button>Export</Button>
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold text-gray-900 dark:text-gray-100">Accounts</h1>
+        <p className="text-gray-600 dark:text-gray-400 mt-2">Manage user accounts and permissions</p>
       </div>
 
       <Card className="bg-white dark:bg-gray-900 border-gray-200 dark:border-gray-800">
@@ -138,11 +135,19 @@ export default function AccountsPage() {
                             const next = editStatuses[account.id] ?? account.status
                             setUpdatingId(account.id)
                             try {
-                              const res = await apiCall(`/admin/accounts/${account.id}/status?status=${encodeURIComponent(next)}`, { method: 'PUT' })
-                              if (!res.ok) throw new Error('Failed to update status')
+                              const res = await apiCall(`/admin/accounts/${account.id}/status`, {
+                                method: 'PUT',
+                                body: JSON.stringify({ status: next }),
+                              })
+                              if (!res.ok) {
+                                const body = await res.json().catch(() => null)
+                                alert(`Failed to update status: ${body?.detail ?? res.statusText}`)
+                                return
+                              }
                               setAccounts((prev) => prev.map(a => a.id === account.id ? { ...a, status: next } : a))
                             } catch (err) {
                               logger.error('Update status failed', err)
+                              alert('An error occurred while updating the status')
                             } finally {
                               setUpdatingId(null)
                             }

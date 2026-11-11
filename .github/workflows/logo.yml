@@ -12,6 +12,8 @@ on:
       - saas-platform/platform-frontend/public/res/branding/mindroom.*
       - saas-platform/platform-frontend/src/app/favicon.ico
       - avatars/spaces/root_space.png
+      - macos/MindRoom/Resources/MindRoom.icon/Assets/*.png
+      - macos/MindRoom/Sources/MindRoom/Resources/logo*
       - .github/workflows/logo.yml
   pull_request:
     paths:
@@ -23,10 +25,17 @@ on:
       - saas-platform/platform-frontend/public/res/branding/mindroom.*
       - saas-platform/platform-frontend/src/app/favicon.ico
       - avatars/spaces/root_space.png
+      - macos/MindRoom/Resources/MindRoom.icon/Assets/*.png
+      - macos/MindRoom/Sources/MindRoom/Resources/logo*
       - .github/workflows/logo.yml
 
 permissions:
   contents: read
+
+# A newer push to the same pull request makes older runs obsolete; other events never share a group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   verify:

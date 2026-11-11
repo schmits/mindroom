@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="duckdb",
+    file_access=ToolFileAccess.UNCONFINED,
+    requires_primary_runtime=True,
     display_name="DuckDB",
     description="In-memory analytical database for data processing and analysis",
     category=ToolCategory.PRODUCTIVITY,
@@ -29,18 +31,12 @@ if TYPE_CHECKING:
             default=None,
         ),
         ConfigField(
-            name="connection",
-            label="Connection",
-            type="text",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
             name="init_commands",
             label="Init Commands",
-            type="text",
+            type="string[]",
             required=False,
             default=None,
+            description="SQL statements run, in order, when the tool opens its database connection.",
         ),
         ConfigField(
             name="read_only",
@@ -49,16 +45,9 @@ if TYPE_CHECKING:
             required=False,
             default=False,
         ),
-        ConfigField(
-            name="config",
-            label="Config",
-            type="text",
-            required=False,
-            default=None,
-        ),
     ],
     dependencies=["duckdb"],
-    docs_url="https://docs.agno.com/tools/toolkits/database/duckdb",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#duckdb",
     function_names=(
         "create_fts_index",
         "create_table_from_path",

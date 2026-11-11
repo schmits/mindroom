@@ -1,0 +1,317 @@
+"""Minimal Bash's provider batch is saved before its shell can run."""
+
+# ruff: noqa: D103
+from __future__ import annotations
+
+import sqlite3
+import sys
+import threading
+from contextlib import closing
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+from mindroom.agent_cli.bash import minimal_bash_toolkit
+from mindroom.agent_cli.checkpoint import BatchCheckpoint
+from mindroom.agent_loop.tools import PlannedCall
+from mindroom.history.run_visibility import is_model_history_visible_run
+from mindroom.llm.media import Audio, Image
+from mindroom.llm.messages import Message
+from mindroom.llm.runs import RunRecord, RunStatus, ToolExecution
+from mindroom.session_storage.agent_storage import create_agent_state_storage
+from mindroom.session_storage.store import ConversationStore, persist_to, write_with_session_state
+from mindroom.session_storage.types import ConversationSession, session_state_snapshot
+from mindroom.tool_system.tool_function import ToolOutcome
+from tests.conftest import seed_session_state, stored_session_state
+from tests.minimal_agent_fixtures import checkpoint_loop_state
+from tests.test_agent_tool_calls import _catalog
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
+
+
+def _assistant(*call_ids: str, content: str | None = None) -> Message:
+    return Message(
+        role="assistant",
+        content=content,
+        tool_calls=[
+            {"id": call_id, "type": "function", "function": {"name": "bash", "arguments": '{"command":"work"}'}}
+            for call_id in call_ids
+        ],
+        provider_data={"signature": "real-provider-data"},
+    )
+
+
+async def _capture(checkpoint: BatchCheckpoint, record: RunRecord, messages: list[Message]) -> None:
+    """Capture the batch the last assistant message requests, as the loop does before it runs any call."""
+    bash = minimal_bash_toolkit().functions[0]
+    planned = [
+        PlannedCall(
+            function=bash,
+            execution=ToolExecution(tool_call_id=call["id"], tool_name="bash", tool_args={"command": "work"}),
+        )
+        for call in messages[-1].tool_calls or ()
+    ]
+    state = checkpoint_loop_state(messages, checkpoint.catalog.run, record)
+    await checkpoint.capture(state, planned)
+
+
+async def _stored_catalog(tmp_path: Path) -> PreparedAgentToolCatalog:
+    catalog = await _catalog(tmp_path, [])
+    catalog.store = create_agent_state_storage("helper", tmp_path)
+    return catalog
+
+
+def _record() -> RunRecord:
+    return RunRecord(run_id="run", session_id="session", agent_id="helper", status=RunStatus.running)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_captures_exact_batch_and_propagates_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    record = _record()
+    assistant = _assistant("bash-1", "bash-2", content="working")
+    messages = [Message(role="user", content="do work"), assistant]
+    with pytest.raises(ValueError, match="captured"):
+        await checkpoint.persist("bash-1")
+    await _capture(checkpoint, record, messages)
+    original = deepcopy(messages)
+    assistant.content = "mutated after capture"
+    await checkpoint.persist("bash-1")
+    assert catalog.store is not None
+    saved = catalog.store.get_run("run")
+    assert isinstance(saved, RunRecord)
+    assert [item.to_dict() for item in saved.messages] == [item.to_dict() for item in original]
+    assert [(tool.tool_call_id, tool.tool_args) for tool in saved.tools or ()] == [
+        ("bash-1", {"command": "work"}),
+        ("bash-2", {"command": "work"}),
+    ]
+    # A crash before the run's own terminal save must not replay the unanswered Bash call.
+    assert not is_model_history_visible_run(saved)
+    assert record.status is RunStatus.running
+    assert record.messages == []
+    await checkpoint.persist("bash-2")
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        msg = "injected database failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(ConversationStore, "save_run", fail)
+    await _capture(checkpoint, record, messages)
+    with pytest.raises(OSError, match="injected"):
+        await checkpoint.persist("bash-1")
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_keeps_the_batch_s_calls_in_call_order(tmp_path: Path) -> None:
+    """A refused call between two Bash calls keeps its place in the saved record, as the loop recorded the batch."""
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    record = _record()
+    record.tools = [
+        ToolExecution(tool_call_id="bash-1", tool_name="bash", tool_args={"command": "work"}),
+        ToolExecution(tool_call_id="bad-1", tool_name="missing", is_error=True, result="not offered"),
+        ToolExecution(tool_call_id="bash-2", tool_name="bash", tool_args={"command": "work"}),
+    ]
+    await _capture(checkpoint, record, [Message(role="user", content="do work"), _assistant("bash-1", "bash-2")])
+
+    await checkpoint.persist("bash-1")
+
+    assert catalog.store is not None
+    saved = catalog.store.get_run("run")
+    assert isinstance(saved, RunRecord)
+    assert [(tool.tool_call_id, tool.is_error) for tool in saved.tools or ()] == [
+        ("bash-1", None),
+        ("bad-1", True),
+        ("bash-2", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_turns_session_holds_the_checkpoint_as_stored(tmp_path: Path) -> None:
+    """A checkpoint saves through the turn's own session, which then holds the saved run as a load would."""
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    await _capture(checkpoint, _record(), [_assistant("bash-1")])
+
+    await checkpoint.persist("bash-1")
+
+    assert catalog.store is not None
+    stored = catalog.store.load_session("session")
+    assert stored is not None
+    assert [(run.run_id, run.status) for run in catalog.session.runs] == [("run", RunStatus.cancelled)]
+    assert [run.to_dict() for run in catalog.session.runs] == [run.to_dict() for run in stored.runs]
+
+
+@pytest.mark.asyncio
+async def test_approval_checkpoint_refreshes_mutable_session_state(tmp_path: Path) -> None:
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    await _capture(checkpoint, _record(), [_assistant("bash-1")])
+    await checkpoint.persist("bash-1")
+    catalog.run.session_state["before_approval"] = "kept"
+    await checkpoint.persist_approval("bash-1")
+    assert catalog.store is not None
+    assert stored_session_state(catalog.store, "session")["before_approval"] == "kept"
+    saved = catalog.store.get_run("run")
+    assert saved is not None
+    assert saved.messages[0].tool_calls[0]["id"] == "bash-1"
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_and_the_state_its_calls_ran_with_are_stored_together_or_neither(tmp_path: Path) -> None:
+    """A checkpoint the database refuses leaves the session state as it was, so a restart finds no state without it."""
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    await _capture(checkpoint, _record(), [_assistant("bash-1")])
+    await checkpoint.persist("bash-1")
+    store = catalog.store
+    assert store is not None
+    with closing(sqlite3.connect(store.path)) as connection, connection:
+        connection.execute(
+            f"CREATE TRIGGER refuse_run BEFORE UPDATE ON {store.names.log_runs} BEGIN SELECT RAISE(ABORT, 'run refused'); END",
+        )
+    catalog.run.session_state["before_approval"] = "kept"
+
+    with pytest.raises(sqlite3.IntegrityError, match="run refused"):
+        await checkpoint.persist_approval("bash-1")
+
+    assert stored_session_state(store, "session") == {}
+    assert catalog.session.stored_session_state == {}
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_save_restores_a_session_state_a_checkpoint_stored_changed(tmp_path: Path) -> None:
+    """A state one Bash call changes and the next restores is stored restored, though a checkpoint stored the change."""
+    catalog = await _stored_catalog(tmp_path)
+    store = catalog.store
+    assert store is not None
+    session = catalog.session
+    session.session_state["cwd"] = "/repo"
+    seed_session_state(store, session, session_state_snapshot(session.session_state))
+    persist = persist_to(store, session)
+    checkpoint = BatchCheckpoint(catalog)
+    record = _record()
+    messages = [Message(role="user", content="do work"), _assistant("bash-1")]
+
+    await _capture(checkpoint, record, messages)
+    await checkpoint.persist("bash-1")
+    session.session_state["cwd"] = "/repo/sub"
+    checkpoint.complete("bash-1", ToolOutcome(content="moved"))
+    messages = [*messages, _assistant("bash-2")]
+    await _capture(checkpoint, record, messages)
+    await checkpoint.persist("bash-2")
+    assert stored_session_state(store, "session") == {"cwd": "/repo/sub"}
+    session.session_state["cwd"] = "/repo"
+    record.status = RunStatus.completed
+    await persist(record)
+
+    assert stored_session_state(store, "session") == {"cwd": "/repo"}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_retains_only_the_current_provider_batch(tmp_path: Path) -> None:
+    """Long minimal turns keep one history snapshot, not one per Bash batch."""
+    catalog = await _catalog(tmp_path, [])
+    checkpoint = BatchCheckpoint(catalog)
+    messages = [Message(role="user", content="do work")]
+    for index in range(3):
+        messages.append(_assistant(f"bash-{index}"))
+        await _capture(checkpoint, _record(), messages)
+        checkpoint.complete(f"bash-{index}", ToolOutcome(content="done"))
+        for earlier in range(index):
+            with pytest.raises(ValueError, match="captured"):
+                checkpoint.complete(f"bash-{earlier}", ToolOutcome(content="late"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("media", "failed"),
+    [(False, False), (True, False), (True, True)],
+    ids=["text", "media", "failed"],
+)
+async def test_approval_checkpoint_keeps_completed_sibling_result(tmp_path: Path, media: bool, failed: bool) -> None:
+    """A finished sibling's result is saved as the loop answers it: a failed one marked failed and without media."""
+    catalog = await _stored_catalog(tmp_path)
+    checkpoint = BatchCheckpoint(catalog)
+    await _capture(checkpoint, _record(), [_assistant("done", "waiting")])
+    await checkpoint.persist("done")
+    outcome = ToolOutcome(
+        content="real sibling result",
+        images=(Image(content=b"sibling-image", mime_type="image/png"),) if media else (),
+        audios=(Audio(url="https://example.test/sibling.wav"),) if media else (),
+        is_error=failed,
+    )
+    checkpoint.complete("done", outcome)
+    await checkpoint.persist_approval("waiting")
+    assert catalog.store is not None
+    saved = catalog.store.get_run("run")
+    assert saved is not None
+    assert saved.messages[-1].tool_call_id == "done"
+    assert (saved.messages[-1].content, saved.messages[-1].tool_call_error) == ("real sibling result", failed)
+    assert [(tool.tool_call_id, tool.result, tool.is_error) for tool in saved.tools or ()] == [
+        ("done", "real sibling result", failed),
+        ("waiting", None, None),
+    ]
+    if media and not failed:
+        assert saved.messages[-1].images[0].content == b"sibling-image"
+        assert saved.messages[-1].audio[0].url == "https://example.test/sibling.wav"
+    else:
+        assert (saved.messages[-1].images, saved.messages[-1].audio) == (None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_without_session_storage_refuses_the_bash_call(tmp_path: Path) -> None:
+    """Bash never runs when its batch cannot be saved first."""
+    checkpoint = BatchCheckpoint(await _catalog(tmp_path, []))
+    await _capture(checkpoint, _record(), [_assistant("bash-1")])
+    with pytest.raises(RuntimeError, match="persisted session storage"):
+        await checkpoint.persist("bash-1")
+
+
+@pytest.mark.asyncio
+async def test_a_checkpoint_saves_a_session_state_another_thread_keeps_changing(tmp_path: Path) -> None:
+    """The checkpoint copies the live state in one step while a sync tool's thread changes a nested dict in it.
+
+    A copy that walks the state in Python, even after a shallow copy of its top level, fails with "dictionary changed
+    size during iteration" once the interpreter hands over mid-walk; the tiny switch interval makes it do so.
+    """
+    store = create_agent_state_storage("helper", tmp_path)
+    nested: dict[str, Any] = {f"key-{index}": [index] for index in range(2_000)}
+    live: dict[str, Any] = {"nested": nested}
+    session = ConversationSession(session_id="session", kind="agent", owner_id="helper", session_state=live)
+    record = _record()
+    stop = threading.Event()
+
+    def churn() -> None:
+        # One change per pass, so the thread can hand the interpreter over with the extra key present.
+        while not stop.is_set():
+            if nested.pop("churn", None) is None:
+                nested["churn"] = True
+
+    switch_interval = sys.getswitchinterval()
+    changer = threading.Thread(target=churn)
+    sys.setswitchinterval(1e-6)
+    changer.start()
+    try:
+        for _ in range(3):
+            await write_with_session_state(
+                store,
+                session,
+                lambda opened, state: opened.save_run(session, record, record_usage=False, state=state),
+            )
+            assert session.stored_session_state == stored_session_state(store, "session")
+    finally:
+        stop.set()
+        changer.join()
+        sys.setswitchinterval(switch_interval)
+
+    assert session.stored_session_state is not live
+    assert session.stored_session_state["nested"] is not nested

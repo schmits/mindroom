@@ -1,0 +1,786 @@
+"""Paid helper calls retain content-free usage in their caller's conversation."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+import threading
+from contextlib import closing
+from dataclasses import replace
+from functools import partial
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
+
+import pytest
+from openai.types import CompletionUsage
+
+from mindroom.agent_cli.approval import CliApprovalCall
+from mindroom.agents import create_agent
+from mindroom.ai import ai_response
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
+from mindroom.config.approval import ToolApprovalConfig
+from mindroom.config.models import ModelConfig, ToolConfigEntry
+from mindroom.custom_tools.calculator import CalculatorTools
+from mindroom.custom_tools.dynamic_workflow import _execute_participant, _run_room_agent_turn, _WorkflowRun
+from mindroom.dynamic_workflows.spec import RoomAgentParticipant
+from mindroom.event_journal import ApprovalCall, ApprovalDecision, approval_arguments_digest
+from mindroom.helper_usage import (
+    HelperUsageOwner,
+    get_helper_usage_owner,
+    helper_usage_context,
+    record_helper_usage,
+    record_run_usage,
+)
+from mindroom.history.session_context import (
+    load_bound_scope_session,
+    load_scope_session,
+)
+from mindroom.history.turn_recorder import TurnRecorder
+from mindroom.history.types import HistoryScope
+from mindroom.hooks import HookRegistry
+from mindroom.llm import usage as llm_usage
+from mindroom.llm.errors import ProviderError
+from mindroom.llm.messages import AGGREGATE_USAGE_KEY, Message, model_provenance
+from mindroom.llm.provider import UsageReported
+from mindroom.llm.runs import RunRecord
+from mindroom.llm.usage import HelperUsage, TokenCounts
+from mindroom.memory._mem0_usage import counted_mem0_usage, install_mem0_usage_capture, mem0_usage
+from mindroom.memory.auto_flush import _extract_memory_summary
+from mindroom.response_turn import (
+    CompletedApprovalRun,
+    PausedAnswer,
+    PausedAttempt,
+    ResponsePausedForApproval,
+    TurnSinks,
+)
+from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.session_storage.schema import quote_identifier
+from mindroom.session_storage.types import session_state_snapshot
+from mindroom.teams.envelope import TeamTurnSpec
+from mindroom.teams.resume import continue_paused_team_run
+from mindroom.teams.spec import TeamMode
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import (
+    tool_runtime_context,
+)
+from mindroom.usage.stats import collect_admin_usage, collect_self_usage
+from tests.ai_user_id_helpers import team_orchestrator
+from tests.approval_continuation_helpers import approval_continuation
+from tests.conftest import (
+    install_model_providers,
+    make_turn_context,
+    seed_session_state,
+    unwrap_extracted_collaborator,
+)
+from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call
+from tests.fakes.scripted_model import usage as owned_usage
+from tests.history_helpers import (
+    _completed_run,
+    _forced_compaction_context,
+    _hook_runtime_context,
+    _make_config,
+    _session,
+)
+from tests.identity_helpers import persist_entity_accounts
+from tests.response_runner_helpers import _bot
+from tests.team_turn_helpers import collect_team_reply
+from tests.turn_model_helpers import turn_model
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from mindroom.session_storage.store import ConversationStore
+
+
+def _usage_rows(storage: ConversationStore) -> list[tuple[str, str]]:
+    """Return every stored usage row as ``(session_id, usage_data)``."""
+    with storage.transaction(write=False) as connection:
+        return connection.execute(
+            f"SELECT session_id, usage_data FROM {quote_identifier(storage.names.usage)}",  # noqa: S608
+        ).fetchall()
+
+
+def _resumed_turn(outcome: str) -> list[ScriptStep]:
+    """Return the scripted turn a resumed run requests after its approved call: an answer, or a failed request."""
+    if outcome != "error":
+        return answer("Finished.")
+
+    async def fail() -> None:
+        msg = "Resumed provider failed"
+        raise ProviderError(msg, provider="Synthetic")
+
+    return [Await(fail)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller",
+    [
+        "agent",
+        "private_agent",
+        "team",
+        "cli_agent",
+        "private_cli_agent",
+    ],
+)
+@pytest.mark.parametrize("outcome", ["completed", "error", "cancel"])
+async def test_approval_resumed_helpers_keep_caller_usage_and_reset_context(  # noqa: C901, PLR0915 - shared native/CLI ownership outcomes
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+    outcome: str,
+) -> None:
+    """Approval resume must retain paid helper output in its real caller store even if the resumed run fails."""
+    config, paths = _make_config(tmp_path)
+    config.agents["general"] = config.agents.pop("test_agent")
+    is_cli = caller in {"cli_agent", "private_cli_agent"}
+    config.agents["general"].tools = [ToolConfigEntry(name="calculator")]
+    if is_cli:
+        config.agents["general"].tools.append(ToolConfigEntry(name="shell"))
+        config.administrators = ["@user:localhost"]
+    config.memory.backend = "none"
+    # The approved call pauses the reply, which needs background tool jobs off.
+    config.background_tool_jobs.enabled = False
+    config.models["helper"] = ModelConfig(provider="openai", id="helper-model")
+    config.agents["helper"] = AgentConfig(display_name="Helper", model="helper")
+    config.tool_approval = ToolApprovalConfig.model_validate(
+        {"default": "auto_approve", "rules": [{"match": "add", "action": "require_approval"}]},
+    )
+    config.agents["general"].private = (
+        AgentPrivateConfig(per="user", root="mind_data") if caller in {"private_agent", "private_cli_agent"} else None
+    )
+    if caller == "team":
+        config.agents["second"] = AgentConfig(display_name="Second")
+        config.teams["reviewers"] = TeamConfig(display_name="Reviewers", role="Review", agents=["general", "second"])
+    persist_entity_accounts(config, paths)
+    context = replace(
+        _hook_runtime_context(
+            config=config,
+            runtime_paths=paths,
+            registry=HookRegistry.empty(),
+            session_id="approval-session",
+        ),
+        agent_name="general",
+    )
+    identity = context.execution_identity
+    helper_context = replace(context, target=replace(context.target, session_id="ephemeral-participant-session"))
+    turns = [calls(tool_call("add", "approved", a=2, b=3)), _resumed_turn(outcome)]
+    if caller == "team":
+        # The leader and its members share the default model: the leader delegates, the member's approved call
+        # pauses the run, and the resume answers as the member, then as the leader.
+        delegate = calls(tool_call("delegate_task_to_member", "delegate", member_id="general", task="Add 2 and 3"))
+        turns = [delegate, *turns, _resumed_turn(outcome)]
+    install_model_providers(
+        monkeypatch,
+        {
+            "default": ScriptedModel(turns),
+            "helper": ScriptedModel([answer("Sample helper output.", owned_usage(20, 2))]),
+        },
+    )
+    original_add = CalculatorTools.add
+    helper_results: list[object] = []
+
+    async def add(self: CalculatorTools, a: float, b: float) -> str:
+        helper = create_agent(
+            "helper",
+            config,
+            paths,
+            identity,
+            knowledge=None,
+            model=turn_model(config, paths, "helper"),
+            plugins=config_plugins(config, paths),
+        )
+        helper_results.append(await _run_room_agent_turn(helper_context, helper, "Sample task."))
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        return original_add(self, a, b)
+
+    monkeypatch.setattr(CalculatorTools, "add", add)
+    scope = HistoryScope(
+        kind="team" if caller == "team" else "agent",
+        scope_id="reviewers" if caller == "team" else "general",
+    )
+    load_scope = partial(
+        load_scope_session,
+        scope=scope,
+        session_id="approval-session",
+        config=config,
+        runtime_paths=paths,
+        execution_identity=identity,
+    )
+    turn = replace(
+        make_turn_context(
+            "reviewers" if caller == "team" else "general",
+            session_id="approval-session",
+            room_id=context.room_id,
+            thread_id=context.thread_id,
+            requester_id=context.requester_id,
+        ),
+        prompt="Add 2 and 3",
+        execution_identity=identity,
+    )
+    orchestrator = team_orchestrator(config, paths)
+
+    async def pause() -> None:
+        with tool_runtime_context(context):
+            if caller == "team":
+                await collect_team_reply(
+                    TeamTurnSpec(
+                        agent_names=["general", "second"],
+                        mode=TeamMode.COORDINATE,
+                        orchestrator=orchestrator,
+                        member_model_names={"general": "default", "second": "default"},
+                        configured_team_name="reviewers",
+                    ),
+                    turn,
+                    sinks=TurnSinks(turn_recorder=TurnRecorder(user_message="Add 2 and 3")),
+                )
+            else:
+                await ai_response(replace(turn, supports_native_tool_approval=True), paths, config)
+
+    with pytest.raises(ResponsePausedForApproval) as raised:
+        await pause()
+    paused = raised.value.paused
+    if is_cli:
+        # Reconstruct an interrupted minimal response using its exact saved approval.
+        scope_context = load_scope()
+        assert isinstance(scope_context.storage.get_run(paused.run_id), RunRecord)
+        assert scope_context.session is not None
+        assert scope_context.storage.patch_run_metadata(
+            scope_context.session.session_id,
+            paused.run_id,
+            {"agent_mode": "minimal"},
+            session=scope_context.session,
+        )
+    calls_ = (
+        ApprovalCall(
+            "approved",
+            "add",
+            "general",
+            2**62,
+            decision=ApprovalDecision.APPROVED,
+            toolkit_name="calculator",
+            arguments_digest=approval_arguments_digest({"a": 2, "b": 3}),
+        ),
+    )
+    cli_call = None
+    if is_cli:
+        cli_call = CliApprovalCall(
+            toolkit="calculator",
+            function="add",
+            call_id="approved",
+            parent_bash_call_id="interrupted-bash",
+            arguments={"a": 2, "b": 3},
+            requirements=tuple(paused.requirements),
+            delegation_depth=0,
+        ).to_dict()
+
+        async def recovered_response(*_args: object, **_kwargs: object) -> CompletedApprovalRun:
+            # The approved helper has already run; the old Bash is never replayed.
+            if outcome == "error":
+                msg = "Resumed provider failed"
+                raise RuntimeError(msg)
+            return CompletedApprovalRun(response_text="Finished.", metadata_content={})
+
+        monkeypatch.setattr("mindroom.approval.execution._stream_continuation_turn", recovered_response)
+
+    async def resume() -> CompletedApprovalRun | PausedAttempt:
+        if caller == "team":
+            with tool_runtime_context(context):
+                return await continue_paused_team_run(
+                    member_names=("general", "second"),
+                    mode=TeamMode.COORDINATE,
+                    config=config,
+                    runtime_paths=paths,
+                    execution_identity=identity,
+                    session_id="approval-session",
+                    run_id=paused.run_id,
+                    user_id=context.requester_id,
+                    configured_team_name="reviewers",
+                    model_name="default",
+                    refresh_scheduler=None,
+                    approval_calls=calls_,
+                    history_scope=scope,
+                    prior_presentation_state=paused.response_presentation_state,
+                    prior_tool_trace=paused.tool_trace,
+                    progress=None,
+                    member_model_names=None,
+                    show_tool_calls=True,
+                    tool_trace_collector=[],
+                    system_enrichment_items=(),
+                    quiet=False,
+                )
+        runner = unwrap_extracted_collaborator(_bot(tmp_path / "runner")._response_runner)
+        execution = replace(runner.approvals._approval_execution, config=lambda: config, runtime_paths=paths)
+        return await execution.continue_run(
+            approval_continuation(
+                approval_id="sample-approval",
+                run_id=paused.run_id,
+                session_id="approval-session",
+                room_id=context.room_id,
+                thread_id=context.thread_id,
+                requester_id=context.requester_id,
+                state="claimed",
+                calls=calls_,
+                request_body="Add 2 and 3",
+                cli_call=cli_call,
+            ),
+            paused_answer=PausedAnswer(),
+            tool_context=context,
+            tool_trace_collector=[],
+            quiet=False,
+            progress=None,
+            system_enrichment_items=(),
+        )
+
+    assert helper_results == []
+    assert get_helper_usage_owner() is None
+    if outcome == "completed":
+        assert isinstance(await resume(), CompletedApprovalRun)
+    else:
+        # A native resume raises the provider's failure; the CLI follow-up turn raises its reply's error.
+        failure = RuntimeError if is_cli else ProviderError
+        with pytest.raises(asyncio.CancelledError if outcome == "cancel" else failure):
+            await resume()
+    assert get_helper_usage_owner() is None
+    assert helper_results == ["Sample helper output."]
+    scope_context = load_scope()
+    rows = _usage_rows(scope_context.storage)
+    helpers = [
+        (session_id, json.loads(value))
+        for session_id, value in rows
+        if json.loads(value).get("kind") == "dynamic_workflow"
+    ]
+    assert len(helpers) == 1
+    assert helpers[0][0] == "approval-session"
+    assert helpers[0][1]["user_id"] == "@user:localhost"
+    assert helpers[0][1]["metrics"]["total_tokens"] == 22
+    assert "Sample helper output" not in json.dumps(helpers)
+    report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
+    assert report.totals.total_tokens == 22
+    assert sum(row.run_count for row in report.model_breakdown) == 0
+
+
+@pytest.mark.asyncio
+async def test_mem0_extraction_calls_are_complete_request_rows(tmp_path: Path) -> None:
+    """Each Mem0 extraction call is one request row, so the conversation's request detail stays complete."""
+    run = _completed_run("ordinary")
+    run.user_id = "@user:localhost"
+    run.model = "reply-model"
+    run.model_provider = "test-provider"
+    run.metrics = llm_usage.RunMetrics(
+        tokens=TokenCounts(input_tokens=7, output_tokens=3, total_tokens=10),
+        details={
+            "model": [
+                llm_usage.ModelMetrics(
+                    tokens=TokenCounts(input_tokens=7, output_tokens=3, total_tokens=10),
+                    id="reply-model",
+                    provider="test-provider",
+                ),
+            ],
+        },
+    )
+    for message in run.messages or []:
+        if message.role == "assistant":
+            message.metrics = llm_usage.MessageMetrics(
+                tokens=TokenCounts(input_tokens=7, output_tokens=3, total_tokens=10),
+            )
+            message.created_at = 1_790_000_000
+            message.provider_data = {"mindroom_model": {"id": "reply-model", "provider": "test-provider"}}
+    session = _session("session", runs=[run])
+    config, paths, _storage, _scope, _context = _forced_compaction_context(tmp_path, session=session)
+    usage = CompletionUsage(prompt_tokens=120, completion_tokens=30, total_tokens=150)
+    create = MagicMock(return_value=SimpleNamespace(usage=usage))
+    llm = SimpleNamespace(
+        config=SimpleNamespace(model="gpt-6-luna"),
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))),
+    )
+    install_mem0_usage_capture(llm, "openai")
+    with counted_mem0_usage() as calls:
+        llm.client.chat.completions.create()
+        llm.client.chat.completions.create()
+    extraction = mem0_usage(calls)
+    assert extraction is not None
+    await record_helper_usage(
+        extraction,
+        owner=HelperUsageOwner(
+            storage_factory=partial(create_session_storage, "test_agent", config, paths, execution_identity=None),
+            session_id="session",
+        ),
+        kind="memory_extraction",
+        requester_id="@user:localhost",
+    )
+
+    report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
+    assert report.totals.total_tokens == 310
+    assert report.request_breakdown is not None
+    assert [(row.kind, row.model_provider, row.model, row.totals.total_tokens) for row in report.request_breakdown] == [
+        ("run", "test-provider", "reply-model", 10),
+        ("memory_extraction", "OpenAI", "gpt-6-luna", 150),
+        ("memory_extraction", "OpenAI", "gpt-6-luna", 150),
+    ]
+    assert report.request_coverage is not None
+    assert report.request_coverage.unavailable_sources == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["Remember the sample preference.", "NO_REPLY"])
+@pytest.mark.parametrize("has_requester", [True, False])
+async def test_memory_usage_survives_rejected_output_and_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    content: str,
+    has_requester: bool,
+) -> None:
+    """Discarding a returned extractor's metrics loses paid retries and rejected output."""
+    run = _completed_run("ordinary")
+    run.user_id = "@previous:localhost"
+    run.metrics = llm_usage.RunMetrics(tokens=TokenCounts(input_tokens=7, output_tokens=3, total_tokens=10))
+    session = _session("session", runs=[run])
+    config, paths, storage, _scope, context = _forced_compaction_context(tmp_path, session=session)
+    identity = context.execution_identity
+    model = ScriptedModel(
+        [answer(content, owned_usage(100, 10)), answer("Remember another preference.", owned_usage(50, 5))],
+    )
+    install_model_providers(monkeypatch, {"default": model})
+    for _ in range(2):
+        await _extract_memory_summary(
+            config=config,
+            runtime_paths=paths,
+            agent_name="test_agent",
+            session_id="session",
+            lines=["Synthetic conversation excerpt."],
+            existing_context="",
+            execution_identity=identity if has_requester else None,
+        )
+    report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
+    assert report.totals.total_tokens == 175
+    assert sum(row.run_count for row in report.model_breakdown) == 1
+    assert sum(row.totals.total_tokens for row in report.cumulative_model_breakdown) == 175
+    assert report.request_breakdown is not None
+    assert [row.totals.total_tokens for row in report.request_breakdown] == [110, 55]
+    assert {row.kind for row in report.request_breakdown} == {"memory_auto_flush"}
+    expected_requester = "@user:localhost" if has_requester else None
+    assert {row.user_id for row in report.request_breakdown} == {expected_requester}
+    own = collect_self_usage(
+        agent_name="test_agent",
+        requester_id="@user:localhost",
+        config=config,
+        runtime_paths=paths,
+        execution_identity=identity,
+    )
+    assert own.totals.total_tokens == (165 if has_requester else 0)
+    helpers = [
+        json.loads(value)
+        for _session_id, value in _usage_rows(storage)
+        if json.loads(value).get("kind") == "memory_auto_flush"
+    ]
+    assert len(helpers) == 2
+    assert len({row["run_id"] for row in helpers}) == 2
+    assert "Synthetic conversation" not in json.dumps(helpers)
+    assert "Remember" not in json.dumps(helpers)
+    seed_session_state(storage, session, session_state_snapshot(session.session_state))
+    assert collect_admin_usage(config=config, runtime_paths=paths).totals == report.totals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["agent", "private_agent", "configured_team", "ad_hoc_team"])
+async def test_workflow_first_turn_uses_actual_caller_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caller: str,
+) -> None:
+    """Synthetic room-agent participant IDs must not replace private, configured or ad hoc caller ownership."""
+    config, paths = _make_config(tmp_path)
+    config.memory.backend = "none"
+    if caller == "private_agent":
+        config.agents["test_agent"].private = AgentPrivateConfig(per="user", root="mind_data")
+    config.agents["second"] = AgentConfig(display_name="Second")
+    config.teams["reviewers"] = TeamConfig(display_name="Reviewers", role="Review", agents=["test_agent", "second"])
+    persist_entity_accounts(config, paths)
+    context = _hook_runtime_context(
+        config=config,
+        runtime_paths=paths,
+        registry=HookRegistry.empty(),
+        session_id="first-turn",
+    )
+    identity = context.execution_identity
+    if caller.endswith("team"):
+        load_scope = partial(
+            load_bound_scope_session,
+            member_names=["test_agent", "second"],
+            team_name="reviewers" if caller == "configured_team" else None,
+            session_id=context.session_id,
+            config=config,
+            runtime_paths=paths,
+            execution_identity=identity,
+        )
+    else:
+        load_scope = partial(
+            load_scope_session,
+            scope=HistoryScope(kind="agent", scope_id="test_agent"),
+            session_id=context.session_id,
+            config=config,
+            runtime_paths=paths,
+            execution_identity=identity,
+        )
+    model = ScriptedModel([answer("Sample output.", owned_usage(20, 2))])
+    install_model_providers(monkeypatch, {"default": model})
+    scope_context = load_scope()
+    with helper_usage_context(scope_context):
+        storage = scope_context.storage
+        result = await _execute_participant(
+            context,
+            RoomAgentParticipant.model_validate({"id": "writer", "kind": "room_agent", "agent": "test_agent"}),
+            "Sample task.",
+            _WorkflowRun("sample-workflow"),
+        )
+        assert result.content == "Sample output."
+        loaded = storage.load_session(context.session_id)
+        assert loaded is not None, "First-turn helper usage needs its actual caller session row"
+        assert not loaded.runs
+        rows = _usage_rows(storage)
+        assert len(rows) == 1
+        assert rows[0][0] == "first-turn"
+        snapshot = json.loads(rows[0][1])
+        assert snapshot["kind"] == "dynamic_workflow"
+        assert snapshot["user_id"] == "@user:localhost"
+        assert snapshot["metrics"]["total_tokens"] == 22
+        assert "Sample" not in rows[0][1]
+    if caller == "ad_hoc_team":
+        # Existing reporting policy excludes unconfigured teams, even though their store is retained.
+        return
+    report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
+    assert report.totals.total_tokens == 22
+    assert sum(row.run_count for row in report.model_breakdown) == 0
+    assert report.request_breakdown is not None
+    assert len(report.request_breakdown) == 1
+    assert report.request_breakdown[0].totals.total_tokens == 22
+    if caller in {"agent", "private_agent"}:
+        own = collect_self_usage(
+            agent_name="test_agent",
+            requester_id=context.requester_id,
+            config=config,
+            runtime_paths=paths,
+            execution_identity=identity,
+        )
+        other = collect_self_usage(
+            agent_name="test_agent",
+            requester_id="@other:localhost",
+            config=config,
+            runtime_paths=paths,
+            execution_identity=replace(identity, requester_id="@other:localhost"),
+        )
+        assert own.totals.total_tokens == 22
+        assert other.totals.total_tokens == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["completed", "error", "cancelled"])
+async def test_workflow_participant_usage_counts_however_its_run_ends(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    """A room-agent participant's paid requests count once, also when its run fails or is stopped mid-request."""
+    config, paths, _storage, scope, context = _forced_compaction_context(tmp_path, session=_session("session"))
+    requested = asyncio.Event()
+
+    async def interrupt() -> None:
+        requested.set()
+        if ending == "error":
+            msg = "provider auth failed"
+            raise ProviderError(msg, provider="Synthetic")
+        await asyncio.Event().wait()
+
+    turn = (
+        answer("Sample output.", owned_usage(30, 3))
+        if ending == "completed"
+        else [UsageReported(owned_usage(30, 3), final=ending == "error"), Await(interrupt)]
+    )
+    install_model_providers(monkeypatch, {"default": ScriptedModel([turn])})
+    load_scope = partial(
+        load_scope_session,
+        scope=scope,
+        session_id="session",
+        config=config,
+        runtime_paths=paths,
+        execution_identity=context.execution_identity,
+    )
+    scope_context = load_scope()
+    with helper_usage_context(scope_context):
+        participant = asyncio.create_task(
+            _execute_participant(
+                context,
+                RoomAgentParticipant.model_validate({"id": "writer", "kind": "room_agent", "agent": "test_agent"}),
+                "Sample task.",
+                _WorkflowRun("sample-workflow"),
+            ),
+        )
+        if ending == "completed":
+            assert (await participant).content == "Sample output."
+        elif ending == "error":
+            with pytest.raises(ProviderError, match="provider auth failed"):
+                await participant
+        else:
+            await requested.wait()
+            participant.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await participant
+    report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
+    assert report.totals.total_tokens == 33
+    assert sum(row.run_count for row in report.model_breakdown) == 0
+    assert report.user_breakdown[0].user_id == "@user:localhost"
+    assert report.request_breakdown is not None
+    assert [row.totals.total_tokens for row in report.request_breakdown] == [33]
+
+
+@pytest.mark.asyncio
+async def test_scope_reset_and_first_turn_write_preserve_concurrent_session(tmp_path: Path) -> None:
+    """A helper owner must reset on cancellation, and first-turn initialization must not overwrite live state."""
+    config, paths = _make_config(tmp_path)
+    scope = HistoryScope(kind="agent", scope_id="test_agent")
+    load_scope = partial(
+        load_scope_session,
+        scope=scope,
+        session_id="session",
+        config=config,
+        runtime_paths=paths,
+        execution_identity=None,
+    )
+    assert get_helper_usage_owner() is None
+    context = load_scope()
+    with (  # noqa: PT012 - cancellation intentionally exits the bound scope
+        pytest.raises(asyncio.CancelledError),
+        helper_usage_context(context),
+    ):
+        owner = get_helper_usage_owner()
+        assert owner is not None
+        assert owner.initial_session is not None
+        context.storage.update_metadata(_session("session"), lambda _metadata: {"marker": "concurrent session"})
+        await record_helper_usage(
+            HelperUsage(
+                run_id="paid",
+                model=None,
+                provider=None,
+                metrics=llm_usage.RunMetrics(tokens=TokenCounts(input_tokens=10, output_tokens=1, total_tokens=11)),
+            ),
+            owner=owner,
+            kind="dynamic_workflow",
+            requester_id=None,
+        )
+        loaded = context.storage.load_session("session")
+        assert loaded is not None
+        assert loaded.metadata == {"marker": "concurrent session"}
+        raise asyncio.CancelledError
+    assert get_helper_usage_owner() is None
+    assert collect_admin_usage(config=config, runtime_paths=paths).totals.total_tokens == 11
+    context = load_scope()
+    sessions = quote_identifier(context.storage.names.sessions)
+    with context.storage.transaction(write=True) as connection:
+        connection.execute(f"DELETE FROM {sessions} WHERE session_id = ?", ("session",))  # noqa: S608
+    assert _usage_rows(context.storage) == []
+
+
+@pytest.mark.asyncio
+async def test_returned_helper_usage_write_finishes_after_cancellation(tmp_path: Path) -> None:
+    """Once counters are returned, cancellation must wait for the accepted SQLite write."""
+    config, paths, storage, _scope, _context = _forced_compaction_context(tmp_path, session=_session("session"))
+    started = threading.Event()
+
+    def create_storage() -> ConversationStore:
+        started.set()
+        return create_session_storage("test_agent", config, paths, execution_identity=None)
+
+    with closing(sqlite3.connect(storage.path, isolation_level=None)) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        task = asyncio.create_task(
+            record_helper_usage(
+                HelperUsage(
+                    run_id="paid-attempt",
+                    model=None,
+                    provider=None,
+                    metrics=llm_usage.RunMetrics(tokens=TokenCounts(input_tokens=20, output_tokens=2, total_tokens=22)),
+                ),
+                owner=HelperUsageOwner(create_storage, "session"),
+                kind="memory_auto_flush",
+                requester_id=None,
+            ),
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=0.02)
+            assert not done
+        finally:
+            connection.rollback()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=3)
+    assert collect_admin_usage(config=config, runtime_paths=paths).totals.total_tokens == 22
+
+
+@pytest.mark.asyncio
+async def test_a_helper_run_lists_each_answer_of_its_own_model_as_a_request(tmp_path: Path) -> None:
+    """A helper that ran as a whole run records its time and its model's own answers, not history or summed retries."""
+    config, paths, storage, _scope, _context = _forced_compaction_context(tmp_path, session=_session("session"))
+    provenance = model_provenance("helper-model", "test-provider")
+
+    def metrics(input_tokens: int) -> llm_usage.MessageMetrics:
+        return llm_usage.MessageMetrics(tokens=TokenCounts(input_tokens=input_tokens, total_tokens=input_tokens))
+
+    run = RunRecord(
+        run_id="review",
+        model="helper-model",
+        model_provider="test-provider",
+        created_at=1_700_000_000,
+        metrics=llm_usage.RunMetrics(tokens=TokenCounts(input_tokens=30, total_tokens=30)),
+        messages=[
+            # A reply the run's input carried from the thread, with the usage its own run counted.
+            Message(
+                role="assistant",
+                content="Earlier.",
+                from_history=True,
+                metrics=metrics(100),
+                provider_data=provenance,
+            ),
+            Message(role="user", content="Review the conversation."),
+            Message(
+                role="assistant",
+                content="First.",
+                created_at=1_700_000_001,
+                metrics=metrics(10),
+                provider_data=provenance,
+            ),
+            Message(
+                role="assistant",
+                content="Retried.",
+                created_at=1_700_000_002,
+                metrics=metrics(20),
+                provider_data={AGGREGATE_USAGE_KEY: True, **provenance},
+            ),
+        ],
+    )
+
+    await record_run_usage(
+        run,
+        owner=HelperUsageOwner(
+            storage_factory=partial(create_session_storage, "test_agent", config, paths, execution_identity=None),
+            session_id="session",
+        ),
+        kind="skill_learning",
+        requester_id=None,
+    )
+
+    [(_session_id, stored)] = _usage_rows(storage)
+    row = json.loads(stored)
+    assert row["created_at"] == 1_700_000_000
+    assert row["requests"] == [
+        {
+            "created_at": 1_700_000_001,
+            "metrics": {"input_tokens": 10, "total_tokens": 10},
+            "model": "helper-model",
+            "model_provider": "test-provider",
+        },
+    ]

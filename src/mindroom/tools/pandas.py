@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="pandas",
+    file_access=ToolFileAccess.UNCONFINED,
+    requires_primary_runtime=True,
     display_name="Pandas",
     description="Advanced data manipulation and analysis",
     category=ToolCategory.PRODUCTIVITY,
@@ -44,7 +46,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["pandas"],
-    docs_url="https://docs.agno.com/tools/toolkits/database/pandas",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#pandas",
     function_names=("create_pandas_dataframe", "run_dataframe_operation"),
 )
 def pandas_tools() -> type[PandasTools]:

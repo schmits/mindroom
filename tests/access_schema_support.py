@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
@@ -13,9 +14,10 @@ from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.matrix.state import MatrixState
 from tests.conftest import bind_runtime_paths, runtime_paths_for, test_runtime_paths
+from tests.matrix_state_helpers import save_matrix_state
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
 
@@ -85,7 +87,8 @@ def with_responder_access(
     return config
 
 
-def _joined_members(room_id: str, user_ids: Sequence[str]) -> nio.JoinedMembersResponse:
+def joined_members_response(room_id: str, *user_ids: str) -> nio.JoinedMembersResponse:
+    """Return a joined-members response listing ``user_ids`` in ``room_id``."""
     return nio.JoinedMembersResponse(
         members=[nio.RoomMember(user_id, None, None) for user_id in user_ids],
         room_id=room_id,
@@ -95,6 +98,8 @@ def _joined_members(room_id: str, user_ids: Sequence[str]) -> nio.JoinedMembersR
 async def membership_index(
     config: Config,
     memberships_by_room_key: Mapping[str, set[str]],
+    *,
+    clock: Callable[[], float] = time.monotonic,
 ) -> AgentReplyMembershipIndex:
     """Build an authoritative ready membership index for configured grant rooms."""
     runtime_paths = runtime_paths_for(config)
@@ -104,15 +109,15 @@ async def membership_index(
         room_id = f"!{room_key}:example.com"
         room_ids[room_key] = room_id
         state.add_room(room_key, room_id, f"#{room_key}:example.com", room_key.title())
-    state.save(runtime_paths=runtime_paths)
+    save_matrix_state(state, runtime_paths)
 
     client = AsyncMock()
     client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=list(room_ids.values()))
     client.joined_members.side_effect = [
-        _joined_members(room_ids[room_key], sorted(memberships_by_room_key[room_key]))
+        joined_members_response(room_ids[room_key], *sorted(memberships_by_room_key[room_key]))
         for room_key in sorted(memberships_by_room_key)
     ]
-    index = AgentReplyMembershipIndex()
+    index = AgentReplyMembershipIndex(clock=clock)
     await index.refresh(config, runtime_paths, client)
     return index
 

@@ -5,8 +5,8 @@ the full runtime import (~11-17 s on a 2-CPU worker pod) on every request.
 This module keeps one long-lived *template* process per interpreter that pays
 that import once and then blocks on a unix socket. Each request forks the
 template; the fork child applies the per-request env and cwd, executes the
-already-prepared envelope, streams the response back over the socket, and
-exits. Isolation semantics match spawn-per-call - every request still runs in
+already-prepared envelope, streams its progress and then the response back
+over the socket, and exits. Isolation semantics match spawn-per-call - every request still runs in
 its own fresh process - at ~ms fork cost instead of the import cost.
 
 The template must stay fork-safe: it only imports modules and then blocks on
@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+import select
 import shutil
 import signal
 import socket
@@ -35,7 +36,7 @@ import threading
 import time
 import traceback
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -94,7 +95,7 @@ def _template_fingerprint(python_executable: str, template_env: Mapping[str, str
 
 
 def _default_template_command(python_executable: str, socket_path: str) -> list[str]:
-    return [python_executable, "-m", "mindroom.api.sandbox_runner", TEMPLATE_ARG, socket_path]
+    return [python_executable, "-P", "-s", "-m", "mindroom.api.sandbox_runner", TEMPLATE_ARG, socket_path]
 
 
 @dataclass
@@ -115,7 +116,38 @@ class _ChildRequest:
     env: dict[str, str] | None
     cwd: str | None
     envelope: str
-    timeout_seconds: float
+    timeout_seconds: float | None
+
+
+@dataclass
+class _RequestChild:
+    """The child serving one request, signalled only while that request runs.
+
+    The template reaps children as they exit, so after its request ended a child's PID may name another process.
+    """
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _pid: int | None = None
+    _ended: bool = False
+
+    def started(self, pid: int) -> None:
+        with self._lock:
+            if not self._ended:
+                self._pid = pid
+
+    def end(self) -> None:
+        with self._lock:
+            self._ended = True
+            self._pid = None
+
+    def kill(self) -> None:
+        """Kill the child's process group, which also stops what its tool started."""
+        with self._lock:
+            # The pid is deserialized from the child's socket message; never let a
+            # degenerate value reach os.killpg, where 0 targets this process's own group.
+            if self._pid is not None and self._pid > 0:
+                with suppress(OSError):
+                    os.killpg(self._pid, signal.SIGKILL)
 
 
 def _stderr_tail(stderr_path: Path) -> str:
@@ -143,17 +175,17 @@ class _ConnectionClosedError(RuntimeError):
 
 
 class _SocketLineReader:
-    """Read newline-framed protocol lines from a socket under one deadline."""
+    """Read newline-framed protocol lines from a socket under one deadline, or none."""
 
-    def __init__(self, conn: socket.socket, deadline: float) -> None:
+    def __init__(self, conn: socket.socket, deadline: float | None) -> None:
         self._conn = conn
         self._deadline = deadline
         self._buffer = bytearray()
 
     def read_line(self) -> bytes:
         while b"\n" not in self._buffer:
-            remaining = self._deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = None if self._deadline is None else self._deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 raise TimeoutError
             self._conn.settimeout(remaining)
             chunk = self._conn.recv(_RECV_CHUNK_BYTES)
@@ -189,14 +221,24 @@ class _SandboxForkserver:
         request_env: dict[str, str] | None,
         request_cwd: str | None,
         envelope: str,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
+        startup_timeout_seconds: float,
+        bind_stop: Callable[[Callable[[], None]], None],
+        on_progress: Callable[[str], None],
     ) -> subprocess.CompletedProcess[str]:
-        """Execute one prepared envelope in a fresh fork of the warm template."""
-        deadline = time.monotonic() + timeout_seconds
+        """Execute one prepared envelope in a fresh fork of the warm template.
+
+        ``timeout_seconds`` of ``None`` lets the request run however long it takes; getting a warm template still
+        has ``startup_timeout_seconds``. ``bind_stop`` receives a function that stops the request by hanging up on
+        its forked child. ``on_progress`` receives each progress report the child sends before its response.
+        """
+        now = time.monotonic()
+        deadline = None if timeout_seconds is None else now + timeout_seconds
+        startup_deadline = deadline if deadline is not None else now + startup_timeout_seconds
         key = python_executable or sys.executable
         fingerprint = _template_fingerprint(key, template_env)
         key_lock = self._key_lock(key)
-        remaining = deadline - time.monotonic()
+        remaining = startup_deadline - time.monotonic()
         if remaining <= 0 or not key_lock.acquire(timeout=remaining):
             msg = "Timed out waiting for the sandbox forkserver template."
             raise ForkserverTimeoutError(msg)
@@ -205,7 +247,7 @@ class _SandboxForkserver:
                 key=key,
                 fingerprint=fingerprint,
                 template_env=template_env,
-                deadline=deadline,
+                deadline=startup_deadline,
             )
         finally:
             key_lock.release()
@@ -216,6 +258,8 @@ class _SandboxForkserver:
             request_cwd=request_cwd,
             envelope=envelope,
             deadline=deadline,
+            bind_stop=bind_stop,
+            on_progress=on_progress,
         )
 
     def shutdown(self) -> None:
@@ -343,6 +387,39 @@ class _SandboxForkserver:
                 )
                 return
 
+    def _send_request(
+        self,
+        conn: socket.socket,
+        key: str,
+        template: _Template,
+        request_payload: bytes,
+        bind_stop: Callable[[Callable[[], None]], None],
+        child: _RequestChild,
+    ) -> None:
+        stopped = threading.Event()
+
+        def stop() -> None:
+            # Killing reaches a tool that holds the GIL, which the child's own hang-up
+            # watcher cannot; the hang-up still ends a child whose PID is not known yet.
+            stopped.set()
+            child.kill()
+            _hang_up(conn)
+
+        try:
+            conn.connect(template.socket_path)
+            # Armed before the envelope leaves: a stop accepted while the template warmed
+            # up hangs up at once, so sending fails and the request never starts.
+            bind_stop(stop)
+            conn.sendall(request_payload)
+        except TimeoutError as exc:
+            raise ForkserverTimeoutError from exc
+        except OSError as exc:
+            if stopped.is_set():
+                raise ForkserverError(_STOPPED_BEFORE_DISPATCH) from exc
+            self._discard(key, template)
+            msg = f"Failed to reach the sandbox forkserver template: {exc}"
+            raise ForkserverError(msg) from exc
+
     def _request(
         self,
         key: str,
@@ -351,10 +428,12 @@ class _SandboxForkserver:
         request_env: dict[str, str] | None,
         request_cwd: str | None,
         envelope: str,
-        deadline: float,
+        deadline: float | None,
+        bind_stop: Callable[[Callable[[], None]], None],
+        on_progress: Callable[[str], None],
     ) -> subprocess.CompletedProcess[str]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
             # Never deliver a request the caller has no budget left for; a
             # delivered request forks a child the parent may not learn about.
             raise ForkserverTimeoutError
@@ -364,32 +443,28 @@ class _SandboxForkserver:
             ).encode("utf-8")
             + b"\n"
         )
-        child_pid: int | None = None
         try:
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError as exc:
             msg = f"Failed to open a sandbox forkserver connection: {exc}"
             raise ForkserverError(msg) from exc
+        child = _RequestChild()
         try:
-            conn.settimeout(remaining)
-            try:
-                conn.connect(template.socket_path)
-                conn.sendall(request_payload)
-            except TimeoutError as exc:
-                raise ForkserverTimeoutError from exc
-            except OSError as exc:
-                self._discard(key, template)
-                msg = f"Failed to reach the sandbox forkserver template: {exc}"
-                raise ForkserverError(msg) from exc
+            # Handing a job's request over still has a bound; only waiting for its response does not.
+            conn.settimeout(remaining if remaining is not None else _CHILD_REQUEST_READ_TIMEOUT_SECONDS)
+            self._send_request(conn, key, template, request_payload, bind_stop, child)
             reader = _SocketLineReader(conn, deadline)
             try:
-                child_pid = int(json.loads(reader.read_line())["pid"])
-                response = json.loads(reader.read_line())
+                child.started(int(json.loads(reader.read_line())["pid"]))
+                while "progress" in (response := json.loads(reader.read_line())):
+                    on_progress(str(response["progress"]))
                 returncode = int(response["returncode"])
                 stdout_text = str(response["stdout"])
                 stderr_text = str(response["stderr"])
             except TimeoutError as exc:
-                self._kill_child(child_pid)
+                # At its deadline the child is still running, maybe holding the GIL in a
+                # long C call that a hang-up cannot interrupt, so kill it as before.
+                child.kill()
                 raise ForkserverTimeoutError from exc
             except (_ConnectionClosedError, OSError, ValueError, KeyError, TypeError) as exc:
                 if template.process.poll() is not None:
@@ -397,6 +472,7 @@ class _SandboxForkserver:
                 msg = "Sandbox forkserver child exited without returning a response."
                 raise ForkserverError(msg) from exc
         finally:
+            child.end()
             conn.close()
         return subprocess.CompletedProcess(
             args=["sandbox-forkserver", key],
@@ -405,14 +481,14 @@ class _SandboxForkserver:
             stderr=stderr_text,
         )
 
-    @staticmethod
-    def _kill_child(child_pid: int | None) -> None:
-        # The pid is deserialized from the child's socket message; never let a
-        # degenerate value reach os.kill, where 0 targets the process group.
-        if child_pid is None or child_pid <= 0:
-            return
-        with suppress(OSError):
-            os.kill(child_pid, signal.SIGKILL)
+
+_STOPPED_BEFORE_DISPATCH = "Sandbox forkserver request was stopped before it was sent."
+
+
+def _hang_up(conn: socket.socket) -> None:
+    """Stop one request; after the request ended its socket is closed and this does nothing."""
+    with suppress(OSError):
+        conn.shutdown(socket.SHUT_RDWR)
 
 
 _forkserver: _SandboxForkserver | None = None
@@ -429,8 +505,13 @@ def get_sandbox_forkserver() -> _SandboxForkserver:
         return _forkserver
 
 
-def serve_template(socket_path: str, run_payload: Callable[[str], tuple[int, str, str]]) -> int:
+def serve_template(
+    socket_path: str,
+    run_payload: Callable[[str, Callable[[str], None]], tuple[int, str, str]],
+) -> int:
     """Template process main loop: accept one connection per request and fork.
+
+    ``run_payload`` executes one envelope and receives the function that sends its progress to the runner.
 
     Runs inside ``python -m mindroom.api.sandbox_runner --sandbox-forkserver-template``
     after the heavy runtime import has completed. Must stay fork-safe: no
@@ -476,8 +557,13 @@ def serve_template(socket_path: str, run_payload: Callable[[str], tuple[int, str
         server.close()
 
 
-def _child_main(conn: socket.socket, run_payload: Callable[[str], tuple[int, str, str]]) -> NoReturn:
+def _child_main(
+    conn: socket.socket,
+    run_payload: Callable[[str, Callable[[str], None]], tuple[int, str, str]],
+) -> NoReturn:
     """Fork-child request handler; never returns to the template loop."""
+    # Lead a process group, outside the template's, so stopping the request stops what its tool started.
+    os.setsid()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     exit_code = 1
     try:
@@ -518,23 +604,47 @@ def _parse_child_request(request_line: bytes) -> _ChildRequest:
 def _run_child_request(
     conn: socket.socket,
     request: _ChildRequest,
-    run_payload: Callable[[str], tuple[int, str, str]],
+    run_payload: Callable[[str, Callable[[str], None]], tuple[int, str, str]],
 ) -> int:
-    # Self-destruct backstop for the rare case where the runner never learned
-    # this child's pid; the grace keeps the runner-side SIGKILL primary.
-    signal.alarm(max(1, math.ceil(request.timeout_seconds + _CHILD_TIMEOUT_GRACE_SECONDS)))
+    if request.timeout_seconds is not None:
+        # Self-destruct backstop for the rare case where the runner never learned
+        # this child's pid; the grace keeps the runner-side SIGKILL primary.
+        signal.alarm(max(1, math.ceil(request.timeout_seconds + _CHILD_TIMEOUT_GRACE_SECONDS)))
     if request.env is not None:
         os.environ.clear()
         os.environ.update(request.env)
     if request.cwd is not None:
         os.chdir(request.cwd)
-    # `python -m` prepends the effective cwd to sys.path; mirror that for the
-    # request cwd (the runner template drops its own baked entry at startup).
-    sys.path.insert(0, str(Path.cwd()))
-    returncode, stdout_text, stderr_text = run_payload(request.envelope)
-    conn.settimeout(_CHILD_RESPONSE_WRITE_TIMEOUT_SECONDS)
-    _send_json(conn, {"returncode": returncode, "stdout": stdout_text, "stderr": stderr_text})
+    if select.select([conn], [], [], 0)[0]:
+        # The runner hung up while handing this request over; never start it.
+        return 1
+    answered = threading.Event()
+    threading.Thread(target=_exit_when_runner_hangs_up, args=(conn, answered), daemon=True).start()
+    # Tool threads report progress too; one lock keeps every line whole and the response last.
+    lines = threading.Lock()
+
+    def report(text: str) -> None:
+        with lines, suppress(OSError):
+            _send_json(conn, {"progress": text})
+
+    returncode, stdout_text, stderr_text = run_payload(request.envelope, report)
+    with lines:
+        answered.set()
+        conn.settimeout(_CHILD_RESPONSE_WRITE_TIMEOUT_SECONDS)
+        _send_json(conn, {"returncode": returncode, "stdout": stdout_text, "stderr": stderr_text})
     return 0
+
+
+def _exit_when_runner_hangs_up(conn: socket.socket, answered: threading.Event) -> None:
+    """Exit when the runner stops this request; it sends nothing after the request line, so readable means hung up.
+
+    A stopped request also kills what its tool started; a hang-up after the response keeps what the tool left running.
+    """
+    select.select([conn], [], [])
+    if not answered.is_set():
+        with suppress(OSError):
+            os.killpg(0, signal.SIGKILL)
+    os._exit(1)
 
 
 def _send_json(conn: socket.socket, payload: dict[str, object]) -> None:

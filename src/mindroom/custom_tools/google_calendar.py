@@ -13,22 +13,28 @@ from googleapiclient.discovery import build
 
 from mindroom.custom_tools.google_service import ThreadLocalGoogleServiceMixin
 from mindroom.logging_config import get_logger
+from mindroom.oauth.agno_compat_google_auth import AgnoGoogleAuthBindingMixin
 from mindroom.oauth.client import ScopedOAuthClientMixin
-from mindroom.oauth.google_calendar import google_calendar_oauth_provider
+from mindroom.oauth.google import google_oauth_provider
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 logger = get_logger(__name__)
 
 
-class GoogleCalendarTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, AgnoGoogleCalendarTools):
+class GoogleCalendarTools(
+    ScopedOAuthClientMixin,
+    AgnoGoogleAuthBindingMixin,
+    ThreadLocalGoogleServiceMixin,
+    AgnoGoogleCalendarTools,
+):
     """Google Calendar tools wrapper that uses MindRoom's credential management."""
 
-    _oauth_provider = google_calendar_oauth_provider()
+    _oauth_provider = google_oauth_provider("google_calendar")
     _oauth_tool_name = "google_calendar"
 
     def __init__(
@@ -71,9 +77,16 @@ class GoogleCalendarTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin,
             defer_to_original_auth=defer_to_original_auth,
         )
 
-        # Agno's toolkit still validates its legacy broad scope markers during
-        # construction. Those markers are not used for MindRoom's OAuth flow:
-        # the credentials injected below carry the provider's granular scopes.
+        # AGNO_COMPAT: Calendar construction rejects granular OAuth scope combinations.
+        # Reason: Agno requires calendar/calendar.readonly in its scope list even
+        # when granular scopes cover the registered operations. Keep its default
+        # construction markers and inject MindRoom's narrowly scoped credentials.
+        # Upstream issue: No matching granular Calendar scope validation issue identified.
+        # Upstream PR: None identified; operation-aware scope validation remains untracked.
+        # Remove when: Agno accepts sufficient granular scopes during construction;
+        # retain MindRoom's scope selection, credential ownership, and tool permissions.
+        # Coverage: tests/test_google_calendar_oauth_tool.py::test_google_calendar_default_config_enables_write_methods;
+        # tests/test_google_oauth_providers.py::test_each_google_provider_declares_its_service_on_the_shared_google_contract.
         super().__init__(**kwargs)
         self.creds = creds
 

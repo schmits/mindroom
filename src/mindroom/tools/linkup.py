@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="linkup",
+    file_access=ToolFileAccess.NONE,
     display_name="Linkup",
     description="Web search using Linkup API for real-time information",
     category=ToolCategory.RESEARCH,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("LINKUP_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -58,7 +60,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["linkup-sdk"],
-    docs_url="https://docs.agno.com/tools/toolkits/search/linkup",
+    docs_url="https://docs.mindroom.chat/tools/web-search/#linkup",
     function_names=("web_search_with_linkup",),
 )
 def linkup_tools() -> type[LinkupTools]:

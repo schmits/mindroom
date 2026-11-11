@@ -6,41 +6,38 @@ import re
 from copy import deepcopy
 from dataclasses import replace
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from agno.tools import Toolkit
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
 
-from mindroom.api.config_lifecycle import persist_runtime_validated_config, validate_and_persist_config_payload
+from mindroom.api.config_lifecycle import commit_config
 from mindroom.authorization import (
-    is_platform_administrator,
     is_sender_allowed_for_agent_credential_management,
     responder_candidate_entities_from_cached_room,
 )
-from mindroom.commands.parsing import get_command_help
 from mindroom.config.agent import AgentConfig, TeamConfig
+from mindroom.config.commit import ConfigCommit
 from mindroom.config.main import (
     Config,
     ConfigRuntimeValidationError,
     format_invalid_config_message,
     load_config_or_user_error,
 )
-from mindroom.config.models import AgentLearningMode, ToolConfigEntry
+from mindroom.config.models import ToolConfigEntry
+from mindroom.config.schema_hints import redaction_marker_location
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.logging_config import get_logger
 from mindroom.oauth import oauth_connect_url_requires_host_browser
 from mindroom.oauth.credential_lifecycle import oauth_credentials_worker_target
-from mindroom.oauth.registry import load_oauth_providers
 from mindroom.oauth.service import oauth_connect_url
-from mindroom.redaction import redact_sensitive_data
-from mindroom.tool_system.catalog import ToolCategory, ToolStatus, resolved_tool_metadata_for_runtime
-from mindroom.tool_system.runtime_context import (
-    build_execution_identity_from_runtime_context,
-    get_tool_runtime_context,
-)
-from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target
+from mindroom.redaction import REDACTED, redact_sensitive_text
+from mindroom.requester_identity import is_platform_administrator
+from mindroom.runtime_resolution import resolve_agent_execution
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.catalog import ToolCategory, ToolStatus
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import get_tool_runtime_context
 from mindroom.yaml_io import safe_dump
 
 if TYPE_CHECKING:
@@ -52,10 +49,9 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 _CONFIG_CHANGE_REJECTED_MESSAGE = "Changes were NOT applied."
 _PLATFORM_ADMIN_REQUIRED_MESSAGE = (
-    "Error: Full configuration changes require an active platform administrator requester."
+    "Error: Reading or changing the full configuration requires an active platform administrator requester."
 )
 _AgentScope = Literal["current_room", "all"]
-_VALID_AGENT_SCOPES = {"current_room", "all"}
 _MAX_CONFIG_INSPECTION_CHARS = 20_000
 
 
@@ -85,23 +81,31 @@ class _ConfigPatchChange(BaseModel):
         return self
 
 
-def _normalize_patch_changes(
-    changes: Sequence[_ConfigPatchChange | dict[str, Any]],
-) -> list[_ConfigPatchChange]:
-    """Normalize tool-decoded models and direct-call dictionaries."""
-    normalized: list[_ConfigPatchChange] = []
-    for position, change in enumerate(changes):
-        try:
-            model = change if isinstance(change, _ConfigPatchChange) else _ConfigPatchChange.model_validate(change)
-        except ValidationError as exc:
-            details = "; ".join(
-                f"changes[{position}]{'.' if error['loc'] else ''}{'.'.join(map(str, error['loc']))}: {error['msg']}"
-                for error in exc.errors(include_input=False, include_url=False)
+def _reject_redaction_markers(changes: list[_ConfigPatchChange]) -> None:
+    """Reject values copied from redacted inspection output before they replace hidden real values."""
+    for change in changes:
+        location = redaction_marker_location(change.value)
+        if location is None:
+            continue
+        msg = (
+            f"{change.path + _encode_json_pointer(location)!r} contains the redaction marker {REDACTED!r} or a masked URL password, "
+            "which inspection shows in place of a hidden value; set that field to its real value or leave it out "
+            "of the patch"
+        )
+        raise _ConfigPatchError(msg)
+
+
+def redaction_marker_error(fields: dict[str, object]) -> str | None:
+    """Return a refusal when a field value copies redacted read output, which would replace the hidden real value."""
+    for field_name, value in fields.items():
+        if redaction_marker_location(value) is not None:
+            # These writers replace the whole value, so dropping one redacted element would delete the hidden real one.
+            return (
+                f"Error: {field_name!r} holds the redaction marker {REDACTED!r} or a masked URL password, "
+                f"which configuration reads show in place of a hidden value; pass {field_name!r} only with its "
+                f"real values, or omit it to keep the stored value.\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
             )
-            msg = f"Invalid patch request: {details}"
-            raise _ConfigPatchError(msg) from exc
-        normalized.append(model)
-    return normalized
+    return None
 
 
 def _reject_normalized_root_nulls(changes: list[_ConfigPatchChange], validated_authored: dict[str, Any]) -> None:
@@ -147,6 +151,11 @@ def _decode_json_pointer(path: str) -> list[str]:
     return decoded
 
 
+def _encode_json_pointer(tokens: Sequence[str]) -> str:
+    """Encode reference tokens into one RFC 6901 JSON Pointer."""
+    return "".join(f"/{token.replace('~', '~0').replace('/', '~1')}" for token in tokens)
+
+
 def _array_index(reference_token: str, *, length: int, allow_append: bool, path: str) -> int:
     """Return one validated RFC 6902 array index."""
     if reference_token == "-":  # noqa: S105 - JSON Patch append sentinel, not a password
@@ -164,13 +173,13 @@ def _array_index(reference_token: str, *, length: int, allow_append: bool, path:
     return int(reference_token)
 
 
-def _resolve_json_pointer(document: Any, path: str) -> Any:  # noqa: ANN401
-    """Resolve one JSON Pointer against an authored config document."""
+def _walk_json_pointer(document: Any, tokens: list[str], path: str, *, missing: str) -> Any:  # noqa: ANN401
+    """Return the value ``tokens`` of JSON Pointer ``path`` name; ``missing`` names the path a missing key ends."""
     current = document
-    for token in _decode_json_pointer(path):
+    for token in tokens:
         if isinstance(current, dict):
             if token not in current:
-                msg = f"Path does not exist in the authored configuration: {path!r}"
+                msg = f"{missing} does not exist in the authored configuration: {path!r}"
                 raise _ConfigPatchError(msg)
             current = current[token]
             continue
@@ -186,27 +195,15 @@ def _resolve_json_pointer(document: Any, path: str) -> Any:  # noqa: ANN401
     return current
 
 
+def _resolve_json_pointer(document: Any, path: str) -> Any:  # noqa: ANN401
+    """Resolve one JSON Pointer against an authored config document."""
+    return _walk_json_pointer(document, _decode_json_pointer(path), path, missing="Path")
+
+
 def _resolve_patch_parent(document: Any, path: str) -> tuple[Any, str]:  # noqa: ANN401
     """Resolve the parent container and final token for one non-root patch path."""
     tokens = _decode_json_pointer(path)
-    parent = document
-    for token in tokens[:-1]:
-        if isinstance(parent, dict):
-            if token not in parent:
-                msg = f"Parent path does not exist in the authored configuration: {path!r}"
-                raise _ConfigPatchError(msg)
-            parent = parent[token]
-            continue
-        if isinstance(parent, list):
-            index = _array_index(token, length=len(parent), allow_append=False, path=path)
-            if index >= len(parent):
-                msg = f"Array index {index} is out of range in JSON Pointer {path!r}"
-                raise _ConfigPatchError(msg)
-            parent = parent[index]
-            continue
-        msg = f"Cannot traverse through {type(parent).__name__} in JSON Pointer {path!r}"
-        raise _ConfigPatchError(msg)
-    return parent, tokens[-1]
+    return _walk_json_pointer(document, tokens[:-1], path, missing="Parent path"), tokens[-1]
 
 
 def _apply_mapping_patch(parent: dict[str, Any], change: _ConfigPatchChange, reference_token: str) -> None:
@@ -281,11 +278,6 @@ def _apply_config_patch(
     return candidate, [change.path for change in changes]
 
 
-def _is_known_tool_entry(tool_name: str, tool_metadata: dict[str, ToolMetadata]) -> bool:
-    """Return whether a tool entry is a known registered tool."""
-    return tool_name in tool_metadata
-
-
 def preserve_tool_overrides(
     existing_entries: list[ToolConfigEntry],
     updated_tool_names: list[str],
@@ -329,8 +321,8 @@ def _build_oauth_onboarding_guidance(
     config: Config,
     runtime_paths: RuntimePaths,
     agent_name: str,
-    previous_tools: list[str],
-    updated_tools: list[str],
+    previous_tools: Sequence[str],
+    updated_tools: Sequence[str],
     tool_metadata: dict[str, ToolMetadata],
 ) -> str:
     """Return target-scoped connect links for newly enabled generic OAuth providers."""
@@ -362,21 +354,18 @@ def _build_oauth_onboarding_guidance(
             f"credentials for agent `{agent_name}`."
         )
 
-    caller_identity = build_execution_identity_from_runtime_context(runtime_context)
     target_identity = replace(
-        caller_identity,
+        runtime_context.execution_identity,
         agent_name=agent_name,
         transport_agent_name=agent_name,
     )
-    agent = config.get_agent(agent_name)
-    worker_target = build_agent_toolkit_worker_target(
-        config.resolve_entity(agent_name).execution_scope,
+    worker_target = resolve_agent_execution(
         agent_name,
-        is_private=agent.private is not None,
+        config,
+        runtime_paths,
         execution_identity=target_identity,
-        runtime_paths=runtime_paths,
-    )
-    providers = load_oauth_providers(config, runtime_paths)
+    ).worker_target
+    providers = config_plugins(config, runtime_paths).oauth_providers
     link_lines: list[str] = []
     any_requires_host_browser = False
     for provider_id, tool_names in added_tools_by_provider.items():
@@ -420,8 +409,8 @@ def _oauth_onboarding_guidance(
     config: Config,
     runtime_paths: RuntimePaths,
     agent_name: str,
-    previous_tools: list[str],
-    updated_tools: list[str],
+    previous_tools: Sequence[str],
+    updated_tools: Sequence[str],
     tool_metadata: dict[str, ToolMetadata],
 ) -> str:
     """Build optional OAuth guidance without changing a successful config write into an error."""
@@ -439,10 +428,59 @@ def _oauth_onboarding_guidance(
         return ""
 
 
+def platform_administrator_error(config: Config, message: str) -> str | None:
+    """Return ``message`` unless the current tool requester is a platform administrator.
+
+    Every authored-configuration read and write shares this rule; calls without a requester fail closed.
+    """
+    runtime_context = get_tool_runtime_context()
+    if runtime_context is not None and is_platform_administrator(
+        runtime_context.requester_id,
+        config,
+        runtime_context.runtime_paths,
+    ):
+        return None
+    return message
+
+
+def _personal_agent_template(config: Config, tokens: list[str]) -> tuple[str, str, str] | None:
+    """Return the template key, the matching template pointer, and a note when ``tokens`` address a personal agent.
+
+    ``/agents/<name>`` maps to the whole template and ``/agents/<name>/<field>`` to that field of its ``agent``.
+    """
+    if len(tokens) < 2 or tokens[0] != "agents" or (instance := config.personal_agent_instance(tokens[1])) is None:
+        return None
+    field = f"/agent{_encode_json_pointer(tokens[2:])}" if len(tokens) > 2 else ""
+    return (
+        instance.template,
+        f"/personal_agents/{instance.template}{field}",
+        f"Agent '{tokens[1]}' has no `agents` entry: it is generated from the template "
+        f"`personal_agents.{instance.template}` for {instance.user_id}. Its configuration is that template, "
+        "plus the template's `users` overrides for its owner and any edits its owner made with update_agent.",
+    )
+
+
+def _reject_personal_agent_paths(config: Config, authored: dict[str, Any], changes: list[_ConfigPatchChange]) -> None:
+    """Point a change to a personal agent at its template while the patched config still generates that agent."""
+    addressed = [
+        (change, template)
+        for change in changes
+        if (template := _personal_agent_template(config, _decode_json_pointer(change.path))) is not None
+    ]
+    if not addressed:
+        return
+    # Changes under a generated agent cannot touch personal_agents, so the other changes decide which templates remain.
+    others = [change for change in changes if all(change is not other for other, _ in addressed)]
+    templates = (_apply_config_patch(authored, others)[0] if others else authored).get("personal_agents")
+    for change, (template_key, pointer, note) in addressed:
+        if isinstance(templates, dict) and template_key in templates:
+            msg = f"{change.path!r} is not editable here. {note} Patch `{pointer}` instead."
+            raise _ConfigPatchError(msg)
+
+
 class _InfoType(str, Enum):
     """Types of information that can be retrieved."""
 
-    MINDROOM_DOCS = "mindroom_docs"
     CONFIG_SCHEMA = "config_schema"
     AVAILABLE_MODELS = "available_models"
     AGENTS = "agents"
@@ -451,6 +489,24 @@ class _InfoType(str, Enum):
     TOOL_DETAILS = "tool_details"
     AGENT_CONFIG = "agent_config"
     AGENT_TEMPLATE = "agent_template"
+
+
+# Each agent template's tool category and role.
+_AGENT_TEMPLATES: dict[str, tuple[ToolCategory, str]] = {
+    "researcher": (ToolCategory.RESEARCH, "Research specialist focused on finding and analyzing information"),
+    "developer": (ToolCategory.DEVELOPMENT, "Software development expert for coding and technical tasks"),
+    "social": (ToolCategory.SOCIAL, "Social interaction specialist for community engagement"),
+    "communicator": (ToolCategory.COMMUNICATION, "Communication expert for messaging and collaboration"),
+    "analyst": (ToolCategory.INFORMATION, "Information analyst for data processing and insights"),
+    "productivity": (ToolCategory.PRODUCTIVITY, "Productivity specialist for task and workflow management"),
+}
+
+
+def commit_authored_config(config: Config, runtime_paths: RuntimePaths) -> Config:
+    """Commit an in-place edit of the loaded `config`, refused when the file changed since; return what runs."""
+    commit = ConfigCommit.from_payload(config.authored_model_dump(), runtime_paths)
+    commit_config(runtime_paths, commit, loaded=config)
+    return commit.config
 
 
 class ConfigManagerTools(Toolkit):
@@ -469,8 +525,6 @@ class ConfigManagerTools(Toolkit):
         """
         self.runtime_paths = runtime_paths
         self.config_path = runtime_paths.config_path
-        self._mindroom_docs: str | None = None
-        self._help_text: str | None = None
 
         # Register only the consolidated tools
         super().__init__(
@@ -492,7 +546,8 @@ class ConfigManagerTools(Toolkit):
     ) -> str:
         """Inspect or patch any authored MindRoom configuration field.
 
-        This is full-configuration control. Both operations address the authored
+        This is full-configuration control and requires a platform administrator
+        requester for both operations. Both operations address the authored
         document written to ``config.yaml``: unset defaults and runtime overlays
         are not present. Paths use RFC 6901 JSON Pointer syntax; the empty string
         addresses the document root. Inspection output is always redacted, at any
@@ -514,9 +569,7 @@ class ConfigManagerTools(Toolkit):
         """
         if operation == "inspect":
             return self._inspect_authored_config(path=path, changes=changes, dry_run=dry_run)
-        if operation == "patch":
-            return self._patch_authored_config(path=path, changes=changes, dry_run=dry_run)
-        return "Error: Unknown operation. Use 'inspect' or 'patch'."
+        return self._patch_authored_config(path=path, changes=changes, dry_run=dry_run)
 
     def _inspect_authored_config(  # noqa: PLR0911
         self,
@@ -535,10 +588,15 @@ class ConfigManagerTools(Toolkit):
         if load_error:
             return load_error
         assert config is not None
+        authorization_error = platform_administrator_error(config, _PLATFORM_ADMIN_REQUIRED_MESSAGE)
+        if authorization_error is not None:
+            return authorization_error
 
+        template_note = ""
         try:
-            redacted_document = redact_sensitive_data(config.authored_model_dump())
-            value = _resolve_json_pointer(redacted_document, path)
+            if (template := _personal_agent_template(config, _decode_json_pointer(path))) is not None:
+                path, template_note = template[1], f"\n\n⚠️ {template[2]}"
+            value = _resolve_json_pointer(config.redacted_authored_model_dump(), path)
             rendered = safe_dump(
                 value,
                 default_flow_style=False,
@@ -560,7 +618,7 @@ class ConfigManagerTools(Toolkit):
         include_note = (
             "\n\n⚠️ This configuration is composed from multiple files via `!include`. "
             "Inspection shows the composed authored document, but structured patching is unavailable."
-            if len(config.source_files) > 1
+            if config.uses_includes
             else ""
         )
         return (
@@ -569,6 +627,7 @@ class ConfigManagerTools(Toolkit):
             f"- JSON Pointer: `{path}`\n"
             "- View: authored values only; unset defaults and runtime overlays are excluded\n\n"
             f"```yaml\n{rendered}\n```"
+            f"{template_note}"
             f"{include_note}"
         )
 
@@ -591,10 +650,10 @@ class ConfigManagerTools(Toolkit):
         if load_error:
             return load_error
         assert config is not None
-        authorization_error = self._configuration_mutation_authorization_error(config)
+        authorization_error = platform_administrator_error(config, _PLATFORM_ADMIN_REQUIRED_MESSAGE)
         if authorization_error is not None:
-            return authorization_error
-        if len(config.source_files) > 1:
+            return f"{authorization_error}\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
+        if config.uses_includes:
             return (
                 "Error: configuration is composed from multiple files via !include; "
                 f"edit the source files instead.\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
@@ -602,12 +661,13 @@ class ConfigManagerTools(Toolkit):
 
         try:
             authored = config.authored_model_dump()
-            normalized_changes = _normalize_patch_changes(changes)
-            candidate, changed_paths = _apply_config_patch(authored, normalized_changes)
-            validated_config = Config.validate_with_runtime(candidate, self.runtime_paths)
-            _reject_normalized_root_nulls(normalized_changes, validated_config.authored_model_dump())
+            _reject_redaction_markers(changes)
+            _reject_personal_agent_paths(config, authored, changes)
+            candidate, changed_paths = _apply_config_patch(authored, changes)
+            commit = ConfigCommit.from_payload(candidate, self.runtime_paths)
+            _reject_normalized_root_nulls(changes, commit.config.authored_model_dump())
             if not dry_run:
-                persist_runtime_validated_config(validated_config, self.runtime_paths)
+                commit_config(self.runtime_paths, commit, loaded=config)
         except _ConfigPatchError as exc:
             return f"Error: {exc}\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
         except (ValidationError, ConfigRuntimeValidationError) as exc:
@@ -641,7 +701,7 @@ class ConfigManagerTools(Toolkit):
             f"{runtime_note}"
         )
 
-    def get_info(  # noqa: C901, PLR0911, PLR0912
+    def get_info(  # noqa: C901, PLR0911
         self,
         info_type: str,
         name: str | None = None,
@@ -651,14 +711,14 @@ class ConfigManagerTools(Toolkit):
 
         Args:
             info_type: Type of information to retrieve. Options:
-                - "mindroom_docs": MindRoom documentation and help
                 - "config_schema": Configuration schema for agents and teams
                 - "available_models": List of configured AI models
                 - "agents": List agents in the current room by default
                 - "teams": List all configured teams
                 - "available_tools": List all available tools by category
                 - "tool_details": Get details about a specific tool (requires name)
-                - "agent_config": Get configuration for a specific agent (requires name)
+                - "agent_config": Get redacted configuration for a specific agent (requires name and a
+                  platform administrator requester)
                 - "agent_template": Generate template for agent type (requires name as type)
             name: Optional name/identifier for specific queries (tool name, agent name, or template type)
             agent_scope: Agent listing scope. Use "current_room" to show current room agents or
@@ -669,8 +729,6 @@ class ConfigManagerTools(Toolkit):
 
         """
         try:
-            if info_type == _InfoType.MINDROOM_DOCS:
-                return self._get_mindroom_info()
             if info_type == _InfoType.CONFIG_SCHEMA:
                 return self._get_config_schema()
             if info_type == _InfoType.AVAILABLE_MODELS:
@@ -698,7 +756,7 @@ class ConfigManagerTools(Toolkit):
             logger.exception("config_info_lookup_failed", info_type=info_type)
             return f"Error getting {info_type}: {e}"
 
-    def manage_agent(
+    def manage_agent(  # noqa: PLR0911
         self,
         operation: Literal["create", "update", "validate"],
         agent_name: str,
@@ -711,8 +769,6 @@ class ConfigManagerTools(Toolkit):
         knowledge_bases: list[str] | None = None,
         include_default_tools: bool | None = None,
         markdown: bool | None = None,
-        learning: bool | None = None,
-        learning_mode: AgentLearningMode | None = None,
     ) -> str:
         """Manage agent configurations - create, update, or validate agents.
 
@@ -727,31 +783,31 @@ class ConfigManagerTools(Toolkit):
             rooms: List of room IDs or names to auto-join
             knowledge_bases: List of knowledge base IDs to assign to this agent
             include_default_tools: Whether this agent should include defaults.tools
-            markdown: Whether to use markdown formatting
-            learning: Whether to enable Agno Learning for this agent
-            learning_mode: Learning mode for Agno Learning ("always" or "agentic")
+            markdown: Whether the agent's system prompt says its replies are shown as Markdown
 
         Returns:
             Success message or error details
 
         """
-        if operation not in {"create", "update"}:
-            return (
-                self._validate_agent_config(agent_name)
-                if operation == "validate"
-                else f"Error: Unknown operation '{operation}'. Valid options: create, update, validate"
-            )
+        if operation == "validate":
+            return self._validate_agent_config(agent_name)
 
         config, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error(
+            listing=False,
             footer=_CONFIG_CHANGE_REJECTED_MESSAGE,
         )
         if load_error is not None:
             return load_error
         assert config is not None
         assert tool_metadata is not None
-        authorization_error = self._configuration_mutation_authorization_error(config)
+        authorization_error = platform_administrator_error(config, _PLATFORM_ADMIN_REQUIRED_MESSAGE)
         if authorization_error is not None:
-            return authorization_error
+            return f"{authorization_error}\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
+        marker_error = redaction_marker_error(
+            {"display_name": display_name, "role": role, "instructions": instructions},
+        )
+        if marker_error is not None:
+            return marker_error
 
         if operation == "update":
             return self._update_agent_config(
@@ -765,8 +821,6 @@ class ConfigManagerTools(Toolkit):
                 knowledge_bases=knowledge_bases,
                 include_default_tools=include_default_tools,
                 markdown=markdown,
-                learning=learning,
-                learning_mode=learning_mode,
                 config=config,
                 tool_metadata=tool_metadata,
             )
@@ -783,8 +837,6 @@ class ConfigManagerTools(Toolkit):
             knowledge_bases=knowledge_bases or [],
             include_default_tools=include_default_tools,
             markdown=markdown,
-            learning=learning,
-            learning_mode=learning_mode,
             config=config,
             tool_metadata=tool_metadata,
         )
@@ -795,7 +847,7 @@ class ConfigManagerTools(Toolkit):
         display_name: str,
         role: str,
         agents: list[str],
-        mode: str = "coordinate",
+        mode: Literal["coordinate", "collaborate"] = "coordinate",
     ) -> str:
         """Create or manage team configurations.
 
@@ -814,30 +866,12 @@ class ConfigManagerTools(Toolkit):
         if load_error is not None:
             return load_error
         assert config is not None
-        authorization_error = self._configuration_mutation_authorization_error(config)
+        authorization_error = platform_administrator_error(config, _PLATFORM_ADMIN_REQUIRED_MESSAGE)
         if authorization_error is not None:
-            return authorization_error
+            return f"{authorization_error}\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
         return self._create_team_config(team_name, display_name, role, agents, mode, config=config)
 
     # ===== Internal helper methods (not exposed as tools) =====
-
-    def _load_mindroom_docs(self) -> str:
-        """Load MindRoom documentation once and cache it."""
-        if self._mindroom_docs is None:
-            readme_path = Path(__file__).parent.parent.parent.parent / "README.md"
-            try:
-                with readme_path.open() as f:
-                    self._mindroom_docs = f.read()
-            except Exception as e:
-                logger.warning("mindroom_readme_load_failed", error=str(e))
-                self._mindroom_docs = "README.md not available"
-        return self._mindroom_docs
-
-    def _load_help_text(self) -> str:
-        """Load help text once and cache it."""
-        if self._help_text is None:
-            self._help_text = get_command_help()
-        return self._help_text
 
     def _load_config_or_error(
         self,
@@ -851,37 +885,23 @@ class ConfigManagerTools(Toolkit):
             tolerate_plugin_load_errors=True,
         )
 
-    @staticmethod
-    def _configuration_mutation_authorization_error(config: Config) -> str | None:
-        """Deny full configuration writes without a current platform administrator."""
-        runtime_context = get_tool_runtime_context()
-        if runtime_context is not None and is_platform_administrator(
-            runtime_context.requester_id,
-            config,
-            runtime_context.runtime_paths,
-        ):
-            return None
-        return f"{_PLATFORM_ADMIN_REQUIRED_MESSAGE}\n\n{_CONFIG_CHANGE_REJECTED_MESSAGE}"
-
     def _load_config_and_tool_metadata_or_error(
         self,
         *,
+        listing: bool,
         footer: str | None = None,
     ) -> tuple[Config | None, dict[str, ToolMetadata] | None, str | None]:
-        """Load config and resolve one runtime-aware tool metadata snapshot."""
+        """Load config and one runtime-aware tool metadata snapshot.
+
+        With `listing`, only the tools this runtime offers, for the tool lists, details, and templates. The agent checks
+        get every tool the config accepts, so a config naming `egress_credentials` stays valid while the broker is off.
+        """
         config, load_error = self._load_config_or_error(footer=footer)
         if load_error:
             return None, None, load_error
         assert config is not None
-        return (
-            config,
-            resolved_tool_metadata_for_runtime(
-                self.runtime_paths,
-                config,
-                tolerate_plugin_load_errors=True,
-            ),
-            None,
-        )
+        tools = config_plugins(config, self.runtime_paths).tools
+        return config, tools.listable() if listing else dict(tools.entries), None
 
     def _get_available_models(self) -> str:
         """Get the list of configured models from the current configuration."""
@@ -906,7 +926,8 @@ class ConfigManagerTools(Toolkit):
             output.append(f"- **Model ID**: {model_id}")
 
             if model_config.host:
-                output.append(f"- **Host**: {model_config.host}")
+                # Any requester may list models, so URL userinfo and credential query values stay masked.
+                output.append(f"- **Host**: {redact_sensitive_text(model_config.host)}")
 
             if model_name == "default":
                 output.append("- **Note**: This is typically the system default model")
@@ -969,33 +990,10 @@ class ConfigManagerTools(Toolkit):
 
         return "\n".join(output)
 
-    def _get_mindroom_info(self) -> str:
-        """Get comprehensive information about MindRoom."""
-        docs = self._load_mindroom_docs()
-        help_text = self._load_help_text()
-
-        return f"""# MindRoom Documentation
-
-## README Content:
-{docs}
-
-## Available Commands:
-{help_text}
-
-## Key Concepts:
-- **Agents**: AI assistants with specific roles and tools
-- **Teams**: Groups of agents that collaborate
-- **Tools**: Integrations that give agents capabilities (80+ available)
-- **Memory**: Persistent conversation memory across sessions
-- **Threading**: Responders use explicit thread relations, and plain replies inherit thread membership transitively when their reply chain reaches a threaded ancestor
-- **Routing**: Smart agent or team selection based on message content
-- **Commands**: Special !commands for configuration and control
-"""
-
     def _agent_entries_for_scope(
         self,
         config: Config,
-        agent_scope: str,
+        agent_scope: _AgentScope,
     ) -> tuple[str, list[tuple[str, AgentConfig]]]:
         """Return the heading and agent entries for one listing scope."""
         all_agents = list(config.agents.items())
@@ -1026,15 +1024,12 @@ class ConfigManagerTools(Toolkit):
         agent_entries = [(name, agent) for name, agent in all_agents if name in available_responder_names]
         return "Agents in This Room", agent_entries
 
-    def _list_agents(self, *, agent_scope: _AgentScope = "current_room") -> str:
+    def _list_agents(self, *, agent_scope: _AgentScope) -> str:
         """List agents and their details."""
         config, load_error = self._load_config_or_error()
         if load_error:
             return load_error
         assert config is not None
-
-        if agent_scope not in _VALID_AGENT_SCOPES:
-            return "Error: agent_scope must be 'current_room' or 'all'."
 
         heading, agent_entries = self._agent_entries_for_scope(config, agent_scope)
         agents_info = []
@@ -1078,7 +1073,7 @@ class ConfigManagerTools(Toolkit):
 
     def _list_available_tools(self) -> str:
         """List all available tools that can be used by agents."""
-        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error()
+        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error(listing=True)
         if load_error:
             return load_error
         assert tool_metadata is not None
@@ -1088,10 +1083,7 @@ class ConfigManagerTools(Toolkit):
         for tool_name in sorted(tool_metadata):
             metadata = tool_metadata[tool_name]
             category = metadata.category.value
-            description = metadata.description
-            if category not in tools_by_category:
-                tools_by_category[category] = []
-            tools_by_category[category].append((tool_name, description))
+            tools_by_category.setdefault(category, []).append((tool_name, metadata.description))
 
         output = ["## Available Tools by Category:\n"]
         for category in sorted(tools_by_category.keys()):
@@ -1103,7 +1095,7 @@ class ConfigManagerTools(Toolkit):
 
     def _get_tool_details(self, tool_name: str) -> str:
         """Get detailed information about a specific tool."""
-        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error()
+        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error(listing=True)
         if load_error:
             return load_error
         assert tool_metadata is not None
@@ -1112,31 +1104,29 @@ class ConfigManagerTools(Toolkit):
             available = ", ".join(sorted(tool_metadata.keys()))
             return f"Unknown tool: {tool_name}\n\nAvailable tools: {available}"
 
-        output = [f"## Tool: {tool_name}\n"]
+        metadata = tool_metadata[tool_name]
+        output = [
+            f"## Tool: {tool_name}\n",
+            f"**Display Name**: {metadata.display_name}",
+            f"**Description**: {metadata.description}",
+            f"**Category**: {metadata.category.value}",
+            f"**Status**: {metadata.status.value}",
+            f"**Setup Type**: {metadata.setup_type.value}",
+        ]
 
-        if tool_name in tool_metadata:
-            metadata = tool_metadata[tool_name]
-            output.append(f"**Display Name**: {metadata.display_name}")
-            output.append(f"**Description**: {metadata.description}")
-            output.append(f"**Category**: {metadata.category.value}")
-            output.append(f"**Status**: {metadata.status.value}")
-            output.append(f"**Setup Type**: {metadata.setup_type.value}")
+        if metadata.config_fields:
+            output.append("\n**Configuration Fields**:")
+            for field in metadata.config_fields:
+                required = "Required" if field.required else "Optional"
+                output.append(f"- **{field.name}** ({field.type}, {required}): {field.description}")
+                if field.default is not None:
+                    output.append(f"  Default: {field.default}")
 
-            if metadata.config_fields:
-                output.append("\n**Configuration Fields**:")
-                for field in metadata.config_fields:
-                    required = "Required" if field.required else "Optional"
-                    output.append(f"- **{field.name}** ({field.type}, {required}): {field.description}")
-                    if field.default is not None:
-                        output.append(f"  Default: {field.default}")
+        if metadata.dependencies:
+            output.append(f"\n**Dependencies**: {', '.join(metadata.dependencies)}")
 
-            if metadata.dependencies:
-                output.append(f"\n**Dependencies**: {', '.join(metadata.dependencies)}")
-
-            if metadata.docs_url:
-                output.append(f"\n**Documentation**: {metadata.docs_url}")
-        else:
-            output.append("No metadata available for this tool.")
+        if metadata.docs_url:
+            output.append(f"\n**Documentation**: {metadata.docs_url}")
 
         return "\n".join(output)
 
@@ -1152,8 +1142,6 @@ class ConfigManagerTools(Toolkit):
         knowledge_bases: list[str],
         include_default_tools: bool | None,
         markdown: bool | None,
-        learning: bool | None,
-        learning_mode: AgentLearningMode | None,
         config: Config,
         tool_metadata: dict[str, ToolMetadata],
     ) -> str:
@@ -1162,7 +1150,7 @@ class ConfigManagerTools(Toolkit):
         if not re.match(r"^[a-z0-9_]+$", agent_name):
             return "Error: Agent name must be lowercase alphanumeric with underscores only"
 
-        invalid_tools = [t for t in tools if not _is_known_tool_entry(t, tool_metadata)]
+        invalid_tools = [t for t in tools if t not in tool_metadata]
         if invalid_tools:
             return f"Error: Unknown tools: {', '.join(invalid_tools)}\n\nUse get_info with info_type='available_tools' to see valid tools."
 
@@ -1185,25 +1173,19 @@ class ConfigManagerTools(Toolkit):
                 knowledge_bases=knowledge_bases,
                 include_default_tools=True if include_default_tools is None else include_default_tools,
                 markdown=markdown,
-                learning=learning,
-                learning_mode=learning_mode,
             )
 
             # Add to config
             config.agents[agent_name] = new_agent
 
-            # Save config
-            persisted_config = validate_and_persist_config_payload(
-                config.authored_model_dump(),
-                self.runtime_paths,
-            )
+            persisted_config = commit_authored_config(config, self.runtime_paths)
 
             oauth_guidance = _oauth_onboarding_guidance(
                 persisted_config,
                 self.runtime_paths,
                 agent_name,
                 [],
-                persisted_config.resolve_entity(agent_name).available_tools,
+                persisted_config.resolve_agent(agent_name).tools.tool_names,
                 tool_metadata,
             )
 
@@ -1227,7 +1209,7 @@ class ConfigManagerTools(Toolkit):
             logger.exception("Failed to create agent")
             return f"Error creating agent: {e}"
 
-    def _update_agent_config(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def _update_agent_config(  # noqa: C901, PLR0911, PLR0912
         self,
         agent_name: str,
         display_name: str | None,
@@ -1239,8 +1221,6 @@ class ConfigManagerTools(Toolkit):
         knowledge_bases: list[str] | None,
         include_default_tools: bool | None,
         markdown: bool | None,
-        learning: bool | None,
-        learning_mode: AgentLearningMode | None,
         config: Config,
         tool_metadata: dict[str, ToolMetadata],
     ) -> str:
@@ -1250,11 +1230,11 @@ class ConfigManagerTools(Toolkit):
                 return f"Error: Agent '{agent_name}' not found. Use manage_agent with operation='create' to create it."
 
             agent = config.agents[agent_name]
-            previous_tools = config.resolve_entity(agent_name).available_tools
+            previous_tools = config.resolve_agent(agent_name).tools.tool_names
 
             # Validate tools if provided
             if tools is not None:
-                invalid_tools = [t for t in tools if not _is_known_tool_entry(t, tool_metadata)]
+                invalid_tools = [t for t in tools if t not in tool_metadata]
                 if invalid_tools:
                     return f"Error: Unknown tools: {', '.join(invalid_tools)}"
 
@@ -1304,29 +1284,17 @@ class ConfigManagerTools(Toolkit):
                 agent.markdown = markdown
                 changes.append(f"Markdown -> {markdown}")
 
-            if learning is not None and learning != agent.learning:
-                agent.learning = learning
-                changes.append(f"Learning -> {learning}")
-
-            if learning_mode is not None and learning_mode != agent.learning_mode:
-                agent.learning_mode = learning_mode
-                changes.append(f"Learning Mode -> {learning_mode}")
-
             if not changes:
                 return "No changes made. All provided values are the same as current configuration."
 
-            # Save config
-            persisted_config = validate_and_persist_config_payload(
-                config.authored_model_dump(),
-                self.runtime_paths,
-            )
+            persisted_config = commit_authored_config(config, self.runtime_paths)
 
             oauth_guidance = _oauth_onboarding_guidance(
                 persisted_config,
                 self.runtime_paths,
                 agent_name,
                 previous_tools,
-                persisted_config.resolve_entity(agent_name).available_tools,
+                persisted_config.resolve_agent(agent_name).tools.tool_names,
                 tool_metadata,
             )
 
@@ -1347,14 +1315,11 @@ class ConfigManagerTools(Toolkit):
         display_name: str,
         role: str,
         agents: list[str],
-        mode: str = "coordinate",
+        mode: Literal["coordinate", "collaborate"] = "coordinate",
         *,
         config: Config,
     ) -> str:
         """Create a new team configuration."""
-        if mode not in ["coordinate", "collaborate"]:
-            return "Error: Team mode must be 'coordinate' or 'collaborate'"
-
         try:
             if team_name in config.teams:
                 return f"Error: Team '{team_name}' already exists."
@@ -1375,8 +1340,7 @@ class ConfigManagerTools(Toolkit):
             # Add to config
             config.teams[team_name] = new_team
 
-            # Save config
-            validate_and_persist_config_payload(config.authored_model_dump(), self.runtime_paths)
+            commit_authored_config(config, self.runtime_paths)
 
             return (
                 f"✅ Successfully created team '{team_name}'!\n\n"
@@ -1395,7 +1359,7 @@ class ConfigManagerTools(Toolkit):
 
     def _validate_agent_config(self, agent_name: str) -> str:  # noqa: C901, PLR0912
         """Validate an agent's configuration."""
-        config, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error()
+        config, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error(listing=False)
         if load_error:
             return load_error
         assert config is not None
@@ -1422,7 +1386,7 @@ class ConfigManagerTools(Toolkit):
         if not agent.tools:
             warnings.append("No tools configured")
         else:
-            invalid_tools = [t for t in agent.tool_names if not _is_known_tool_entry(t, tool_metadata)]
+            invalid_tools = [t for t in agent.tool_names if t not in tool_metadata]
             if invalid_tools:
                 issues.append(f"Invalid tools: {', '.join(invalid_tools)}")
 
@@ -1455,43 +1419,39 @@ class ConfigManagerTools(Toolkit):
         return "\n".join(output)
 
     def _get_agent_config(self, agent_name: str) -> str:
-        """Get the full configuration for a specific agent."""
+        """Get the redacted authored configuration for a specific agent."""
         config, load_error = self._load_config_or_error()
         if load_error:
             return load_error
         assert config is not None
+        authorization_error = platform_administrator_error(config, _PLATFORM_ADMIN_REQUIRED_MESSAGE)
+        if authorization_error is not None:
+            return authorization_error
 
-        if agent_name not in config.agents:
+        authored = config.redacted_authored_model_dump()
+        heading = f"## Configuration for '{agent_name}':"
+        agent_dict = authored.get("agents", {}).get(agent_name)
+        if agent_dict is None and (template := _personal_agent_template(config, ["agents", agent_name])) is not None:
+            heading = f"⚠️ {template[2]}\n\n## Template configuration at `{template[1]}`:"
+            agent_dict = _resolve_json_pointer(authored, template[1])
+        if agent_dict is None:
             return f"Error: Agent '{agent_name}' not found."
 
-        agent = config.agents[agent_name]
-        agent_dict = agent.authored_model_dump()
-
         yaml_str = yaml.dump(agent_dict, default_flow_style=False, sort_keys=False)
-        return f"## Configuration for '{agent_name}':\n\n```yaml\n{yaml_str}```"
+        return f"{heading}\n\n```yaml\n{yaml_str}```"
 
     def _generate_agent_template(self, agent_type: str) -> str:
         """Generate a template configuration for common agent types."""
-        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error()
+        _, tool_metadata, load_error = self._load_config_and_tool_metadata_or_error(listing=True)
         if load_error:
             return load_error
         assert tool_metadata is not None
 
-        # Map agent types to tool categories
-        type_to_category = {
-            "researcher": ToolCategory.RESEARCH,
-            "developer": ToolCategory.DEVELOPMENT,
-            "social": ToolCategory.SOCIAL,
-            "communicator": ToolCategory.COMMUNICATION,
-            "analyst": ToolCategory.INFORMATION,
-            "productivity": ToolCategory.PRODUCTIVITY,
-        }
-
-        if agent_type not in type_to_category:
-            available = ", ".join(type_to_category.keys())
+        if agent_type not in _AGENT_TEMPLATES:
+            available = ", ".join(_AGENT_TEMPLATES)
             return f"Unknown template type: {agent_type}\n\nAvailable templates: {available}"
 
-        category = type_to_category[agent_type]
+        category, role = _AGENT_TEMPLATES[agent_type]
 
         # Get tools from this category that are available
         tools = [
@@ -1499,18 +1459,6 @@ class ConfigManagerTools(Toolkit):
             for name, metadata in tool_metadata.items()
             if metadata.category == category and metadata.status == ToolStatus.AVAILABLE
         ][:5]  # Limit to 5 tools
-
-        # Generate role based on category
-        role_descriptions = {
-            ToolCategory.RESEARCH: "Research specialist focused on finding and analyzing information",
-            ToolCategory.DEVELOPMENT: "Software development expert for coding and technical tasks",
-            ToolCategory.SOCIAL: "Social interaction specialist for community engagement",
-            ToolCategory.COMMUNICATION: "Communication expert for messaging and collaboration",
-            ToolCategory.INFORMATION: "Information analyst for data processing and insights",
-            ToolCategory.PRODUCTIVITY: "Productivity specialist for task and workflow management",
-        }
-
-        role = role_descriptions.get(category, f"Specialist in {category.value} tasks")
 
         # Generic instructions
         instructions = [

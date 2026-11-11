@@ -1,0 +1,242 @@
+"""Portable OpenAI summaries must finish completely within the engine's attempt count."""
+
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, Any, Literal
+
+import httpx
+import httpx2
+import pytest
+
+from mindroom.config.models import ModelConfig
+from mindroom.constants import resolve_runtime_paths
+from mindroom.history.summary_call import (
+    CompactionSummaryIncompleteError,
+    CompactionSummaryOutputLimitError,
+    generate_compaction_summary,
+    is_summary_timeout,
+)
+from mindroom.llm.errors import TRANSPORT_TIMEOUT, ProviderError, ProviderUnavailable
+from mindroom.llm.messages import Message
+from mindroom.llm.provider import ModelRequest, complete
+from mindroom.providers.openai.build import build_provider
+from tests.providers.golden_support import httpx2_transport, pipeline_provider, streamed_reply
+from tests.providers.openai_family_support import provider_runtime
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from mindroom.llm.provider import ModelProvider
+
+pytestmark = pytest.mark.asyncio
+
+type _Route = Literal["chat", "responses"]
+
+
+def _model(
+    route: _Route,
+    root: Path,
+    respond: Callable[[httpx.Request], httpx.Response],
+    **extra_kwargs: Any,  # noqa: ANN401
+) -> ModelProvider:
+    """Build the route's owned adapter inside the request pipeline, answering every request with ``respond``."""
+    output_limit = {"max_completion_tokens": 4} if route == "chat" else {"max_output_tokens": 4, "store": False}
+    config = ModelConfig(
+        provider="openai",
+        id="gpt-6-astra",
+        api="chat_completions" if route == "chat" else "responses",
+        extra_kwargs={"api_key": "test-key", "base_url": "https://mock.invalid/v1", **output_limit, **extra_kwargs},
+    )
+    runtime = provider_runtime(
+        resolve_runtime_paths(config_path=root / "config.yaml", storage_path=root / "data", process_env={}),
+        http_client=httpx2.AsyncClient(transport=httpx2_transport(respond)),
+    )
+    return pipeline_provider(build_provider(config, runtime))
+
+
+def _response(
+    route: _Route,
+    *,
+    complete: bool = False,
+    reason: str = "length",
+    output_tokens: int = 1,
+    model: str = "gpt-6-astra",
+) -> httpx.Response:
+    """Return the route's streamed summary reply "Project facts", cut off for ``reason`` unless ``complete``."""
+    if route == "chat":
+        return streamed_reply(
+            {
+                "id": "chatcmpl-summary",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop" if complete else reason,
+                        "message": {"role": "assistant", "content": "Project facts"},
+                    },
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": output_tokens, "total_tokens": 10 + output_tokens},
+            },
+        )
+    return streamed_reply(
+        {
+            "id": "resp_summary",
+            "object": "response",
+            "created_at": 1,
+            "model": model,
+            "status": "completed" if complete else "incomplete",
+            "incomplete_details": None
+            if complete
+            else {"reason": "max_output_tokens" if reason == "length" else reason},
+            "error": None,
+            "output": [
+                {
+                    "id": "msg_summary",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed" if complete else "incomplete",
+                    "content": [{"type": "output_text", "text": "Project facts", "annotations": []}],
+                },
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": output_tokens,
+                "total_tokens": 10 + output_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_summary_rejects_explicit_output_limit_below_usage_cap(route: _Route, tmp_path: Path) -> None:
+    """Completion metadata must prevent committing partial text even below the configured cap."""
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return _response(route)
+
+    with pytest.raises(CompactionSummaryOutputLimitError):
+        await generate_compaction_summary(
+            model=_model(route, tmp_path, respond),
+            summary_input="Conversation",
+            summary_prompt="Summarize",
+            timeout_seconds=10,
+            on_usage=None,
+        )
+    assert len(requests) == 1
+    assert requests[0]["max_completion_tokens" if route == "chat" else "max_output_tokens"] == 4
+
+
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_summary_rejects_partial_text_stopped_by_content_filter(route: _Route, tmp_path: Path) -> None:
+    """Partial nonempty content is still incomplete when a provider stops for another reason."""
+    with pytest.raises(CompactionSummaryIncompleteError, match="incomplete"):
+        await generate_compaction_summary(
+            model=_model(route, tmp_path, lambda _: _response(route, reason="content_filter")),
+            summary_input="Conversation",
+            summary_prompt="Summarize",
+            timeout_seconds=10,
+            on_usage=None,
+        )
+
+
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_summary_accepts_explicit_completion_at_usage_cap(route: _Route, tmp_path: Path) -> None:
+    """A complete response is valid even when its usage equals the configured cap."""
+    summary = await generate_compaction_summary(
+        model=_model(route, tmp_path, lambda _: _response(route, complete=True, output_tokens=4)),
+        summary_input="Conversation",
+        summary_prompt="Summarize",
+        timeout_seconds=10,
+        on_usage=None,
+    )
+    assert summary == "Project facts"
+
+
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_summary_makes_one_http_attempt_whatever_retries_the_model_authors(route: _Route, tmp_path: Path) -> None:
+    """SDK retries authored in ``client_params`` cannot multiply a summary attempt."""
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            503,
+            headers={"retry-after-ms": "1"},
+            json={"error": {"message": "Unavailable", "type": "server_error", "code": "unavailable"}},
+        )
+
+    with pytest.raises(ProviderError):
+        await generate_compaction_summary(
+            model=_model(route, tmp_path, respond, client_params={"max_retries": 2}),
+            summary_input="Conversation",
+            summary_prompt="Summarize",
+            timeout_seconds=10,
+            on_usage=None,
+        )
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("route", ["chat", "responses"])
+async def test_a_summary_whose_transport_times_out_fails_as_a_timeout(route: _Route, tmp_path: Path) -> None:
+    """The SDK's timeout error keeps the transport timeout's code, so compaction reports a timeout."""
+
+    def respond(request: httpx2.Request) -> httpx.Response:
+        msg = "The read operation timed out"
+        raise httpx2.ReadTimeout(msg, request=request)
+
+    with pytest.raises(ProviderUnavailable) as raised:
+        await generate_compaction_summary(
+            model=_model(route, tmp_path, respond),
+            summary_input="Conversation",
+            summary_prompt="Summarize",
+            timeout_seconds=10,
+            on_usage=None,
+        )
+    assert raised.value.code == TRANSPORT_TIMEOUT
+    assert is_summary_timeout(raised.value)
+
+
+async def test_openrouter_claude_summary_writes_no_prompt_cache(tmp_path: Path) -> None:
+    """An OpenRouter route to Claude marks cache breakpoints on replies, but never on a one-off summary."""
+    bodies: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return _response("chat", complete=True, model="anthropic/claude-sonnet-5")
+
+    config = ModelConfig(
+        provider="openrouter",
+        id="anthropic/claude-sonnet-5",
+        extra_kwargs={"api_key": "test-key", "cache_system_prompt": True},
+    )
+    runtime = provider_runtime(
+        resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "data", process_env={}),
+        http_client=httpx2.AsyncClient(transport=httpx2_transport(respond)),
+    )
+    model = pipeline_provider(build_provider(config, runtime))
+    messages = (Message(role="system", content="Summarize"), Message(role="user", content="Conversation"))
+
+    await complete(model, ModelRequest(messages=messages))
+    summary = await generate_compaction_summary(
+        model=model,
+        summary_input="Conversation",
+        summary_prompt="Summarize",
+        timeout_seconds=10,
+        on_usage=None,
+    )
+
+    assert summary == "Project facts"
+    reply_body, summary_body = bodies
+    assert "cache_control" in json.dumps(reply_body)
+    assert "cache_control" not in json.dumps(summary_body)

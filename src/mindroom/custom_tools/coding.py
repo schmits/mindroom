@@ -20,16 +20,31 @@ import shutil
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from glob import has_magic
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from agno.tools import Toolkit
-
-from mindroom.tools.path_safety import (
+from mindroom.git_invocation import hardened_git_command, hardened_git_env
+from mindroom.path_confinement import is_git_metadata_path
+from mindroom.path_safety import (
+    blocked_git_metadata_message,
     format_path_for_output,
     is_within_base_dir,
+    read_resolved_file,
     resolve_base_dir_path,
+    resolve_tool_base_dir,
+    spelled_output_path,
     split_search_pattern,
+    write_resolved_file,
 )
+from mindroom.shared_directories.tool_roots import no_shared_directory_roots, shared_directory_aware
+from mindroom.tool_system.authoring import Toolkit
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from mindroom.config.models import FileAccess
+    from mindroom.shared_directories.tool_roots import SharedDirectoryRoot
 
 _MAX_LINES = 2000
 _MAX_BYTES = 50 * 1024  # 50KB
@@ -364,9 +379,10 @@ def _gitignored_paths(paths: list[Path], base_dir: Path) -> set[Path]:
     payload = "\0".join(path_map.keys()) + "\0"
     try:
         result = subprocess.run(
-            ["git", "check-ignore", "--stdin", "-z"],
+            hardened_git_command(["check-ignore", "--stdin", "-z"]),
             check=False,
             cwd=str(base_dir),
+            env=hardened_git_env(),
             input=payload.encode("utf-8"),
             capture_output=True,
             timeout=5,
@@ -442,7 +458,7 @@ def _list_directory(target: Path, limit: int) -> str:
     entries: list[str] = []
     try:
         for item in sorted(target.iterdir(), key=lambda p: p.name.lower()):
-            name = item.name + ("/" if item.is_dir() else "")
+            name = (spelled_output_path(item) or item.name) + ("/" if item.is_dir() else "")
             entries.append(name)
             if len(entries) > limit:
                 break
@@ -480,14 +496,13 @@ def _find_files_in(
         return f"Error: Invalid glob pattern '{pattern}': {e}"
 
     filter_root = base_dir if restrict_to_base_dir else search_path
-    filtered = _filter_hidden_and_ignored(candidates, filter_root)
+    # A dot directory named in `path` or in the pattern's literal prefix was asked for, so only dot paths below it hide.
+    parts = Path(pattern).parts
+    named = parts[: next((index for index, part in enumerate(parts) if has_magic(part)), len(parts))]
+    filtered = _filter_hidden_and_ignored(candidates, filter_root, search_path.joinpath(*named))
     matches: list[str] = []
     for candidate in filtered:
-        try:
-            rel = candidate.relative_to(base_dir)
-        except ValueError:
-            rel = candidate
-        matches.append(str(rel))
+        matches.append(format_path_for_output(candidate, base_dir))
         if len(matches) > limit:
             break
 
@@ -504,12 +519,20 @@ def _find_files_in(
     return result
 
 
-def _resolve_and_read(base_dir: Path, path: str, restrict_to_base_dir: bool = True) -> tuple[Path, str] | str:
+def _resolve_and_read(
+    base_dir: Path,
+    path: str,
+    restrict_to_base_dir: bool = True,
+    *,
+    writable: bool = False,
+) -> tuple[Path, str] | str:
     """Resolve path and read file content. Returns (resolved, content) or error string."""
     try:
         resolved = resolve_base_dir_path(base_dir, path, restrict_to_base_dir)
     except ValueError as e:
         return f"Error: {e}"
+    if writable and is_git_metadata_path(resolved):
+        return blocked_git_metadata_message("writing file", path)
 
     if not resolved.exists():
         return f"Error: File not found: {path}"
@@ -517,8 +540,8 @@ def _resolve_and_read(base_dir: Path, path: str, restrict_to_base_dir: bool = Tr
         return f"Error: Not a file: {path}"
 
     try:
-        return resolved, resolved.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
+        return resolved, read_resolved_file(base_dir, resolved).decode("utf-8", errors="replace")
+    except (OSError, ValueError) as e:
         return f"Error reading file: {e}"
 
 
@@ -529,9 +552,17 @@ class CodingTools(Toolkit):
     smart truncation, fuzzy matching, and actionable pagination hints.
     """
 
-    def __init__(self, base_dir: str | None = None, restrict_to_base_dir: bool = True) -> None:
-        self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
-        self.restrict_to_base_dir = restrict_to_base_dir
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        file_access: FileAccess = "workspace",
+        shared_directory_roots: Callable[[], tuple[SharedDirectoryRoot, ...]] = no_shared_directory_roots,
+    ) -> None:
+        self.base_dir = resolve_tool_base_dir(base_dir)
+        # Without a workspace the base dir is only the process working directory, which workspace access refuses.
+        self.has_workspace = bool(base_dir)
+        self.restrict_to_base_dir = file_access == "workspace"
+        self.shared_directory_roots = shared_directory_roots
         super().__init__(
             name="coding",
             tools=[
@@ -544,6 +575,7 @@ class CodingTools(Toolkit):
             ],
         )
 
+    @shared_directory_aware("path", writes=False)
     def read_file(
         self,
         path: str,
@@ -566,6 +598,7 @@ class CodingTools(Toolkit):
             return result
         return _format_read_output(result[1], offset, limit)
 
+    @shared_directory_aware("path", writes=True)
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         """Replace a specific text occurrence in a file. Uses fuzzy matching to handle whitespace/Unicode differences.
 
@@ -584,7 +617,7 @@ class CodingTools(Toolkit):
         if not old_text:
             return "Error: old_text must be non-empty."
 
-        result = _resolve_and_read(self.base_dir, path, self.restrict_to_base_dir)
+        result = _resolve_and_read(self.base_dir, path, self.restrict_to_base_dir, writable=True)
         if isinstance(result, str):
             return result
         resolved, content = result
@@ -599,7 +632,7 @@ class CodingTools(Toolkit):
         new_content = content[: match.start] + new_text + content[match.end :]
 
         try:
-            resolved.write_text(new_content, encoding="utf-8")
+            write_resolved_file(self.base_dir, resolved, new_content.encode("utf-8"))
         except OSError as e:
             return f"Error writing file: {e}"
 
@@ -608,6 +641,7 @@ class CodingTools(Toolkit):
         line_num = content[: match.start].count("\n") + 1
         return f"Applied edit at line {line_num}{fuzzy_note}:\n\n{diff}"
 
+    @shared_directory_aware("path", writes=True)
     def write_file(self, path: str, content: str) -> str:
         """Write content to a file, creating parent directories if needed.
 
@@ -623,10 +657,11 @@ class CodingTools(Toolkit):
             resolved = resolve_base_dir_path(self.base_dir, path, self.restrict_to_base_dir)
         except ValueError as e:
             return f"Error: {e}"
+        if is_git_metadata_path(resolved):
+            return blocked_git_metadata_message("writing file", path)
 
         try:
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
+            write_resolved_file(self.base_dir, resolved, content.encode("utf-8"))
         except OSError as e:
             return f"Error writing file: {e}"
 
@@ -634,6 +669,7 @@ class CodingTools(Toolkit):
         lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
         return f"Wrote {byte_count} bytes ({lines} lines) to {path}"
 
+    @shared_directory_aware("path", writes=False)
     def grep(
         self,
         pattern: str,
@@ -663,9 +699,7 @@ class CodingTools(Toolkit):
 
         """
         try:
-            search_path = (
-                resolve_base_dir_path(self.base_dir, path, self.restrict_to_base_dir) if path else self.base_dir
-            )
+            search_path = resolve_base_dir_path(self.base_dir, path or ".", self.restrict_to_base_dir)
         except ValueError as e:
             return f"Error: {e}"
         effective_glob = glob
@@ -704,6 +738,7 @@ class CodingTools(Toolkit):
             )
         return rg_result
 
+    @shared_directory_aware("path", writes=False)
     def find_files(
         self,
         pattern: str,
@@ -719,14 +754,13 @@ class CodingTools(Toolkit):
 
         Returns:
             List of matching file paths, one per line.
-            Hidden files/directories and gitignored files are automatically
-            excluded from results.
+            Hidden files/directories below the searched directory and gitignored
+            files are automatically excluded from results; a hidden directory
+            named in path or in the pattern's leading directories is searched.
 
         """
         try:
-            search_path = (
-                resolve_base_dir_path(self.base_dir, path, self.restrict_to_base_dir) if path else self.base_dir
-            )
+            search_path = resolve_base_dir_path(self.base_dir, path or ".", self.restrict_to_base_dir)
         except ValueError as e:
             return f"Error: {e}"
         search_pattern = pattern
@@ -749,6 +783,7 @@ class CodingTools(Toolkit):
             restrict_to_base_dir=self.restrict_to_base_dir,
         )
 
+    @shared_directory_aware("path", writes=False)
     def ls(self, path: str | None = None, limit: int = _DEFAULT_LS_LIMIT) -> str:
         """List directory contents with directory indicators.
 
@@ -762,7 +797,7 @@ class CodingTools(Toolkit):
 
         """
         try:
-            target = resolve_base_dir_path(self.base_dir, path, self.restrict_to_base_dir) if path else self.base_dir
+            target = resolve_base_dir_path(self.base_dir, path or ".", self.restrict_to_base_dir)
         except ValueError as e:
             return f"Error: {e}"
 
@@ -977,10 +1012,7 @@ def _grep_file(
     except (OSError, UnicodeDecodeError):
         return match_count
 
-    try:
-        rel = filepath.relative_to(base_dir)
-    except ValueError:
-        rel = filepath
+    rel = format_path_for_output(filepath, base_dir)
 
     lines = text.splitlines()
     emitted_lines: set[int] = set()
@@ -1007,9 +1039,10 @@ def _grep_file(
     return match_count
 
 
-def _filter_hidden_and_ignored(files: list[Path], search_path: Path) -> list[Path]:
-    """Filter out hidden files (dotfiles) and gitignored files."""
+def _filter_hidden_and_ignored(files: list[Path], search_path: Path, visible_root: Path | None = None) -> list[Path]:
+    """Filter out files outside ``search_path``, gitignored files, and dotfiles below ``visible_root``."""
     search_root = search_path.resolve()
+    hidden_root = search_path if visible_root is None else visible_root
     visible: list[Path] = []
     for filepath in files:
         if not is_within_base_dir(filepath, search_root):
@@ -1017,7 +1050,7 @@ def _filter_hidden_and_ignored(files: list[Path], search_path: Path) -> list[Pat
         if not filepath.is_file():
             continue
         try:
-            rel = filepath.relative_to(search_path)
+            rel = filepath.relative_to(hidden_root)
         except ValueError:
             rel = filepath.resolve()
         if any(part.startswith(".") for part in rel.parts):
@@ -1037,7 +1070,7 @@ def _collect_grep_files(search_path: Path, glob_filter: str | None) -> list[Path
         patterns = [glob_filter]
         if "/" not in glob_filter and "\\" not in glob_filter and not glob_filter.startswith("**/"):
             # pathlib's "*.ext" only matches the top level, while ripgrep's --glob
-            # applies recursively; include both patterns for parity in fallback mode.
+            # applies recursively; include both so the fallback matches what ripgrep would.
             patterns.append(f"**/{glob_filter}")
     else:
         patterns = ["**/*"]

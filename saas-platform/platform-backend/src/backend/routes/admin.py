@@ -1,11 +1,18 @@
 """Admin-only routes for platform management."""
 
-from collections import defaultdict
-from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from collections import Counter
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal
 
-from backend.config import logger, stripe
-from backend.deps import ensure_supabase, limiter, verify_admin
+from backend.config import ENABLE_CLEANUP_SCHEDULER, INSTANCE_TEARDOWN_GRACE_DAYS, logger
+from backend.deps import (
+    ACTIVE_ACCOUNT_STATUS,
+    account_may_sign_in,
+    ensure_supabase,
+    invalidate_account_auth_cache,
+    limiter,
+    verify_admin,
+)
 from backend.models import (
     ActionResult,
     AdminAccountDetailsResponse,
@@ -13,22 +20,23 @@ from backend.models import (
     AdminDashboardMetricsResponse,
     AdminDeleteResponse,
     AdminGetOneResponse,
+    AdminInstanceLifecycleResponse,
     AdminListResponse,
-    AdminLogoutResponse,
-    AdminStatsOut,
     AdminUpdateResponse,
     ProvisionResponse,
     SyncResult,
     UpdateAccountStatusResponse,
 )
-from backend.pricing import PRICING_CONFIG_MODEL
-from backend.services import instances_data, provisioner_service
+from backend.services import instance_lifecycle, instances_data, provisioner_service
 from backend.utils.audit import create_audit_log
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from backend.utils.paging import select_all_pages
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 router = APIRouter()
-ALLOWED_RESOURCES = {"accounts", "subscriptions", "instances", "audit_logs", "usage_metrics"}
+ALLOWED_RESOURCES = {"accounts", "subscriptions", "instances", "audit_logs"}
+# The accounts.status CHECK constraint allows exactly these values.
+ACCOUNT_STATUSES = ("active", "suspended", "deleted", "pending_verification")
 
 
 def audit_log_entry(
@@ -46,53 +54,10 @@ def audit_log_entry(
     )
 
 
-def _monthly_plan_prices_usd() -> dict[str, int]:
-    """Return configured monthly prices in dollars for automatic MRR estimates."""
-    prices: dict[str, int] = {}
-    for tier, plan in PRICING_CONFIG_MODEL.plans.items():
-        if isinstance(plan.price_monthly, int):
-            prices[tier] = plan.price_monthly // 100
-        else:
-            prices[tier] = 0
-    return prices
-
-
-@router.get("/admin/stats", response_model=AdminStatsOut)
-@limiter.limit("30/minute")
-async def get_admin_stats(request: Request, admin: Annotated[dict, Depends(verify_admin)]) -> dict[str, Any]:  # noqa: FAST002, B008, ARG001
-    """Get platform statistics for admin dashboard."""
-    audit_log_entry(account_id=admin["user_id"], action="view", resource_type="stats")
-    sb = ensure_supabase()
-
-    try:
-        accounts = sb.table("accounts").select("*", count="exact").execute()
-        subscriptions = sb.table("subscriptions").select("*", count="exact").eq("status", "active").execute()
-        instances = sb.table("instances").select("*", count="exact").eq("status", "running").execute()
-
-        # Get recent activity for dashboard
-        recent_logs = (
-            sb.table("audit_logs").select("*, accounts(email)").order("created_at", desc=True).limit(5).execute()
-        )
-
-        recent_activity = []
-        if recent_logs.data:
-            recent_activity.extend(
-                {
-                    "type": log.get("action", "unknown"),
-                    "description": f"{log.get('resource_type', '')} {log.get('action', '')} by {log.get('accounts', {}).get('email', 'System')}",
-                    "timestamp": log.get("created_at", ""),
-                }
-                for log in recent_logs.data
-            )
-
-        return {
-            "accounts": len(accounts.data) if accounts.data else 0,
-            "active_subscriptions": len(subscriptions.data) if subscriptions.data else 0,
-            "running_instances": len(instances.data) if instances.data else 0,
-        }
-    except Exception as e:
-        logger.exception("Error fetching admin stats")
-        raise HTTPException(status_code=500, detail="Failed to fetch statistics") from e
+def _monthly_revenue_usd(subscription: dict[str, Any]) -> float:
+    """Return the monthly revenue of a subscription's recorded Stripe price, or 0 before a price is recorded."""
+    months = 12 if subscription["billing_cycle"] == "yearly" else 1
+    return (subscription["price_cents"] or 0) / months / 100
 
 
 @router.post("/admin/instances/{instance_id}/start", response_model=ActionResult)
@@ -170,11 +135,16 @@ async def admin_provision_instance(
     if instance.get("status") not in ["deprovisioned", "error"]:
         raise HTTPException(status_code=400, detail="Instance must be deprovisioned or in error state to provision")
 
+    # The subscription's tier, not the instance's copy of an older one, decides the resources and AI budget.
+    subscriptions = sb.table("subscriptions").select("tier").eq("id", instance["subscription_id"]).limit(1).execute()
+    if not subscriptions.data:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
     # Call the provisioner service with existing instance data
     data = {
         "subscription_id": instance.get("subscription_id"),
         "account_id": instance.get("account_id"),
-        "tier": instance.get("tier", "free"),
+        "tier": subscriptions.data[0]["tier"],
         "instance_id": instance_id,  # Re-use existing instance ID
     }
 
@@ -184,9 +154,27 @@ async def admin_provision_instance(
         action="provision",
         resource_type="instance",
         resource_id=str(instance_id),
-        details={"account_id": instance.get("account_id"), "tier": instance.get("tier")},
+        details={"account_id": instance.get("account_id"), "tier": data["tier"]},
     )
     return result
+
+
+@router.get("/admin/instance-lifecycle", response_model=AdminInstanceLifecycleResponse)
+@limiter.limit("30/minute")
+async def get_instance_lifecycle(
+    request: Request,  # noqa: ARG001
+    admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008, ARG001
+) -> dict[str, Any]:
+    """Show the last nightly cleanup run, instances pending teardown, and stuck lifecycle states."""
+    runs = ensure_supabase().table("cleanup_runs").select("*").order("started_at", desc=True).limit(1).execute()
+    pending, stuck = instance_lifecycle.lifecycle_overview()
+    return {
+        "cleanup_scheduler_enabled": ENABLE_CLEANUP_SCHEDULER,
+        "teardown_grace_days": INSTANCE_TEARDOWN_GRACE_DAYS,
+        "last_run": runs.data[0] if runs.data else None,
+        "pending_teardown": pending,
+        "stuck": stuck,
+    }
 
 
 @router.post("/admin/sync-instances", response_model=SyncResult)
@@ -252,6 +240,19 @@ class UpdateAccountStatusRequest(BaseModel):
     reason: str | None = None
 
 
+def _update_account_auth_ban(sb: Any, account: dict[str, Any]) -> None:
+    """Ban Auth sign-in for a saved account that every platform route refuses; failed updates can be retried.
+
+    An account awaiting deletion stays unbanned so its owner can still cancel the deletion.
+    """
+    try:
+        sb.auth.admin.update_user_by_id(
+            account["id"], {"ban_duration": "none" if account_may_sign_in(account) else "876000h"}
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to update account authentication") from exc
+
+
 @router.put("/admin/accounts/{account_id}/status", response_model=UpdateAccountStatusResponse)
 async def update_account_status(
     account_id: str,
@@ -261,11 +262,20 @@ async def update_account_status(
     """Update account status (active, suspended, etc)."""
     sb = ensure_supabase()
 
-    valid_statuses = ["active", "suspended", "deleted", "pending_verification"]
-    if request.status not in valid_statuses:
-        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {valid_statuses}")
+    if request.status not in ACCOUNT_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {list(ACCOUNT_STATUSES)}")
 
     try:
+        # Setting active would leave deleted_at set, which keeps the account refused everywhere.
+        if request.status == ACTIVE_ACCOUNT_STATUS:
+            account = sb.table("accounts").select("deleted_at").eq("id", account_id).execute()
+            if account.data and account.data[0].get("deleted_at") is not None:
+                raise HTTPException(  # noqa: TRY301
+                    status_code=409,
+                    detail=(
+                        "Account is awaiting deletion. Set its status to deleted so the owner can cancel the deletion."
+                    ),
+                )
         result = (
             sb.table("accounts")
             .update({"status": request.status, "updated_at": datetime.now(UTC).isoformat()})
@@ -275,6 +285,8 @@ async def update_account_status(
 
         if not result.data:
             raise HTTPException(status_code=404, detail="Account not found")  # noqa: TRY301
+        # The database's id spelling is the one cached auth entries carry.
+        invalidate_account_auth_cache(result.data[0]["id"])
 
         audit_log_entry(
             account_id=admin["user_id"],
@@ -283,17 +295,14 @@ async def update_account_status(
             resource_id=account_id,
             details={"status": request.status, "reason": request.reason},
         )
+        _update_account_auth_ban(sb, result.data[0])
 
         return {"status": "success", "account_id": account_id, "new_status": request.status}  # noqa: TRY300
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Error updating account status")
         raise HTTPException(status_code=500, detail="Failed to update account status") from e
-
-
-@router.post("/admin/auth/logout", response_model=AdminLogoutResponse)
-async def admin_logout() -> dict[str, bool]:
-    """Admin logout placeholder."""
-    return {"success": True}
 
 
 @router.get("/admin/metrics/dashboard", response_model=AdminDashboardMetricsResponse)
@@ -308,37 +317,16 @@ async def get_dashboard_metrics(
 
     try:
         accounts = sb.table("accounts").select("*", count="exact", head=True).execute()
-        active_subs = sb.table("subscriptions").select("*", count="exact", head=True).eq("status", "active").execute()
-        _ = sb.table("instances").select("*", count="exact", head=True).eq("status", "running").execute()
-
-        subs_data = sb.table("subscriptions").select("tier").eq("status", "active").execute()
-        tier_prices = _monthly_plan_prices_usd()
-        mrr = sum(tier_prices.get(sub.get("tier", "free"), 0) for sub in (subs_data.data or []))
-
-        seven_days_ago = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-        messages = (
-            sb.table("usage_metrics")
-            .select("metric_date, messages_sent")
-            .gte("metric_date", seven_days_ago)
-            .order("metric_date")
-            .execute()
+        active_subs = select_all_pages(
+            lambda: (
+                sb.table("subscriptions")
+                .select("billing_cycle,price_cents")
+                .eq("status", "active")
+                .neq("tier", "free")
+                .order("id")
+            )
         )
-
-        if messages.data:
-            by_date = defaultdict(int)
-            for m in messages.data:
-                date = m["metric_date"][:10]
-                by_date[date] += m.get("messages_sent", 0)
-            _ = [  # noqa: F841
-                {"date": date, "messages_sent": count} for date, count in sorted(by_date.items())
-            ]
-
-        all_instances = instances_data.list_instances(sb, columns="status")
-        status_counts: dict[str, int] = {}
-        for inst in all_instances:
-            status = inst.get("status", "unknown")
-            status_counts[status] = status_counts.get(status, 0) + 1
-
+        instances = instances_data.list_instances(sb, columns="status")
         audit_logs = (
             sb.table("audit_logs")
             .select("created_at, action, account_id")
@@ -346,102 +334,57 @@ async def get_dashboard_metrics(
             .limit(10)
             .execute()
         )
-        recent_activity = audit_logs.data if audit_logs.data else []
-    except Exception:
-        logger.exception("Error fetching metrics")
-        return {
-            "total_accounts": 0,
-            "active_subscriptions": 0,
-            "total_instances": 0,
-            "instances_by_status": {},
-            "subscription_revenue": 0.0,
-            "subscriptions_by_tier": {},
-            "recent_signups": [],
-            "recent_instances": [],
-        }
-    else:
-        # Build subscriptions by tier
-        subscriptions_by_tier = {}
-        if subs_data.data:
-            for sub in subs_data.data:
-                tier = sub.get("tier", "free")
-                subscriptions_by_tier[tier] = subscriptions_by_tier.get(tier, 0) + 1
+    except Exception as e:
+        logger.exception("Error fetching dashboard metrics")
+        raise HTTPException(status_code=500, detail="Failed to fetch dashboard metrics") from e
 
-        # Build instances by status dict
-        instances_by_status = {status: count for status, count in status_counts.items()}
-
-        return {
-            "total_accounts": accounts.count or 0,
-            "active_subscriptions": active_subs.count or 0,
-            "total_instances": len(all_instances),
-            "instances_by_status": instances_by_status,
-            "subscription_revenue": float(mrr),
-            "subscriptions_by_tier": subscriptions_by_tier,
-            "recent_signups": [],  # Not implemented yet
-            "recent_instances": recent_activity if recent_activity else [],
-        }
+    return {
+        "total_accounts": accounts.count or 0,
+        "active_subscriptions": len(active_subs),
+        "instances_by_status": Counter(inst["status"] for inst in instances),
+        "subscription_revenue": float(round(sum(_monthly_revenue_usd(sub) for sub in active_subs))),
+        "recent_instances": audit_logs.data or [],
+    }
 
 
-# === React Admin Data Provider ===
+# === Generic admin resources ===
+# Admin lists embed the account each row belongs to.
+_LIST_COLUMNS = {
+    "instances": "*, accounts(email, full_name)",
+    "subscriptions": "*, accounts(email, full_name)",
+    "audit_logs": "*, accounts(email)",
+}
+
+
 @router.get("/admin/{resource}", response_model=AdminListResponse)
 @limiter.limit("60/minute")
-async def admin_get_list(  # noqa: C901
+async def admin_get_list(
     request: Request,  # noqa: ARG001
     resource: str,
     admin: Annotated[dict, Depends(verify_admin)],  # noqa: FAST002, B008
-    _sort: Annotated[str | None, Query()] = None,
-    _order: Annotated[str | None, Query()] = None,
-    _start: int = Query(0),  # noqa: FAST002
-    _end: int = Query(10),  # noqa: FAST002
-    q: Annotated[str | None, Query()] = None,
+    limit: int | None = None,
 ) -> dict[str, Any]:
-    """Generic list endpoint for React Admin."""
+    """List a resource's rows, newest first.
+
+    Without ``limit``, every row; with it, the ``limit`` newest rows. ``total`` counts every row.
+    """
     if resource not in ALLOWED_RESOURCES:
         raise HTTPException(status_code=400, detail="Invalid resource")
     sb = ensure_supabase()
 
-    audit_log_entry(
-        account_id=admin["user_id"],
-        action="list",
-        resource_type=resource,
-        details={"query": q, "start": _start, "end": _end},
-    )
+    audit_log_entry(account_id=admin["user_id"], action="list", resource_type=resource, details={"limit": limit})
 
-    try:
-        # Add joins for better data display in admin panel
-        if resource == "instances":
-            query = sb.table("instances").select("*, accounts(email, full_name)", count="exact")
-        elif resource == "subscriptions":
-            query = sb.table("subscriptions").select("*, accounts(email, full_name)", count="exact")
-        elif resource == "audit_logs":
-            query = sb.table("audit_logs").select("*, accounts(email)", count="exact")
-        elif resource == "usage_metrics":
-            query = sb.table("usage_metrics").select("*, accounts(email, full_name)", count="exact")
-        else:
-            query = sb.table(resource).select("*", count="exact")
+    def build_query(count: Literal["exact"] | None = None) -> Any:  # noqa: ANN401
+        query = sb.table(resource).select(_LIST_COLUMNS.get(resource, "*"), count=count)
+        # Ordering ties by id keeps the pages of a full listing from skipping or repeating a row.
+        return query.order("created_at", desc=True).order("id")
 
-        if q:
-            search_fields = {
-                "accounts": ["email", "full_name", "company_name"],
-                "instances": ["name", "subdomain"],
-                "audit_logs": ["action", "details"],
-                "subscriptions": ["tier", "status"],
-            }
-            if resource in search_fields:
-                or_conditions = [f"{field}.ilike.%{q}%" for field in search_fields[resource]]
-                query = query.or_(",".join(or_conditions))
-
-        if _sort:
-            order_column = f"{_sort}.{_order.lower() if _order else 'asc'}"
-            query = query.order(order_column)
-
-        query = query.range(_start, _end - 1)
-        result = query.execute()
-    except Exception:
-        logger.exception("Error in get_list")
-        return {"data": [], "total": 0}
-    else:
-        return {"data": result.data, "total": result.count}
+    if limit is None:
+        # No count here: with one, PostgREST refuses the final empty page if a row was deleted meanwhile.
+        rows = select_all_pages(build_query)
+        return {"data": rows, "total": len(rows)}
+    result = build_query("exact").limit(limit).execute()
+    return {"data": result.data, "total": result.count}
 
 
 @router.get("/admin/{resource}/{resource_id}", response_model=AdminGetOneResponse)
@@ -527,8 +470,14 @@ async def admin_update(
             resource_id=resource_id,
             details={"data": data},
         )
+        if resource == "accounts" and result.data:
+            invalidate_account_auth_cache(result.data[0]["id"])
+            if data.keys() & {"status", "deleted_at"}:
+                _update_account_auth_ban(sb, result.data[0])
 
         return {"data": result.data[0] if result.data else None}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Error updating resource")
         raise HTTPException(status_code=400, detail="Invalid request") from None
@@ -551,62 +500,69 @@ async def admin_delete_account_complete(
         raise HTTPException(status_code=404, detail="Account not found")
 
     account = account_result.data[0]
+    # The stored id is canonical, whatever spelling the path used, so cache and auth lookups match it.
+    account_id = account["id"]
     logger.info(
         f"Admin {admin['user_id']} initiating complete deletion of account {account_id} ({account.get('email')})"
     )
 
-    # 1. First, get all instances for this account
+    # 1. Mark the account pending deletion, so nothing provisions, starts, or bills it again during teardown, and
+    # claim it for teardown, so the customer can no longer restore it and hard_delete_account accepts it.
+    sb.rpc(
+        "soft_delete_account",
+        {"target_account_id": account_id, "reason": "admin_complete_deletion", "requested_by": admin["user_id"]},
+    ).execute()
+    invalidate_account_auth_cache(account_id)
+    claimed = (
+        sb.table("accounts")
+        .update({"hard_delete_started_at": datetime.now(UTC).isoformat()})
+        .eq("id", account_id)
+        .not_.is_("deleted_at", "null")
+        .execute()
+        .data
+    )
+    if not claimed:
+        detail = "The account could not be marked pending deletion, so nothing was deleted; retry the deletion"
+        raise HTTPException(status_code=500, detail=detail)
+
+    # 2. Cancel Stripe billing and uninstall every instance; the rows are the only record of what to tear down,
+    # so they stay until this succeeds.
     instances = instances_data.get_instances_for_account(sb, account_id)
-
-    # 2. Deprovision all instances
-    for instance in instances:
-        instance_id = instance.get("instance_id")
-        if instance.get("status") not in ["deprovisioned", "terminated"]:
-            logger.info(f"Deprovisioning instance {instance_id} for account {account_id}")
-            try:
-                await provisioner_service.uninstall_instance(instance_id)
-            except Exception as e:
-                logger.error(f"Failed to deprovision instance {instance_id}: {e}")
-                # Continue with other instances even if one fails
-
-    # 3. Cancel any active Stripe subscriptions
-    if account.get("stripe_customer_id"):
-        try:
-            # List and cancel all subscriptions for this customer
-            subscriptions = stripe.Subscription.list(customer=account["stripe_customer_id"], status="active")
-            for subscription in subscriptions.data:
-                logger.info(f"Canceling Stripe subscription {subscription.id}")
-                stripe.Subscription.cancel(subscription.id)
-
-            # Delete the Stripe customer (optional - you may want to keep for records)
-            # stripe.Customer.delete(account["stripe_customer_id"])
-
-        except Exception as e:
-            logger.error(f"Failed to cancel Stripe subscriptions: {e}")
-            # Continue with deletion even if Stripe fails
-
-    # 4. Delete the account (cascade deletion will handle related records)
     try:
-        sb.table("accounts").delete().eq("id", account_id).execute()
-
-        # Log the complete deletion
-        audit_log_entry(
-            account_id=admin["user_id"],
-            action="delete_complete",
-            resource_type="accounts",
-            resource_id=account_id,
-            details={
-                "deleted_email": account.get("email"),
-                "instances_deprovisioned": len(instances),
-                "had_stripe_customer": bool(account.get("stripe_customer_id")),
-            },
-        )
-
-        logger.info(f"Successfully deleted account {account_id} and all associated resources")
-
+        await instance_lifecycle.tear_down_account(account_id)
     except Exception as e:
-        logger.exception(f"Error deleting account {account_id}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}") from None
+        logger.exception("Tearing down account %s failed; its rows are kept", account_id)
+        detail = (
+            "Teardown failed, so the account rows were kept, but Stripe billing may already be cancelled and "
+            f"some instances uninstalled; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    # 3. Delete the account's instance, subscription, and audit rows, then the login, whose account row goes with it.
+    try:
+        sb.rpc("hard_delete_account", {"target_account_id": account_id}).execute()
+        await instance_lifecycle.delete_auth_user(account_id)
+        invalidate_account_auth_cache(account_id)
+    except Exception as e:
+        logger.exception("Deleting the rows or auth user of account %s failed; its account row is kept", account_id)
+        detail = (
+            "Billing and instances are torn down, but deleting the account's rows or login failed, so the account "
+            f"row was kept; retry the deletion: {e!s}"
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
+
+    audit_log_entry(
+        account_id=admin["user_id"],
+        action="delete_complete",
+        resource_type="accounts",
+        resource_id=account_id,
+        details={
+            "deleted_email": account.get("email"),
+            "instances_deprovisioned": len(instances),
+            "had_stripe_customer": bool(account.get("stripe_customer_id")),
+        },
+    )
+    logger.info(f"Successfully deleted account {account_id} and all associated resources")
 
     return {"data": {"id": account_id}}
 

@@ -5,6 +5,7 @@ import { requestConnection } from "./request";
 interface McpSelection {
   enabled: boolean;
   agents: Record<string, string[] | null>;
+  unavailable_reason?: "account_required";
 }
 
 const selectionPath = "/api/connections/mcp/selection";
@@ -94,7 +95,7 @@ export function useMcpSelection() {
     const tools = new Set(
       current === null
         ? agent.tools
-            .filter((item) => !item.requires_room_context)
+            .filter((item) => item.mcp_available)
             .map((item) => item.name)
         : (current ?? []),
     );

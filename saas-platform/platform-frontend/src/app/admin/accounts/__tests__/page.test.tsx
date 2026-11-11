@@ -92,6 +92,8 @@ describe('Admin Accounts Page', () => {
       await waitFor(() => {
         expect(screen.getByText('No accounts found')).toBeInTheDocument()
       })
+      // Every action belongs to an account row.
+      expect(screen.queryAllByRole('button')).toEqual([])
     })
 
     it('should handle fetch error gracefully', async () => {
@@ -346,9 +348,27 @@ describe('Admin Accounts Page', () => {
 
       await waitFor(() => {
         expect(mockApiCall).toHaveBeenCalledWith(
-          '/admin/accounts/account_1/status?status=suspended',
-          { method: 'PUT' }
+          '/admin/accounts/account_1/status',
+          { method: 'PUT', body: JSON.stringify({ status: 'suspended' }) }
         )
+      })
+    })
+
+    it('should show the backend reason when a status change fails', async () => {
+      const detail = 'Failed to update account authentication'
+      mockApiCall.mockResolvedValue({
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error',
+        json: async () => ({ detail })
+      })
+      const user = userEvent.setup()
+
+      await user.selectOptions(screen.getAllByRole('combobox')[0], 'suspended')
+      await user.click(screen.getAllByText('Save')[0])
+
+      await waitFor(() => {
+        expect(mockAlert).toHaveBeenCalledWith(`Failed to update status: ${detail}`)
       })
     })
   })

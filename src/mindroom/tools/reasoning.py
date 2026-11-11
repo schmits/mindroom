@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="reasoning",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Reasoning",
     description="Step-by-step reasoning scratchpad with think and analyze tools for structured problem solving",
     category=ToolCategory.DEVELOPMENT,
@@ -34,13 +36,6 @@ if TYPE_CHECKING:
             type="boolean",
             required=False,
             default=True,
-        ),
-        ConfigField(
-            name="add_instructions",
-            label="Add Instructions",
-            type="boolean",
-            required=False,
-            default=False,
         ),
         ConfigField(
             name="add_few_shot",
@@ -74,7 +69,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=[],
-    docs_url="https://docs.agno.com/tools/toolkits/others/reasoning",
+    docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#reasoning",
     function_names=("analyze", "think"),
 )
 def reasoning_tools() -> type[ReasoningTools]:

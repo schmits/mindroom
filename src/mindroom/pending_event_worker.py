@@ -39,6 +39,11 @@ def _assume_owner_is_live(event: JournalEvent) -> bool:
     return True
 
 
+def _no_reply_owner(reply_ids: tuple[str, ...]) -> None:
+    """A worker without a reply runtime has no reply debt to deliver."""
+    del reply_ids
+
+
 @dataclass
 class _RoomProgress:
     """The lane advances its cursor; outside notifications only request rewinds."""
@@ -75,6 +80,8 @@ class PendingEventWorker:
     handle: _EventHandler
     runtime_generation: str = "unmanaged"
     deferral_is_live: _DeferralLivenessProbe = _assume_owner_is_live
+    # Delivers what the replies a settlement ended owe Matrix.
+    replies_ended: Callable[[tuple[str, ...]], None] = _no_reply_owner
     deferral_scan_seconds: float = _DEFERRAL_SCAN_SECONDS
     _lanes: dict[str, asyncio.Task[_RoomPass]] = field(default_factory=dict, init=False, repr=False)
     _rooms: dict[str, _RoomProgress] = field(default_factory=dict, init=False, repr=False)
@@ -149,7 +156,7 @@ class PendingEventWorker:
 
     def begin_shutdown(self, *, shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN) -> None:
         """Close admission and mark cancellations before teardown can yield."""
-        process_shutdown = shutdown_intent.stop_reason == "shutdown"
+        process_shutdown = shutdown_intent.hands_off_unfinished_work
         if self._stopped and (not process_shutdown or self._process_shutdown):
             return
         if not self._stopped:
@@ -188,9 +195,9 @@ class PendingEventWorker:
         self._scan_cursor = None
         return True
 
-    async def stop(self) -> None:
+    async def stop(self, *, shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN) -> None:
         """Stop owners without settling their unfinished journal work."""
-        self.begin_shutdown()
+        self.begin_shutdown(shutdown_intent=shutdown_intent)
         await self.wait_stopped(timeout_seconds=None)
 
     def _queue_room(self, room_id: str, *, rewind_before: int | None = None) -> None:
@@ -416,7 +423,12 @@ class PendingEventWorker:
         if event.event_id in self._deferred:
             progress.cursor = event.receipt_order
             return True
-        self._record_room_progress(room_id, event.receipt_order - 1)
+        if progress.deferred_count == 0:
+            # Reaching a later event only proves the earlier ones done when none
+            # of them is still handed to a turn. A handed-off source that keeps
+            # coming back failed is not progress, and counting it as progress
+            # reset the cooldown to its first step on every pass.
+            self._record_room_progress(room_id, event.receipt_order - 1)
         pending = await self.store.is_pending(event.event_id)
         if self._stopped:
             return False
@@ -438,7 +450,7 @@ class PendingEventWorker:
                     self._reclaim_deferral(event)
             else:
                 self.release((event.event_id,))
-                await self.store.settle(event.event_id)
+                self.replies_ended(await self.store.settle(event.event_id))
                 self._record_room_progress(room_id, event.receipt_order)
         progress.cursor = event.receipt_order
         return True

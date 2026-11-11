@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Protocol, cast
 from unittest.mock import AsyncMock
 
@@ -25,11 +28,26 @@ from mindroom.api import config_lifecycle
 from mindroom.api import external_triggers as external_triggers_api
 from mindroom.api import main as api_main
 from mindroom.config.main import Config
-from mindroom.external_triggers.auth import mint_trigger_capability, sign_trigger_request
-from mindroom.external_triggers.replay_store import ExternalTriggerEventClaim, ExternalTriggerReplayStore
-from mindroom.external_triggers.store import ExternalTriggerStore, ExternalTriggerTarget, TriggerDeliverySnapshot
+from mindroom.delivery_replay import DeliveryEventClaim, DeliveryReplayStore
+from mindroom.external_triggers import executor as trigger_executor
+from mindroom.external_triggers.auth import (
+    TriggerSignatureHeaders,
+    canonical_trigger_signing_payload,
+    mint_trigger_capability,
+    sign_trigger_request,
+)
+from mindroom.external_triggers.store import (
+    ExternalTriggerStore,
+    ExternalTriggerTarget,
+    TriggerDeliverySnapshot,
+    external_trigger_replay_store,
+)
+from mindroom.matrix.client_delivery import DeliveredMatrixEvent
 from mindroom.matrix.state import MatrixState
-from mindroom.response_admission import ResponseAdmissionGate
+from mindroom.response_admission import ResponseAdmissionGate, admitted_response_decision
+from tests.identity_helpers import persist_entity_accounts
+from tests.matrix_state_helpers import save_matrix_state
+from tests.runtime_fakes import bind_test_embedded_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
@@ -216,6 +234,8 @@ def _bind_runtime(
 ) -> object:
     client = object()
     admission_gate = response_admission_gate or ResponseAdmissionGate()
+    runtime_config = config_lifecycle.require_api_state(api_main.app).snapshot.runtime_config
+    assert runtime_config is not None
 
     async def is_trigger_snapshot_ready(snapshot: TriggerDeliverySnapshot) -> bool:
         ready_snapshots.append(snapshot)
@@ -225,14 +245,22 @@ def _bind_runtime(
         await admission_gate.wait_until_open()
         return True
 
+    bind_test_embedded_runtime(
+        api_main.app,
+        agent_reply_memberships=agent_reply_memberships or AgentReplyMembershipIndex(),
+        response_admission_gate=admission_gate,
+    )
     api_main.bind_external_trigger_runtime(
         api_main.app,
         client=client,
         conversation_reader=object(),
+        runtime_config=runtime_config,
         is_trigger_snapshot_ready=is_trigger_snapshot_ready,
-        agent_reply_memberships=agent_reply_memberships or AgentReplyMembershipIndex(),
-        response_admission_gate=admission_gate,
-        wait_for_admission_or_shutdown=wait_for_admission_or_shutdown or wait_for_admission,
+        admission_fence=partial(
+            admitted_response_decision,
+            admission_gate,
+            wait_for_admission_or_shutdown or wait_for_admission,
+        ),
     )
     return client
 
@@ -285,7 +313,7 @@ async def test_external_trigger_target_accepts_grant_room_member(tmp_path: Path)
     grant_room_id = "!campground:example.org"
     state = MatrixState.load(runtime_paths=runtime_paths)
     state.add_room("campground", grant_room_id, "#campground:example.org", "Campground")
-    state.save(runtime_paths=runtime_paths)
+    save_matrix_state(state, runtime_paths)
     client = AsyncMock(spec=nio.AsyncClient)
     client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[grant_room_id])
     client.joined_members.return_value = nio.JoinedMembersResponse(
@@ -337,7 +365,7 @@ async def _membership_authorized_runtime(
     grant_room_id = "!campground:example.org"
     state = MatrixState.load(runtime_paths=runtime_paths)
     state.add_room("campground", grant_room_id, "#campground:example.org", "Campground")
-    state.save(runtime_paths=runtime_paths)
+    save_matrix_state(state, runtime_paths)
     membership_client = AsyncMock(spec=nio.AsyncClient)
     membership_client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[grant_room_id])
     membership_client.joined_members.return_value = nio.JoinedMembersResponse(
@@ -361,10 +389,10 @@ def _trigger_api_context(
     runtime_paths = constants.resolve_primary_runtime_paths(
         config_path=config_path,
         storage_path=tmp_path / "mindroom_data",
-        process_env={},
+        process_env={"MATRIX_HOMESERVER": "http://localhost:8008"},
     )
     api_main.initialize_api_app(api_main.app, runtime_paths)
-    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app) is True
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     _create_record(runtime_paths, config, _public_key_b64(private_key))
     api_main.unbind_external_trigger_runtime(api_main.app)
     ready_snapshots: list[TriggerDeliverySnapshot] = []
@@ -506,19 +534,114 @@ def test_capability_trigger_survives_failed_delivery_for_retry(
     assert third.status_code == 404
 
 
+def test_capability_duplicate_is_not_delivered_after_a_later_trigger_write_drops_its_replay_record(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A duplicate that read the trigger before another copy consumed it is refused once its record is gone."""
+    token, snapshot = _create_capability_record(trigger_api)
+    store = ExternalTriggerStore(trigger_api.runtime_paths)
+    assert trigger_api.runtime_paths.control_state_root is not None
+    replay_store = external_trigger_replay_store(trigger_api.runtime_paths.control_state_root)
+    executed: list[TriggerDeliverySnapshot] = []
+
+    async def other_copy_delivers_while_owner_is_checked(*_args: object, **_kwargs: object) -> bool:
+        now = int(time.time())
+        assert replay_store.claim_event_id(snapshot.replay_scope, snapshot.uid, now=now, ttl_seconds=300) is (
+            DeliveryEventClaim.FRESH
+        )
+        replay_store.mark_event_delivered(snapshot.replay_scope, snapshot.uid, now=now, ttl_seconds=300)
+        store.consume_single_use(snapshot.trigger_id, expected_uid=snapshot.uid)
+        # An unrelated trigger write deletes the consumed trigger's replay records.
+        _create_capability_record(trigger_api, trigger_id="callback_456")
+        return True
+
+    async def execute_external_trigger(*, snapshot: TriggerDeliverySnapshot, **_kwargs: object) -> str:
+        executed.append(snapshot)
+        return "$second-message"
+
+    monkeypatch.setattr(
+        "mindroom.api.external_triggers.is_external_trigger_owner_joined_target_room",
+        other_copy_delivers_while_owner_is_checked,
+    )
+    monkeypatch.setattr("mindroom.api.external_triggers.execute_external_trigger", execute_external_trigger)
+
+    response = trigger_api.client.post(
+        f"/api/triggers/{snapshot.trigger_id}",
+        content=_body(),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 404
+    assert executed == []
+
+
 def test_trigger_invalidated_by_current_config_returns_404_before_replay_claim(
     trigger_api: TriggerApiContext,
 ) -> None:
     """Stored triggers that no longer target configured rooms are hidden as not found."""
     runtime_paths = trigger_api.runtime_paths
-    config = _write_runtime_config(runtime_paths.config_path, research_rooms=[])
-    assert config_lifecycle._publish_runtime_config_into_app(config, runtime_paths, api_main.app)
+    _write_runtime_config(runtime_paths.config_path, research_rooms=[])
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
 
     response = _post_signed(trigger_api, nonce="stale-target")
 
     assert response.status_code == 404
     assert response.json()["detail"] == "External trigger not found"
-    assert not (runtime_paths.control_state_root / "external_triggers" / "replay.json").exists()
+    assert not (runtime_paths.control_state_root / "external_triggers" / "replay").exists()
+
+
+def test_oversized_nonce_or_event_id_is_refused_before_replay_claim(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validly signed requests cannot store long nonces or event ids in the shared replay store."""
+    monkeypatch.setattr(
+        "mindroom.api.external_triggers.execute_external_trigger",
+        AsyncMock(return_value="$matrix-event"),
+    )
+    body, nonce, timestamp = _body(), "n" * 257, str(int(time.time()))
+    # The bundled signer refuses long nonces, so sign the canonical payload directly as a hostile client would.
+    signature = trigger_api.private_key.sign(
+        canonical_trigger_signing_payload(
+            method="POST",
+            path="/api/triggers/campground",
+            timestamp=timestamp,
+            nonce=nonce,
+            body=body,
+        ),
+    )
+    headers = TriggerSignatureHeaders(
+        key_id="campground-main",
+        timestamp=timestamp,
+        nonce=nonce,
+        signature=base64.b64encode(signature).decode("ascii"),
+    ).to_mapping()
+
+    long_nonce = trigger_api.client.post("/api/triggers/campground", content=body, headers=headers)
+    long_event_id = _post_signed(trigger_api, body=_body(event_id="e" * 257))
+
+    assert (long_nonce.status_code, long_event_id.status_code) == (401, 422)
+    assert not (trigger_api.runtime_paths.control_state_root / "external_triggers" / "replay").exists()
+
+
+def test_full_replay_scope_returns_429_and_still_refuses_replays(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trigger whose replay scope is full gets 429 for new claims, while a replayed nonce stays a 409."""
+    monkeypatch.setattr(
+        "mindroom.api.external_triggers.execute_external_trigger",
+        AsyncMock(return_value="$matrix-event"),
+    )
+    monkeypatch.setattr("mindroom.delivery_replay._MAX_LIVE_CLAIMS_PER_SCOPE", 1)
+
+    delivered = _post_signed(trigger_api, nonce="nonce-1")
+    refused = _post_signed(trigger_api, nonce="nonce-2")
+    replayed = _post_signed(trigger_api, nonce="nonce-1")
+
+    assert (delivered.status_code, refused.status_code, replayed.status_code) == (202, 429, 409)
+    assert refused.json()["detail"] == "External trigger replay limit reached"
 
 
 def test_missing_signature_headers_return_401(trigger_api: TriggerApiContext) -> None:
@@ -591,6 +714,16 @@ def test_disallowed_kind_returns_422(trigger_api: TriggerApiContext) -> None:
     response = _post_signed(trigger_api, body=_body(kind="campground.closed"), nonce="wrong-kind")
 
     assert response.status_code == 422
+
+
+def test_non_finite_payload_value_returns_422_without_echoing_it(trigger_api: TriggerApiContext) -> None:
+    """A rejected NaN, which JSON responses cannot render, gets a 422 that does not repeat the body."""
+    response = _post_signed(trigger_api, body=_body(message=float("nan")), nonce="nan-message")
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert (error["type"], error["loc"], error["msg"]) == ("string_type", ["message"], "Input should be a valid string")
+    assert "input" not in error
 
 
 def test_delivery_uses_single_snapshot_for_auth_readiness_and_execute(
@@ -666,6 +799,50 @@ def test_delivery_snapshot_read_runs_off_event_loop(
     assert "delivery_snapshot" in to_thread_calls
 
 
+def test_replay_store_calls_stay_off_the_default_executor(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay work queues on its own threads, never on the default executor that chat turns share."""
+    call_threads: dict[str, set[str]] = {}
+    replay_calls = (
+        "claim_nonce",
+        "claim_event_id",
+        "claim_thread_key",
+        "bind_thread_root",
+        "mark_event_delivered",
+        "release_event_id",
+        "release_thread_key",
+    )
+
+    def recording(name: str) -> Callable[..., object]:
+        original = getattr(DeliveryReplayStore, name)
+
+        def record_thread(store: DeliveryReplayStore, *args: object, **kwargs: object) -> object:
+            call_threads.setdefault(name, set()).add(threading.current_thread().name)
+            return original(store, *args, **kwargs)
+
+        return record_thread
+
+    for name in replay_calls:
+        monkeypatch.setattr(DeliveryReplayStore, name, recording(name))
+    outcomes = iter([None, "$root-a"])
+
+    async def execute_external_trigger(**_kwargs: object) -> str | None:
+        return next(outcomes)
+
+    monkeypatch.setattr("mindroom.api.external_triggers.execute_external_trigger", execute_external_trigger)
+    trigger_id = _create_new_thread_record(trigger_api)
+
+    failed = _post_keyed(trigger_api, trigger_id, "msg-1", "nonce-1")
+    delivered = _post_keyed(trigger_api, trigger_id, "msg-1", "nonce-2")
+
+    assert (failed.status_code, delivered.status_code) == (502, 202)
+    assert sorted(call_threads) == sorted(replay_calls)
+    thread_names = set().union(*call_threads.values())
+    assert all(thread_name.startswith("mindroom-external-trigger-replay") for thread_name in thread_names)
+
+
 def test_policy_caps_apply_at_request_time(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -680,11 +857,11 @@ def test_policy_caps_apply_at_request_time(
         process_env={},
     )
     api_main.initialize_api_app(api_main.app, runtime_paths)
-    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app) is True
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     _create_record(runtime_paths, initial_config, _public_key_b64(private_key))
 
-    lowered_config = _write_runtime_config(config_path, max_body_bytes=1024)
-    assert config_lifecycle._publish_runtime_config_into_app(lowered_config, runtime_paths, api_main.app)
+    _write_runtime_config(config_path, max_body_bytes=1024)
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     ready_snapshots: list[TriggerDeliverySnapshot] = []
     _bind_runtime(ready_snapshots)
     monkeypatch.setattr("mindroom.api.external_triggers.is_external_trigger_owner_joined_target_room", _owner_joined)
@@ -709,14 +886,14 @@ def test_owner_permission_removed_blocks_delivery_before_replay_claim(
 ) -> None:
     """Current authorization is checked before replay state is touched."""
     runtime_paths = trigger_api.runtime_paths
-    config = _write_runtime_config(runtime_paths.config_path, owner_authorized=False)
-    assert config_lifecycle._publish_runtime_config_into_app(config, runtime_paths, api_main.app)
+    _write_runtime_config(runtime_paths.config_path, owner_authorized=False)
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     _bind_runtime(trigger_api.ready_snapshots)
 
     response = _post_signed(trigger_api)
 
     assert response.status_code == 403
-    assert not (runtime_paths.control_state_root / "external_triggers" / "replay.json").exists()
+    assert not (runtime_paths.control_state_root / "external_triggers" / "replay").exists()
 
 
 @pytest.mark.asyncio
@@ -735,7 +912,7 @@ async def test_trigger_waiting_for_reload_rebinds_and_rechecks_current_authoriza
         process_env={},
     )
     api_main.initialize_api_app(api_main.app, runtime_paths)
-    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app) is True
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     _create_record(runtime_paths, initial_config, _public_key_b64(private_key))
     gate = ResponseAdmissionGate()
     assert gate.close_if_idle()
@@ -772,8 +949,8 @@ async def test_trigger_waiting_for_reload_rebinds_and_rechecks_current_authoriza
             )
             await asyncio.wait_for(wait_started.wait(), timeout=1)
 
-            replacement = _write_runtime_config(config_path, owner_authorized=False)
-            assert config_lifecycle._publish_runtime_config_into_app(replacement, runtime_paths, api_main.app)
+            _write_runtime_config(config_path, owner_authorized=False)
+            assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
             _bind_runtime(
                 ready_snapshots,
                 response_admission_gate=gate,
@@ -784,7 +961,7 @@ async def test_trigger_waiting_for_reload_rebinds_and_rechecks_current_authoriza
 
         assert response.status_code == 403
         execute.assert_not_awaited()
-        assert not (runtime_paths.control_state_root / "external_triggers" / "replay.json").exists()
+        assert not (runtime_paths.control_state_root / "external_triggers" / "replay").exists()
     finally:
         gate.reopen()
         if request_task is not None:
@@ -804,7 +981,7 @@ async def test_membership_authorized_trigger_waits_for_reload_snapshot(
     config, runtime_paths, memberships, membership_client = await _membership_authorized_runtime(tmp_path)
 
     api_main.initialize_api_app(api_main.app, runtime_paths)
-    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app) is True
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
     _create_record(runtime_paths, config, _public_key_b64(private_key))
     gate = ResponseAdmissionGate()
     assert gate.close_if_idle()
@@ -870,7 +1047,7 @@ def test_owner_not_joined_blocks_delivery_before_replay_claim(
     response = _post_signed(trigger_api)
 
     assert response.status_code == 403
-    assert not (trigger_api.runtime_paths.control_state_root / "external_triggers" / "replay.json").exists()
+    assert not (trigger_api.runtime_paths.control_state_root / "external_triggers" / "replay").exists()
 
 
 def test_private_owner_not_joined_blocks_delivery_before_replay_claim(
@@ -886,7 +1063,7 @@ def test_private_owner_not_joined_blocks_delivery_before_replay_claim(
     response = _post_signed(private_trigger_api)
 
     assert response.status_code == 403
-    assert not (private_trigger_api.runtime_paths.control_state_root / "external_triggers" / "replay.json").exists()
+    assert not (private_trigger_api.runtime_paths.control_state_root / "external_triggers" / "replay").exists()
 
 
 def test_duplicate_event_id_returns_duplicate_response(
@@ -964,10 +1141,10 @@ def test_thread_key_is_ignored_for_fixed_thread_targets(
     assert continued == [None, None]
 
 
-def _new_thread_replay_store(trigger_api: TriggerApiContext) -> ExternalTriggerReplayStore:
+def _new_thread_replay_store(trigger_api: TriggerApiContext) -> DeliveryReplayStore:
     control_state_root = trigger_api.runtime_paths.control_state_root
     assert control_state_root is not None
-    return ExternalTriggerReplayStore(control_state_root)
+    return external_trigger_replay_store(control_state_root)
 
 
 def _post_keyed(trigger_api: TriggerApiContext, trigger_id: str, event_id: str, nonce: str) -> Response:
@@ -1062,8 +1239,86 @@ def test_thread_key_being_opened_elsewhere_returns_409_for_retry(
     # The event id claim was rolled back, so the same event can be retried once the thread exists.
     assert (
         replay_store.claim_event_id(snapshot.replay_scope, "msg-2", now=int(time.time()), ttl_seconds=60)
-        is ExternalTriggerEventClaim.FRESH
+        is DeliveryEventClaim.FRESH
     )
+
+
+def test_full_thread_key_scope_returns_429_and_releases_the_event_claim(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct thread keys past the live-claim limit are refused, and the refused event id stays retryable."""
+    execute = AsyncMock(return_value="$root")
+    monkeypatch.setattr("mindroom.api.external_triggers.execute_external_trigger", execute)
+    monkeypatch.setattr("mindroom.delivery_replay._MAX_LIVE_CLAIMS_PER_SCOPE", 2)
+    trigger_id = _create_new_thread_record(trigger_api)
+    snapshot = ExternalTriggerStore(trigger_api.runtime_paths).delivery_snapshot(
+        trigger_id,
+        config=Config.model_validate(_config_payload()),
+        config_generation=1,
+    )
+    assert snapshot is not None
+    replay_store = _new_thread_replay_store(trigger_api)
+    for index in range(2):
+        replay_store.claim_thread_key(
+            snapshot.replay_scope,
+            f"chat:C1:{index}",
+            room_id=snapshot.resolved_room_id,
+            now=int(time.time()),
+            pending_ttl_seconds=60,
+        )
+
+    response = _post_keyed(trigger_api, trigger_id, "msg-1", "nonce-1")
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "External trigger replay limit reached"
+    execute.assert_not_awaited()
+    assert (
+        replay_store.claim_event_id(snapshot.replay_scope, "msg-1", now=int(time.time()), ttl_seconds=60)
+        is DeliveryEventClaim.FRESH
+    )
+
+
+def test_delivery_whose_expired_thread_key_no_longer_fits_is_still_marked_delivered(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A posted message keeps its event deduplicated even when its key cannot be bound in a full scope."""
+    monkeypatch.setattr("mindroom.delivery_replay._MAX_LIVE_CLAIMS_PER_SCOPE", 2)
+    trigger_id = _create_new_thread_record(trigger_api)
+    snapshot = ExternalTriggerStore(trigger_api.runtime_paths).delivery_snapshot(
+        trigger_id,
+        config=Config.model_validate(_config_payload()),
+        config_generation=1,
+    )
+    assert snapshot is not None
+    replay_store = _new_thread_replay_store(trigger_api)
+
+    async def execute_external_trigger(**_kwargs: object) -> str:
+        # While this delivery posts, its reservation expires and other keys fill the scope.
+        later = int(time.time()) + external_triggers_api._PENDING_THREAD_KEY_TTL_SECONDS + 1
+        for index in range(2):
+            replay_store.claim_thread_key(
+                snapshot.replay_scope,
+                f"chat:C1:{index}",
+                room_id=snapshot.resolved_room_id,
+                now=later,
+                pending_ttl_seconds=60,
+            )
+        return "$root"
+
+    monkeypatch.setattr("mindroom.api.external_triggers.execute_external_trigger", execute_external_trigger)
+
+    delivered = _post_keyed(trigger_api, trigger_id, "msg-1", "nonce-1")
+    retried = _post_keyed(trigger_api, trigger_id, "msg-1", "nonce-2")
+
+    assert (delivered.status_code, retried.status_code) == (202, 202)
+    assert retried.json()["duplicate"] is True
+    control_state_root = trigger_api.runtime_paths.control_state_root
+    assert control_state_root is not None
+    scope_file = f"{hashlib.sha256(snapshot.replay_scope.encode()).hexdigest()}.json"
+    stored = json.loads((control_state_root / "external_triggers" / "replay" / scope_file).read_text(encoding="utf-8"))
+    assert sorted(stored["threads"]) == ["chat:C1:0", "chat:C1:1"]
 
 
 def test_exception_during_first_delivery_releases_thread_key_reservation(
@@ -1090,3 +1345,128 @@ def test_exception_during_first_delivery_releases_thread_key_reservation(
 
     assert opened.status_code == 202
     assert continued == [None, None]
+
+
+@pytest.mark.usefixtures("enforce_turn_authorization")
+@pytest.mark.parametrize("capability", [False, True], ids=["signed-reusable", "single-use-capability"])
+@pytest.mark.parametrize(
+    ("joined_id", "membership", "state_failure", "expected_status"),
+    [
+        pytest.param(_OWNER, "join", None, 202, id="canonical-raced-lookup"),
+        pytest.param("@bridge_owner:example.org", "join", None, 202, id="alias-raced-lookup"),
+        pytest.param(None, "join", None, 403, id="neither-joined"),
+        pytest.param(_OWNER, "invite", None, 403, id="owner-invited"),
+        pytest.param(_OWNER, "leave", None, 403, id="owner-left"),
+        pytest.param(_OWNER, "ban", None, 403, id="owner-banned"),
+        pytest.param(None, "join", "response", 503, id="membership-unavailable"),
+        pytest.param(None, "join", "timeout", 503, id="membership-timeout"),
+        pytest.param(None, "join", "invalid", 503, id="membership-invalid"),
+        pytest.param("@bridgebot:example.org", "join", None, 403, id="excluded-bot"),
+        pytest.param("@persisted_research:localhost", "join", None, 403, id="excluded-persisted-agent"),
+        pytest.param("@mindroom_research:localhost", "join", None, 403, id="excluded-generated-agent"),
+        pytest.param("@persisted_router:localhost", "join", None, 403, id="excluded-router"),
+        pytest.param("@internal:localhost", "join", None, 403, id="excluded-internal-user"),
+    ],
+)
+def test_trigger_endpoint_requires_live_human_equivalent_membership(
+    trigger_api: TriggerApiContext,
+    monkeypatch: pytest.MonkeyPatch,
+    joined_id: str | None,
+    membership: str,
+    state_failure: str | None,
+    expected_status: int,
+    *,
+    capability: bool,
+) -> None:
+    """Both endpoints bypass a raced member cache and distinguish denial from unreadable state."""
+    payload = _config_payload()
+    payload["bot_accounts"] = ["@bridgebot:example.org"]
+    payload["mindroom_user"] = {"username": "internal"}
+    payload["authorization"] = {
+        "aliases": {
+            _OWNER: [
+                "@bridge_owner:example.org",
+                "@bridgebot:example.org",
+                "@persisted_research:localhost",
+                "@mindroom_research:localhost",
+                "@persisted_router:localhost",
+                "@internal:localhost",
+            ],
+        },
+    }
+    runtime_paths = trigger_api.runtime_paths
+    runtime_paths.config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    assert config_lifecycle.load_config_into_app(runtime_paths, api_main.app).loaded
+    config, _ = config_lifecycle.read_app_committed_runtime_config(api_main.app)
+    persist_entity_accounts(
+        config,
+        runtime_paths,
+        usernames={"router": "persisted_router", "research": "persisted_research"},
+    )
+    _bind_runtime(trigger_api.ready_snapshots)
+    app_state = config_lifecycle.app_state(api_main.app)
+    runtime = app_state.external_trigger_runtime
+    assert runtime is not None
+    matrix_client = AsyncMock(spec=nio.AsyncClient)
+
+    matrix_client.joined_members.side_effect = nio.LocalProtocolError("room membership changed during lookup")
+
+    async def room_get_state(room_id: str) -> nio.RoomGetStateResponse | nio.RoomGetStateError:
+        if state_failure == "response":
+            return nio.RoomGetStateError("forbidden", "M_FORBIDDEN", room_id=room_id)
+        if state_failure == "timeout":
+            raise TimeoutError
+        if state_failure == "invalid":
+            return nio.RoomGetStateResponse(
+                events=[{"type": "m.room.member", "state_key": _OWNER, "content": None}],
+                room_id=room_id,
+            )
+        events = (
+            [{"type": "m.room.member", "state_key": joined_id, "content": {"membership": membership}}]
+            if joined_id is not None
+            else []
+        )
+        return nio.RoomGetStateResponse(events=events, room_id=room_id)
+
+    matrix_client.room_get_state.side_effect = room_get_state
+    conversation_reader = AsyncMock()
+    conversation_reader.latest_thread_event_id.return_value = "$latest"
+    app_state.external_trigger_runtime = replace(runtime, client=matrix_client, conversation_reader=conversation_reader)
+    delivered_owners: list[str] = []
+
+    async def send(_client: object, _room_id: str, content: dict[str, object]) -> DeliveredMatrixEvent:
+        delivered_owners.append(cast("str", content[constants.ORIGINAL_SENDER_KEY]))
+        return DeliveredMatrixEvent(event_id="$delivered", content_sent=content)
+
+    monkeypatch.setattr(
+        external_triggers_api,
+        "is_external_trigger_owner_joined_target_room",
+        trigger_executor.is_external_trigger_owner_joined_target_room,
+    )
+    monkeypatch.setattr(trigger_executor, "send_matrix_message", send)
+    if capability:
+        token, snapshot = _create_capability_record(trigger_api)
+        response = trigger_api.client.post(
+            f"/api/triggers/{snapshot.trigger_id}",
+            content=_body(),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    else:
+        response = _post_signed(trigger_api)
+
+    assert response.status_code == expected_status
+    assert delivered_owners == ([_OWNER] if expected_status == 202 else [])
+    matrix_client.joined_members.assert_not_awaited()
+    matrix_client.room_get_state.assert_awaited_once_with(trigger_api.ready_snapshots[-1].resolved_room_id)
+    if expected_status in {403, 503}:
+        assert runtime_paths.control_state_root is not None
+        assert not (runtime_paths.control_state_root / "external_triggers" / "replay").exists()
+        if capability:
+            assert (
+                ExternalTriggerStore(runtime_paths).delivery_snapshot(
+                    snapshot.trigger_id,
+                    config=config,
+                    config_generation=runtime.config_generation,
+                )
+                is not None
+            )

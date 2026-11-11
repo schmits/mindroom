@@ -13,12 +13,13 @@ from fastapi import HTTPException
 
 from mindroom.api import sandbox_exec
 from mindroom.logging_config import get_logger
-from mindroom.private_storage_paths import resolve_private_scope_path
+from mindroom.path_confinement import resolve_path_within_root
 from mindroom.tool_system.sandbox_proxy import sandbox_proxy_config
 from mindroom.tool_system.worker_routing import (
     requires_explicit_private_agent_visibility,
-    visible_state_roots_for_worker_key,
+    visible_workspace_roots,
     worker_dir_name,
+    worker_log_id,
 )
 from mindroom.workers.backend import WorkerBackendError
 from mindroom.workers.backends.local import (
@@ -32,12 +33,14 @@ from mindroom.workers.backends.local import (
 from mindroom.workers.models import WorkerHandle, WorkerSpec
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
 
 _MAX_LEASE_TTL_SECONDS = 3600
-DEFAULT_LEASE_TTL_SECONDS = 60
 
 
 @dataclass
@@ -60,11 +63,15 @@ _LEASES_LOCK = threading.Lock()
 
 @dataclass(frozen=True)
 class PreparedWorkerRequest:
-    """Prepared worker state reused across validation and dispatch."""
+    """Prepared worker state reused across validation and dispatch.
+
+    ``base_dir`` is the request's ``base_dir`` confined to the worker root or one of its visible workspaces, or the
+    worker's default workspace when the request named none.
+    """
 
     handle: WorkerHandle
     paths: LocalWorkerStatePaths
-    runtime_overrides: dict[str, object]
+    base_dir: Path
 
 
 class WorkerRequestPreparationError(ValueError):
@@ -74,7 +81,7 @@ class WorkerRequestPreparationError(ValueError):
         self,
         message: str,
         *,
-        failure_kind: Literal["request", "worker"] = "request",
+        failure_kind: Literal["tool", "worker"] = "tool",
     ) -> None:
         super().__init__(message)
         self.failure_kind = failure_kind
@@ -155,20 +162,16 @@ def _prepare_worker(
     dedicated_worker_key = sandbox_exec.runner_dedicated_worker_key(runtime_paths)
     if dedicated_worker_key is not None:
         if worker_key != dedicated_worker_key:
-            msg = f"Dedicated sandbox worker is pinned to '{dedicated_worker_key}' but received '{worker_key}'."
+            msg = f"Dedicated sandbox worker is pinned to '{worker_log_id(dedicated_worker_key)}' but received '{worker_log_id(worker_key)}'."
             raise WorkerBackendError(msg)
-        dedicated_root = sandbox_exec.runner_dedicated_worker_root(runtime_paths)
-        if dedicated_root is None:
-            msg = "Dedicated sandbox worker requires a configured worker root."
-            raise WorkerBackendError(msg)
-        paths = local_worker_state_paths_for_root(dedicated_root)
+        paths = local_worker_state_paths_for_root(sandbox_exec.runner_dedicated_worker_root(runtime_paths))
         try:
             if run_scoped_script:
                 ensure_local_script_worker_state_locked(paths)
             else:
                 ensure_local_worker_state_locked(paths)
         except Exception as exc:
-            failure_reason = f"Failed to initialize dedicated worker '{worker_key}': {exc}"
+            failure_reason = f"Failed to initialize dedicated worker '{worker_log_id(worker_key)}': {exc}"
             raise WorkerBackendError(failure_reason) from exc
         now = time.time()
         return WorkerHandle(
@@ -219,50 +222,32 @@ def _resolve_worker_base_dir(
     paths: LocalWorkerStatePaths,
     storage_root: Path,
     worker_key: str,
-    requested_base_dir: object | None,
-    private_agent_names: frozenset[str] = frozenset(),
+    requested_base_dir: str | None,
+    workspace_roots: tuple[Path, ...],
 ) -> Path:
-    """Resolve the effective base_dir inside shared storage or the worker root."""
-    shared_root = storage_root.resolve()
+    """Resolve the effective base_dir inside one visible workspace or the worker root."""
     if requested_base_dir is None:
         return paths.workspace.resolve()
-    if not isinstance(requested_base_dir, str):
-        msg = "base_dir must be a string path."
-        raise TypeError(msg)
 
-    visible_state_roots = visible_state_roots_for_worker_key(
-        storage_root,
-        worker_key,
-        private_agent_names=private_agent_names,
-    )
     raw_path = Path(requested_base_dir).expanduser()
     if raw_path.is_absolute():
         candidate = raw_path.resolve()
-    elif visible_state_roots:
-        candidate = (shared_root / raw_path).resolve()
+    elif workspace_roots:
+        candidate = (storage_root.resolve() / raw_path).resolve()
     else:
-        msg = f"base_dir requires a resolved worker key with visible state roots: {worker_key}"
+        msg = f"base_dir requires a resolved worker key with visible workspaces: {worker_log_id(worker_key)}"
         raise ValueError(msg)
 
-    allowed_roots = (paths.root.resolve(), *visible_state_roots)
-    if not any(candidate.is_relative_to(root) for root in allowed_roots):
-        candidate = resolve_private_scope_path(shared_root, worker_key, candidate)
-    if not any(candidate.is_relative_to(root) for root in allowed_roots):
-        msg = f"base_dir must stay inside the allowed state roots or worker root: {requested_base_dir}"
-        raise ValueError(msg)
-
-    return candidate
-
-
-def ready_runtime_overrides(runtime_overrides: dict[str, object] | None) -> dict[str, object] | None:
-    """Materialize runtime override paths before tool execution."""
-    if runtime_overrides is None:
-        return None
-
-    base_dir = runtime_overrides.get("base_dir")
-    if isinstance(base_dir, Path):
-        base_dir.mkdir(parents=True, exist_ok=True)
-    return runtime_overrides
+    for root in (paths.root.resolve(), *workspace_roots):
+        # Workspaces authorize their configured location, not a linked replacement.
+        if root.resolve() != root:
+            continue
+        try:
+            return resolve_path_within_root(root, candidate, symlinks="internal")
+        except ValueError:
+            continue
+    msg = f"base_dir must stay inside a visible workspace or the worker root: {requested_base_dir}"
+    raise ValueError(msg)
 
 
 def _explicit_private_agent_names(
@@ -273,74 +258,50 @@ def _explicit_private_agent_names(
     if not requires_explicit_private_agent_visibility(worker_key):
         return frozenset()
     if private_agent_names is None:
-        msg = f"user_agent workers require explicit private-agent visibility: {worker_key}"
+        msg = f"user_agent workers require explicit private-agent visibility: {worker_log_id(worker_key)}"
         raise ValueError(msg)
     return private_agent_names
 
 
 def prepare_worker_request(
     *,
-    worker_key: str | None,
-    tool_init_overrides: dict[str, object],
+    worker_key: str,
+    base_dir: str | None,
     runtime_paths: RuntimePaths,
+    agent_policies: Mapping[str, ResolvedAgentPolicy],
     private_agent_names: frozenset[str] | None = None,
     runner_token: str | None = None,
 ) -> PreparedWorkerRequest:
-    """Prepare one worker-backed request for execution."""
-    if worker_key is None:
-        msg = "worker_key is required for worker-backed sandbox execution."
-        raise WorkerRequestPreparationError(msg, failure_kind="request")
-
+    """Prepare one worker-backed request for execution, confining its ``base_dir``."""
     try:
         worker_handle = _prepare_worker(worker_key, runtime_paths, runner_token=runner_token)
     except WorkerBackendError as exc:
-        logger.warning("sandbox_worker_initialization_failed", worker_key=worker_key, exc_info=True)
+        logger.warning("sandbox_worker_initialization_failed", worker=worker_log_id(worker_key), exc_info=True)
         dedicated_worker_key = sandbox_exec.runner_dedicated_worker_key(runtime_paths)
-        failure_kind: Literal["request", "worker"] = "worker"
+        failure_kind: Literal["tool", "worker"] = "worker"
         if dedicated_worker_key is not None and worker_key != dedicated_worker_key:
-            failure_kind = "request"
+            failure_kind = "tool"
         raise WorkerRequestPreparationError(str(exc), failure_kind=failure_kind) from exc
 
     try:
         paths = local_worker_state_paths_from_handle(worker_handle)
-        runtime_overrides: dict[str, object] = {
-            "base_dir": _resolve_worker_base_dir(
-                paths,
-                sandbox_exec.runner_storage_root(runtime_paths),
+        storage_root = sandbox_exec.runner_storage_root(runtime_paths)
+        confined_base_dir = _resolve_worker_base_dir(
+            paths,
+            storage_root,
+            worker_key,
+            base_dir,
+            visible_workspace_roots(
+                storage_root,
                 worker_key,
-                tool_init_overrides.get("base_dir"),
+                agent_policies,
                 private_agent_names=_explicit_private_agent_names(worker_key, private_agent_names),
             ),
-        }
+        )
     except (FileNotFoundError, TypeError, ValueError) as exc:
-        raise WorkerRequestPreparationError(str(exc), failure_kind="request") from exc
+        raise WorkerRequestPreparationError(str(exc)) from exc
 
-    return PreparedWorkerRequest(
-        handle=worker_handle,
-        paths=paths,
-        runtime_overrides=runtime_overrides,
-    )
-
-
-def resolve_prepared_worker_request(
-    *,
-    worker_key: str | None,
-    tool_init_overrides: dict[str, object],
-    runtime_paths: RuntimePaths,
-    private_agent_names: frozenset[str] | None = None,
-    prepared_worker: PreparedWorkerRequest | None,
-    runner_token: str | None = None,
-) -> PreparedWorkerRequest | None:
-    """Reuse or prepare worker state for one request."""
-    if worker_key is None:
-        return None
-    return prepared_worker or prepare_worker_request(
-        worker_key=worker_key,
-        tool_init_overrides=tool_init_overrides,
-        runtime_paths=runtime_paths,
-        private_agent_names=private_agent_names,
-        runner_token=runner_token,
-    )
+    return PreparedWorkerRequest(handle=worker_handle, paths=paths, base_dir=confined_base_dir)
 
 
 def record_worker_failure(

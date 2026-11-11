@@ -8,6 +8,7 @@ from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -19,11 +20,13 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="google_docs",
+    file_access=ToolFileAccess.NONE,
     display_name="Google Docs",
     description="Create, read, and edit documents through the connected user's Google Docs",
     category=ToolCategory.PRODUCTIVITY,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.OAUTH,
+    requires_primary_runtime=True,
     auth_provider="google_docs",
     icon="SiGoogledocs",
     icon_color="text-blue-600",
@@ -63,9 +66,8 @@ if TYPE_CHECKING:
         "google-api-python-client",
         "google-auth",
         "google-auth-httplib2",
-        "google-auth-oauthlib",
     ],
-    docs_url="https://developers.google.com/workspace/docs/api/reference/rest",
+    docs_url="https://docs.mindroom.chat/tools/data-and-databases/#google_docs",
     function_names=(
         "google_docs_create_document",
         "google_docs_get_document",

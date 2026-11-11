@@ -9,9 +9,14 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ModelConfig } from "./ModelConfig";
 import { useConfigStore } from "@/store/configStore";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
+import { confirmLeavingUnsavedDrafts } from "@/hooks/useUnsavedDraft";
 
 vi.mock("@/store/configStore", () => ({
   useConfigStore: vi.fn(),
+}));
+vi.mock("@/hooks/useConfigSchema", () => ({
+  useConfigSchema: vi.fn(() => ({ schema: null, error: null })),
 }));
 
 vi.mock("@/components/ui/toaster", () => ({
@@ -20,6 +25,7 @@ vi.mock("@/components/ui/toaster", () => ({
 
 type KeyStatusResponse = {
   has_key: boolean;
+  credential_service?: string;
   source?: string;
   masked_key?: string;
   api_key?: string;
@@ -49,7 +55,11 @@ describe("ModelConfig", () => {
     config: {
       models: {
         default: { provider: "ollama", id: "devstral-small-2:24b" },
-        anthropic: { provider: "anthropic", id: "claude-haiku-4-5" },
+        anthropic: {
+          provider: "anthropic",
+          id: "claude-haiku-4-5",
+          pricing: { input: 1, output: 5 },
+        },
         openrouter: { provider: "openrouter", id: "z-ai/glm-5.3" },
         openrouter_backup: {
           provider: "openrouter",
@@ -67,7 +77,7 @@ describe("ModelConfig", () => {
       defaults: { markdown: true },
       router: { model: "default" },
     },
-    updateModel: vi.fn(),
+    updateConfigValue: vi.fn(),
     deleteModel: vi.fn(),
     saveConfig: vi.fn().mockResolvedValue({ status: "saved" }),
   };
@@ -78,6 +88,11 @@ describe("ModelConfig", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: null,
+      error: null,
+      retry: vi.fn(),
+    });
 
     const mockedUseConfigStore = useConfigStore as unknown as {
       mockReturnValue: (value: unknown) => void;
@@ -141,6 +156,29 @@ describe("ModelConfig", () => {
     expect(within(scrollContainer).getByRole("table")).toBeTruthy();
   });
 
+  it("shows provider keys resolved from their env-var-named service", async () => {
+    keyStatusByService.anthropic = {
+      has_key: true,
+      credential_service: "ANTHROPIC_API_KEY",
+      source: "ui",
+      masked_key: "sk-a...-key",
+    };
+    keyStatusByService.openrouter = {
+      has_key: true,
+      credential_service: "openrouter",
+      masked_key: "sk-o...-key",
+    };
+
+    render(<ModelConfig />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("Source: UI, saved as ANTHROPIC_API_KEY"),
+      ).toBeTruthy();
+    });
+    expect(screen.getAllByText(/saved as/)).toHaveLength(1);
+  });
+
   it("starts inline editing when a row is clicked", () => {
     render(<ModelConfig />);
 
@@ -168,11 +206,13 @@ describe("ModelConfig", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith(
-        "anthropic-fast",
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "anthropic-fast"],
         expect.objectContaining({
           provider: "anthropic",
           id: "claude-sonnet-5",
+          // Budget prices are edited on the Budgets page and survive row edits.
+          pricing: { input: 1, output: 5 },
         }),
       );
       expect(mockStore.deleteModel).toHaveBeenCalledWith("anthropic");
@@ -277,8 +317,8 @@ describe("ModelConfig", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith(
-        "openai_local",
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_local"],
         expect.objectContaining({
           provider: "openai",
           id: "gpt-5.6-terra",
@@ -301,13 +341,218 @@ describe("ModelConfig", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith("openai_local", {
-        provider: "anthropic",
-        id: "gpt-5.6-terra",
-        api: null,
-        context_window: 16384,
-      });
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_local"],
+        {
+          provider: "anthropic",
+          id: "gpt-5.6-terra",
+          context_window: 16384,
+        },
+      );
     });
+  });
+
+  function addModels(models: Record<string, Record<string, unknown>>) {
+    vi.mocked(useConfigStore).mockReturnValue({
+      ...mockStore,
+      config: {
+        ...mockStore.config,
+        models: { ...mockStore.config.models, ...models },
+      },
+    } as unknown as ReturnType<typeof useConfigStore>);
+  }
+
+  function addKeyedOpenAIModel(fields: Record<string, unknown>) {
+    addModels({ keyed: { provider: "openai", id: "gpt-6-astra", ...fields } });
+  }
+
+  function editKeyedRow(): HTMLElement {
+    fireEvent.click(screen.getByText("keyed"));
+    const row = screen.getByDisplayValue("keyed").closest("tr");
+    if (!row) throw new Error("row not found");
+    return row;
+  }
+
+  function chooseProvider(row: HTMLElement, name: RegExp) {
+    fireEvent.click(within(row).getAllByRole("combobox")[0]);
+    fireEvent.click(screen.getByRole("option", { name }));
+  }
+
+  async function renderWithSavedKeyedModelKey() {
+    keyStatusByService["model:keyed"] = {
+      has_key: true,
+      source: "ui",
+      masked_key: "sk-op...1234",
+    };
+    render(<ModelConfig />);
+    await waitFor(() => {
+      expect(screen.getAllByText("Source: UI").length).toBeGreaterThan(0);
+    });
+  }
+
+  function deleteCallsFor(service: string) {
+    return fetchMock.mock.calls.filter(
+      ([url, init]) =>
+        url === `/api/credentials/${service}` &&
+        typeof init === "object" &&
+        init?.method === "DELETE",
+    );
+  }
+
+  it.each([
+    { api_key: "sk-openai-config", extra_kwargs: { temperature: 0.2 } },
+    { extra_kwargs: { api_key: "sk-openai-config", temperature: 0.2 } },
+  ])(
+    "drops config.yaml API keys when changing provider (%o)",
+    async (keyFields) => {
+      addKeyedOpenAIModel(keyFields);
+      render(<ModelConfig />);
+      const row = editKeyedRow();
+      chooseProvider(row, /DeepSeek/i);
+      fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+          ["models", "keyed"],
+          {
+            provider: "deepseek",
+            id: "gpt-6-astra",
+            extra_kwargs: { temperature: 0.2 },
+          },
+        );
+      });
+    },
+  );
+
+  it("clears a saved dashboard key when changing provider", async () => {
+    addKeyedOpenAIModel({});
+    await renderWithSavedKeyedModelKey();
+
+    const row = editKeyedRow();
+    chooseProvider(row, /DeepSeek/i);
+    expect(
+      within(row).getByText(
+        "Custom key will be removed on save because the provider changed.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(deleteCallsFor("model:keyed")).toHaveLength(1);
+    });
+  });
+
+  it.each([
+    { provider: /DeepSeek/i, newKey: "paste" },
+    { provider: /DeepSeek/i, newKey: "reuse" },
+    { provider: /Ollama/i, newKey: "none" },
+  ])(
+    "removes the old saved key once when a renamed model switches provider ($newKey)",
+    async ({ provider, newKey }) => {
+      addModels({
+        keyed: { provider: "openai", id: "gpt-6-astra" },
+        deepseek_other: { provider: "deepseek", id: "deepseek-flash" },
+      });
+      keyStatusByService["model:deepseek_other"] = {
+        has_key: true,
+        source: "ui",
+        masked_key: "sk-ds...0000",
+      };
+      await renderWithSavedKeyedModelKey();
+
+      const row = editKeyedRow();
+      fireEvent.change(within(row).getByDisplayValue("keyed"), {
+        target: { value: "keyed2" },
+      });
+      chooseProvider(row, provider);
+      if (newKey === "paste") {
+        fireEvent.change(
+          within(row).getByPlaceholderText("Paste new API key"),
+          {
+            target: { value: "sk-new" },
+          },
+        );
+      } else if (newKey === "reuse") {
+        const reuseTrigger = within(row)
+          .getByText("Reuse from same provider")
+          .closest("button");
+        if (!reuseTrigger) throw new Error("reuse trigger not found");
+        fireEvent.click(reuseTrigger);
+        fireEvent.click(
+          screen.getByRole("option", { name: /deepseek_other/i }),
+        );
+      }
+      fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockStore.deleteModel).toHaveBeenCalledWith("keyed");
+      });
+      expect(deleteCallsFor("model:keyed")).toHaveLength(1);
+    },
+  );
+
+  it("keeps the saved key when the provider is switched back before saving", async () => {
+    addKeyedOpenAIModel({ api_key: "sk-openai-config" });
+    await renderWithSavedKeyedModelKey();
+
+    const row = editKeyedRow();
+    chooseProvider(row, /DeepSeek/i);
+    chooseProvider(row, /OpenAI/i);
+    expect(
+      within(row).getByText("This model keeps its saved custom key."),
+    ).toBeTruthy();
+    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "keyed"],
+        {
+          provider: "openai",
+          id: "gpt-6-astra",
+          api_key: "sk-openai-config",
+        },
+      );
+    });
+    expect(deleteCallsFor("model:keyed")).toHaveLength(0);
+  });
+
+  it("shows no key status for providers that authenticate without a key", async () => {
+    addModels({
+      codex_model: { provider: "codex", id: "gpt-6-astra" },
+      vertex_model: { provider: "vertexai_claude", id: "claude-opus-5" },
+    });
+    keyStatusByService["vertexai_claude"] = { has_key: true };
+    render(<ModelConfig />);
+
+    for (const modelName of ["codex_model", "vertex_model"]) {
+      const row = screen.getByText(modelName).closest("tr");
+      if (!row) throw new Error("row not found");
+      expect(within(row).getByText("N/A")).toBeTruthy();
+    }
+    fireEvent.click(screen.getByText("vertex_model"));
+    const row = screen.getByDisplayValue("vertex_model").closest("tr");
+    if (!row) throw new Error("row not found");
+    expect(within(row).getByText(/^No key needed for/)).toBeTruthy();
+    expect(within(row).queryByPlaceholderText("Paste new API key")).toBeNull();
+  });
+
+  it("labels a config.yaml key without offering to copy it", async () => {
+    addKeyedOpenAIModel({ api_key: "sk-openai-config" });
+    keyStatusByService["openai"] = {
+      has_key: true,
+      masked_key: "sk-en...5678",
+    };
+    render(<ModelConfig />);
+
+    const row = screen.getByText("keyed").closest("tr");
+    const providerKeyRow = screen.getByText("openai_local").closest("tr");
+    if (!row || !providerKeyRow) throw new Error("row not found");
+    await waitFor(() => {
+      expect(within(providerKeyRow).getByText("Provider key")).toBeTruthy();
+    });
+    expect(within(row).getByText("Config key")).toBeTruthy();
+    expect(within(row).queryByText("Provider key")).toBeNull();
+    expect(within(row).queryByTitle("Copy API key")).toBeNull();
   });
 
   it("changes provider with inline dropdown", async () => {
@@ -324,8 +569,8 @@ describe("ModelConfig", () => {
     fireEvent.click(within(row).getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith(
-        "openrouter",
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openrouter"],
         expect.objectContaining({ provider: "openai" }),
       );
     });
@@ -340,7 +585,6 @@ describe("ModelConfig", () => {
     };
     keyStatusByService["openrouter"] = {
       has_key: true,
-      source: "env",
       masked_key: "sk-en...5678",
       api_key: "sk-openrouter-env-real",
     };
@@ -414,6 +658,38 @@ describe("ModelConfig", () => {
     });
   });
 
+  it("asks before leaving the page drops an edited row", () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<ModelConfig />);
+
+    fireEvent.click(screen.getByText("anthropic"));
+    expect(confirmLeavingUnsavedDrafts()).toBe(true);
+
+    fireEvent.change(screen.getByDisplayValue("claude-haiku-4-5"), {
+      target: { value: "claude-sonnet-5" },
+    });
+
+    expect(confirmLeavingUnsavedDrafts()).toBe(false);
+    expect(confirmSpy).toHaveBeenCalledWith("Discard unsaved changes?");
+    confirmSpy.mockRestore();
+  });
+
+  it("asks before leaving the page drops a model being added", () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<ModelConfig />);
+
+    fireEvent.click(screen.getByRole("button", { name: /add model/i }));
+    expect(confirmLeavingUnsavedDrafts()).toBe(true);
+
+    fireEvent.change(screen.getByPlaceholderText("model name"), {
+      target: { value: "new-model" },
+    });
+
+    expect(confirmLeavingUnsavedDrafts()).toBe(false);
+    expect(confirmSpy).toHaveBeenCalledWith("Discard unsaved changes?");
+    confirmSpy.mockRestore();
+  });
+
   it("adds a model using the top add row", async () => {
     render(<ModelConfig />);
 
@@ -438,15 +714,18 @@ describe("ModelConfig", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Add$/ }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith("new-model", {
-        provider: "openrouter",
-        id: "openai/gpt-5.6-terra",
-        context_window: 200000,
-      });
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "new-model"],
+        {
+          provider: "openrouter",
+          id: "openai/gpt-5.6-terra",
+          context_window: 200000,
+        },
+      );
     });
   });
 
-  it("accepts empty base URL for OpenAI and uses default endpoint", async () => {
+  it("accepts empty base URL for OpenAI and saves no endpoint of its own", async () => {
     render(<ModelConfig />);
 
     fireEvent.click(screen.getByRole("button", { name: /add model/i }));
@@ -466,13 +745,19 @@ describe("ModelConfig", () => {
     expect(
       within(addRow).getByPlaceholderText("https://api.openai.com/v1"),
     ).toBeTruthy();
+    expect(within(addRow).getByText(/^Empty uses/).textContent).toBe(
+      "Empty uses OPENAI_BASE_URL, else https://api.openai.com/v1.",
+    );
     fireEvent.click(screen.getByRole("button", { name: /^Add$/ }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith("openai_default", {
-        provider: "openai",
-        id: "gpt-5.6-terra",
-      });
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_default"],
+        {
+          provider: "openai",
+          id: "gpt-5.6-terra",
+        },
+      );
     });
   });
 
@@ -514,6 +799,71 @@ describe("ModelConfig", () => {
     });
   });
 
+  it("rejects a model name its dashboard key cannot be stored under on add", async () => {
+    const { toast } = await import("@/components/ui/toaster");
+
+    render(<ModelConfig />);
+
+    fireEvent.click(screen.getByRole("button", { name: /add model/i }));
+    const addRow = screen.getByPlaceholderText("model name").closest("tr");
+    if (!addRow) throw new Error("add row not found");
+
+    fireEvent.change(within(addRow).getByPlaceholderText("model name"), {
+      target: { value: "gpt-6.1" },
+    });
+    fireEvent.change(within(addRow).getByPlaceholderText("provider model id"), {
+      target: { value: "openai/gpt-6.1-sol" },
+    });
+    fireEvent.change(within(addRow).getByPlaceholderText("Paste new API key"), {
+      target: { value: "sk-new" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Add$/ }));
+
+    await waitFor(() => {
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Error",
+          description:
+            "Model name can only include letters, numbers, colon, underscore, and hyphen",
+          variant: "destructive",
+        }),
+      );
+    });
+    expect(mockStore.updateConfigValue).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.some(
+        ([, init]) => (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects renaming a model to a name its dashboard key cannot be stored under", async () => {
+    const { toast } = await import("@/components/ui/toaster");
+
+    render(<ModelConfig />);
+
+    fireEvent.click(screen.getByText("anthropic"));
+    const row = screen.getByDisplayValue("anthropic").closest("tr");
+    if (!row) throw new Error("row not found");
+
+    fireEvent.change(within(row).getByDisplayValue("anthropic"), {
+      target: { value: "claude 5.5" },
+    });
+    fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description:
+            "Model name can only include letters, numbers, colon, underscore, and hyphen",
+        }),
+      );
+    });
+    expect(mockStore.updateConfigValue).not.toHaveBeenCalled();
+    expect(mockStore.deleteModel).not.toHaveBeenCalled();
+  });
+
   it("saves custom OpenAI base URL on add", async () => {
     render(<ModelConfig />);
 
@@ -540,11 +890,14 @@ describe("ModelConfig", () => {
     fireEvent.click(screen.getByRole("button", { name: /^Add$/ }));
 
     await waitFor(() => {
-      expect(mockStore.updateModel).toHaveBeenCalledWith("openai_compat", {
-        provider: "openai",
-        id: "gpt-5.6-terra",
-        extra_kwargs: { base_url: "http://localhost:9292/v1" },
-      });
+      expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_compat"],
+        {
+          provider: "openai",
+          id: "gpt-5.6-terra",
+          extra_kwargs: { base_url: "http://localhost:9292/v1" },
+        },
+      );
     });
   });
 
@@ -663,6 +1016,225 @@ describe("ModelConfig", () => {
         description: "Save was superseded by newer draft edits.",
         variant: "destructive",
       });
+    });
+  });
+
+  it("edits model fields the table does not render through More settings", () => {
+    vi.mocked(useConfigStore).mockReturnValue({
+      ...mockStore,
+      agents: [],
+      rooms: [],
+      diagnostics: [],
+    } as never);
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          ModelConfig: {
+            type: "object",
+            properties: {
+              provider: { type: "string" },
+              host: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+                default: null,
+                description: "Optional host URL (e.g., for Ollama)",
+              },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<ModelConfig />);
+    fireEvent.click(screen.getByText("default"));
+    fireEvent.click(
+      screen.getByRole("button", { name: /More settings for default/ }),
+    );
+    fireEvent.change(screen.getByLabelText("Host"), {
+      target: { value: "http://ollama:11434" },
+    });
+
+    expect(mockStore.updateConfigValue).toHaveBeenLastCalledWith(
+      ["models", "default", "host"],
+      "http://ollama:11434",
+    );
+  });
+
+  it("hides More settings fields that saving the row drops for its provider", () => {
+    vi.mocked(useConfigStore).mockReturnValue({
+      ...mockStore,
+      agents: [],
+      rooms: [],
+      diagnostics: [],
+    } as never);
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: {
+        type: "object",
+        properties: {},
+        $defs: {
+          ModelConfig: {
+            type: "object",
+            properties: {
+              provider: { type: "string" },
+              api: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+                default: null,
+              },
+              host: {
+                anyOf: [{ type: "string" }, { type: "null" }],
+                default: null,
+              },
+              extra_kwargs: { anyOf: [{ type: "object" }, { type: "null" }] },
+            },
+          },
+        },
+      },
+      error: null,
+      retry: vi.fn(),
+    });
+
+    render(<ModelConfig />);
+    fireEvent.click(screen.getByText("openai_local"));
+    expect(
+      screen.getByRole("button", { name: /More settings for openai_local/ }),
+    ).toHaveTextContent("API, Extra kwargs");
+
+    const row = screen.getByDisplayValue("openai_local").closest("tr");
+    if (!row) throw new Error("row not found");
+    fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByText("default"));
+    expect(
+      screen.getByRole("button", { name: /More settings for default/ }),
+    ).toHaveTextContent("Host, Extra kwargs");
+  });
+
+  describe("while More settings edit the model being edited", () => {
+    const withEditedExtraKwargs = () => ({
+      ...mockStore,
+      config: {
+        ...mockStore.config,
+        models: {
+          ...mockStore.config.models,
+          openai_local: {
+            ...mockStore.config.models.openai_local,
+            extra_kwargs: {
+              base_url: "http://proxy:8080/v1",
+              temperature: 0.2,
+            },
+          },
+        },
+      },
+    });
+
+    it("keeps the More settings base URL when the row's Base URL is untouched", async () => {
+      const { rerender } = render(<ModelConfig />);
+      fireEvent.click(screen.getByText("openai_local"));
+      vi.mocked(useConfigStore).mockReturnValue(
+        withEditedExtraKwargs() as never,
+      );
+      rerender(<ModelConfig />);
+
+      const row = screen.getByDisplayValue("openai_local").closest("tr");
+      if (!row) throw new Error("row not found");
+      fireEvent.click(within(row).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(mockStore.updateConfigValue).toHaveBeenCalledWith(
+          ["models", "openai_local"],
+          expect.objectContaining({
+            extra_kwargs: {
+              base_url: "http://proxy:8080/v1",
+              temperature: 0.2,
+            },
+          }),
+        );
+      });
+    });
+
+    it("reverts only the More settings edits made since the last save", () => {
+      const updateConfigValue = vi.fn();
+      const { rerender } = render(<ModelConfig />);
+      fireEvent.click(screen.getByText("openai_local"));
+      // A save committed the edited model, whatever its result status, and
+      // a later edit changed it again.
+      const committed = withEditedExtraKwargs().config;
+      const draft = {
+        ...committed,
+        models: {
+          ...committed.models,
+          openai_local: {
+            ...committed.models.openai_local,
+            extra_kwargs: {
+              base_url: "http://proxy:8080/v1",
+              temperature: 0.5,
+            },
+          },
+        },
+      };
+      vi.mocked(useConfigStore).mockReturnValue({
+        ...mockStore,
+        config: draft,
+        loadedConfig: committed,
+        updateConfigValue,
+      } as never);
+      rerender(<ModelConfig />);
+
+      const row = screen.getByDisplayValue("openai_local").closest("tr");
+      if (!row) throw new Error("row not found");
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+
+      expect(updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_local"],
+        committed.models.openai_local,
+      );
+    });
+
+    it("keeps the edited row when another row's Edit button is clicked", async () => {
+      const updateConfigValue = vi.fn();
+      const { rerender } = render(<ModelConfig />);
+      fireEvent.click(screen.getByText("openai_local"));
+      vi.mocked(useConfigStore).mockReturnValue({
+        ...withEditedExtraKwargs(),
+        updateConfigValue,
+      } as never);
+      rerender(<ModelConfig />);
+
+      fireEvent.click(screen.getAllByTitle("Edit")[0]);
+      const { toast } = await import("@/components/ui/toaster");
+      expect(toast).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Finish current edit first" }),
+      );
+
+      const row = screen.getByDisplayValue("openai_local").closest("tr");
+      if (!row) throw new Error("row not found");
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+      expect(updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_local"],
+        mockStore.config.models.openai_local,
+      );
+    });
+
+    it("reverts More settings edits when the row edit is cancelled", () => {
+      const updateConfigValue = vi.fn();
+      const { rerender } = render(<ModelConfig />);
+      fireEvent.click(screen.getByText("openai_local"));
+      vi.mocked(useConfigStore).mockReturnValue({
+        ...withEditedExtraKwargs(),
+        updateConfigValue,
+      } as never);
+      rerender(<ModelConfig />);
+
+      const row = screen.getByDisplayValue("openai_local").closest("tr");
+      if (!row) throw new Error("row not found");
+      fireEvent.click(within(row).getByRole("button", { name: "Cancel" }));
+
+      expect(updateConfigValue).toHaveBeenCalledWith(
+        ["models", "openai_local"],
+        mockStore.config.models.openai_local,
+      );
     });
   });
 });

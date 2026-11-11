@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from backend.models import PricingConfigResponse, StripePriceResponse
+from backend.models import PricingConfigResponse
 from backend.pricing import PRICING_CONFIG_MODEL, get_stripe_price_id
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 router = APIRouter()
 
@@ -15,7 +15,7 @@ router = APIRouter()
 async def get_pricing_config() -> dict[str, Any]:
     """Get the current pricing configuration.
 
-    This returns the pricing plans, features, and limits.
+    This returns the pricing plans and their features.
     Stripe price IDs are only included if they are configured.
     """
     config_model = PRICING_CONFIG_MODEL
@@ -50,7 +50,6 @@ async def get_pricing_config() -> dict[str, Any]:
             "price_yearly": f"${price_yearly / 100:.0f}" if isinstance(price_yearly, (int, float)) else price_yearly,
             "description": plan_data.description,
             "features": plan_data.features,
-            "limits": plan_data.limits.model_dump(),
             "recommended": plan_data.recommended,
             "included_ai_budget_usd": plan_data.included_ai_budget_usd,
             "requires_customer_provider_keys": plan_data.requires_customer_provider_keys,
@@ -60,28 +59,3 @@ async def get_pricing_config() -> dict[str, Any]:
         }
 
     return config
-
-
-@router.get("/pricing/stripe-price/{plan}/{billing_cycle}", response_model=StripePriceResponse)
-async def get_stripe_price(plan: str, billing_cycle: str) -> dict[str, Any]:
-    """Get the Stripe price ID for a specific plan and billing cycle.
-
-    Args:
-        plan: Plan key (e.g., 'byok', 'hobby', 'pro')
-        billing_cycle: Either 'monthly' or 'yearly'
-
-    Returns:
-        Dict with price_id or error
-
-    """
-    if billing_cycle not in ["monthly", "yearly"]:
-        raise HTTPException(status_code=400, detail="Invalid billing cycle. Must be 'monthly' or 'yearly'")
-
-    price_id = get_stripe_price_id(plan, billing_cycle)
-    if not price_id:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No Stripe price configured for {plan} ({billing_cycle}). Run sync-stripe-prices.py",
-        )
-
-    return {"price_id": price_id, "plan": plan, "billing_cycle": billing_cycle}

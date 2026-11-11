@@ -1,27 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, useNavigate, useLocation } from "react-router-dom";
 import {
-  BookOpen,
-  Bot,
-  Brain,
-  CalendarClock,
-  Check,
-  DoorOpen,
-  Home,
-  KeyRound,
-  LayoutDashboard,
-  Menu,
-  Mic,
-  Plug,
-  Puzzle,
-  Settings2,
-  type LucideIcon,
-  Users,
-} from "lucide-react";
+  createBrowserRouter,
+  RouterProvider,
+  useBlocker,
+  useLocation,
+} from "react-router-dom";
 import { useConfigStore } from "@/store/configStore";
 import { AgentList } from "@/components/AgentList/AgentList";
 import { AgentEditor } from "@/components/AgentEditor/AgentEditor";
+import { PersonalAgents } from "@/components/PersonalAgents/PersonalAgents";
 import { TeamList } from "@/components/TeamList/TeamList";
 import { TeamEditor } from "@/components/TeamEditor/TeamEditor";
 import { RoomList } from "@/components/RoomList/RoomList";
@@ -35,95 +23,53 @@ import { Integrations } from "@/components/Integrations/Integrations";
 import { UnconfiguredRooms } from "@/components/UnconfiguredRooms/UnconfiguredRooms";
 import { SyncStatus } from "@/components/SyncStatus/SyncStatus";
 import { Dashboard } from "@/components/Dashboard/Dashboard";
+import { Usage } from "@/components/Usage/Usage";
+import { Budgets } from "@/components/Budgets/Budgets";
 import { Skills } from "@/components/Skills/Skills";
+import { Settings } from "@/components/Settings/Settings";
 import { Schedules } from "@/components/Schedules/Schedules";
 import { Credentials } from "@/components/Credentials/Credentials";
+import { ProviderSetupBanner } from "@/components/ProviderSetup/ProviderSetup";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Toaster } from "@/components/ui/toaster";
 import { ThemeProvider } from "@/contexts/ThemeContext";
 import { ThemeToggle } from "@/components/ThemeToggle/ThemeToggle";
 import { showSaveFailureToastIfNeeded } from "@/components/shared";
 import {
+  confirmLeavingUnsavedDrafts,
+  useBeforeUnloadPrompt,
+} from "@/hooks/useUnsavedDraft";
+import {
   getConfigValidationIssues,
   getGlobalConfigDiagnostics,
   type GlobalConfigDiagnostic,
 } from "@/lib/configValidation";
-import { cn } from "@/lib/utils";
+import {
+  getNavigationValue,
+  NAV_ITEMS,
+  Navigation,
+} from "@/components/Navigation/Navigation";
 
 const queryClient = new QueryClient();
 
-type NavItem = {
-  value: string;
+function RoutePanel({
+  active,
+  label,
+  className,
+  children,
+}: {
+  active: boolean;
   label: string;
-  icon: LucideIcon;
-  group: "Workspace" | "Configuration";
-};
-
-const NAV_ITEMS: NavItem[] = [
-  {
-    value: "dashboard",
-    label: "Dashboard",
-    icon: LayoutDashboard,
-    group: "Workspace",
-  },
-  { value: "agents", label: "Agents", icon: Bot, group: "Workspace" },
-  { value: "teams", label: "Teams", icon: Users, group: "Workspace" },
-  { value: "rooms", label: "Rooms", icon: Home, group: "Workspace" },
-  {
-    value: "schedules",
-    label: "Schedules",
-    icon: CalendarClock,
-    group: "Workspace",
-  },
-  {
-    value: "unconfigured-rooms",
-    label: "External",
-    icon: DoorOpen,
-    group: "Workspace",
-  },
-  { value: "models", label: "Models", icon: Settings2, group: "Configuration" },
-  { value: "memory", label: "Memory", icon: Brain, group: "Configuration" },
-  {
-    value: "knowledge",
-    label: "Knowledge",
-    icon: BookOpen,
-    group: "Configuration",
-  },
-  {
-    value: "credentials",
-    label: "Credentials",
-    icon: KeyRound,
-    group: "Configuration",
-  },
-  { value: "voice", label: "Voice", icon: Mic, group: "Configuration" },
-  { value: "integrations", label: "Tools", icon: Plug, group: "Configuration" },
-  { value: "skills", label: "Skills", icon: Puzzle, group: "Configuration" },
-];
-
-const NAV_GROUPS: NavItem["group"][] = ["Workspace", "Configuration"];
-const DEFAULT_TAB = NAV_ITEMS[0].value;
-const NAV_VALUES = new Set(NAV_ITEMS.map((item) => item.value));
-
-const TAB_TRIGGER_CLASS =
-  "inline-flex items-center gap-1.5 rounded-lg data-[state=active]:bg-white/50 dark:data-[state=active]:bg-primary/20 data-[state=active]:text-primary data-[state=active]:shadow-sm data-[state=active]:backdrop-blur-xl data-[state=active]:border data-[state=active]:border-white/50 dark:data-[state=active]:border-primary/30 transition-all whitespace-nowrap";
-const NAV_OVERFLOW_ENTER_PX = 1;
-const NAV_OVERFLOW_EXIT_BUFFER_PX = 24;
-
-export function resolveCurrentTab(pathname: string): string {
-  const [firstSegment] = pathname.split("/").filter(Boolean);
-  if (firstSegment && NAV_VALUES.has(firstSegment)) {
-    return firstSegment;
-  }
-  return DEFAULT_TAB;
+  className: string;
+  children: ReactNode;
+}) {
+  if (!active) return null;
+  return (
+    <section aria-label={`${label} workspace`} className={className}>
+      {children}
+    </section>
+  );
 }
 
 function isAuthDiagnosticMessage(message: string): boolean {
@@ -164,24 +110,39 @@ function AppContent() {
     diagnostics,
     configUsesIncludes,
     configJournalPendingRestart,
+    committedGeneration,
     isLoading,
+    isDirty,
     selectedAgentId,
     selectedTeamId,
     selectedRoomId,
   } = useConfigStore();
-  const navigate = useNavigate();
   const location = useLocation();
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [desktopCompactNav, setDesktopCompactNav] = useState(false);
-  const tabsListRef = useRef<HTMLDivElement | null>(null);
-  const compactNavEnteredWidthRef = useRef<number | null>(null);
+  // Leaving a tab unmounts its page, so ask before an unsaved draft goes with it.
+  // A declined navigation leaves the blocker blocked until the next one, which
+  // the router allows, so nothing needs to reset it.
+  useBlocker(
+    ({ currentLocation, nextLocation }) =>
+      getNavigationValue(currentLocation.pathname) !==
+        getNavigationValue(nextLocation.pathname) &&
+      !confirmLeavingUnsavedDrafts(),
+  );
+  // Configuration edits outlive a tab switch in the store, but not a reload.
+  useBeforeUnloadPrompt(isDirty);
 
   // Get the current tab from URL or default to 'dashboard'
-  const currentTab = resolveCurrentTab(location.pathname);
+  const currentTab = getNavigationValue(location.pathname);
   const currentNavItem =
     NAV_ITEMS.find((item) => item.value === currentTab) || NAV_ITEMS[0];
-  const CurrentNavIcon = currentNavItem.icon;
+  const previousSelectedRoomIdRef = useRef(selectedRoomId);
   const validationIssues = getConfigValidationIssues(diagnostics);
+  const validationIssueItems = validationIssues.map((issue, index) => (
+    <li key={`${issue.loc.join(".")}-${issue.msg}-${index}`}>
+      <span className="font-medium">{issue.loc.join(" → ")}</span>
+      {": "}
+      {issue.msg}
+    </li>
+  ));
   const globalDiagnostics = getGlobalConfigDiagnostics(diagnostics);
   const blockingDiagnostic =
     globalDiagnostics.find(
@@ -219,66 +180,40 @@ function AppContent() {
     loadConfig();
   }, [loadConfig]);
 
-  useEffect(() => {
-    setMobileMenuOpen(false);
-  }, [currentTab]);
+  useLayoutEffect(() => {
+    const previousSelectedRoomId = previousSelectedRoomIdRef.current;
+    previousSelectedRoomIdRef.current = selectedRoomId;
 
-  useEffect(() => {
-    const tabsList = tabsListRef.current;
-    if (!tabsList) return;
-
-    let frameId: number | null = null;
-    const updateDesktopNavMode = () => {
-      if (frameId !== null) {
-        cancelAnimationFrame(frameId);
+    if (
+      currentTab === "rooms" &&
+      window.innerWidth < 1024 &&
+      previousSelectedRoomId === null &&
+      selectedRoomId !== null
+    ) {
+      const workspace = document.querySelector<HTMLElement>(".rooms-workspace");
+      const roomsLayout =
+        workspace?.querySelector<HTMLElement>(".rooms-layout");
+      if (workspace && roomsLayout) {
+        const workspaceTop = workspace.getBoundingClientRect().top;
+        const layoutTop = roomsLayout.getBoundingClientRect().top;
+        const paddingTop = Number.parseFloat(
+          window.getComputedStyle(workspace).paddingTop,
+        );
+        workspace.scrollTo(
+          0,
+          Math.max(
+            0,
+            workspace.scrollTop + layoutTop - workspaceTop - paddingTop,
+          ),
+        );
       }
-      frameId = requestAnimationFrame(() => {
-        const clientWidth = tabsList.clientWidth;
-        const hasHorizontalOverflow =
-          tabsList.scrollWidth > clientWidth + NAV_OVERFLOW_ENTER_PX;
-        setDesktopCompactNav((prevCompact) => {
-          if (!prevCompact) {
-            if (hasHorizontalOverflow) {
-              compactNavEnteredWidthRef.current = clientWidth;
-              return true;
-            }
-            return false;
-          }
-          const enteredWidth = compactNavEnteredWidthRef.current ?? clientWidth;
-          const hasGrownEnoughToExit =
-            clientWidth >= enteredWidth + NAV_OVERFLOW_EXIT_BUFFER_PX;
-          if (!hasHorizontalOverflow && hasGrownEnoughToExit) {
-            compactNavEnteredWidthRef.current = null;
-            return false;
-          }
-          return true;
-        });
-      });
-    };
-
-    updateDesktopNavMode();
-
-    const resizeObserver = new ResizeObserver(updateDesktopNavMode);
-    resizeObserver.observe(tabsList);
-    window.addEventListener("resize", updateDesktopNavMode);
-
-    return () => {
-      resizeObserver.disconnect();
-      window.removeEventListener("resize", updateDesktopNavMode);
-      if (frameId !== null) {
-        cancelAnimationFrame(frameId);
-      }
-    };
-  }, []);
-
-  // Handle tab change - update the URL
-  const handleTabChange = (value: string) => {
-    navigate(`/${value}`);
-  };
+    }
+  }, [currentTab, selectedRoomId]);
 
   const getPlatformUrl = () => {
     const configured = (import.meta as any).env?.VITE_PLATFORM_URL as
-      string | undefined;
+      | string
+      | undefined;
     if (configured && configured.length > 0) return configured;
     if (typeof window !== "undefined") {
       const host = window.location.host;
@@ -296,8 +231,8 @@ function AppContent() {
 
     if (!isAuthError && canRecoverInvalidConfig) {
       return (
-        <div className="flex items-center justify-center h-screen bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20">
-          <div className="max-w-4xl w-full mx-4 p-6 bg-white dark:bg-stone-900 rounded-lg shadow-lg space-y-4">
+        <div className="flex h-screen items-center justify-center">
+          <div className="glass-overlay mx-4 w-full max-w-4xl space-y-4 rounded-xl p-5 md:p-6">
             <div className="space-y-2">
               <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
                 {validationIssues.length > 0
@@ -317,15 +252,7 @@ function AppContent() {
               <p className="font-medium">{blockingDiagnostic.message}</p>
               {validationIssues.length > 0 && (
                 <ul className="mt-3 list-disc space-y-1 pl-5">
-                  {validationIssues.map((issue, index) => (
-                    <li key={`${issue.loc.join(".")}-${issue.msg}-${index}`}>
-                      <span className="font-medium">
-                        {issue.loc.join(" → ") || "config"}
-                      </span>
-                      {": "}
-                      {issue.msg}
-                    </li>
-                  ))}
+                  {validationIssueItems}
                 </ul>
               )}
             </div>
@@ -367,8 +294,8 @@ function AppContent() {
     }
 
     return (
-      <div className="flex items-center justify-center h-screen bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20">
-        <div className="max-w-md w-full mx-4 p-6 bg-white dark:bg-stone-900 rounded-lg shadow-lg">
+      <div className="flex h-screen items-center justify-center">
+        <div className="glass-overlay mx-4 w-full max-w-md rounded-xl p-6">
           <div className="flex items-center mb-4">
             <span className="text-3xl mr-3">🔒</span>
             <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
@@ -380,20 +307,12 @@ function AppContent() {
           {!isAuthError && validationIssues.length > 0 && (
             <div className="mb-6 rounded-md border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
               <p className="font-medium">Current configuration is invalid.</p>
-              <p className="mt-1 text-destructive/80">
+              <p className="mt-1">
                 Fix the reported issues in <code>config.yaml</code> or the
                 referenced plugin manifests, then retry loading the dashboard.
               </p>
               <ul className="mt-3 list-disc space-y-1 pl-5">
-                {validationIssues.map((issue, index) => (
-                  <li key={`${issue.loc.join(".")}-${issue.msg}-${index}`}>
-                    <span className="font-medium">
-                      {issue.loc.join(" → ") || "config"}
-                    </span>
-                    {": "}
-                    {issue.msg}
-                  </li>
-                ))}
+                {validationIssueItems}
               </ul>
             </div>
           )}
@@ -411,24 +330,20 @@ function AppContent() {
                     <li>Request access from your administrator</li>
                     <li>Return to your dashboard</li>
                   </ul>
-                  <a
-                    href={`${getPlatformUrl()}/dashboard`}
-                    className="block w-full text-center px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
-                  >
-                    Go to Dashboard
-                  </a>
+                  <Button asChild className="w-full">
+                    <a href={`${getPlatformUrl()}/dashboard`}>
+                      Go to Dashboard
+                    </a>
+                  </Button>
                 </>
               ) : (
                 <>
                   <p className="text-sm text-gray-500 dark:text-gray-400">
                     Please log in to access this MindRoom instance.
                   </p>
-                  <a
-                    href={`${getPlatformUrl()}/auth/login`}
-                    className="block w-full text-center px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
-                  >
-                    Log In
-                  </a>
+                  <Button asChild className="w-full">
+                    <a href={`${getPlatformUrl()}/auth/login`}>Log In</a>
+                  </Button>
                 </>
               )}
             </div>
@@ -436,12 +351,12 @@ function AppContent() {
 
           {!isAuthError && (
             <div className="space-y-3">
-              <button
+              <Button
+                className="w-full"
                 onClick={() => window.location.reload()}
-                className="w-full px-4 py-2 bg-primary text-white rounded-md hover:bg-primary/90 transition-colors"
               >
                 Retry
-              </button>
+              </Button>
               <p className="text-sm text-gray-500 dark:text-gray-400 text-center">
                 If the problem persists, please contact support.
               </p>
@@ -453,61 +368,45 @@ function AppContent() {
   }
 
   return (
-    <div className="flex flex-col h-screen relative overflow-hidden">
-      {/* Warm gradient background layers */}
-      <div className="absolute inset-0 bg-gradient-to-br from-amber-50 via-orange-50/40 to-yellow-50/50 dark:from-stone-950 dark:via-stone-900 dark:to-amber-950/20" />
-      <div className="absolute inset-0 bg-gradient-to-tl from-orange-100/30 via-transparent to-amber-100/20 dark:from-amber-950/10 dark:via-transparent dark:to-orange-950/10" />
-      <div className="absolute inset-0 gradient-mesh" />
+    <div className="relative flex h-screen overflow-hidden">
+      <a
+        href="#main-content"
+        // Focus without following the fragment: a fragment adds a history entry
+        // the router cannot hold back, so Back into it would drop a draft.
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById("main-content")?.focus();
+        }}
+        className="fixed left-3 top-3 z-[100] -translate-y-16 rounded-md bg-card px-3 py-2 text-sm font-medium focus:translate-y-0 focus:shadow-lg"
+      >
+        Skip to content
+      </a>
+      <Navigation mode="desktop" />
 
-      {/* Content wrapper */}
-      <div className="relative z-10 flex flex-col h-full">
-        {/* Header */}
-        <header className="bg-white/80 dark:bg-stone-900/50 backdrop-blur-xl border-b border-gray-200/50 dark:border-white/10 shadow-sm dark:shadow-2xl">
-          <div className="px-3 sm:px-6 py-2 sm:py-4 flex items-center justify-between gap-2">
-            <h1 className="flex items-center gap-2 sm:gap-3">
-              <img
-                src="/logo.svg"
-                alt="MindRoom logo"
-                className="h-8 w-8 sm:h-10 sm:w-10 shrink-0"
-              />
-              <div className="flex flex-col">
-                <span className="text-base sm:text-3xl font-bold tracking-tight text-gray-900 dark:text-white">
-                  MindRoom
-                </span>
-                <span className="hidden sm:block text-xs sm:text-sm font-normal text-gray-600 dark:text-gray-400 -mt-1">
-                  Configuration
-                </span>
-              </div>
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b px-2 md:px-6">
+          <div className="flex min-w-0 items-center gap-2">
+            <Navigation mode="mobile" />
+            <img
+              src="/logo.svg"
+              alt="MindRoom logo"
+              className="h-7 w-7 shrink-0 md:hidden"
+            />
+            <h1 className="truncate text-base font-semibold">
+              {currentNavItem.label}
             </h1>
+          </div>
 
-            <div className="flex items-center gap-1.5 sm:gap-4">
-              <button
-                type="button"
-                onClick={() => setMobileMenuOpen(true)}
-                aria-haspopup="dialog"
-                aria-expanded={mobileMenuOpen}
-                className={cn(
-                  "h-[30px] max-w-[8.5rem] sm:max-w-[11rem] rounded-lg border border-white/60 dark:border-white/10 bg-white/80 dark:bg-stone-900/70 backdrop-blur-xl px-2 py-1.5 items-center gap-1.5 min-w-0 text-left shadow-sm",
-                  desktopCompactNav ? "flex" : "flex sm:hidden",
-                )}
-              >
-                <CurrentNavIcon className="h-4 w-4 shrink-0 text-gray-700 dark:text-gray-200" />
-                <span className="text-xs font-medium text-gray-900 dark:text-gray-100 truncate">
-                  {currentNavItem.label}
-                </span>
-                <Menu className="h-4 w-4 shrink-0 text-gray-600 dark:text-gray-300" />
-              </button>
-              <ThemeToggle
-                className={cn(
-                  "h-[30px] w-[30px] rounded-lg border-white/60 dark:border-white/10 bg-white/80 dark:bg-stone-900/70 backdrop-blur-xl shadow-sm hover:bg-white/90 dark:hover:bg-stone-900/80",
-                  desktopCompactNav
-                    ? "sm:h-[30px] sm:w-[30px]"
-                    : "sm:h-9 sm:w-9",
-                )}
-              />
-              <SyncStatus status={syncStatus} compact className="sm:hidden" />
-              <SyncStatus status={syncStatus} className="hidden sm:flex" />
-            </div>
+          <div className="flex shrink-0 items-center gap-1.5 md:gap-3">
+            {isDirty && (
+              <span className="hidden items-center gap-1.5 rounded-full bg-accent px-2.5 py-1 text-xs font-medium text-accent-foreground sm:flex">
+                <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+                Draft
+              </span>
+            )}
+            <SyncStatus status={syncStatus} compact className="sm:hidden" />
+            <SyncStatus status={syncStatus} className="hidden sm:flex" />
+            <ThemeToggle />
           </div>
         </header>
 
@@ -531,6 +430,14 @@ function AppContent() {
           </div>
         )}
 
+        {config != null && (
+          // Refetch on navigation and config commits so keys added on the
+          // Models or Credentials pages clear the banner.
+          <ProviderSetupBanner
+            refreshKey={`${committedGeneration ?? "none"}:${currentTab}`}
+          />
+        )}
+
         {visibleGlobalDiagnostics.map((diagnostic, index) => (
           <div
             key={`${diagnostic.kind}-${diagnostic.message}-${index}`}
@@ -546,144 +453,79 @@ function AppContent() {
               <p className="font-medium">
                 This draft still has configuration validation issues.
               </p>
-              <p className="text-destructive/80">
+              <p>
                 Resolve the reported issues in the draft below, then save to
                 replace <code>config.yaml</code>.
               </p>
               <ul className="list-disc space-y-1 pl-5">
-                {validationIssues.map((issue, index) => (
-                  <li key={`${issue.loc.join(".")}-${issue.msg}-${index}`}>
-                    <span className="font-medium">
-                      {issue.loc.join(" → ") || "config"}
-                    </span>
-                    {": "}
-                    {issue.msg}
-                  </li>
-                ))}
+                {validationIssueItems}
               </ul>
             </div>
           </div>
         )}
 
-        {/* Main Content */}
-        <div className="flex-1 overflow-hidden">
-          <Tabs
-            value={currentTab}
-            onValueChange={handleTabChange}
-            className="h-full flex flex-col relative"
-          >
-            {/* Desktop Tab Navigation */}
-            <TabsList
-              ref={tabsListRef}
-              className={cn(
-                "hidden sm:flex px-3 sm:px-6 py-3 bg-white/70 dark:bg-stone-900/50 backdrop-blur-lg border-b border-gray-200/50 dark:border-white/10 flex-shrink-0 overflow-x-auto overflow-y-hidden",
-                desktopCompactNav &&
-                  "sm:absolute sm:inset-x-0 sm:top-0 sm:opacity-0 sm:pointer-events-none sm:overflow-hidden",
-              )}
-            >
-              {NAV_ITEMS.map((item) => {
-                const ItemIcon = item.icon;
-                return (
-                  <TabsTrigger
-                    key={item.value}
-                    value={item.value}
-                    className={TAB_TRIGGER_CLASS}
-                  >
-                    <ItemIcon className="h-4 w-4" aria-hidden="true" />
-                    <span>{item.label}</span>
-                  </TabsTrigger>
-                );
-              })}
-            </TabsList>
-
-            <Dialog open={mobileMenuOpen} onOpenChange={setMobileMenuOpen}>
-              <DialogContent className="w-[calc(100%-1.5rem)] max-w-sm p-0 border-white/60 dark:border-white/10 bg-white/95 dark:bg-stone-900/95 backdrop-blur-xl">
-                <DialogHeader className="px-4 pt-4 pb-2 text-left">
-                  <DialogTitle className="text-base text-gray-900 dark:text-gray-100">
-                    Navigate
-                  </DialogTitle>
-                  <DialogDescription className="text-xs text-gray-600 dark:text-gray-400">
-                    Choose a section
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="max-h-[70vh] overflow-y-auto px-2 pb-3">
-                  {NAV_GROUPS.map((group) => (
-                    <div key={group} className="mb-3 last:mb-0">
-                      <p className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                        {group}
-                      </p>
-                      <div className="space-y-1">
-                        {NAV_ITEMS.filter((item) => item.group === group).map(
-                          (item) => {
-                            const isActive = item.value === currentTab;
-                            const ItemIcon = item.icon;
-                            return (
-                              <button
-                                key={item.value}
-                                type="button"
-                                onClick={() => handleTabChange(item.value)}
-                                aria-current={isActive ? "page" : undefined}
-                                className={`w-full rounded-lg px-3 py-2 text-sm flex items-center justify-between transition-colors ${
-                                  isActive
-                                    ? "bg-primary/10 dark:bg-primary/20 text-primary"
-                                    : "text-gray-700 dark:text-gray-200 hover:bg-gray-100/80 dark:hover:bg-white/10"
-                                }`}
-                              >
-                                <span className="flex items-center gap-2">
-                                  <ItemIcon
-                                    className="h-4 w-4"
-                                    aria-hidden="true"
-                                  />
-                                  <span>{item.label}</span>
-                                </span>
-                                {isActive ? (
-                                  <Check className="h-4 w-4" />
-                                ) : null}
-                              </button>
-                            );
-                          },
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </DialogContent>
-            </Dialog>
-
-            <TabsContent
-              value="dashboard"
-              className="flex-1 p-2 sm:p-4 overflow-auto min-h-0"
+        <main
+          id="main-content"
+          tabIndex={-1}
+          className="workspace-surface min-w-0 flex-1 overflow-hidden"
+        >
+          <div className="relative flex h-full flex-col">
+            <RoutePanel
+              active={currentTab === "dashboard"}
+              label="Dashboard"
+              className="min-h-0 flex-1 overflow-auto"
             >
               <div className="min-h-full">
                 <Dashboard />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="agents"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "usage"}
+              label="Usage"
+              className="min-h-0 flex-1 overflow-auto p-3 md:p-5"
             >
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 sm:gap-4 h-full">
-                <div
-                  className={`col-span-1 lg:col-span-4 h-full overflow-hidden ${
-                    selectedAgentId ? "hidden lg:block" : "block"
-                  }`}
-                >
-                  <AgentList />
-                </div>
-                <div
-                  className={`col-span-1 lg:col-span-8 h-full overflow-hidden ${
-                    selectedAgentId ? "block" : "hidden lg:block"
-                  }`}
-                >
-                  <AgentEditor />
+              <Usage />
+            </RoutePanel>
+
+            <RoutePanel
+              active={currentTab === "budgets"}
+              label="Budgets"
+              className="min-h-0 flex-1 overflow-auto p-3 md:p-5"
+            >
+              <Budgets />
+            </RoutePanel>
+
+            <RoutePanel
+              active={currentTab === "agents"}
+              label="Agents"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
+            >
+              <div className="flex h-full flex-col gap-3 sm:gap-4">
+                <PersonalAgents />
+                <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-12 gap-3 sm:gap-4">
+                  <div
+                    className={`col-span-1 lg:col-span-4 h-full overflow-hidden ${
+                      selectedAgentId ? "hidden lg:block" : "block"
+                    }`}
+                  >
+                    <AgentList />
+                  </div>
+                  <div
+                    className={`col-span-1 lg:col-span-8 h-full overflow-hidden ${
+                      selectedAgentId ? "block" : "hidden lg:block"
+                    }`}
+                  >
+                    <AgentEditor />
+                  </div>
                 </div>
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="teams"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "teams"}
+              label="Teams"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 sm:gap-4 h-full">
                 <div
@@ -701,129 +543,154 @@ function AppContent() {
                   <TeamEditor />
                 </div>
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="rooms"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "rooms"}
+              label="Rooms"
+              className="rooms-workspace min-h-0 flex-1 overflow-y-auto p-3 md:p-5 lg:overflow-hidden"
             >
-              <div className="flex h-full flex-col gap-3 sm:gap-4">
+              <div className="rooms-stack flex min-h-full flex-col gap-3 sm:gap-4 lg:h-full lg:min-h-0">
                 <RoomAdmins />
-                <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 sm:gap-4 flex-1 min-h-0">
+                <div className="rooms-layout grid grid-cols-1 gap-3 sm:gap-4 lg:min-h-0 lg:flex-1 lg:grid-cols-12">
                   <div
-                    className={`col-span-1 lg:col-span-4 h-full overflow-hidden ${
+                    className={`col-span-1 overflow-visible lg:col-span-4 lg:h-full lg:overflow-hidden ${
                       selectedRoomId ? "hidden lg:block" : "block"
                     }`}
                   >
                     <RoomList />
                   </div>
                   <div
-                    className={`col-span-1 lg:col-span-8 h-full overflow-hidden ${
+                    className={`col-span-1 overflow-visible lg:col-span-8 lg:h-full lg:overflow-hidden ${
                       selectedRoomId ? "block" : "hidden lg:block"
                     }`}
                   >
-                    <RoomEditor />
+                    <RoomEditor
+                      key={
+                        selectedRoomId === null
+                          ? "no-room"
+                          : `room:${selectedRoomId}`
+                      }
+                    />
                   </div>
                 </div>
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="schedules"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "schedules"}
+              label="Schedules"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <Schedules />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="unconfigured-rooms"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "unconfigured-rooms"}
+              label="External rooms"
+              className="min-h-0 flex-1 overflow-y-auto p-3 md:p-5"
             >
-              <div className="h-full overflow-hidden">
-                <UnconfiguredRooms />
-              </div>
-            </TabsContent>
+              <UnconfiguredRooms />
+            </RoutePanel>
 
-            <TabsContent
-              value="models"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "models"}
+              label="Models"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <ModelConfig />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="memory"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "memory"}
+              label="Memory"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <MemoryConfig />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="knowledge"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "knowledge"}
+              label="Knowledge"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <Knowledge />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="credentials"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "credentials"}
+              label="Credentials"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <Credentials />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="voice"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "voice"}
+              label="Voice"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-auto">
                 <VoiceConfig />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="integrations"
-              className="flex-1 p-2 sm:p-4 overflow-auto min-h-0"
+            <RoutePanel
+              active={currentTab === "integrations"}
+              label="Tools"
+              className="min-h-0 flex-1 overflow-auto p-3 md:p-5"
             >
               <div className="h-full overflow-auto">
                 <Integrations />
               </div>
-            </TabsContent>
+            </RoutePanel>
 
-            <TabsContent
-              value="skills"
-              className="flex-1 p-2 sm:p-4 overflow-hidden min-h-0"
+            <RoutePanel
+              active={currentTab === "skills"}
+              label="Skills"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
             >
               <div className="h-full overflow-hidden">
                 <Skills />
               </div>
-            </TabsContent>
-          </Tabs>
-        </div>
+            </RoutePanel>
+
+            <RoutePanel
+              active={currentTab === "settings"}
+              label="Settings"
+              className="min-h-0 flex-1 overflow-hidden p-3 md:p-5"
+            >
+              <div className="h-full overflow-hidden">
+                <Settings />
+              </div>
+            </RoutePanel>
+          </div>
+        </main>
       </div>
     </div>
   );
 }
 
+// A data router, because only it can hold back a navigation that would drop a draft.
+const router = createBrowserRouter([{ path: "*", element: <AppContent /> }]);
+
 export default function App() {
   return (
-    <BrowserRouter>
-      <QueryClientProvider client={queryClient}>
-        <ThemeProvider>
-          <AppContent />
-          <Toaster />
-        </ThemeProvider>
-      </QueryClientProvider>
-    </BrowserRouter>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider>
+        <RouterProvider router={router} />
+        <Toaster />
+      </ThemeProvider>
+    </QueryClientProvider>
   );
 }

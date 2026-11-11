@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-__all__ = ["open_worker_state_root", "remove_directory_tree_at"]
+__all__ = ["open_worker_state_root", "read_worker_identity", "remove_directory_tree_at"]
 
 
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -99,12 +99,13 @@ def _identity_value(payload: dict[str, object], field_path: tuple[str, ...]) -> 
     return value
 
 
-def _read_identity(
+def read_worker_identity(
     worker_fd: int,
     *,
     identity_path: tuple[str, ...],
     identity_field_path: tuple[str, ...],
 ) -> object:
+    """Read one bounded identity field below an open worker tree without following symlinks."""
     if not identity_path or not identity_field_path:
         msg = "Worker identity metadata path is missing."
         raise ValueError(msg)
@@ -145,6 +146,11 @@ class _BoundWorkerStateRoot:
     absent_root: Path | None = None
     absent_name: str | None = None
 
+    @property
+    def exists(self) -> bool:
+        """Return whether the validated worker tree is present."""
+        return self.worker_fd is not None
+
     def remove(self) -> None:
         """Remove the validated worker tree or confirm that it is still absent."""
         if self.worker_fd is None:
@@ -166,7 +172,7 @@ class _BoundWorkerStateRoot:
 
         assert self.parent_fd is not None
         _require_current_directory(self.parent_fd, self.worker_name, self.worker_fd)
-        shutil.rmtree(self.worker_name, dir_fd=self.parent_fd)
+        _remove_tree(self.parent_fd, self.worker_name)
 
 
 def remove_directory_tree_at(parent_fd: int, name: str) -> None:
@@ -174,10 +180,21 @@ def remove_directory_tree_at(parent_fd: int, name: str) -> None:
     descriptor = _open_directory_at(parent_fd, name)
     try:
         _require_current_directory(parent_fd, name, descriptor)
-        shutil.rmtree(name, dir_fd=parent_fd)
+        _remove_tree(parent_fd, name)
     finally:
         with suppress(OSError):
             os.close(descriptor)
+
+
+def _remove_tree(parent_fd: int, name: str) -> None:
+    """Remove one child tree, first letting its owner change read-only directories such as Go's module cache."""
+    for _path, _dirnames, _filenames, directory_fd in os.fwalk(name, dir_fd=parent_fd, follow_symlinks=False):
+        mode = stat.S_IMODE(os.fstat(directory_fd).st_mode)
+        if mode & stat.S_IRWXU != stat.S_IRWXU:
+            # A directory owned by someone else keeps its mode, and rmtree removes it as before when it is empty.
+            with suppress(PermissionError):
+                os.fchmod(directory_fd, mode | stat.S_IRWXU)
+    shutil.rmtree(name, dir_fd=parent_fd)
 
 
 @contextmanager
@@ -225,13 +242,13 @@ def open_worker_state_root(
             return
         descriptors.append(worker_fd)
         if expected_worker_key is not None:
-            actual_worker_key = _read_identity(
+            actual_worker_key = read_worker_identity(
                 worker_fd,
                 identity_path=identity_path,
                 identity_field_path=identity_field_path,
             )
             if actual_worker_key != expected_worker_key:
-                msg = f"Worker identity metadata does not match retirement key '{expected_worker_key}'."
+                msg = "Worker identity metadata does not match the retirement key."
                 raise ValueError(msg)
         _require_current_directory(worker_parent_fd, worker_name, worker_fd)
         yield _BoundWorkerStateRoot(worker_parent_fd, worker_name, worker_fd)

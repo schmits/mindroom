@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,9 +13,10 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="spider",
+    file_access=ToolFileAccess.NONE,
     display_name="Spider",
     description="Web scraper and crawler that returns LLM-ready data",
-    category=ToolCategory.RESEARCH,  # Based on web_scrape category in docs
+    category=ToolCategory.RESEARCH,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     icon="FaSpider",
@@ -32,13 +33,6 @@ if TYPE_CHECKING:
             name="url",
             label="URL",
             type="url",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
-            name="optional_params",
-            label="Optional Params",
-            type="text",
             required=False,
             default=None,
         ),
@@ -72,7 +66,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["spider-client"],
-    docs_url="https://docs.agno.com/tools/toolkits/web_scrape/spider",
+    docs_url="https://docs.mindroom.chat/tools/web-scraping-and-browser/#spider",
     helper_text="Get your API key from the [Spider dashboard](https://spider.cloud)",
     function_names=("crawl", "scrape", "search_web"),
 )

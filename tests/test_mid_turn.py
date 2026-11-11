@@ -1,0 +1,1271 @@
+"""Opt-in judgments decide whether queued messages need a mid-turn handoff."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import replace
+from typing import TYPE_CHECKING, Literal
+
+import pytest
+from agno.media import Image as AgnoImage
+from agno.tools.function import ToolResult
+from pydantic import ValidationError
+from structlog.testing import capture_logs
+
+from mindroom.agent_loop.model_loop import EMPTY_REQUEST, LoopHooks
+from mindroom.agent_loop.run import resume_agent, run_agent
+from mindroom.ai_runtime import (
+    queued_message_signal_context,
+    queued_notice_after_tool_batch,
+    queued_notice_on_resume_entry,
+)
+from mindroom.config.main import Config
+from mindroom.config.mid_turn import MidTurnConfig
+from mindroom.constants import ATTACHMENT_IDS_KEY, ORIGINAL_SENDER_KEY
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.history.request_messages import build_resume_request
+from mindroom.judgment.client import JudgmentClient
+from mindroom.judgment.conversation import conversation_context_before_sources
+from mindroom.judgment.state import MAX_REQUEST_BYTES, JudgmentMessage
+from mindroom.judgment.typesafe import _PINNED_MODEL
+from mindroom.llm.messages import Message
+from mindroom.llm.runs import RunRecord, RunStatus
+from mindroom.mid_turn import MidTurnGate, QueuedMessage
+from mindroom.mid_turn_judgment import create_mid_turn_gate
+from mindroom.model_defaults import OPENAI_DECISIONS_MODEL
+from mindroom.redaction import redact_sensitive_text
+from mindroom.response_lifecycle import _QueuedMessageState
+from mindroom.tool_system.events import ToolTraceEntry, build_tool_trace_content
+from tests.agent_loop.helpers import collect, context, external, gated, spec, toolkit
+from tests.conftest import install_model_providers, make_visible_message, request_envelope, test_runtime_paths
+from tests.cpu_budget_helpers import cpu_budget
+from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls, tool_call
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping
+    from pathlib import Path
+
+    from mindroom.judgment.state import JudgmentRequest
+    from mindroom.tool_system.tool_function import AdaptedToolkit
+
+_NOTICE = "WRAP UP NOW"
+_NOTICE_HOOKS = LoopHooks(
+    after_tool_batch=(queued_notice_after_tool_batch(_NOTICE),),
+    on_resume_entry=(queued_notice_on_resume_entry(_NOTICE),),
+)
+
+
+def _has_notice(messages: list[Message] | tuple[Message, ...]) -> bool:
+    return any(message.content == _NOTICE for message in messages)
+
+
+class _ResumedRequests:
+    """Resumed requests as the queued-notice resume hook leaves them for the provider."""
+
+    def __init__(self) -> None:
+        self.sent: list[list[Message]] = []
+        self._hook = queued_notice_on_resume_entry(_NOTICE)
+
+    async def send(self, messages: list[Message] | None = None) -> list[Message]:
+        request = messages if messages is not None else _resumed_messages()
+        await self._hook(request, ())
+        self.sent.append(request)
+        return request
+
+
+async def _run_turn(
+    model: ScriptedModel,
+    *toolkits: AdaptedToolkit,
+    persist: Callable[[RunRecord], Awaitable[None]] | None = None,
+) -> RunRecord:
+    """Run one turn of "Do the task" on the owned loop with the queued-notice hooks a reply installs."""
+    _, record = await collect(
+        run_agent(
+            spec(model, *toolkits),
+            [Message(role="user", content="Do the task")],
+            ctx=context(),
+            hooks=_NOTICE_HOOKS,
+            persist=persist,
+            request_template=EMPTY_REQUEST,
+        ),
+    )
+    return record
+
+
+async def _resume_turn(
+    model: ScriptedModel,
+    paused: RunRecord,
+    *toolkits: AdaptedToolkit,
+    external_results: Mapping[str, str],
+) -> RunRecord:
+    """Resume a paused turn with the results of its externally executed calls."""
+    _, record = await collect(
+        resume_agent(
+            spec(model, *toolkits),
+            paused,
+            build_resume_request(paused=paused.messages, summary=None, history=[]),
+            approved=(),
+            denied={},
+            external_results=external_results,
+            context=lambda run_id: context(run_id=run_id),
+            hooks=_NOTICE_HOOKS,
+            persist=None,
+            request_template=EMPTY_REQUEST,
+        ),
+    )
+    return record
+
+
+def _resumed_messages() -> list[Message]:
+    return [
+        Message(role="user", content="Do the task"),
+        Message(
+            role="assistant",
+            tool_calls=[
+                {"id": "call", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        ),
+        Message(role="tool", content="Private result", tool_call_id="call", tool_name="read_file"),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["llm", "typesafe"])
+def test_mid_turn_config_accepts_both_backends_and_validates_model_aliases(backend: str) -> None:
+    """Mid-turn settings belong to an agent, not the room or another responder."""
+    judgment = {"provider": backend, **({"model": "default"} if backend == "llm" else {})}
+    config = Config.model_validate(
+        {
+            "models": {"default": {"provider": "synthetic", "id": "test"}},
+            "agents": {
+                "helper": {"display_name": "Helper", "mid_turn": {"judgment": judgment}},
+                "ordinary": {"display_name": "Ordinary"},
+            },
+        },
+    )
+    assert config.agents["helper"].mid_turn is not None
+    assert config.agents["helper"].mid_turn.judgment.provider == backend
+    assert config.agents["ordinary"].mid_turn is None
+    with pytest.raises(ValidationError, match="Unknown judgment model for agent"):
+        Config.model_validate(
+            {
+                "agents": {
+                    "helper": {
+                        "display_name": "Helper",
+                        "mid_turn": {"judgment": {"provider": "llm", "model": "missing"}},
+                    },
+                },
+            },
+        )
+    with pytest.raises(ValidationError):
+        Config.model_validate({"agents": {"helper": {"display_name": "Helper", "mid_turn": {}}}})
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        {"judgment": {"provider": "typesafe"}},
+        {"judgment": {"provider": "llm", "model": "default"}, "defer_reaction": "👀"},
+    ],
+)
+def test_mid_turn_survives_authored_config_round_trip(settings: dict[str, object] | None) -> None:
+    """Saving config preserves explicit disables and the agent's judgment settings."""
+    config = Config.model_validate(
+        {
+            "models": {"default": {"provider": "synthetic", "id": "test"}},
+            "agents": {"helper": {"display_name": "Helper", "mid_turn": settings}},
+        },
+    )
+    authored = config.authored_model_dump()
+    assert authored["agents"]["helper"]["mid_turn"] == settings
+    assert Config.model_validate(authored).agents["helper"].mid_turn == config.agents["helper"].mid_turn
+
+
+def test_retired_room_mid_turn_is_rejected() -> None:
+    """An old room configuration must not silently enable every agent in the room."""
+    with pytest.raises(ValidationError, match="room_mid_turn"):
+        Config.model_validate({"room_mid_turn": {"lobby": {"judgment": {"provider": "typesafe"}}}})
+
+
+@pytest.mark.parametrize("room", ["!first:localhost", "!adhoc:localhost"])
+@pytest.mark.parametrize("agent", ["helper", "ordinary", "team", "missing"])
+def test_mid_turn_follows_only_the_configured_agent(tmp_path: Path, room: str, agent: str) -> None:
+    """Agent opt-in follows its Matrix user across rooms without recruiting other agents or teams."""
+    config = Config.model_validate(
+        {
+            "models": {"default": {"provider": "synthetic", "id": "test"}},
+            "agents": {
+                "helper": {
+                    "display_name": "Helper",
+                    "mid_turn": {"judgment": {"provider": "llm", "model": "default"}, "defer_reaction": "👀"},
+                },
+                "ordinary": {"display_name": "Ordinary"},
+            },
+            "teams": {"team": {"display_name": "Team", "role": "Work together", "agents": ["helper"]}},
+        },
+    )
+    gate = create_mid_turn_gate(
+        config,
+        test_runtime_paths(tmp_path),
+        request_envelope(room_id=room, agent_name=agent),
+        prompt="Do the task",
+        has_media=False,
+    )
+    assert (gate is not None) is (agent == "helper")
+
+
+def test_queued_snapshot_keeps_text_until_exact_event_is_consumed() -> None:
+    """The judge needs a stable snapshot without taking ownership of queued dispatch."""
+    state = _QueuedMessageState()
+    assert state.add_waiting_human_message("$first", text="First")
+    assert not state.add_waiting_human_message("$first", text="Duplicate")
+    assert state.add_waiting_human_message("$second", text="Second")
+    snapshot = state.pending_message_snapshot()
+    assert [(message.event_id, message.text) for message in snapshot] == [("$first", "First"), ("$second", "Second")]
+    state.consume_waiting_human_message("$first")
+    assert [message.text for message in state.pending_message_snapshot()] == ["Second"]
+    assert len(snapshot) == 2
+    assert state.has_pending_human_messages()
+
+
+@pytest.mark.parametrize("reaction", ["", "   ", "\n", "x" * 65, 123])
+def test_defer_reaction_rejects_invalid_keys(reaction: object) -> None:
+    """Deferred acknowledgements use bounded, nonblank Matrix reaction keys."""
+    with pytest.raises(ValidationError):
+        MidTurnConfig.model_validate({"judgment": {"provider": "typesafe"}, "defer_reaction": reaction})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["finish", "wrap_up", "error", "queue_changed", "cancel", "reaction_error"])
+async def test_defer_reaction_requires_accepted_current_decision(outcome: str) -> None:
+    """Never acknowledge a failed, cancelled, negative, or superseded judgment."""
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$first", text="Thanks")
+    acknowledgements: list[str] = []
+
+    async def acknowledge(event_id: str) -> None:
+        acknowledgements.append(event_id)
+        if outcome == "reaction_error":
+            msg = "Matrix unavailable"
+            raise RuntimeError(msg)
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        if outcome == "error":
+            raise TimeoutError
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        if outcome == "queue_changed":
+            state.add_waiting_human_message("$correction", text="Stop")
+        return outcome != "wrap_up"
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate, on_defer=acknowledge)
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(state, mid_turn_gate=gate):
+        if outcome == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await resumed.send()
+        else:
+            await resumed.send()
+            await resumed.send()
+            if outcome == "finish":
+                state.add_waiting_human_message("$second", text="No rush")
+                await resumed.send()
+    assert acknowledgements == (
+        ["$first", "$second"] if outcome == "finish" else ["$first"] if outcome == "reaction_error" else []
+    )
+    if outcome == "reaction_error":
+        assert not any(_has_notice(request) for request in resumed.sent)
+    assert state.has_pending_human_messages()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued", [("Thanks",), ("Thanks", "No rush")])
+@pytest.mark.parametrize("change", ["correction", "handoff"])
+async def test_queue_change_during_reaction_still_requests_wrap_up(
+    queued: tuple[str, ...],
+    change: Literal["correction", "handoff"],
+) -> None:
+    """A correction or a concurrent handoff while Matrix acknowledges any reaction must still cause handoff."""
+    state = _QueuedMessageState()
+    for index, text in enumerate(queued):
+        state.add_waiting_human_message(f"$queued{index}", text=text)
+    acknowledgements: list[str] = []
+
+    async def acknowledge(event_id: str) -> None:
+        acknowledgements.append(event_id)
+        if change == "correction":
+            state.add_waiting_human_message("$correction", text="Stop")
+        else:
+            context.notice_fired = True
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        return True
+
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(
+        state,
+        mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate, on_defer=acknowledge),
+    ) as context:
+        await resumed.send()
+        assert context.notice_fired
+    assert acknowledgements == ["$queued0"]
+    assert _has_notice(resumed.sent[0])
+
+
+@pytest.mark.asyncio
+async def test_a_wait_judges_again_a_queue_that_changed_during_its_defer_reaction() -> None:
+    """A message that arrives while Matrix acknowledges another is judged with it, so one that can wait ends no wait."""
+    state = _QueuedMessageState()
+    judged: list[tuple[str | None, ...]] = []
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        judged.append(tuple(message.text for message in state.pending_message_snapshot()))
+        return "Stop" not in judged[-1]
+
+    async def acknowledge(event_id: str) -> None:
+        if event_id == "$thanks":
+            state.add_waiting_human_message("$norush", text="No rush")
+
+    state.mid_turn_gate = MidTurnGate(active_text="Do the task", evaluate=evaluate, on_defer=acknowledge)
+    waiter = asyncio.create_task(state.wait())
+    state.add_waiting_human_message("$thanks", text="Thanks")
+    for _ in range(100):
+        await asyncio.sleep(0)
+    assert not waiter.done()
+    assert judged == [("Thanks",), ("Thanks", "No rush")]
+    state.add_waiting_human_message("$stop", text="Stop")
+    await asyncio.wait_for(waiter, 5)
+
+
+@pytest.mark.asyncio
+async def test_a_wait_judges_again_a_queue_that_lost_a_message_during_its_judgment() -> None:
+    """A decision counts only for the queue it judged, so a queue that shrank meanwhile is judged again at once."""
+    state = _QueuedMessageState()
+    judged: list[tuple[str | None, ...]] = []
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        judged.append(tuple(message.text for message in state.pending_message_snapshot()))
+        if judged[-1] == ("Thanks", "Stop"):
+            # The thanks no longer waits for this reply, as when its own turn is dropped.
+            state.consume_waiting_human_message("$thanks")
+        return "Stop" not in judged[-1]
+
+    state.mid_turn_gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    waiter = asyncio.create_task(state.wait())
+    state.add_waiting_human_message("$thanks", text="Thanks")
+    for _ in range(100):
+        await asyncio.sleep(0)
+    state.add_waiting_human_message("$stop", text="Stop")
+    for _ in range(100):
+        await asyncio.sleep(0)
+    assert waiter.done()
+    assert judged == [("Thanks",), ("Thanks", "Stop"), ("Stop",)]
+
+
+@pytest.mark.asyncio
+async def test_queued_message_freezes_visible_progress_at_admission() -> None:
+    """Later stream edits must not change the context of an earlier human message."""
+    evidence: list[str] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        evidence.append(json.loads(request.body)["state"]["conversation"][0]["text"])
+        return True
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    state = _QueuedMessageState(mid_turn_gate=gate)
+    read = ToolTraceEntry(
+        type="tool_call_completed",
+        tool_name="read_file",
+        args_preview="path=a.py",
+        result_preview="ok",
+    )
+    gate.record_visible_response("I found the file.\n🔧 `read_file` [1]", (read,))
+    state.add_waiting_human_message("$first", text="Use that file")
+    first = state.pending_message_snapshot()
+    gate.record_visible_response("I found the file. Now editing it.", ())
+    assert await gate.defers(first, current=lambda: True)
+    assert evidence[0] == (
+        "<active_request>\nDo the task\n</active_request>\n"
+        "<queued_message>\nUse that file\n</queued_message>\n"
+        '<visible_response>\nI found the file.\n<tool name="read_file" input="path=a.py" output="ok"/>\n</visible_response>'
+    )
+    assert await gate.defers(first, current=lambda: True)
+    assert len(evidence) == 1
+    state.add_waiting_human_message("$second", text="Stop editing")
+    assert await gate.defers(state.pending_message_snapshot(), current=lambda: True)
+    assert evidence[1].endswith("<visible_response>\nI found the file. Now editing it.\n</visible_response>")
+    assert "completed_tools" not in evidence[0]
+
+
+@pytest.mark.asyncio
+async def test_visible_progress_keeps_untraced_markers_and_multiline_tool_output() -> None:
+    """Untraced marker-shaped lines are the agent's text, and redacted multi-line tool output stays judgeable."""
+    evidence: list[str] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        evidence.append(json.loads(request.body)["state"]["conversation"][-1]["text"])
+        return True
+
+    example = "Example:\n\n🔧 `shell` [1]\n\nThe number identifies a tool."
+    output = "services:\n  db:\n    environment:\n      POSTGRES_PASSWORD: hunter2\n      POSTGRES_USER: app\n"
+    shell = ToolTraceEntry(
+        type="tool_call_completed",
+        tool_name="shell",
+        args_preview="command=cat docker-compose.yml",
+        result_preview=redact_sensitive_text(output),
+    )
+    for text, trace in ((example, ()), ("Reading.\n\n🔧 `shell` [1]\n\nDone.", (shell,))):
+        gate = MidTurnGate(active_text="Do the task", evaluate=evaluate, conversation_context=())
+        gate.record_visible_response(text, trace)
+        state = _QueuedMessageState(mid_turn_gate=gate)
+        state.add_waiting_human_message("$queued", text="Thanks")
+        assert await gate.defers(state.pending_message_snapshot(), current=lambda: True)
+    assert example in evidence[0]
+    assert "POSTGRES_USER: app" in evidence[1]
+    assert "hunter2" not in evidence[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "progress",
+    [None, '{"password": "fake_secret_for_test"}'],
+    ids=["unknown", "secret"],
+)
+async def test_unknown_or_unsafe_visible_progress_keeps_wrap_up(progress: str | None) -> None:
+    """Unavailable or sensitive user-visible context must not leave the runtime."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        pytest.fail("Incomplete visible progress must not reach inference")
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    gate.visible_response_text = progress
+    state = _QueuedMessageState(mid_turn_gate=gate)
+    state.add_waiting_human_message("$queued", text="Thanks")
+    assert not await gate.defers(state.pending_message_snapshot(), current=lambda: True)
+
+
+@pytest.mark.asyncio
+async def test_finish_reuses_exact_queue_but_rechecks_a_new_message() -> None:
+    """A later correction must not inherit approval given to unrelated chatter."""
+    requests: list[dict] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        requests.append(json.loads(request.body))
+        return len(requests) == 1
+
+    gate = MidTurnGate(active_text="Install the dependencies", evaluate=evaluate)
+    first = (QueuedMessage("$one", "Thanks"),)
+    assert await gate.defers(first, current=lambda: True)
+    assert await gate.defers(first, current=lambda: True)
+    assert len(requests) == 1
+    assert not await gate.defers(
+        (*first, QueuedMessage("$two", "Use the other version")),
+        current=lambda: True,
+    )
+    assert len(requests) == 2
+    evidence = requests[0]["state"]["conversation"][0]["text"]
+    assert "Install the dependencies" in evidence
+    assert "Thanks" in evidence
+    assert "$one" not in evidence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [None, "", "x" * 16001, "[attachments: report.pdf]", "api_key=sk-" + "x" * 48])
+async def test_incomplete_or_sensitive_queue_keeps_wrap_up(text: str | None) -> None:
+    """Missing or unsafe queued evidence must never authorize continued tool use."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        pytest.fail("Incomplete context must not reach inference")
+
+    gate = MidTurnGate(active_text="Do the original task", evaluate=evaluate)
+    assert not await gate.defers((QueuedMessage("$one", text),), current=lambda: True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [False, None])
+async def test_nonapproval_keeps_wrap_up(decision: bool | None) -> None:
+    """A negative or abstaining judge cannot suppress the default notice."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        return decision
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    assert not await gate.defers((QueuedMessage("$one", "Please change it"),), current=lambda: True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("active", [False, True])
+async def test_json_credentials_are_checked_before_evidence_encoding(*, active: bool) -> None:
+    """JSON escaping must not hide credentials from the redaction boundary."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        pytest.fail("Credentials must not reach the judgment backend")
+
+    credential_text = '{"password": "fake_secret_for_test"}'
+    gate = MidTurnGate(active_text=credential_text if active else "Do the task", evaluate=evaluate)
+    assert not await gate.defers(
+        (QueuedMessage("$new", "Thanks" if active else credential_text),),
+        current=lambda: True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_judgment_cancellation_propagates_without_caching_approval() -> None:
+    """Stopping the active response must stop its judge too."""
+    entered = asyncio.Event()
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    task = asyncio.create_task(gate.defers((QueuedMessage("$one", "Thanks"),), current=lambda: True))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", [False, True])
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_real_tool_loop_judges_before_next_provider_request(
+    *,
+    finish: bool,
+    terminal: bool,
+) -> None:
+    """Both provider paths must receive a notice only when the judge requests wrap-up."""
+    state = _QueuedMessageState()
+    evidence: list[dict] = []
+
+    def queue_followup() -> str:
+        """Queue a follow-up while the turn works."""
+        gate.record_visible_response(
+            "Work started.\n🔧 `queue_followup` [1]",
+            (ToolTraceEntry(type="tool_call_started", tool_name="queue_followup"),),
+        )
+        state.add_waiting_human_message("$new", text="Thanks for doing this")
+        return "Private tool result must not reach the judge"
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        evidence.append(json.loads(request.body))
+        return finish
+
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate)
+    state.mid_turn_gate = gate
+    model = ScriptedModel([calls(tool_call("queue_followup", "call_1")), answer("Done")])
+    tools = toolkit(queue_followup, stop_after_call=True) if terminal else toolkit(queue_followup)
+    with queued_message_signal_context(state, mid_turn_gate=gate) as context:
+        await _run_turn(model, tools)
+        assert context.notice_fired is (not finish and not terminal)
+    assert len(evidence) == (0 if terminal else 1)
+    assert "Private tool result" not in json.dumps(evidence)
+    assert ("queue_followup" in json.dumps(evidence)) is (not terminal)
+    assert len(model.requests) == (1 if terminal else 2)
+    assert _has_notice(model.requests[-1].messages) is (not finish and not terminal)
+    assert {message.event_id for message in state.pending_message_snapshot()} == {"$new"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mixed", [False, True])
+async def test_pending_approval_is_not_judged_as_completed_work(*, mixed: bool) -> None:
+    """Unresolved tool calls must not become evidence of completed actions."""
+    executed: list[str] = []
+    judgments: list[JudgmentRequest] = []
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$queued", text="Thanks")
+
+    def approved_action() -> str:
+        """Act once approved."""
+        executed.append("approved_action")
+        return "Done"
+
+    def ordinary_action() -> str:
+        """Read something."""
+        executed.append("ordinary_action")
+        return "Read complete"
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        judgments.append(request)
+        return True
+
+    names = ["ordinary_action", "approved_action"] if mixed else ["approved_action"]
+    model = ScriptedModel([calls(*(tool_call(name, name) for name in names))])
+    with queued_message_signal_context(state, mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate)):
+        record = await _run_turn(model, gated(approved_action), toolkit(ordinary_action))
+    assert record.status == RunStatus.paused
+    assert executed == (["ordinary_action"] if mixed else [])
+    assert judgments == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove", [False, True])
+async def test_queue_change_during_judgment_cannot_approve_unseen_input(*, remove: bool) -> None:
+    """Only the exact judged queue can finish; a cancelled queue needs no notice."""
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$first", text="Thanks")
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        if remove:
+            state.consume_waiting_human_message("$first")
+        else:
+            state.add_waiting_human_message("$correction", text="Use a different version")
+        return True
+
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(state, mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate)):
+        await resumed.send()
+    assert _has_notice(resumed.sent[0]) is (not remove)
+
+
+@pytest.mark.asyncio
+async def test_wrap_up_remains_settled_after_later_queue_changes() -> None:
+    """Once told to wrap up, later acknowledgements must not reverse the handoff."""
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$first", text="Change the task")
+    judged: list[JudgmentRequest] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        judged.append(request)
+        return len(judged) > 1
+
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(state, mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate)):
+        await resumed.send()
+        state.add_waiting_human_message("$second", text="Thanks")
+        await resumed.send()
+    assert len(judged) == 1
+    assert all(_has_notice(request) for request in resumed.sent)
+
+
+@pytest.mark.asyncio
+async def test_resumed_tools_do_not_expose_invisible_execution_details() -> None:
+    """Approval results do not add model-private execution details to visible context."""
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$queued", text="Thanks")
+    evidence: list[str] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        evidence.append(json.loads(request.body)["state"]["conversation"][0]["text"])
+        return False
+
+    messages = _resumed_messages()
+    messages[-1].tool_call_error = True
+    messages[-1].content = "Denied"
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(state, mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate)):
+        await resumed.send(messages)
+    assert "completed_tools" not in evidence[0]
+    assert _has_notice(resumed.sent[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["llm", "typesafe"])
+@pytest.mark.parametrize("outcome", ["finish", "wrap_up", "invalid", "timeout"])
+async def test_configured_backends_control_resumed_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: str,
+    outcome: str,
+) -> None:
+    """Backend errors retain the actual notice; valid approvals suppress it."""
+
+    async def post(_client: JudgmentClient, _body: bytes) -> bytes:
+        if outcome == "timeout":
+            await asyncio.Event().wait()
+        return json.dumps(
+            {
+                "model": _PINNED_MODEL,
+                "usage": {"input_tokens": 20, "output_tokens": 1},
+                "answers": {
+                    "interrupt_current_turn": {
+                        "type": "noul",
+                        "noul": ("bad" if outcome == "invalid" else 0.1 if outcome == "finish" else 0.9),
+                    },
+                },
+            },
+        ).encode()
+
+    monkeypatch.setattr(JudgmentClient, "_post", post)
+
+    async def time_out() -> None:
+        raise TimeoutError
+
+    judge = ScriptedModel(
+        [
+            [Await(time_out)]
+            if outcome == "timeout"
+            else answer("invalid" if outcome == "invalid" else json.dumps({"decision": outcome != "finish"})),
+        ],
+    )
+    install_model_providers(monkeypatch, {"cheap": judge})
+    settings = {"provider": backend, "timeout_seconds": 0.02}
+    if backend == "llm":
+        settings["model"] = "cheap"
+    config = Config.model_validate(
+        {
+            "models": {"cheap": {"provider": "synthetic", "id": "test"}},
+            "agents": {"test_agent": {"display_name": "Test", "mid_turn": {"judgment": settings}}},
+        },
+    )
+    paths = replace(test_runtime_paths(tmp_path), process_env={"TYPESAFE_API_KEY": "synthetic"})
+    gate = create_mid_turn_gate(
+        config,
+        paths,
+        request_envelope(prompt="Do the task"),
+        prompt="Do the task",
+        has_media=False,
+    )
+    assert gate is not None
+    state = _QueuedMessageState()
+    state.add_waiting_human_message("$new", text="Thanks")
+    resumed = _ResumedRequests()
+    with queued_message_signal_context(state, mid_turn_gate=gate):
+        await resumed.send()
+    assert _has_notice(resumed.sent[0]) is (outcome != "finish")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_existing_tool_checkpoint_survives_judgment_and_cancellation(*, cancel: bool) -> None:
+    """Adding a judgment must not discard the stored results of executed tools."""
+    state = _QueuedMessageState()
+    entered = asyncio.Event()
+    stored: list[RunRecord] = []
+
+    def work() -> str:
+        """Do the work."""
+        state.add_waiting_human_message("$new", text="Change the task")
+        return "Completed action"
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        entered.set()
+        if cancel:
+            await asyncio.Event().wait()
+        return False
+
+    async def persist(record: RunRecord) -> None:
+        stored.append(record)
+
+    model = ScriptedModel([calls(tool_call("work", "call")), answer("Done")])
+
+    async def run() -> None:
+        with queued_message_signal_context(
+            state,
+            mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate),
+        ):
+            await _run_turn(model, toolkit(work), persist=persist)
+
+    task = asyncio.create_task(run())
+    await entered.wait()
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    [record] = stored
+    assert record.status == (RunStatus.cancelled if cancel else RunStatus.completed)
+    assert "Completed action" in [message.get_content_string() for message in record.messages]
+    assert len(model.requests) == (1 if cancel else 2)
+    assert _has_notice(model.requests[-1].messages) is (not cancel)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("media", [False, True])
+async def test_batch_with_paused_delegation_follows_the_judgment(*, interrupt: bool, media: bool) -> None:
+    """A delegation paused beside other calls must not request a wrap-up the judge did not ask for."""
+    state = _QueuedMessageState()
+    judgments: list[JudgmentRequest] = []
+
+    def work() -> ToolResult:
+        """Do the work."""
+        state.add_waiting_human_message("$new", text="Thanks")
+        images = [AgnoImage(content=b"image", mime_type="image/png")] if media else None
+        return ToolResult(content="Completed action", images=images)
+
+    def delegate() -> str:
+        """Hand the subtask to a child."""
+        return "Child result"
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        judgments.append(request)
+        return not interrupt
+
+    tools = (toolkit(work), external(delegate))
+    model = ScriptedModel([calls(tool_call("work", "work"), tool_call("delegate", "child")), answer("Done")])
+    with queued_message_signal_context(
+        state,
+        mid_turn_gate=MidTurnGate(active_text="Do the task", evaluate=evaluate),
+    ):
+        # The loop runs the ordinary call and pauses the delegation for its external driver.
+        paused = await _run_turn(model, *tools)
+        assert paused.status == RunStatus.paused
+        assert len(model.requests) == 1
+        assert judgments == []
+        assert not any(_has_notice([message]) for message in paused.messages)
+        # Generated media follow the ordinary call's result as a user-role message.
+        assert (paused.messages[-1].role == "user") is media
+        # The driver resumes the run with the child's result, completing the batch for the judge.
+        await _resume_turn(model, paused, *tools, external_results={"child": "Child result"})
+    assert len(judgments) == 1
+    assert _has_notice(model.requests[-1].messages) is interrupt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["judge", "defer_reaction"])
+@pytest.mark.parametrize("resumed", [False, True])
+async def test_a_failing_judge_or_defer_reaction_costs_no_reply(*, failure: str, resumed: bool) -> None:
+    """A judge that errors wraps the turn up and a defer reaction Matrix refuses is skipped; the reply finishes.
+
+    The judgment runs after a completed tool batch, or, when the batch paused for a delegation, once the resume
+    completes it.
+    """
+    state = _QueuedMessageState()
+    reactions: list[str] = []
+    judgments: list[JudgmentRequest] = []
+
+    def work() -> str:
+        """Do the work."""
+        state.add_waiting_human_message("$new", text="Thanks")
+        return "Completed action"
+
+    def delegate() -> str:
+        """Hand the subtask to a child."""
+        return "Child result"
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        judgments.append(request)
+        if failure == "judge":
+            msg = "judgment backend unavailable"
+            raise RuntimeError(msg)
+        return True
+
+    async def react(event_id: str) -> None:
+        reactions.append(event_id)
+        msg = "Matrix unavailable"
+        raise RuntimeError(msg)
+
+    tools = (toolkit(work), external(delegate))
+    batch = (tool_call("work", "work"), *((tool_call("delegate", "child"),) if resumed else ()))
+    model = ScriptedModel([calls(*batch), answer("Done")])
+    gate = MidTurnGate(active_text="Do the task", evaluate=evaluate, on_defer=react)
+    with queued_message_signal_context(state, mid_turn_gate=gate):
+        record = await _run_turn(model, *tools)
+        if resumed:
+            assert record.status == RunStatus.paused
+            record = await _resume_turn(model, record, *tools, external_results={"child": "Child result"})
+    assert record.status == RunStatus.completed
+    assert record.content == "Done"
+    assert len(judgments) == 1
+    assert reactions == ([] if failure == "judge" else ["$new"])
+    # A failed judgment wraps the turn up; a decision to finish stands when only its reaction failed.
+    assert _has_notice(model.requests[-1].messages) is (failure == "judge")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("probability", "threshold", "finish"),
+    [
+        (0.05, 0.8, True),
+        (0.2, 0.8, True),
+        (0.21, 0.8, False),
+        (0.7, 0.8, False),
+        (0.9, 0.8, False),
+        (0.1, 0.95, False),
+        (0.0, 1.0, True),
+        (1.0, 0.0, True),
+    ],
+)
+@pytest.mark.parametrize("provider", ["typesafe", "openai_decisions"])
+async def test_interrupt_probability_preserves_continuation_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    probability: float,
+    threshold: float,
+    *,
+    finish: bool,
+) -> None:
+    """A low-confidence no-interruption answer must still request a handoff on every probability backend."""
+
+    async def post(_client: JudgmentClient, body: bytes) -> bytes:
+        questions = json.loads(body)["questions"]
+        if provider == "typesafe":
+            question_id = next(iter(questions))
+            model, answers = _PINNED_MODEL, {question_id: {"type": "noul", "noul": probability}}
+        else:
+            question_id = questions[0]["name"]
+            model = OPENAI_DECISIONS_MODEL
+            answers = [{"type": "predicate", "name": question_id, "probability": probability}]
+        assert question_id == "interrupt_current_turn"
+        return json.dumps(
+            {"model": model, "usage": {"input_tokens": 20, "output_tokens": 1}, "answers": answers},
+        ).encode()
+
+    monkeypatch.setattr(JudgmentClient, "_post", post)
+    config = Config.model_validate(
+        {
+            "agents": {
+                "test_agent": {
+                    "display_name": "Test",
+                    "mid_turn": {
+                        "judgment": {"provider": provider, "threshold": threshold},
+                    },
+                },
+            },
+        },
+    )
+    paths = replace(test_runtime_paths(tmp_path), process_env={"TYPESAFE_API_KEY": "synthetic"})
+    get_runtime_shared_credentials_manager(paths).save_credentials("openai", {"api_key": "synthetic"})
+    gate = create_mid_turn_gate(config, paths, request_envelope(), prompt="Do the task", has_media=False)
+    assert gate is not None
+    assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True) is finish
+
+
+@pytest.mark.asyncio
+async def test_mid_turn_preserves_longer_public_conversation_within_byte_budget() -> None:
+    """Earlier instructions survive repeated continuations without truncating to the last few turns."""
+    context = tuple(JudgmentMessage("user", f"Accepted task constraint {i}") for i in range(12))
+    captured = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        captured.append(json.loads(request.body)["state"]["conversation"])
+        return True
+
+    gate = MidTurnGate(active_text="Continue", evaluate=evaluate, conversation_context=context)
+    assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True)
+    assert captured[0][:-1] == [{"role": "user", "text": message.text} for message in context]
+
+
+def test_traced_agent_reply_reaches_the_judge_with_tool_tags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Judges read what each tool call did, never the bare display markers."""
+    monkeypatch.setattr(
+        "mindroom.judgment.conversation.current_internal_sender_ids",
+        lambda *_: frozenset({"@mindroom_code:localhost"}),
+    )
+    trace = [
+        ToolTraceEntry(
+            type="tool_call_completed",
+            tool_name="shell",
+            args_preview="cmd=pytest",
+            result_preview="3 failed",
+        ),
+    ]
+    history = [
+        make_visible_message(body="Fix the tests", event_id="$root"),
+        make_visible_message(
+            sender="@mindroom_code:localhost",
+            body="Running them.\n\n🔧 `shell` [1]\n\nThree fail.",
+            event_id="$reply",
+            content={"msgtype": "m.text", **(build_tool_trace_content(trace) or {})},
+        ),
+        make_visible_message(body="Continue", event_id="$source"),
+    ]
+    context = conversation_context_before_sources(
+        history,
+        source_event_ids=("$source",),
+        thread_id="$root",
+        config=Config(),
+        runtime_paths=test_runtime_paths(tmp_path),
+    )
+    assert context is not None
+    assert (
+        context[1].text == 'Running them.\n\n<tool name="shell" input="cmd=pytest" output="3 failed"/>\n\nThree fail.'
+    )
+
+
+def test_relayed_messages_keep_their_original_author_role(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A thread move copy of an agent reply stays an assistant turn; a relayed person or the internal user stays a user."""
+    agents = {"@mindroom_router:localhost", "@mindroom_research:localhost"}
+    monkeypatch.setattr(
+        "mindroom.judgment.conversation.current_internal_sender_ids",
+        lambda *_: frozenset({*agents, "@mindroom_user:localhost"}),
+    )
+    monkeypatch.setattr("mindroom.judgment.conversation.mindroom_user_id", lambda *_: "@mindroom_user:localhost")
+    history = [
+        make_visible_message(
+            sender="@mindroom_router:localhost",
+            body="Find the release notes",
+            event_id="$root",
+            content={"msgtype": "m.text", ORIGINAL_SENDER_KEY: "@alice:localhost"},
+        ),
+        make_visible_message(
+            sender="@mindroom_router:localhost",
+            body="I found the release notes.",
+            event_id="$copy",
+            content={"msgtype": "m.text", ORIGINAL_SENDER_KEY: "@mindroom_research:localhost"},
+        ),
+        make_visible_message(
+            sender="@mindroom_router:localhost",
+            body="Daily: check the open PRs",
+            event_id="$automation",
+            content={"msgtype": "m.text", ORIGINAL_SENDER_KEY: "@mindroom_user:localhost"},
+        ),
+        make_visible_message(body="Continue", event_id="$source"),
+    ]
+    assert conversation_context_before_sources(
+        history,
+        source_event_ids=("$source",),
+        thread_id="$root",
+        config=Config(),
+        runtime_paths=test_runtime_paths(tmp_path),
+    ) == (
+        JudgmentMessage("user", "Find the release notes"),
+        JudgmentMessage("assistant", "I found the release notes."),
+        JudgmentMessage("user", "Daily: check the open PRs"),
+    )
+
+
+def test_earlier_media_reaches_the_judge_as_a_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A thread holding files or images is still judged, each shown only by its file name and caption."""
+    history = [
+        make_visible_message(body="report.pdf", event_id="$root", content={"msgtype": "m.file"}),
+        make_visible_message(body="Summarize this report", event_id="$ask"),
+        make_visible_message(
+            sender="@mindroom_helper:localhost",
+            body="Here is the chart",
+            event_id="$chart",
+            content={"msgtype": "m.image", "filename": "chart.png"},
+        ),
+        make_visible_message(event_id="$clip", content={"msgtype": "m.video"}),
+        make_visible_message(event_id="$photo", content={"msgtype": "m.image", "filename": "photo.png"}),
+        make_visible_message(body="x", event_id="$odd", content={"msgtype": ["m.text"]}),
+        make_visible_message(body="Use these too", event_id="$more", content={ATTACHMENT_IDS_KEY: ["att_1"]}),
+        make_visible_message(body="Continue", event_id="$source"),
+    ]
+    monkeypatch.setattr(
+        "mindroom.judgment.conversation.current_internal_sender_ids",
+        lambda *_: frozenset({"@mindroom_helper:localhost"}),
+    )
+
+    def context() -> tuple[JudgmentMessage, ...] | None:
+        return conversation_context_before_sources(
+            history,
+            source_event_ids=("$source",),
+            thread_id="$root",
+            config=Config(),
+            runtime_paths=test_runtime_paths(tmp_path),
+        )
+
+    assert context() == (
+        JudgmentMessage("user", "[file: report.pdf]"),
+        JudgmentMessage("user", "Summarize this report"),
+        JudgmentMessage("assistant", "[image: chart.png]\nHere is the chart"),
+        JudgmentMessage("user", "[video]"),
+        JudgmentMessage("user", "[image: photo.png]"),
+        JudgmentMessage("user", "[media: x]"),
+        JudgmentMessage("user", "Use these too\n[with attachments]"),
+    )
+    # An empty text message or a long-text preview whose full text was never fetched is still unreadable history.
+    for unreadable in (
+        make_visible_message(event_id="$ask"),
+        make_visible_message(
+            body="Preview",
+            event_id="$ask",
+            content={
+                "msgtype": "m.file",
+                "url": "mxc://localhost/full-text",
+                "io.mindroom.long_text": {"version": 2, "encoding": "matrix_event_content_json"},
+            },
+        ),
+    ):
+        history[1] = unreadable
+        assert context() is None
+
+
+@pytest.mark.asyncio
+async def test_earlier_attachment_annotation_does_not_block_judgment() -> None:
+    """An earlier reply that repeats an attachment annotation is background, like a media placeholder."""
+    requests: list[JudgmentRequest] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        requests.append(request)
+        return True
+
+    annotation = '[attachments: att_1 (file, "report.pdf")]'
+    gate = MidTurnGate(
+        active_text="Continue",
+        evaluate=evaluate,
+        conversation_context=(JudgmentMessage("assistant", f"Saved the report {annotation}"),),
+    )
+    assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True)
+    assert len(requests) == 1
+    # The same annotation in a queued message still means an attachment the judge cannot open.
+    assert not await gate.defers((QueuedMessage("$newer", annotation),), current=lambda: True)
+
+
+def _skip_reasons(logs: list[dict]) -> list[str]:
+    return [log["reason"] for log in logs if log["event"] == "Mid-turn judgment skipped"]
+
+
+@pytest.mark.asyncio
+async def test_long_background_reaches_the_judge_as_its_start_and_end() -> None:
+    """A long earlier reply or reply snapshot no longer disables the judge; the request and queued text stay whole."""
+    requests: list[dict] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        assert request.body is not None
+        requests.append(json.loads(request.body))
+        return True
+
+    gate = MidTurnGate(
+        active_text="Triage the next batch",
+        evaluate=evaluate,
+        conversation_context=(
+            JudgmentMessage("user", "Triage the batch"),
+            JudgmentMessage("assistant", "Report start. " + "x" * 80_000 + " Report end."),
+        ),
+    )
+    state = _QueuedMessageState(mid_turn_gate=gate)
+    gate.record_visible_response("Progress start. " + "z" * 50_000 + " Progress end.", ())
+    queued = "Is this still running? " + "q" * 3_000
+    state.add_waiting_human_message("$queued", text=queued)
+    with capture_logs() as logs:
+        assert await gate.defers(state.pending_message_snapshot(), current=lambda: True)
+    assert _skip_reasons(logs) == []
+    conversation = requests[0]["state"]["conversation"]
+    evidence = conversation[-1]["text"]
+    assert conversation[0]["text"] == "Triage the batch"
+    assert evidence.startswith(
+        f"<active_request>\nTriage the next batch\n</active_request>\n<queued_message>\n{queued}\n",
+    )
+    visible = evidence.split("<visible_response>\n")[1].removesuffix("\n</visible_response>")
+    clipped = (conversation[1]["text"], visible)
+    for text, label in zip(clipped, ("Report", "Progress"), strict=True):
+        assert text.startswith(f"{label} start.")
+        assert text.endswith(f"{label} end.")
+        assert "characters omitted" in text
+        assert len(text) < 2_100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("count", "size"), [(100, 10), (30, 1_900)], ids=["many", "large"])
+async def test_judge_sees_the_newest_conversation_that_fits(count: int, size: int) -> None:
+    """Older messages give way to newer ones under the message cap and the request byte limit."""
+    context = tuple(JudgmentMessage("user", f"{i:03} " + "x" * size) for i in range(count))
+    requests: list[JudgmentRequest] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        requests.append(request)
+        return True
+
+    gate = MidTurnGate(active_text="Continue", evaluate=evaluate, conversation_context=context)
+    assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True)
+    assert requests[0].body is not None
+    assert len(requests[0].body) <= MAX_REQUEST_BYTES
+    sent = [message["text"] for message in json.loads(requests[0].body)["state"]["conversation"][:-1]]
+    assert sent == [message.text for message in context[-len(sent) :]]
+    assert len(sent) == 63 if count == 100 else 0 < len(sent) < count
+
+
+@pytest.mark.asyncio
+async def test_credential_across_a_clip_cut_keeps_wrap_up() -> None:
+    """Redaction scans past each clip cut, so the kept half of a split credential never reaches the judge."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        pytest.fail("Credentials must not reach the judgment backend")
+
+    # The kept end starts hundreds of characters into the token, where it no longer looks like a credential.
+    token = "Authorization: Bearer eyJ" + "".join(chr(ord("a") + i * 7 % 26) for i in range(900))
+    text = "x" * 20_000 + token + "x" * 600
+    gate = MidTurnGate(
+        active_text="Do the task",
+        evaluate=evaluate,
+        conversation_context=(JudgmentMessage("user", text),),
+    )
+    with capture_logs() as logs:
+        assert not await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True)
+    assert _skip_reasons(logs) == ["history_unjudgeable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reply", [False, True], ids=["history", "reply"])
+async def test_megabyte_texts_cost_only_what_the_judge_sees(*, reply: bool) -> None:
+    """Huge earlier messages and reply snapshots are scanned only around their clipped text, keeping the loop free."""
+    requests: list[JudgmentRequest] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        requests.append(request)
+        return True
+
+    body = "a=" * 1_000_000
+    gate = MidTurnGate(
+        active_text="Do the task",
+        evaluate=evaluate,
+        conversation_context=() if reply else tuple(JudgmentMessage("user", body) for _ in range(7)),
+    )
+    state = _QueuedMessageState(mid_turn_gate=gate)
+    gate.record_visible_response(body if reply else "", ())
+    state.add_waiting_human_message("$queued", text="Thanks")
+    with cpu_budget(0.25):
+        assert await gate.defers(state.pending_message_snapshot(), current=lambda: True)
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newest", [False, True], ids=["gave-way", "kept"])
+async def test_only_conversation_that_reaches_the_judge_is_checked_for_credentials(*, newest: bool) -> None:
+    """A credential in older conversation that gives way to newer messages no longer forces a wrap-up."""
+    requests: list[JudgmentRequest] = []
+
+    async def evaluate(request: JudgmentRequest) -> bool | None:
+        requests.append(request)
+        return True
+
+    credential = JudgmentMessage("user", '{"password": "fake_secret_for_test"}')
+    newer = tuple(JudgmentMessage("user", f"{i:03} " + "x" * 1_900) for i in range(30))
+    gate = MidTurnGate(
+        active_text="Continue",
+        evaluate=evaluate,
+        conversation_context=(*newer, credential) if newest else (credential, *newer),
+    )
+    assert await gate.defers((QueuedMessage("$new", "Thanks"),), current=lambda: True) is not newest
+    assert all(request.body is not None and b"fake_secret_for_test" not in request.body for request in requests)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [
+        ({"conversation_context": None}, "history_unavailable"),
+        ({"pending": tuple(QueuedMessage(f"${i}", "Thanks") for i in range(9))}, "queued_message_count"),
+        ({"pending": (QueuedMessage("$new", None),)}, "queued_message_unjudgeable"),
+        ({"pending": (QueuedMessage("$new", "x" * 16_001),)}, "queued_message_unjudgeable"),
+        ({"active_text": None}, "active_request_unjudgeable"),
+        ({"active_text": "x" * 16_001}, "active_request_unjudgeable"),
+        ({"pending": (QueuedMessage("$new", "Thanks", None),)}, "visible_response_unavailable"),
+        ({"pending": (QueuedMessage("$new", "x" * 15_000),)}, "essential_input_too_large"),
+        ({"evaluate_error": True}, "judge_error"),
+    ],
+    ids=["history", "count", "missing", "oversized", "media", "long-request", "progress", "request", "error"],
+)
+async def test_skipped_judgment_logs_its_reason(setup: dict, reason: str) -> None:
+    """Every wrap-up without a judge decision says why, once per queue snapshot."""
+
+    async def evaluate(_request: JudgmentRequest) -> bool | None:
+        if setup.get("evaluate_error"):
+            msg = "private input"
+            raise RuntimeError(msg)
+        pytest.fail("A skipped judgment must not reach inference")
+
+    gate = MidTurnGate(
+        active_text=setup.get("active_text", "Do the task"),
+        evaluate=evaluate,
+        conversation_context=setup.get("conversation_context", ()),
+    )
+    pending = setup.get("pending", (QueuedMessage("$new", "Thanks"),))
+    with capture_logs() as logs:
+        assert not await gate.defers(pending, current=lambda: True)
+        assert not await gate.defers(pending, current=lambda: True)
+    assert _skip_reasons(logs) == [reason]
+    assert "private input" not in str(logs)

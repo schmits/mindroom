@@ -89,7 +89,7 @@ describe("RoomList", () => {
     expect(mockSelectRoom).toHaveBeenCalledWith("lobby");
   });
 
-  it("highlights selected room", () => {
+  it("exposes the selected room state", () => {
     (useConfigStore as any).mockReturnValue({
       rooms: mockRooms,
       selectedRoomId: "lobby",
@@ -100,7 +100,7 @@ describe("RoomList", () => {
     render(<RoomList />);
 
     const lobbyCard = screen.getByText("Lobby").closest(".cursor-pointer");
-    expect(lobbyCard).toHaveClass("ring-2", "ring-orange-500");
+    expect(lobbyCard).toHaveAttribute("aria-pressed", "true");
   });
 
   it("shows create room form when Add button is clicked", () => {
@@ -131,7 +131,7 @@ describe("RoomList", () => {
     await waitFor(() => {
       expect(mockCreateRoom).toHaveBeenCalledWith({
         display_name: "Test Room",
-        description: "New room",
+        description: "",
         agents: [],
       });
     });
@@ -180,7 +180,7 @@ describe("RoomList", () => {
     await waitFor(() => {
       expect(mockCreateRoom).toHaveBeenCalledWith({
         display_name: "Enter Test Room",
-        description: "New room",
+        description: "",
         agents: [],
       });
     });

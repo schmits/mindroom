@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,9 +13,10 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="oxylabs",
+    file_access=ToolFileAccess.NONE,
     display_name="Oxylabs",
     description="Powerful web scraping capabilities including SERP, Amazon product data, and universal web scraping",
-    category=ToolCategory.RESEARCH,  # web_scrape maps to RESEARCH
+    category=ToolCategory.RESEARCH,
     status=ToolStatus.REQUIRES_CONFIG,  # requires username and password
     setup_type=SetupType.API_KEY,  # uses username/password credentials
     icon="FaGlobe",
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
         # Authentication credentials
         ConfigField(
             name="username",
+            env=("OXYLABS_USERNAME",),
             label="Username",
             type="text",
             required=False,
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="password",
+            env=("OXYLABS_PASSWORD",),
             label="Password",
             type="password",
             required=False,
@@ -48,7 +51,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["oxylabs"],
-    docs_url="https://docs.agno.com/tools/toolkits/web_scrape/oxylabs",
+    docs_url="https://docs.mindroom.chat/tools/web-scraping-and-browser/#oxylabs",
     function_names=("get_amazon_product", "scrape_website", "search_amazon_products", "search_google"),
 )
 def oxylabs_tools() -> type[OxylabsTools]:

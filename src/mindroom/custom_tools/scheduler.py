@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
-from agno.tools import Toolkit
-
-from mindroom.scheduling import cancel_scheduled_task, edit_scheduled_task, list_scheduled_tasks, schedule_task
+from mindroom.scheduling.errors import SchedulingError
+from mindroom.scheduling.scheduled_tool_calls import prepare_scheduled_call, run_scheduled_call
+from mindroom.scheduling.tasks import (
+    cancel_scheduled_task,
+    edit_scheduled_task,
+    list_scheduled_tasks,
+    schedule_approved_tool_call,
+    schedule_task,
+)
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import (
+    ToolRuntimeContext,
     build_scheduling_runtime_from_tool_runtime_context,
     get_tool_runtime_context,
 )
 
-_TOOL_ERROR_PREFIX = "❌"
-_LIST_SCHEDULES_ERROR = "Unable to retrieve scheduled tasks."
 
+def _scheduling_context(*, needs_room: bool = True) -> ToolRuntimeContext:
+    """Return this call's runtime context, or fail the call where scheduling cannot run.
 
-def _raise_for_scheduler_error(response_text: str) -> None:
-    if response_text.startswith(_TOOL_ERROR_PREFIX) or response_text == _LIST_SCHEDULES_ERROR:
-        raise RuntimeError(response_text)
+    A scheduling operation fails the call by raising ``SchedulingError``, whose text is what the model reads.
+    """
+    context = get_tool_runtime_context()
+    if context is None or (needs_room and context.room is None):
+        msg = "Scheduler tool is unavailable in this context."
+        raise SchedulingError(msg)
+    return context
 
 
 class SchedulerTools(Toolkit):
@@ -25,7 +37,14 @@ class SchedulerTools(Toolkit):
     def __init__(self) -> None:
         super().__init__(
             name="scheduler",
-            tools=[self.schedule, self.edit_schedule, self.list_schedules, self.cancel_schedule],
+            tools=[
+                self.schedule,
+                self.schedule_tool_call,
+                self.run_scheduled_call,
+                self.edit_schedule,
+                self.list_schedules,
+                self.cancel_schedule,
+            ],
         )
 
     async def schedule(
@@ -34,6 +53,7 @@ class SchedulerTools(Toolkit):
         new_thread: bool,
         history_limit: int | None = None,
         silent: bool | None = None,
+        model: str | None = None,
     ) -> str:
         """Schedule a task using natural language.
 
@@ -54,18 +74,17 @@ class SchedulerTools(Toolkit):
                 whitespace-only, or exactly `NO_REPLY`. Findings, failures, and
                 independently sent tool messages remain visible. Leave unset to infer
                 the mode from the scheduling request.
+            model: Configured model alias for each scheduled run (including team
+                members), e.g. "cheap". Leave unset to use normal agent, room, and
+                thread model selection. This does not change the conversation model.
 
         Returns:
             The scheduling result message.
 
         """
-        context = get_tool_runtime_context()
-        if context is None or context.room is None:
-            return "❌ Scheduler tool is unavailable in this context."
-
-        runtime = build_scheduling_runtime_from_tool_runtime_context(context)
-        task_id, response_text = await schedule_task(
-            runtime=runtime,
+        context = _scheduling_context()
+        return await schedule_task(
+            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
             room_id=context.room_id,
             thread_id=context.resolved_thread_id,
             scheduled_by=context.requester_id,
@@ -73,10 +92,74 @@ class SchedulerTools(Toolkit):
             new_thread=new_thread,
             history_limit=history_limit,
             silent=silent,
+            model=model,
         )
-        if task_id is None:
-            raise RuntimeError(response_text)
-        return response_text
+
+    async def schedule_tool_call(
+        self,
+        tool_name: str,
+        arguments_json: str,
+        execute_at: str,
+        description: str,
+    ) -> str:
+        """Schedule one of your approval-gated tool calls that the requester approves now.
+
+        Use this when a gated action, such as sending an external message, must run at
+        a set time while the requester may be away. MindRoom stores the call and posts an
+        approval card in this thread showing it and the send time. When the task fires,
+        you are asked to call `run_scheduled_call` with its task ID, which runs the stored
+        call once without another approval. Tell the requester to approve the card; do
+        not claim the call ran until `run_scheduled_call` reports its result.
+
+        Args:
+            tool_name: One of your tool functions, e.g. "post_slack_message".
+            arguments_json: The call's arguments as a JSON object string.
+            execute_at: When to run, as ISO 8601 with a UTC offset,
+                e.g. "2026-10-04T09:00:00-04:00".
+            description: Short description of the scheduled action; if the requester
+                approves any arguments, it tells you what the call should do when it runs.
+
+        Returns:
+            The scheduling result message.
+
+        """
+        context = _scheduling_context()
+        live, arguments = prepare_scheduled_call(tool_name, arguments_json)
+        return await schedule_approved_tool_call(
+            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
+            room_id=context.room_id,
+            thread_id=context.resolved_thread_id,
+            scheduled_by=context.requester_id,
+            agent_name=context.agent_name,
+            call=live,
+            tool_name=tool_name,
+            arguments=arguments,
+            execute_at=execute_at,
+            description=description,
+        )
+
+    async def run_scheduled_call(
+        self,
+        task_id: str,
+        arguments_json: str | None = None,
+    ) -> object:
+        """Run the call a scheduled task stored, once, with the requester's approval.
+
+        Call this when a scheduled task asks you to. It runs the stored call without
+        another approval card and returns the tool's result. If the requester approved
+        any arguments, you may pass arguments_json to replace the stored arguments for
+        the same tool; otherwise omit it.
+
+        Args:
+            task_id: The scheduled task's ID from its message.
+            arguments_json: Optional replacement arguments as a JSON object string,
+                only when the requester approved any arguments.
+
+        Returns:
+            The tool's result, or why the call did not run.
+
+        """
+        return await run_scheduled_call(_scheduling_context(needs_room=False), task_id, arguments_json)
 
     async def edit_schedule(
         self,
@@ -84,6 +167,7 @@ class SchedulerTools(Toolkit):
         request: str,
         history_limit: int | None = None,
         silent: bool | None = None,
+        model: str | None = None,
     ) -> str:
         """Edit an existing scheduled task by replacing its timing and content.
 
@@ -97,28 +181,25 @@ class SchedulerTools(Toolkit):
                 and omit empty, whitespace-only, or exact `NO_REPLY` finals while
                 keeping findings, failures, and independently sent tool messages
                 visible. Leave unset to preserve the existing mode.
+            model: Configured model alias for each run, including team members.
+                Leave unset to preserve the existing choice. Use an empty string
+                to restore normal agent, room, and thread model selection.
 
         Returns:
             The edit result message.
 
         """
-        context = get_tool_runtime_context()
-        if context is None or context.room is None:
-            return "❌ Scheduler tool is unavailable in this context."
-
-        runtime = build_scheduling_runtime_from_tool_runtime_context(context)
-        response_text = await edit_scheduled_task(
-            runtime=runtime,
+        context = _scheduling_context()
+        return await edit_scheduled_task(
+            runtime=build_scheduling_runtime_from_tool_runtime_context(context),
             room_id=context.room_id,
             task_id=task_id,
             full_text=request,
             scheduled_by=context.requester_id,
-            thread_id=context.resolved_thread_id,
             history_limit=history_limit,
             silent=silent,
+            model=model,
         )
-        _raise_for_scheduler_error(response_text)
-        return response_text
 
     async def list_schedules(self) -> str:
         """List all pending scheduled tasks in the current room/thread.
@@ -127,18 +208,14 @@ class SchedulerTools(Toolkit):
             A formatted list of scheduled tasks with their IDs.
 
         """
-        context = get_tool_runtime_context()
-        if context is None:
-            return "❌ Scheduler tool is unavailable in this context."
-
-        response_text = await list_scheduled_tasks(
+        context = _scheduling_context(needs_room=False)
+        return await list_scheduled_tasks(
             client=context.client,
             room_id=context.room_id,
+            runtime_paths=context.runtime_paths,
             thread_id=context.resolved_thread_id,
             config=context.config,
         )
-        _raise_for_scheduler_error(response_text)
-        return response_text
 
     async def cancel_schedule(self, task_id: str) -> str:
         """Cancel a scheduled task.
@@ -150,15 +227,11 @@ class SchedulerTools(Toolkit):
             The cancellation result message.
 
         """
-        context = get_tool_runtime_context()
-        if context is None:
-            return "❌ Scheduler tool is unavailable in this context."
-
-        response_text = await cancel_scheduled_task(
+        context = _scheduling_context(needs_room=False)
+        return await cancel_scheduled_task(
             client=context.client,
             room_id=context.room_id,
             task_id=task_id,
-            matrix_admin=context.matrix_admin,
+            runtime_paths=context.runtime_paths,
+            task_runtime=context.orchestrator.scheduled_tasks if context.orchestrator is not None else None,
         )
-        _raise_for_scheduler_error(response_text)
-        return response_text

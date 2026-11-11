@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+import ssl
 import time
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -14,18 +15,17 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from mindroom import constants
+from mindroom.background_tasks import retry_delay_seconds
 from mindroom.cancellation import (
     SYNC_RESTART_CANCEL_MSG,
     USER_STOP_CANCEL_MSG,
     CancelSource,
-    cancel_failure_reason,
-    cancel_source_from_failure_reason,
     classify_cancel_source,
     current_task_is_process_shutdown,
     request_task_cancel,
 )
-from mindroom.constants import RuntimePaths, runtime_matrix_ssl_verify
 from mindroom.logging_config import get_logger
+from mindroom.matrix.client_session import maybe_ssl_context
 from mindroom.matrix.health import (
     MATRIX_INGESTION_GRACE_SECONDS,
     MATRIX_SYNC_STARTUP_GRACE_SECONDS,
@@ -42,8 +42,6 @@ from mindroom.runtime_shutdown import (
     RestartReasonCategory,
     RuntimeLifecycleAction,
     RuntimeShutdownIntent,
-    gather_shutdown_phase,
-    shutdown_intent_for_entity,
 )
 from mindroom.runtime_state import set_runtime_starting
 from mindroom.startup_errors import PermanentStartupError
@@ -54,7 +52,8 @@ if TYPE_CHECKING:
 
     import structlog
 
-    from mindroom.bot import AgentBot, TeamBot
+    from mindroom.bot import AgentBot
+    from mindroom.constants import RuntimePaths
 
 logger = get_logger(__name__)
 
@@ -86,11 +85,7 @@ __all__ = [
     "SYNC_RESTART_CANCEL_MSG",
     "USER_STOP_CANCEL_MSG",
     "CancelSource",
-    "EntityStartResults",
-    "cancel_failure_reason",
     "cancel_logged_task",
-    "cancel_source_from_failure_reason",
-    "cancel_sync_task",
     "cancel_task",
     "classify_cancel_source",
     "create_logged_task",
@@ -104,9 +99,8 @@ __all__ = [
     "matrix_ingestion_grace_seconds",
     "matrix_sync_startup_timeout_seconds",
     "request_task_cancel",
-    "retry_delay_seconds",
+    "run_shutdown_step",
     "run_with_retry",
-    "stop_entities",
     "sync_forever_with_restart",
     "wait_for_matrix_homeserver",
 ]
@@ -208,17 +202,6 @@ def _matrix_homeserver_startup_timeout_seconds_from_env(
     return timeout_seconds
 
 
-def retry_delay_seconds(
-    attempt: int,
-    *,
-    initial_delay_seconds: float,
-    max_delay_seconds: float,
-) -> float:
-    """Return capped exponential backoff delay for a retry attempt."""
-    exponent = max(0, attempt - 1)
-    return min(max_delay_seconds, initial_delay_seconds * (2**exponent))
-
-
 def is_permanent_startup_error(exc: Exception) -> bool:
     """Return whether a startup exception is clearly non-retryable."""
     return isinstance(exc, PermanentStartupError)
@@ -255,23 +238,23 @@ class _MatrixSyncStalledError(RuntimeError):
     """Raised when the watchdog detects a stalled Matrix sync loop."""
 
 
-def _matrix_sync_receive_loop_active(bot: AgentBot | TeamBot) -> bool:
+def _matrix_sync_receive_loop_active(bot: AgentBot) -> bool:
     """Return whether the supervisor still owns an active receive loop."""
-    return bot.running and not bot._matrix_ingestion_quiesce_requested
+    return bot.running and not bot.ingestion_quiesced
 
 
 @dataclass(slots=True)
 class _SyncIteration:
     """Own the lifecycle of one sync task and its watchdog."""
 
-    bot: AgentBot | TeamBot
+    bot: AgentBot
     sync_task: asyncio.Task[Any] | None
     watchdog_task: asyncio.Task[Any] | None
     watchdog_cancelled_sync: asyncio.Event = field(default_factory=asyncio.Event)
 
     @staticmethod
     async def _watch(
-        bot: AgentBot | TeamBot,
+        bot: AgentBot,
         sync_task: asyncio.Task[Any],
         watchdog_cancelled_sync: asyncio.Event,
     ) -> None:
@@ -362,11 +345,11 @@ class _SyncIteration:
             msg = f"Matrix sync loop stalled for {bot.agent_name}"
             raise _MatrixSyncStalledError(msg)
 
-        if bot._matrix_ingestion_quiesce_requested:
+        if bot.ingestion_quiesced:
             await sync_task
 
     @classmethod
-    def start(cls, bot: AgentBot | TeamBot) -> _SyncIteration:
+    def start(cls, bot: AgentBot) -> _SyncIteration:
         """Create the sync task and its watchdog for one loop iteration."""
         bot.mark_sync_loop_started()
         # Reset the monotonic watchdog clock so a fresh iteration gets the full
@@ -442,7 +425,7 @@ class _SyncIterationOutcome:
     shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN
 
 
-async def _run_sync_iteration(bot: AgentBot | TeamBot, *, attempt: int) -> _SyncIterationOutcome:
+async def _run_sync_iteration(bot: AgentBot, *, attempt: int) -> _SyncIterationOutcome:
     """Run one receive-loop iteration and settle only the tasks that iteration owns.
 
     Live responses outlive a transport restart: the response runtime is torn down
@@ -564,6 +547,19 @@ async def run_with_retry(
             return
 
 
+def _certificate_verification_failure(error: BaseException) -> ssl.SSLCertVerificationError | None:
+    """Return the certificate verification error behind an httpx transport error, if any."""
+    seen: list[BaseException] = []
+    cause: BaseException | None = error
+    while cause is not None and cause not in seen:
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            return cause
+        seen.append(cause)
+        # Follow __context__ even when suppressed: httpcore re-raises connect errors with a cosmetic `from None`.
+        cause = cause.__cause__ or cause.__context__
+    return None
+
+
 async def wait_for_matrix_homeserver(
     *,
     runtime_paths: RuntimePaths,
@@ -574,7 +570,8 @@ async def wait_for_matrix_homeserver(
     """Wait for the configured Matrix homeserver to answer `/versions`."""
     if timeout_seconds is None:
         timeout_seconds = _matrix_homeserver_startup_timeout_seconds_from_env(runtime_paths)
-    versions_url = matrix_versions_url(constants.runtime_matrix_homeserver(runtime_paths=runtime_paths))
+    homeserver = constants.runtime_matrix_homeserver(runtime_paths=runtime_paths)
+    versions_url = matrix_versions_url(homeserver)
     set_runtime_starting(f"Waiting for Matrix homeserver at {versions_url}")
     loop = asyncio.get_running_loop()
     deadline = None if timeout_seconds is None else loop.time() + timeout_seconds
@@ -585,20 +582,31 @@ async def wait_for_matrix_homeserver(
         timeout_seconds=timeout_seconds,
     )
 
+    # Probe with the TLS trust Matrix logins use, so the probe cannot reject a server logins would accept.
     async with httpx.AsyncClient(
         timeout=request_timeout_seconds,
-        verify=runtime_matrix_ssl_verify(runtime_paths=runtime_paths),
+        verify=maybe_ssl_context(homeserver, runtime_paths) or True,
     ) as client:
         while deadline is None or loop.time() < deadline:
             attempt += 1
             try:
                 response = await client.get(versions_url)
             except httpx.TransportError as exc:
+                # An untrusted certificate is a setup problem that waiting cannot fix.
+                verification_error = _certificate_verification_failure(exc)
+                if verification_error is not None:
+                    msg = (
+                        f"Could not verify the TLS certificate of Matrix homeserver {homeserver}: {verification_error}. "
+                        "Make sure the system CA store trusts the homeserver's certificate, or set SSL_CERT_FILE "
+                        "to a CA bundle that does. Set MATRIX_SSL_VERIFY=false only for local testing."
+                    )
+                    raise PermanentStartupError(msg) from exc
                 if attempt == 1 or attempt % 5 == 0:
                     logger.info(
                         "Matrix homeserver not ready yet",
                         url=versions_url,
                         attempt=attempt,
+                        error_type=type(exc).__name__,
                         error=str(exc),
                     )
                 await asyncio.sleep(retry_interval_seconds)
@@ -622,97 +630,19 @@ async def wait_for_matrix_homeserver(
     raise TimeoutError(msg)
 
 
-@dataclass(slots=True)
-class EntityStartResults:
-    """Result of one pass trying to start a batch of entities."""
-
-    started_bots: list[AgentBot | TeamBot] = field(default_factory=list)
-    retryable_entities: list[str] = field(default_factory=list)
-    permanently_failed_entities: list[str] = field(default_factory=list)
-
-
-async def cancel_sync_task(
-    entity_name: str,
-    sync_tasks: dict[str, asyncio.Task],
-    *,
-    shutdown_intent: RuntimeShutdownIntent = GENERIC_SHUTDOWN,
-) -> None:
-    """Cancel and remove a sync task for an entity."""
-    task = sync_tasks.pop(entity_name, None)
-    await cancel_task(task, shutdown_intent=shutdown_intent)
+async def run_shutdown_step[Result](shutdown_phase: str, operation: Awaitable[Result]) -> Result:
+    """Expose one non-sensitive shutdown boundary without changing its result."""
+    logger.info("orchestrator_shutdown_phase_started", shutdown_phase=shutdown_phase)
+    try:
+        result = await operation
+    except BaseException:
+        logger.info("orchestrator_shutdown_phase_failed", shutdown_phase=shutdown_phase)
+        raise
+    logger.info("orchestrator_shutdown_phase_completed", shutdown_phase=shutdown_phase)
+    return result
 
 
-async def stop_entities(
-    entities_to_stop: set[str],
-    agent_bots: dict[str, AgentBot | TeamBot],
-    sync_tasks: dict[str, asyncio.Task],
-    *,
-    restart_entities: set[str] | None = None,
-) -> None:
-    """Stop a set of entities and remove them from runtime maps."""
-    restart_entities = set() if restart_entities is None else restart_entities
-    shutdown_intents = {
-        entity_name: shutdown_intent_for_entity(entity_name, restart_entities=restart_entities)
-        for entity_name in entities_to_stop
-    }
-    entity_names = sorted(entities_to_stop)
-    bots_to_stop = [agent_bots[entity_name] for entity_name in entity_names if entity_name in agent_bots]
-    phase_cancellations: list[asyncio.CancelledError] = []
-    quiesce_results, cancellation = await gather_shutdown_phase(
-        *(bot._quiesce_matrix_ingestion() for bot in bots_to_stop),
-    )
-    if cancellation is not None:
-        phase_cancellations.append(cancellation)
-    quiesce_failures = [result for result in quiesce_results if isinstance(result, BaseException)]
-    # Stop sync loops before certifying callback drains; otherwise fresh callbacks can
-    # appear after the checkpoint decision.
-    cancel_results, cancellation = await gather_shutdown_phase(
-        *(
-            cancel_sync_task(
-                entity_name,
-                sync_tasks,
-                shutdown_intent=shutdown_intents[entity_name],
-            )
-            for entity_name in entity_names
-        ),
-    )
-    if cancellation is not None:
-        phase_cancellations.append(cancellation)
-    prepare_results, cancellation = await gather_shutdown_phase(
-        *(
-            agent_bots[entity_name].prepare_for_sync_shutdown(
-                shutdown_intent=shutdown_intents[entity_name],
-            )
-            for entity_name in entity_names
-            if entity_name in agent_bots
-        ),
-    )
-    if cancellation is not None:
-        phase_cancellations.append(cancellation)
-    stop_results, cancellation = await gather_shutdown_phase(
-        *(
-            agent_bots[entity_name].stop(shutdown_intent=shutdown_intents[entity_name])
-            for entity_name in entity_names
-            if entity_name in agent_bots
-        ),
-    )
-    if cancellation is not None:
-        phase_cancellations.append(cancellation)
-    cleanup_failures = [
-        result
-        for results in (cancel_results, prepare_results, stop_results)
-        for result in results
-        if isinstance(result, BaseException)
-    ]
-    failures = [*quiesce_failures, *phase_cancellations, *cleanup_failures]
-    if failures:
-        raise failures[0]
-
-    for entity_name in entity_names:
-        agent_bots.pop(entity_name, None)
-
-
-async def sync_forever_with_restart(bot: AgentBot | TeamBot, max_retries: int = -1) -> None:
+async def sync_forever_with_restart(bot: AgentBot, max_retries: int = -1) -> None:
     """Run sync_forever with automatic restart on failure."""
     retry_count = 0
     while _matrix_sync_receive_loop_active(bot) and (max_retries < 0 or retry_count < max_retries):

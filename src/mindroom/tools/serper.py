@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="serper",
+    file_access=ToolFileAccess.NONE,
     display_name="Serper",
     description="Search Google, news, academic papers, and scrape webpages using Serper API",
     category=ToolCategory.RESEARCH,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("SERPER_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -100,7 +102,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["requests"],
-    docs_url="https://docs.agno.com/tools/toolkits/search/serper",
+    docs_url="https://docs.mindroom.chat/tools/web-search/#serper",
     function_names=("scrape_webpage", "search_news", "search_scholar", "search_web"),
 )
 def serper_tools() -> type[SerperTools]:

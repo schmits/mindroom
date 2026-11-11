@@ -6,22 +6,31 @@ import json
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import nio
-from agno.tools import Toolkit
 
+from mindroom.constants import ACTING_REQUESTER_KEY
 from mindroom.custom_tools.attachment_helpers import room_access_allowed
 from mindroom.custom_tools.matrix_helpers import check_rate_limit
-from mindroom.custom_tools.tool_payloads import custom_tool_payload
+from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_context_or_error
 from mindroom.logging_config import get_logger
-from mindroom.matrix.client import send_room_event_result
+from mindroom.matrix.client_delivery import send_room_event_result
+from mindroom.matrix.client_room_admin import room_admin_power_user
+from mindroom.matrix.reserved_content import MINDROOM_RESERVED_PREFIXES, reserved_content_keys
 from mindroom.matrix.thread_mutation_impact import (
-    MutationThreadImpactState,
-    resolve_event_thread_impact_for_client,
-    resolve_redaction_thread_impact_for_client,
+    event_thread_membership_known,
+    redaction_thread_membership_known,
 )
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
+from mindroom.requester_identity import (
+    equivalent_requester_ids,
+    is_access_checked_requester_id,
+    is_human_requester_id,
+)
+from mindroom.tool_system.authoring import Toolkit
+
+if TYPE_CHECKING:
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 logger = get_logger(__name__)
 
@@ -97,15 +106,9 @@ class MatrixApiTools(Toolkit):
     _recent_write_units: ClassVar[dict[tuple[str, str, str], deque[float]]] = defaultdict(deque)
     _RATE_LIMIT_WINDOW_SECONDS: ClassVar[float] = 60.0
     _RATE_LIMIT_MAX_UNITS: ClassVar[int] = 8
-    _VALID_ACTIONS: ClassVar[tuple[str, ...]] = (
-        "send_event",
-        "get_state",
-        "put_state",
-        "redact",
-        "get_event",
-        "search",
+    _VALID_ACTIONS: ClassVar[frozenset[str]] = frozenset(
+        {"send_event", "get_state", "put_state", "redact", "get_event", "search"},
     )
-    _VALID_ACTIONS_SET: ClassVar[frozenset[str]] = frozenset(_VALID_ACTIONS)
     _WRITE_ACTION_WEIGHTS: ClassVar[dict[str, int]] = {
         "send_event": 1,
         "put_state": 2,
@@ -146,13 +149,6 @@ class MatrixApiTools(Toolkit):
         return custom_tool_payload("matrix_api", status, **kwargs)
 
     @classmethod
-    def _context_error(cls) -> str:
-        return cls._payload(
-            "error",
-            message="Matrix API tool context is unavailable in this runtime path.",
-        )
-
-    @classmethod
     def _error_payload(
         cls,
         *,
@@ -180,11 +176,8 @@ class MatrixApiTools(Toolkit):
     ) -> tuple[str | None, str | None]:
         if response is None:
             return None, None
-        if isinstance(
-            response,
-            nio.ErrorResponse,
-        ):
-            return cls._normalize_matrix_error(response)
+        if isinstance(response, nio.ErrorResponse):
+            return str(response), response.status_code
         if isinstance(response, Exception):
             detail = str(response)
             return (
@@ -194,80 +187,88 @@ class MatrixApiTools(Toolkit):
         return str(response), None
 
     @staticmethod
-    def _normalize_matrix_error(
-        response: nio.ErrorResponse,
-    ) -> tuple[str, str | None]:
-        return str(response), response.status_code
-
-    @classmethod
-    def _supported_actions_message(cls) -> str:
-        return "Unsupported action. Use send_event, get_state, put_state, redact, get_event, or search."
-
-    @staticmethod
-    def _normalize_action(action: str) -> str:
-        return action.strip().lower() if isinstance(action, str) else ""
-
-    @staticmethod
     def _resolve_room_id(
         context: ToolRuntimeContext,
-        room_id: object | None,
-    ) -> tuple[str | None, str | None]:
+        room_id: str | None,
+    ) -> tuple[str, str | None]:
         if room_id is None:
             return context.room_id, None
-        if not isinstance(room_id, str):
-            return None, "room_id must be omitted or a non-empty Matrix room ID string."
-
         normalized_room_id = room_id.strip()
         if not normalized_room_id:
-            return None, "room_id must be omitted or a non-empty Matrix room ID string."
-        if not normalized_room_id.startswith("!") or ":" not in normalized_room_id:
-            return None, "room_id must be a Matrix room ID in !room:server form."
+            return normalized_room_id, "room_id must be omitted or a non-empty Matrix room ID string."
+        if not normalized_room_id.startswith("!"):  # room version 12 IDs carry no ":server" part
+            return normalized_room_id, "room_id must be a Matrix room ID starting with !, not an alias."
         return normalized_room_id, None
 
     @staticmethod
-    def _validate_bool(
-        value: object,
-        *,
-        field_name: str,
-    ) -> tuple[bool | None, str | None]:
-        if isinstance(value, bool):
-            return value, None
-        return None, f"{field_name} must be a boolean."
-
-    @staticmethod
     def _validate_non_empty_string(
-        value: object,
+        value: str | None,
         *,
         field_name: str,
     ) -> tuple[str | None, str | None]:
-        if not isinstance(value, str):
-            return None, f"{field_name} is required and must be a non-empty string."
-        normalized_value = value.strip()
+        normalized_value = (value or "").strip()
         if not normalized_value:
             return None, f"{field_name} is required and must be a non-empty string."
         return normalized_value, None
 
     @staticmethod
-    def _resolve_state_key(
-        state_key: str | None,
-    ) -> tuple[str, str | None]:
-        if state_key is None:
-            return "", None
-        if not isinstance(state_key, str):
-            return "", "state_key must be a string."
-        return state_key, None
-
-    @staticmethod
     def _validate_content(
         content: dict[str, object] | None,
+        plugin_namespaces: tuple[str, ...],
     ) -> tuple[dict[str, object] | None, str | None]:
-        if not isinstance(content, dict):
+        if content is None:
             return None, "content must be a JSON object (dict)."
         try:
             json.dumps(content, sort_keys=True)
         except (TypeError, ValueError) as exc:
             return None, f"content must be JSON-serializable: {exc}"
+        reserved_keys = reserved_content_keys(content, MINDROOM_RESERVED_PREFIXES)
+        if reserved_keys:
+            return None, (
+                f"content must not set MindRoom-reserved keys ({', '.join(reserved_keys)}); "
+                "they carry runtime trust metadata such as the relayed requester identity."
+            )
+        plugin_keys = reserved_content_keys(content, plugin_namespaces)
+        if plugin_keys:
+            return None, (
+                f"content must not set plugin-reserved keys ({', '.join(plugin_keys)}); "
+                "a plugin reserves their namespace for content only it writes."
+            )
         return content, None
+
+    @classmethod
+    def _reserved_event_type_error(
+        cls,
+        *,
+        action: str,
+        room_id: str,
+        event_type: str,
+        plugin_namespaces: tuple[str, ...],
+        state_key: str | None = None,
+    ) -> str | None:
+        """Reject writes to event types MindRoom's own runtime or a plugin owns and reads back.
+
+        A runtime-owned event is an instruction, not a message: a scheduled
+        task's state event names the requester its fire will later speak for.
+        Rejecting reserved content keys is not enough, because such a payload
+        can carry the identity inside a field of its own -- so the model must
+        not be able to author one of these events from the agent's Matrix
+        account at all. A plugin's reserved namespaces hold its events alike.
+        """
+        if event_type.startswith(MINDROOM_RESERVED_PREFIXES):
+            reservation = "is reserved for MindRoom runtime state"
+        elif event_type.startswith(plugin_namespaces):
+            reservation = "is reserved by a plugin"
+        else:
+            return None
+        state_key_payload = {} if state_key is None else {"state_key": state_key}
+        return cls._error_payload(
+            action=action,
+            room_id=room_id,
+            event_type=event_type,
+            message=f"Event type '{event_type}' {reservation} and cannot be written by a tool.",
+            **state_key_payload,
+        )
 
     @classmethod
     def _content_summary(
@@ -294,34 +295,20 @@ class MatrixApiTools(Toolkit):
             normalized_value[key] = item
         return normalized_value
 
-    @staticmethod
-    def _validate_string_list(
-        value: object,
-        *,
-        field_name: str,
-    ) -> list[str]:
-        error_message = f"{field_name} must be a list of non-empty strings."
-        if not isinstance(value, list):
-            raise ValueError(error_message)  # noqa: TRY004
-
-        normalized_items: list[str] = []
-        for item in value:
-            if not isinstance(item, str) or not item.strip():
-                raise ValueError(error_message)
-            normalized_items.append(item.strip())
-        return normalized_items
-
     @classmethod
-    def _validate_search_order_by(cls, order_by: object) -> str:
+    def _validate_search_order_by(cls, order_by: str) -> str:
         error_message = "order_by must be one of: rank, recent."
-        normalized_order_by = order_by.strip().lower() if isinstance(order_by, str) else ""
+        normalized_order_by = order_by.strip().lower()
         if normalized_order_by not in cls._SEARCH_ALLOWED_ORDER_BY:
             raise ValueError(error_message)
         return normalized_order_by
 
     @classmethod
-    def _validate_search_keys(cls, keys: object) -> list[str]:
-        normalized_keys = cls._validate_string_list(keys, field_name="keys")
+    def _validate_search_keys(cls, keys: list[str]) -> list[str]:
+        normalized_keys = [key.strip() for key in keys]
+        if not all(normalized_keys):
+            error_message = "keys must be a list of non-empty strings."
+            raise ValueError(error_message)
         invalid_keys = [key for key in normalized_keys if key not in cls._SEARCH_ALLOWED_KEYS]
         if invalid_keys:
             allowed_keys = ", ".join(cls._SEARCH_ALLOWED_KEYS)
@@ -330,38 +317,11 @@ class MatrixApiTools(Toolkit):
         return normalized_keys
 
     @classmethod
-    def _validate_search_limit(cls, limit: object) -> int:
+    def _validate_search_limit(cls, limit: int) -> int:
         error_message = f"limit must be an integer between 1 and {cls._SEARCH_LIMIT_CAP}."
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 0 < limit <= cls._SEARCH_LIMIT_CAP:
+        if not 0 < limit <= cls._SEARCH_LIMIT_CAP:
             raise ValueError(error_message)
         return limit
-
-    @staticmethod
-    def _validate_optional_dict(
-        value: object,
-        *,
-        field_name: str,
-    ) -> dict[str, object] | None:
-        if value is None:
-            return None
-        normalized_value = MatrixApiTools._copy_string_keyed_dict(value)
-        if normalized_value is None:
-            error_message = f"{field_name} must be a JSON object (dict) when provided."
-            raise ValueError(error_message)
-        return normalized_value
-
-    @staticmethod
-    def _validate_optional_string(
-        value: object,
-        *,
-        field_name: str,
-    ) -> str | None:
-        if value is None:
-            return None
-        if not isinstance(value, str) or not value.strip():
-            error_message = f"{field_name} must be omitted or a non-empty string."
-            raise ValueError(error_message)
-        return value.strip()
 
     @classmethod
     def _truncate_snippet(cls, text: object) -> str:
@@ -472,12 +432,12 @@ class MatrixApiTools(Toolkit):
         cls,
         *,
         room_id: str,
-        search_term: object,
-        keys: object,
-        order_by: object,
-        limit: object,
-        search_filter: object,
-        event_context: object,
+        search_term: str | None,
+        keys: list[str] | None,
+        order_by: str,
+        limit: int,
+        search_filter: dict[str, object] | None,
+        event_context: dict[str, object] | None,
     ) -> dict[str, object]:
         normalized_search_term, search_term_error = cls._validate_non_empty_string(
             search_term,
@@ -488,26 +448,26 @@ class MatrixApiTools(Toolkit):
 
         resolved_order_by = cls._validate_search_order_by(order_by)
         resolved_limit = cls._validate_search_limit(limit)
-        resolved_filter = cls._validate_optional_dict(search_filter, field_name="filter")
-        resolved_event_context = cls._validate_optional_dict(event_context, field_name="event_context")
 
         room_events: dict[str, object] = {
             "search_term": normalized_search_term,
-            "filter": cls._build_search_filter(room_id=room_id, raw_filter=resolved_filter, limit=resolved_limit),
+            "filter": cls._build_search_filter(room_id=room_id, raw_filter=search_filter, limit=resolved_limit),
             "order_by": resolved_order_by,
         }
         if keys is not None:
             room_events["keys"] = cls._validate_search_keys(keys)
-        if resolved_event_context is not None:
-            room_events["event_context"] = resolved_event_context
+        if event_context is not None:
+            room_events["event_context"] = event_context
         return {"search_categories": {"room_events": room_events}}
 
-    @classmethod
-    def _build_search_path(cls, next_batch: object) -> str:
-        resolved_next_batch = cls._validate_optional_string(next_batch, field_name="next_batch")
-        if resolved_next_batch is None:
+    @staticmethod
+    def _build_search_path(next_batch: str | None) -> str:
+        if next_batch is None:
             return nio.Api._build_path(["search"])
-        return nio.Api._build_path(["search"], {"next_batch": resolved_next_batch})
+        if not next_batch.strip():
+            error_message = "next_batch must be omitted or a non-empty string."
+            raise ValueError(error_message)
+        return nio.Api._build_path(["search"], {"next_batch": next_batch.strip()})
 
     @classmethod
     def _check_rate_limit(
@@ -546,31 +506,8 @@ class MatrixApiTools(Toolkit):
         content: dict[str, object] | None = None,
         response: object | None = None,
     ) -> None:
-        audit_payload: dict[str, object] = {
-            "agent_name": context.agent_name,
-            "requester_id": context.requester_id,
-            "room_id": room_id,
-            "action": action,
-            "status": status,
-        }
-        if event_type is not None:
-            audit_payload["event_type"] = event_type
-        if state_key is not None:
-            audit_payload["state_key"] = state_key
-        if target_event_id is not None:
-            audit_payload["target_event_id"] = target_event_id
-        if reason is not None:
-            audit_payload["reason"] = reason
-        if dangerous is not None:
-            audit_payload["dangerous"] = dangerous
         content_summary = cls._content_summary(content)
-        if content_summary is not None:
-            audit_payload.update(content_summary)
         normalized_response, status_code = cls._normalize_response(response)
-        if normalized_response is not None:
-            audit_payload["response"] = normalized_response
-        if status_code is not None:
-            audit_payload["status_code"] = status_code
         logger.warning(
             "matrix_api_write_audit",
             agent=context.agent_name,
@@ -589,8 +526,9 @@ class MatrixApiTools(Toolkit):
         )
 
     @classmethod
-    def _state_write_policy_error(
+    async def _state_write_policy_error(
         cls,
+        context: ToolRuntimeContext,
         *,
         action: str,
         room_id: str,
@@ -598,6 +536,15 @@ class MatrixApiTools(Toolkit):
         state_key: str,
         allow_dangerous: bool,
     ) -> tuple[str | None, bool]:
+        reserved_error = cls._reserved_event_type_error(
+            action=action,
+            room_id=room_id,
+            event_type=event_type,
+            plugin_namespaces=context.plugins.reserved_namespaces,
+            state_key=state_key,
+        )
+        if reserved_error is not None:
+            return reserved_error, False
         if event_type in cls._HARD_BLOCKED_STATE_TYPES:
             return (
                 cls._error_payload(
@@ -620,20 +567,75 @@ class MatrixApiTools(Toolkit):
                     dangerous=True,
                     message=(
                         f"State event type '{event_type}' is dangerous. "
-                        "Re-run with allow_dangerous=true only when you intentionally want to change critical room state."
+                        "Re-run with allow_dangerous=true only when you intentionally want to change critical room state; "
+                        "the requester must also be a joined room admin in the target room."
+                    ),
+                ),
+                True,
+            )
+        if dangerous and not await cls._requester_may_write_dangerous_state(context, room_id):
+            return (
+                cls._error_payload(
+                    action=action,
+                    room_id=room_id,
+                    event_type=event_type,
+                    state_key=state_key,
+                    dangerous=True,
+                    message=(
+                        f"State event type '{event_type}' requires the requester to be a joined room admin "
+                        "in the target room."
                     ),
                 ),
                 True,
             )
         return None, dangerous
 
+    @staticmethod
+    async def _requester_may_write_dangerous_state(
+        context: ToolRuntimeContext,
+        room_id: str,
+    ) -> bool:
+        """Return whether the human requester could authorize this room's critical state themselves."""
+        requester_id = context.requester_id
+        config = context.current_config
+        if requester_id == context.client.user_id or not is_human_requester_id(
+            requester_id,
+            config,
+            context.runtime_paths,
+        ):
+            return False
+        joined_ids = [
+            user_id
+            for user_id in sorted(equivalent_requester_ids(requester_id, config, context.runtime_paths))
+            if await MatrixApiTools._is_joined(context.client, room_id, user_id)
+        ]
+        return await room_admin_power_user(context.client, room_id, joined_ids) is not None
+
+    @staticmethod
+    async def _is_joined(client: nio.AsyncClient, room_id: str, user_id: str) -> bool:
+        membership = await client.room_get_state_event(room_id, "m.room.member", user_id)
+        return (
+            isinstance(membership, nio.RoomGetStateEventResponse)
+            and isinstance(membership.content, dict)
+            and membership.content.get("membership") == "join"
+        )
+
     @classmethod
     def _send_event_policy_error(
         cls,
+        context: ToolRuntimeContext,
         *,
         room_id: str,
         event_type: str,
     ) -> str | None:
+        reserved_error = cls._reserved_event_type_error(
+            action="send_event",
+            room_id=room_id,
+            event_type=event_type,
+            plugin_namespaces=context.plugins.reserved_namespaces,
+        )
+        if reserved_error is not None:
+            return reserved_error
         if event_type == "m.room.redaction":
             return cls._error_payload(
                 action="send_event",
@@ -662,39 +664,19 @@ class MatrixApiTools(Toolkit):
         return None
 
     @staticmethod
-    async def _redaction_thread_resolution_error(
+    def _with_acting_requester(
         context: ToolRuntimeContext,
-        *,
-        room_id: str,
-        event_id: str,
-    ) -> str | None:
-        """Return a fail-closed error when redaction thread impact cannot be resolved."""
-        try:
-            thread_impact = await resolve_redaction_thread_impact_for_client(
-                context.client,
-                room_id=room_id,
-                event_id=event_id,
-                relations=context.relations,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to resolve redaction target thread mapping for matrix_api redact",
-                room_id=room_id,
-                target_event_id=event_id,
-                error=str(exc),
-            )
-            return "Failed to resolve redaction target thread mapping."
-
-        if thread_impact is MutationThreadImpactState.UNKNOWN:
-            logger.warning(
-                "Failed to resolve redaction target thread mapping for matrix_api redact",
-                room_id=room_id,
-                target_event_id=event_id,
-                error="thread impact unknown",
-            )
-            return "Failed to resolve redaction target thread mapping."
-
-        return None
+        event_type: str,
+        content: dict[str, object],
+    ) -> dict[str, object]:
+        """Name a human or bot-account requester on a room message, so entities it mentions act for it as on replies."""
+        if event_type != "m.room.message" or not is_access_checked_requester_id(
+            context.requester_id,
+            context.config,
+            context.runtime_paths,
+        ):
+            return content
+        return {**content, ACTING_REQUESTER_KEY: context.requester_id}
 
     async def _send_event(  # noqa: PLR0911
         self,
@@ -715,7 +697,7 @@ class MatrixApiTools(Toolkit):
                 room_id=room_id,
                 message=event_type_error,
             )
-        normalized_content, content_error = self._validate_content(content)
+        normalized_content, content_error = self._validate_content(content, context.plugins.reserved_namespaces)
         if content_error is not None:
             return self._error_payload(
                 action="send_event",
@@ -728,32 +710,17 @@ class MatrixApiTools(Toolkit):
         assert normalized_content is not None
 
         if (
-            policy_error := self._send_event_policy_error(room_id=room_id, event_type=normalized_event_type)
+            policy_error := self._send_event_policy_error(context, room_id=room_id, event_type=normalized_event_type)
         ) is not None:
             return policy_error
 
-        try:
-            thread_impact = await resolve_event_thread_impact_for_client(
-                context.client,
-                room_id=room_id,
-                event_type=normalized_event_type,
-                content=normalized_content,
-                relations=context.relations,
-            )
-            if thread_impact is MutationThreadImpactState.UNKNOWN:
-                return self._error_payload(
-                    action="send_event",
-                    room_id=room_id,
-                    event_type=normalized_event_type,
-                    message="Failed to resolve threaded Matrix message send target.",
-                )
-        except Exception as exc:
-            logger.warning(
-                "Failed to resolve threaded send_event target for matrix_api",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                error=str(exc),
-            )
+        if not await event_thread_membership_known(
+            context.conversation_reader,
+            context.relations,
+            room_id,
+            event_type=normalized_event_type,
+            content=normalized_content,
+        ):
             return self._error_payload(
                 action="send_event",
                 room_id=room_id,
@@ -781,6 +748,7 @@ class MatrixApiTools(Toolkit):
                 message=limit_error,
             )
 
+        normalized_content = self._with_acting_requester(context, normalized_event_type, normalized_content)
         try:
             response = await send_room_event_result(
                 context.client,
@@ -790,22 +758,7 @@ class MatrixApiTools(Toolkit):
                 operation="matrix_api_send_event",
             )
         except Exception as exc:
-            self._audit_write(
-                context=context,
-                room_id=room_id,
-                action="send_event",
-                status="error",
-                event_type=normalized_event_type,
-                content=normalized_content,
-                response=exc,
-            )
-            return self._error_payload(
-                action="send_event",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                message="Failed to send Matrix event.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, nio.RoomSendResponse):
             self._audit_write(
@@ -841,7 +794,7 @@ class MatrixApiTools(Toolkit):
             response=response,
         )
 
-    async def _get_state(  # noqa: PLR0911
+    async def _get_state(
         self,
         context: ToolRuntimeContext,
         *,
@@ -859,14 +812,7 @@ class MatrixApiTools(Toolkit):
                 room_id=room_id,
                 message=event_type_error,
             )
-        resolved_state_key, state_key_error = self._resolve_state_key(state_key)
-        if state_key_error is not None:
-            return self._error_payload(
-                action="get_state",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                message=state_key_error,
-            )
+        resolved_state_key = state_key or ""
 
         assert normalized_event_type is not None
 
@@ -877,14 +823,7 @@ class MatrixApiTools(Toolkit):
                 state_key=resolved_state_key,
             )
         except Exception as exc:
-            return self._error_payload(
-                action="get_state",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                state_key=resolved_state_key,
-                message="Failed to fetch Matrix state event.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, nio.RoomGetStateEventError) and response.status_code == "M_NOT_FOUND":
             return self._payload(
@@ -944,15 +883,8 @@ class MatrixApiTools(Toolkit):
                 room_id=room_id,
                 message=event_type_error,
             )
-        resolved_state_key, state_key_error = self._resolve_state_key(state_key)
-        if state_key_error is not None:
-            return self._error_payload(
-                action="put_state",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                message=state_key_error,
-            )
-        normalized_content, content_error = self._validate_content(content)
+        resolved_state_key = state_key or ""
+        normalized_content, content_error = self._validate_content(content, context.plugins.reserved_namespaces)
         if content_error is not None:
             return self._error_payload(
                 action="put_state",
@@ -965,7 +897,8 @@ class MatrixApiTools(Toolkit):
         assert normalized_event_type is not None
         assert normalized_content is not None
 
-        policy_error, dangerous = self._state_write_policy_error(
+        policy_error, dangerous = await self._state_write_policy_error(
+            context,
             action="put_state",
             room_id=room_id,
             event_type=normalized_event_type,
@@ -1008,25 +941,7 @@ class MatrixApiTools(Toolkit):
                 content=normalized_content,
             )
         except Exception as exc:
-            self._audit_write(
-                context=context,
-                room_id=room_id,
-                action="put_state",
-                status="error",
-                event_type=normalized_event_type,
-                state_key=resolved_state_key,
-                dangerous=dangerous,
-                content=normalized_content,
-                response=exc,
-            )
-            return self._error_payload(
-                action="put_state",
-                room_id=room_id,
-                event_type=normalized_event_type,
-                state_key=resolved_state_key,
-                message="Failed to write Matrix state event.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, nio.RoomPutStateResponse):
             self._audit_write(
@@ -1068,6 +983,42 @@ class MatrixApiTools(Toolkit):
             response=response,
         )
 
+    async def _redaction_state_policy_error(
+        self,
+        context: ToolRuntimeContext,
+        *,
+        room_id: str,
+        event_id: str,
+        allow_dangerous: bool,
+    ) -> tuple[str | None, bool]:
+        """Hold a state event redaction to the put_state policy, because redacting current state rewrites it."""
+        try:
+            response = await context.client.room_get_event(room_id, event_id)
+        except Exception as exc:
+            response = exc
+        if not isinstance(response, nio.RoomGetEventResponse):
+            return (
+                self._error_payload(
+                    action="redact",
+                    room_id=room_id,
+                    target_event_id=event_id,
+                    message="Failed to fetch the redaction target.",
+                    response=response,
+                ),
+                False,
+            )
+        target = response.event.source
+        if "state_key" not in target:
+            return None, False
+        return await self._state_write_policy_error(
+            context,
+            action="redact",
+            room_id=room_id,
+            event_type=str(target["type"]),
+            state_key=str(target["state_key"]),
+            allow_dangerous=allow_dangerous,
+        )
+
     async def _redact(  # noqa: PLR0911
         self,
         context: ToolRuntimeContext,
@@ -1076,38 +1027,45 @@ class MatrixApiTools(Toolkit):
         event_id: str | None,
         reason: str | None,
         dry_run: bool,
+        allow_dangerous: bool,
     ) -> str:
         normalized_event_id, event_id_error = self._validate_non_empty_string(
             event_id,
             field_name="event_id",
         )
-        normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
-        error_message = event_id_error if event_id_error is not None else None
-        if error_message is not None:
+        normalized_reason = (reason or "").strip() or None
+        if event_id_error is not None:
             return self._error_payload(
                 action="redact",
                 room_id=room_id,
-                message=error_message,
+                message=event_id_error,
             )
 
         assert normalized_event_id is not None
 
-        thread_resolution_error = await self._redaction_thread_resolution_error(
+        # A redaction whose thread membership is unknown fails closed.
+        if not await redaction_thread_membership_known(
+            context.conversation_reader,
+            context.relations,
+            room_id,
+            event_id=normalized_event_id,
+        ):
+            return self._error_payload(
+                action="redact",
+                room_id=room_id,
+                target_event_id=normalized_event_id,
+                message="Failed to resolve redaction target thread mapping.",
+            )
+        state_policy_error, dangerous = await self._redaction_state_policy_error(
             context,
             room_id=room_id,
             event_id=normalized_event_id,
+            allow_dangerous=allow_dangerous,
         )
-        if thread_resolution_error is not None:
-            error_message = thread_resolution_error
+        if state_policy_error is not None:
+            return state_policy_error
 
         if dry_run:
-            if error_message is not None:
-                return self._error_payload(
-                    action="redact",
-                    room_id=room_id,
-                    target_event_id=normalized_event_id,
-                    message=error_message,
-                )
             return self._payload(
                 "ok",
                 action="redact",
@@ -1122,14 +1080,11 @@ class MatrixApiTools(Toolkit):
             )
 
         if (limit_error := self._check_rate_limit(context, room_id, action="redact")) is not None:
-            error_message = limit_error
-
-        if error_message is not None:
             return self._error_payload(
                 action="redact",
                 room_id=room_id,
                 target_event_id=normalized_event_id,
-                message=error_message,
+                message=limit_error,
             )
 
         try:
@@ -1139,22 +1094,7 @@ class MatrixApiTools(Toolkit):
                 reason=normalized_reason,
             )
         except Exception as exc:
-            self._audit_write(
-                context=context,
-                room_id=room_id,
-                action="redact",
-                status="error",
-                target_event_id=normalized_event_id,
-                reason=normalized_reason,
-                response=exc,
-            )
-            return self._error_payload(
-                action="redact",
-                room_id=room_id,
-                target_event_id=normalized_event_id,
-                message="Failed to redact Matrix event.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, nio.RoomRedactResponse):
             self._audit_write(
@@ -1164,6 +1104,7 @@ class MatrixApiTools(Toolkit):
                 status="ok",
                 target_event_id=normalized_event_id,
                 reason=normalized_reason,
+                dangerous=dangerous,
             )
             return self._payload(
                 "ok",
@@ -1181,6 +1122,7 @@ class MatrixApiTools(Toolkit):
             status="error",
             target_event_id=normalized_event_id,
             reason=normalized_reason,
+            dangerous=dangerous,
             response=response,
         )
         return self._error_payload(
@@ -1214,13 +1156,7 @@ class MatrixApiTools(Toolkit):
         try:
             response = await context.client.room_get_event(room_id, normalized_event_id)
         except Exception as exc:
-            return self._error_payload(
-                action="get_event",
-                room_id=room_id,
-                event_id=normalized_event_id,
-                message="Failed to fetch Matrix event.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, nio.RoomGetEventError) and response.status_code == "M_NOT_FOUND":
             return self._payload(
@@ -1267,13 +1203,13 @@ class MatrixApiTools(Toolkit):
         context: ToolRuntimeContext,
         *,
         room_id: str,
-        search_term: object,
-        keys: object,
-        order_by: object,
-        limit: object,
-        next_batch: object,
-        search_filter: object,
-        event_context: object,
+        search_term: str | None,
+        keys: list[str] | None,
+        order_by: str,
+        limit: int,
+        next_batch: str | None,
+        search_filter: dict[str, object] | None,
+        event_context: dict[str, object] | None,
     ) -> str:
         try:
             request_body = self._build_search_request_body(
@@ -1293,22 +1229,15 @@ class MatrixApiTools(Toolkit):
                 message=str(exc),
             )
 
-        method = "POST"
-
         try:
             response = await context.client._send(
                 _MatrixSearchResponse,
-                method,
+                "POST",
                 path,
                 nio.Api.to_json(request_body),
             )
         except Exception as exc:
-            return self._error_payload(
-                action="search",
-                room_id=room_id,
-                message="Failed to search Matrix room events.",
-                response=exc,
-            )
+            response = exc
 
         if isinstance(response, _MatrixSearchResponse):
             normalized_results: list[dict[str, object]] = []
@@ -1342,7 +1271,7 @@ class MatrixApiTools(Toolkit):
             response=response,
         )
 
-    async def matrix_api(  # noqa: C901, PLR0911, PLR0912
+    async def matrix_api(  # noqa: C901, PLR0911
         self,
         action: str = "send_event",
         room_id: str | None = None,
@@ -1367,68 +1296,46 @@ class MatrixApiTools(Toolkit):
         - send_event: Send an arbitrary room event with `event_type` and `content`.
         - get_state: Read one state event by `event_type` and optional `state_key`.
         - put_state: Write one state event by `event_type`, optional `state_key`, and `content`.
-        - redact: Redact an event by `event_id`.
+        - redact: Redact an event by `event_id`; redacting a state event follows the put_state policy for its type.
         - get_event: Fetch one event by `event_id`.
         - search: Full-text search one room's events with `search_term`, optional `keys`, pagination, and context.
 
         `room_id` defaults to the current Matrix tool runtime context room.
         `search` enforces a single-room scope via `room_id`; if `filter.rooms` is supplied it must match that room.
         `search` always uses the top-level `limit`; `filter.limit` is rejected to avoid conflicting inputs.
+        `com.mindroom.*`, `io.mindroom.*`, and the chat client's `chat.mindroom.*` are reserved for runtime metadata:
+        `content` may not set keys in those namespaces, and `send_event`/`put_state` may not write event types in them.
         `dry_run` is supported for send_event, put_state, and redact.
-        `allow_dangerous` only affects put_state for a small set of high-risk room-state event types.
+        `allow_dangerous` only affects put_state and redact for a small set of high-risk room-state event types,
+        which also require the requester to be a joined room admin in the target room.
         `search` rejects `dry_run` and `allow_dangerous` because it is read-only.
         """
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._context_error()
+        if isinstance(context := tool_context_or_error(self._payload, "Matrix API"), str):
+            return context
 
-        normalized_action = self._normalize_action(action)
-        if normalized_action not in self._VALID_ACTIONS_SET:
+        normalized_action = action.strip().lower()
+        if normalized_action not in self._VALID_ACTIONS:
             return self._error_payload(
-                action=normalized_action or str(action),
-                message=self._supported_actions_message(),
-            )
-
-        normalized_dry_run, dry_run_error = self._validate_bool(dry_run, field_name="dry_run")
-        if dry_run_error is not None:
-            return self._error_payload(
-                action=normalized_action,
-                message=dry_run_error,
-            )
-
-        normalized_allow_dangerous, allow_dangerous_error = self._validate_bool(
-            allow_dangerous,
-            field_name="allow_dangerous",
-        )
-        if allow_dangerous_error is not None:
-            return self._error_payload(
-                action=normalized_action,
-                message=allow_dangerous_error,
+                action=normalized_action or action,
+                message="Unsupported action. Use send_event, get_state, put_state, redact, get_event, or search.",
             )
 
         resolved_room_id, room_id_error = self._resolve_room_id(context, room_id)
         if room_id_error is not None:
-            room_id_payload: dict[str, object] = {}
-            if isinstance(room_id, str):
-                room_id_payload["room_id"] = room_id.strip()
             return self._error_payload(
                 action=normalized_action,
+                room_id=resolved_room_id,
                 message=room_id_error,
-                **room_id_payload,
             )
 
-        assert normalized_dry_run is not None
-        assert normalized_allow_dangerous is not None
-        assert resolved_room_id is not None
-
-        if normalized_action == "search" and (normalized_dry_run or normalized_allow_dangerous):
+        if normalized_action == "search" and (dry_run or allow_dangerous):
             return self._error_payload(
                 action="search",
                 room_id=resolved_room_id,
                 message="dry_run/allow_dangerous not applicable to read-only search action",
             )
 
-        if not room_access_allowed(context, resolved_room_id):
+        if not await room_access_allowed(context, resolved_room_id):
             return self._error_payload(
                 action=normalized_action,
                 room_id=resolved_room_id,
@@ -1441,7 +1348,7 @@ class MatrixApiTools(Toolkit):
                 room_id=resolved_room_id,
                 event_type=event_type,
                 content=content,
-                dry_run=normalized_dry_run,
+                dry_run=dry_run,
             )
         if normalized_action == "get_state":
             return await self._get_state(
@@ -1457,8 +1364,8 @@ class MatrixApiTools(Toolkit):
                 event_type=event_type,
                 state_key=state_key,
                 content=content,
-                dry_run=normalized_dry_run,
-                allow_dangerous=normalized_allow_dangerous,
+                dry_run=dry_run,
+                allow_dangerous=allow_dangerous,
             )
         if normalized_action == "redact":
             return await self._redact(
@@ -1466,7 +1373,8 @@ class MatrixApiTools(Toolkit):
                 room_id=resolved_room_id,
                 event_id=event_id,
                 reason=reason,
-                dry_run=normalized_dry_run,
+                dry_run=dry_run,
+                allow_dangerous=allow_dangerous,
             )
         if normalized_action == "get_event":
             return await self._get_event(

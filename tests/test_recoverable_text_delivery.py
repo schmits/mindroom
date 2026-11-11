@@ -9,10 +9,10 @@ anchor event ID is exactly that identity.
 
 Two things follow from the omission, and these tests pin both.
 
-A direct send settles nothing, so the terminal record lands in the handled-turn
-ledger while the journal source is still pending -- the window that forces the
-degraded replay guard to consult two records instead of one. Routing the send
-through the outbox settles the sources inside the enqueue, so the answer
+A direct send settles nothing, so the turn is recorded answered while the
+journal source is still pending -- the window that forces the degraded replay
+guard to consult two records instead of one. Routing the send through the
+outbox binds the turn and settles its sources inside the enqueue, so the answer
 becoming durably owed and the turn leaving the journal are one commit.
 
 And a direct send is recovered only by scanning the room for something that may
@@ -24,10 +24,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 
-from mindroom.event_journal import DeliveryStage
 from mindroom.turn_record import TurnRecord
 from mindroom.visible_response_reconciliation import (
     VisibleResponseReconciler,
@@ -59,12 +59,11 @@ class _RecordingGateway:
 class _RecordingTurnStore:
     """The slice of the turn store this delivery touches."""
 
-    recorded: list[TurnRecord] = field(default_factory=list)
+    placeholders: list[tuple[TurnRecord, str]] = field(default_factory=list)
 
-    async def record_pending_turn(self, turn_record: TurnRecord) -> TurnRecord:
+    async def record_placeholder(self, turn_record: TurnRecord, response_event_id: str) -> None:
         """Bind one visible response to its turn."""
-        self.recorded.append(turn_record)
-        return turn_record
+        self.placeholders.append((turn_record, response_event_id))
 
 
 def _reconciler(gateway: _RecordingGateway) -> VisibleResponseReconciler:
@@ -81,6 +80,7 @@ def _reconciler(gateway: _RecordingGateway) -> VisibleResponseReconciler:
             turn_store=_RecordingTurnStore(),  # type: ignore[arg-type]
             delivery_gateway=gateway,  # type: ignore[arg-type]
             settle_ignored_sources=settle_ignored,
+            replies=MagicMock(),
         ),
     )
 
@@ -107,7 +107,7 @@ class TestAReplyWithATurnBehindItIsDurable:
         resend.
         """
         gateway = _RecordingGateway()
-        handled_turn = TurnRecord.create([SOURCE])
+        handled_turn = TurnRecord.create([SOURCE], turn_key="stored-turn")
 
         await _reconciler(gateway).deliver_recoverable_text(
             handled_turn,
@@ -119,7 +119,7 @@ class TestAReplyWithATurnBehindItIsDurable:
         assert len(gateway.requests) == 1
         assert gateway.requests[0].delivery_turn_id == handled_turn.anchor_event_id
         assert gateway.requests[0].delivery_turn_id is not None
-        assert gateway.requests[0].delivery_stage is DeliveryStage.FINAL
+        assert gateway.requests[0].delivery_turn_key == "stored-turn"
 
     async def test_an_answer_recovery_already_found_is_never_sent_again(self) -> None:
         """Adoption still wins over the outbox, and must not enqueue anything.
@@ -139,31 +139,3 @@ class TestAReplyWithATurnBehindItIsDurable:
 
         assert adopted == "$already-there"
         assert gateway.requests == []
-
-    async def test_a_placeholder_reply_claims_the_initial_stage(self) -> None:
-        """A send a later answer edits is the turn's placeholder, not its answer.
-
-        The interactive-selection acknowledgement is exactly this: the answer
-        is generated with ``existing_event_is_placeholder=True`` against the
-        event this send produced. Filing it as the answer would claim the
-        turn's ``FINAL`` row, so the real answer's delivery would be refused
-        and its text would never reach the room.
-
-        The stage also decides settlement. Only an answer discharges a turn, so
-        a placeholder must not settle the journal sources -- a crash before the
-        model finished would otherwise leave the acknowledgement in the room
-        with nothing pending to replay.
-        """
-        gateway = _RecordingGateway()
-        handled_turn = TurnRecord.create([SOURCE])
-
-        await _reconciler(gateway).deliver_recoverable_text(
-            handled_turn,
-            target=_target(),  # type: ignore[arg-type]
-            response_text="Processing your response...",
-            recovered_response_event_id=None,
-            as_placeholder=True,
-        )
-
-        assert gateway.requests[0].delivery_turn_id == handled_turn.anchor_event_id
-        assert gateway.requests[0].delivery_stage is DeliveryStage.INITIAL

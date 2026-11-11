@@ -1,6 +1,10 @@
 """Test configuration and fixtures for MindRoom tests."""
 
 import asyncio
+import gc
+import ipaddress
+import json
+import logging
 import os
 import re
 import shutil
@@ -8,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import warnings
@@ -16,6 +21,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Generator,
     Iterable,
     Iterator,
@@ -23,50 +29,81 @@ from collections.abc import (
     MutableMapping,
     Sequence,
 )
-from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from itertools import count
 from pathlib import Path
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING, Any, NoReturn, cast
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
+from urllib.parse import unquote, urlsplit
 
+import httpcore
+import httpcore2
+import httpx
+import httpx2
 import nio
 import pytest
 import pytest_asyncio
 import structlog
 import yaml
-from agno.models.base import Model
-from agno.models.response import ModelResponse
+from agno.utils import log as agno_log
 from aioresponses import aioresponses
+from openai import AsyncOpenAI, OpenAI
 from structlog.testing import ReturnLoggerFactory
 from structlog.typing import BindableLogger, Context, Processor, WrappedLogger
 
-import mindroom.approval_manager as approval_manager_module
+import mindroom.agent_cli.shell_access as agent_cli_shell_access_module
+import mindroom.api.sandbox_exec as sandbox_exec_module
+import mindroom.approval.continuation_runner as continuation_runner_module
+import mindroom.approval.manager as approval_manager_module
 import mindroom.bot  # noqa: F401
-import mindroom.handled_turns as handled_turns_module
+import mindroom.cli.config as cli_config_module
+import mindroom.cli.desktop as cli_desktop_module
+import mindroom.cli.service as cli_service_module
+import mindroom.custom_tools.todo as todo_tool_module
+import mindroom.knowledge.refresh_scheduler as knowledge_refresh_scheduler_module
+import mindroom.managed_avatars as managed_avatars_module
 import mindroom.matrix.client_room_admin as client_room_admin_module
 import mindroom.matrix.rooms as matrix_rooms_module
+import mindroom.memory._entrypoint_snapshots as memory_entrypoint_snapshots_module
+import mindroom.reply_turn.locked_turn as locked_turn_module
+import mindroom.reply_turn.request as reply_request_module
+import mindroom.response_runner as response_runner_module
+import mindroom.streaming as streaming_module
+import mindroom.tool_jobs.instances as tool_jobs_instances
+import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
+import mindroom.tools.shell as shell_tool_module
+from mindroom import ai as mindroom_ai
+from mindroom.agent_cli.turn import LiveTurnTools
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
-from mindroom.agent_storage import get_agent_session, get_team_session
-from mindroom.ai import ResponseTurnContext
+from mindroom.approval.manager import (
+    ApprovalActionResult,
+    ApprovalManager,
+    ToolApprovalTransportError,
+    initialize_approval_store,
+)
 from mindroom.authorization import _ReplyAuthorizationDecision
-from mindroom.bot import AgentBot, TeamBot
-from mindroom.coalescing import CoalescingDrainResult
-from mindroom.coalescing_batch import PendingEvent
+from mindroom.bot import AgentBot
+from mindroom.coalescing.batch import PendingEvent
+from mindroom.coalescing.gate import CoalescingDrainResult
 from mindroom.command_turn_executor import CommandTurnExecutor
+from mindroom.config.load_attempt import ConfigLoad
 from mindroom.config.main import Config, load_config
+from mindroom.config.plugin import PluginEntryConfig
+from mindroom.config.resolution import entity_model_name
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, safe_replace
-from mindroom.conversation_resolver import DispatchContextResult, MessageContext
 from mindroom.delivery_gateway import DeliveryGateway, EditTextRequest, FinalDeliveryRequest, SendTextRequest
 from mindroom.dispatch_handoff import (
     MediaDispatchEvent,
-    PendingDispatchMetadata,
     PreparedIngress,
     prepare_media_ingress,
 )
-from mindroom.dispatch_source import ScheduledHistoryBudget
+from mindroom.dispatch_source import MESSAGE_SOURCE_KIND, ScheduledHistoryBudget
 from mindroom.edit_regenerator import EditRegenerator
+from mindroom.embeddings.openai_embedder import OpenAIEmbedder
 from mindroom.event_journal import (
     AdmissionResult,
     ConversationPage,
@@ -74,28 +111,32 @@ from mindroom.event_journal import (
     DeliveryStage,
     EventClass,
     EventKind,
+    FinalAnswerEnqueue,
     InboundEvent,
-    JournalEvent,
     MatrixDelivery,
     MatrixDeliveryView,
-    PendingTurnView,
+    PermanentDeliveryFailure,
     PrincipalStore,
     ProjectedEvent,
     RelationView,
-    TerminalTurnWrite,
     VisibleMessage,
+    turn_rows,
 )
 from mindroom.event_journal import reads as journal_reads
 from mindroom.event_journal.outbox import matrix_delivery_payload
-from mindroom.final_delivery import FinalDeliveryOutcome
-from mindroom.handled_turns import _reset_handled_turn_ledger_runtime
+from mindroom.execution_preparation import _build_unseen_context_messages
+from mindroom.final_delivery import Completed, Failed, FailureCause, FinalDeliveryOutcome, TurnEnding
+from mindroom.history.request_messages import TurnMessages
+from mindroom.history.request_size import RequestFrame, request_sizer
 from mindroom.history.runtime import (
-    ScopeSessionContext,
-    _resolve_history_scope,
     finalize_history_preparation,
-    open_scope_session_context,
     prepare_scope_history,
-    resolve_agent_preparation_inputs,
+    resolve_entity_preparation_inputs,
+)
+from mindroom.history.session_context import (
+    ScopeSessionContext,
+    load_scope_session,
+    resolve_bound_team_scope,
 )
 from mindroom.history.types import (
     CompactionLifecycle,
@@ -108,51 +149,98 @@ from mindroom.hooks import EnrichmentItem, MessageEnvelope
 from mindroom.ingress_validation import IngressValidator
 from mindroom.interactive import InteractiveMetadata
 from mindroom.interactive_models import InteractivePrompt, interactive_prompt_content
-from mindroom.legacy_delivery_payloads import _inline_final_result
-from mindroom.matrix.client import DeliveredMatrixEvent, ResolvedVisibleMessage
-from mindroom.matrix.client_delivery import build_edit_event_content
+from mindroom.llm.messages import Message
+from mindroom.llm.provider import ModelRequest
+from mindroom.matrix.client_delivery import DeliveredMatrixEvent, build_edit_event_content
 from mindroom.matrix.client_room_admin import RoomJoinOutcome
+from mindroom.matrix.client_session import MindRoomAsyncClient, matrix_client_config, olm_store_dir
+from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.conversation_reads import ConversationReader
 from mindroom.matrix.identity import MatrixID
+from mindroom.matrix.large_messages import _oversized_nonterminal_streaming_edit_next_allowed_at
 from mindroom.matrix.media import is_matrix_media_dispatch_event
 from mindroom.matrix.relation_lookup import RelationLookup
-from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
-from mindroom.matrix_delivery import TurnHandoff
+from mindroom.matrix_rtc.call_manager import CallManager
+from mindroom.mcp import toolkit as mcp_toolkit_module
 from mindroom.message_target import MessageTarget
-from mindroom.provider_media_fallback import reset_model_media_capability_cache
+from mindroom.model_defaults import OLLAMA_HOST_DEFAULT
+from mindroom.orchestration.config_lifecycle import ConfigReloadLifecycle, load_published_config, load_startup_config
+from mindroom.personal_room_lifecycle import PersonalRoomLifecycle
+from mindroom.providers import registry as provider_registry
+from mindroom.providers.pipeline import media as media_pipeline
 from mindroom.reaction_dispatch import ReactionDispatcher
+from mindroom.reply_turn.request import ResponseRequest
+from mindroom.response_admission import ResponseAdmissionGate
+from mindroom.response_lifecycle import QueuedHumanNoticeReservation
 from mindroom.response_payload_preparation import (
     DispatchPayloadInputs,
     ResponsePayloadPreparation,
     ResponsePayloadPreparer,
 )
-from mindroom.response_runner import PostLockRequestPreparationError, ResponseRequest, ResponseRunner
+from mindroom.response_runner import ResponseRunner
+from mindroom.response_sources import Owned, ResponseSources, SourceFate, Unclaimed
+from mindroom.response_turn import CompletedAttempt, ResponseTurnContext
+from mindroom.session_storage.agent_storage import create_state_storage
+from mindroom.session_storage.legacy_usage_totals import add_pre_ledger_baselines
+from mindroom.session_storage.schema import quote_identifier
+from mindroom.session_storage.store import (
+    ConversationStore,
+    _session_state,
+    _write_session_state,
+    delete_runs_in_transaction,
+    ensure_session_row,
+    persist_to,
+    runs_without,
+)
+from mindroom.thread_summary import schedule as thread_summary_schedule
+from mindroom.thread_summary.schedule import _ThreadSummaryBaselines
 from mindroom.thread_utils import decide_agent_response
-from mindroom.turn_controller import TurnController, _DispatchPreparation, _ReplayGuardContext
+from mindroom.token_counting.families import load_o200k
+from mindroom.tool_system import plugin_imports
+from mindroom.tool_system import plugins as plugins_module
+from mindroom.tool_system import registry as tool_registry_module
+from mindroom.tool_system.declarations import ToolMetadata
+from mindroom.tools.shell import shell_refuses_commands as _real_shell_refuses_commands
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
-from mindroom.turn_store import TurnStore
+from mindroom.turn_store import _CLAIM_REGISTRIES, TurnClaim, TurnStore, _ClaimRegistry
+from mindroom.turns.dispatch import TurnDispatcher
+from mindroom.turns.facts import IngressFacts
+from mindroom.turns.ingress import TurnIngress
+from mindroom.turns.interactive_selection import InteractiveSelections
 from mindroom.user_stop_reconciliation import UserStopReconciler
 from mindroom.visible_response_reconciliation import VisibleResponseReconciler
-from mindroom.visible_voice_echo import VisibleVoiceEchoLifecycle, _reset_visible_voice_echo_barriers
+from mindroom.voice.ingress import VoiceIngress
+from mindroom.voice.visible_voice_echo import VisibleVoiceEchoLifecycle, _reset_visible_voice_echo_barriers
+from mindroom.workers import runtime as workers_runtime_module
+from mindroom.workers.backends import static_runner as static_runner_module
+from mindroom.workers.compatibility import worker_health_payload
+from tests.fakes.scripted_model import estimate_only_model
 from tests.identity_helpers import persist_entity_accounts
+from tests.test_helpers import make_test_ca_pem
 
 if TYPE_CHECKING:
-    from agno.agent import Agent
-    from agno.db.base import BaseDb
-    from agno.session.agent import AgentSession
-    from agno.session.team import TeamSession
+    from _typeshed import DataclassInstance
     from xdist.workermanage import WorkerController
 
-    from mindroom.config.models import CompactionConfig
+    from mindroom.agent_cli.session import CliTurnOwner
+    from mindroom.approval.recovery import ApprovalRecovery
     from mindroom.dispatch_handoff import DispatchEvent
-    from mindroom.event_journal import EventJournalStore
+    from mindroom.event_journal import ApprovalDeliveryView, EventJournalStore
     from mindroom.event_journal.backend import Backend, Operation
-    from mindroom.matrix_rtc.call_manager import CallManager
+    from mindroom.llm.provider import ModelProvider
+    from mindroom.llm.runs import AnyRunRecord
+    from mindroom.orchestrator import _MultiAgentOrchestrator
+    from mindroom.session_storage.types import ConversationSession
+    from mindroom.streaming import StreamingResponse
+    from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
+    from mindroom.tool_system.tool_access import ToolKey
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+    from tests.team_turn_helpers import ProbeToolkit
 
 
 _STRUCTLOG_CONFIGURE = structlog.configure
+_REAL_BUILD_MODEL_PROVIDER = provider_registry.build_model_provider
 _POSTGRES_STARTUP_TIMEOUT_SECONDS = 30
 
 # The event journal orders text in SQL, in SQLite, and in Python, and those
@@ -161,7 +249,7 @@ _POSTGRES_STARTUP_TIMEOUT_SECONDS = 30
 # breaks against a glibc server. The journal's server is therefore glibc.
 _POSTGRES_JOURNAL_RUN_ID_STASH_KEY = pytest.StashKey[str]()
 _POSTGRES_JOURNAL_CONTAINER_PREFIX = "mindroom-postgres-journal-test-"
-_POSTGRES_JOURNAL_IMAGE = "postgres:16"
+_POSTGRES_JOURNAL_IMAGE = "mirror.gcr.io/library/postgres:16"
 _POSTGRES_JOURNAL_LOCALE = "en_US.utf8"
 
 # `postgres:16` declares `VOLUME /var/lib/postgresql/data`, so every container
@@ -183,10 +271,10 @@ _POSTGRES_JOURNAL_LOCALE = "en_US.utf8"
 # and `docker system df -v`, not `du`.
 _POSTGRES_JOURNAL_DATA_DIR = "/var/lib/postgresql/data"
 # A cap, not an allocation: tmpfs pages are only backed as they are written, and
-# a fresh cluster plus one database per xdist worker measures well under 1 GB.
+# each worker retains test schemas for the full suite, including their indexes.
 # Docker's default of half of host RAM is left behind on purpose -- an uncapped
 # runaway on a shared machine is the same class of failure as the disk leak.
-_POSTGRES_JOURNAL_TMPFS_SIZE = "2g"
+_POSTGRES_JOURNAL_TMPFS_SIZE = "4g"
 
 # A killed run reaches no teardown, so its container outlives it forever. The
 # tmpfs above means such a container no longer strands storage, but it still
@@ -410,23 +498,27 @@ _configure_quiet_structlog()
 __all__ = [
     "TEST_ACCESS_TOKEN",
     "TEST_PASSWORD",
+    "FakeApprovalTransport",
     "FakeCredentialsManager",
+    "FakeMediaResponse",
     "activate_interactive_prompt",
     "agent_response_should_respond",
     "aioresponse",
-    "bind_mock_config_event_journal",
+    "approval_manager_for_test",
     "bind_runtime_paths",
     "build_private_template_dir",
     "bypass_authorization",
     "create_mock_room",
     "delivered_matrix_event",
     "delivered_matrix_side_effect",
-    "dispatch_context_result",
     "drain_coalescing",
     "enforce_turn_authorization",
-    "install_call_manager_mock",
+    "handle_card_response_for_test",
+    "initialize_approval_store_for_test",
     "install_edit_message_mock",
+    "install_edit_regeneration_mock",
     "install_generate_response_mock",
+    "install_personal_room_shutdown_mock",
     "install_runtime_journal_support",
     "install_send_response_mock",
     "install_shutdown_drain_mocks",
@@ -440,16 +532,18 @@ __all__ = [
     "patch_response_runner_module",
     "prepare_history_for_run_for_test",
     "prepare_payload_via_seam",
-    "prepared_dispatch_result",
     "replace_delivery_gateway_deps",
     "replace_edit_regenerator_deps",
     "replace_response_runner_deps",
-    "replace_turn_controller_deps",
+    "replace_turn_deps",
     "replace_turn_policy_deps",
     "replace_turn_store_deps",
     "request_envelope",
     "requires_linux",
     "runtime_paths_for",
+    "serve_media_download",
+    "serve_media_from_download",
+    "start_call_manager",
     "sync_bot_runtime_state",
     "test_runtime_paths",
     "unwrap_extracted_collaborator",
@@ -461,115 +555,273 @@ _TEST_RUNTIME_PATHS_BY_CONFIG_ID: dict[int, RuntimePaths] = {}
 _VISIBLE_MESSAGE_IDS = count(1)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _SOFT_WRAP_RE = re.compile(r"(?<=\S)\n(?=\S)")
-RuntimeBot = AgentBot | TeamBot
+RuntimeBot = AgentBot
 TestFunction = Callable[..., object]
+
+
+async def prepare_agent_and_prompt_for_test(
+    ctx: ResponseTurnContext,
+    *,
+    prompt: str,
+    runtime_paths: RuntimePaths,
+    config: Config,
+    scope_context: ScopeSessionContext | None = None,
+    current_event_id: str | None = None,
+    **turn_inputs: Any,  # noqa: ANN401
+) -> Any:  # noqa: ANN401
+    """Prepare one agent turn through ``ai._prepare_agent_and_prompt`` with a plain top-level turn's inputs.
+
+    ``turn_inputs`` names the ``ResponseTurnContext`` fields a test sets beyond ``prompt``; every other one keeps
+    ``ctx``'s value.
+    """
+    return await mindroom_ai._prepare_agent_and_prompt(
+        replace(ctx, prompt=prompt, **turn_inputs),
+        runtime_paths=runtime_paths,
+        config=config,
+        scope_context=scope_context,
+        current_event_id=current_event_id,
+    )
+
+
+def build_unseen_context_messages_for_test(
+    prompt: str,
+    thread_history: Sequence[ResolvedVisibleMessage],
+    **options: Any,  # noqa: ANN401
+) -> "tuple[TurnMessages, list[str]]":
+    """Build one turn's unseen thread context through ``_build_unseen_context_messages`` with a plain reply's options.
+
+    ``options`` names the options a test sets; the others take the values a thread reply without a sender, display
+    names, timestamp, transient context, or attachments passes, in UTC.
+    """
+    turn_options: dict[str, Any] = {
+        "transient_context_messages": (),
+        "current_sender_id": None,
+        "member_display_names": {},
+        "current_timestamp_ms": None,
+        "prompt_event_id": None,
+        "current_prompt_is_structured": False,
+        "timezone": "UTC",
+        "attachment_context": None,
+    }
+    return _build_unseen_context_messages(prompt, thread_history, **(turn_options | options))
+
+
+def call_proxy_sync_for_test(
+    *,
+    function_name: str,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+    **stand_ins: Any,  # noqa: ANN401
+) -> object:
+    """Send one tool call through ``sandbox_proxy._call_proxy_sync`` with the stand-in options a test names.
+
+    The others take a plain call's values: an entrypoint that leaves the call's agent alone, no overrides,
+    execution env, extra passthrough, or resolved worker target, and the built-in tools.
+    """
+    return sandbox_proxy_module._call_proxy_sync(
+        stand_ins=sandbox_proxy_module.WorkerStandIns(
+            **({"tools": tool_registry_module.builtin_tool_registry()} | stand_ins),
+        ),
+        function_name=function_name,
+        args=args,
+        kwargs=kwargs,
+        function_entrypoint=lambda *_args, **_kwargs: None,
+    )
+
+
+@contextmanager
+def bound_worker_launch_config(config: Config) -> Iterator[None]:
+    """Bind ``config`` as the applied config dedicated workers launch from, as `mindroom run` does."""
+    with workers_runtime_module.bind_worker_launch_config_source(lambda: config):
+        yield
+
+
+def live_turn_tools_for_test(
+    owner: "CliTurnOwner",
+    *,
+    catalog: "PreparedAgentToolCatalog",
+    authorize: "Callable[[ToolKey, dict[str, object]], Awaitable[None]]",
+    **options: Any,  # noqa: ANN401
+) -> LiveTurnTools:
+    """Build one CLI turn's live tools with the options a test names, which include its output-file policy.
+
+    The others take a top-level turn's values: no context documents or knowledge refresh.
+    """
+    turn_options: dict[str, Any] = {
+        "context": {},
+        "delegation_depth": 0,
+        "refresh_scheduler": None,
+    }
+    return LiveTurnTools(owner, catalog=catalog, authorize=authorize, **(turn_options | options))
+
+
+async def _no_approval_event(_room_id: str, _thread_id: str | None, _content: dict[str, Any]) -> dict[str, Any] | None:
+    return None
+
+
+async def _no_approval_delivery(_delivery: MatrixDelivery) -> str:
+    msg = "This test sends no approval delivery"
+    raise ToolApprovalTransportError(msg)
+
+
+async def _no_delivered_event(*_target: object) -> str | None:
+    return None
+
+
+async def _no_sources_to_wake(_entity_name: str, _room_id: str, _source_event_ids: tuple[str, ...]) -> None:
+    return None
+
+
+@dataclass
+class FakeApprovalTransport:
+    """The approval transport an approval manager uses, with the methods a test sets.
+
+    The others prepare and send nothing, find no earlier delivery, know no sender, device, or responder principal,
+    wake nothing, and find the router in every room.
+    """
+
+    prepare_approval_event: Callable[[str, str | None, dict[str, Any]], Awaitable[dict[str, Any] | None]] = (
+        _no_approval_event
+    )
+    send_approval_delivery: Callable[[MatrixDelivery], Awaitable[str]] = _no_approval_delivery
+    resolve_approval_delivery: Callable[[MatrixDelivery], Awaitable[str | None]] = _no_delivered_event
+    resolve_approval_action_delivery: Callable[[str, str], Awaitable[str | None]] = _no_delivered_event
+    transport_sender_id: Callable[[], str | None] = lambda: None
+    transport_device_id: Callable[[], str | None] = lambda: None
+    wake_continuation_sources: Callable[[str, str, tuple[str, ...]], Awaitable[None]] = _no_sources_to_wake
+    responder_principal_id: Callable[[str], str | None] = lambda _entity_name: None
+    router_missing: Callable[[str], bool] = lambda _room_id: False
+
+
+def approval_manager_for_test(
+    runtime_paths: RuntimePaths,
+    *,
+    cards: "ApprovalDeliveryView | None" = None,
+    **transport: Any,  # noqa: ANN401
+) -> ApprovalManager:
+    """Build an approval manager over the transport methods a test names, as ``FakeApprovalTransport`` fields."""
+    return ApprovalManager(runtime_paths, transport=FakeApprovalTransport(**transport), cards=cards)
+
+
+def initialize_approval_store_for_test(
+    runtime_paths: RuntimePaths,
+    *,
+    cards: "ApprovalDeliveryView | None" = None,
+    recovery: "ApprovalRecovery | None" = None,
+    **transport: Any,  # noqa: ANN401
+) -> ApprovalManager:
+    """Initialize the approval store over the transport methods a test names, as ``FakeApprovalTransport`` fields."""
+    return initialize_approval_store(
+        runtime_paths,
+        transport=FakeApprovalTransport(**transport),
+        cards=cards,
+        recovery=recovery,
+    )
+
+
+async def handle_card_response_for_test(manager: ApprovalManager, **response: Any) -> ApprovalActionResult:  # noqa: ANN401
+    """Answer one approval card through ``manager.handle_card_response`` as a plain card response does.
+
+    ``response`` names the card, its responder, the decision, and whatever else a test sets; the reason, consume
+    callback, timed approval, and binding and schedule scopes otherwise stay unset.
+    """
+    unset = dict.fromkeys(("reason", "before_consume", "auto_approve_seconds", "current_binding", "scheduled_scope"))
+    return await manager.handle_card_response(**(unset | response))
+
+
+def request_frame(
+    prompt: str = "Current prompt",
+    *,
+    system: str | None = None,
+    turn: Message | None = None,
+) -> RequestFrame:
+    """Return the frame of a reply without settings or tools around the scope's history.
+
+    Its system prompt is ``system``, none when None, and its turn is ``turn``, a user message of ``prompt`` when None.
+    """
+    return RequestFrame(
+        ModelRequest(messages=()),
+        () if system is None else (Message(role="system", content=system),),
+        TurnMessages(prompt=turn or Message(role="user", content=prompt)),
+    )
 
 
 async def prepare_history_for_run_for_test(
     *,
-    agent: "Agent",
     agent_name: str,
     full_prompt: str,
     session_id: str | None,
     runtime_paths: RuntimePaths,
     config: Config,
     execution_identity: "ToolExecutionIdentity | None",
-    storage: "BaseDb | None" = None,
-    session: "AgentSession | TeamSession | None" = None,
+    model: "ModelProvider | None" = None,
+    storage: "ConversationStore | None" = None,
+    session: "ConversationSession | None" = None,
     history_settings: ResolvedHistorySettings | None = None,
-    compaction_config: "CompactionConfig | None" = None,
-    has_authored_compaction_config: bool | None = None,
     active_model_name: str | None = None,
     active_context_window: int | None = None,
-    static_prompt_tokens: int | None = None,
-    available_history_budget: int | None = None,
+    system_prompt: str | None = None,
     scope: HistoryScope | None = None,
     execution_plan: ResolvedHistoryExecutionPlan | None = None,
     compaction_lifecycle: CompactionLifecycle | None = None,
 ) -> PreparedHistoryState:
-    """Compose the production history-preparation seams for one test run."""
-    resolved_scope = scope or _resolve_history_scope(agent)
-    resolved_inputs = resolve_agent_preparation_inputs(
-        agent=agent,
-        agent_name=agent_name,
-        full_prompt=full_prompt,
+    """Compose the production history-preparation seams for one test run of an agent without tools.
+
+    The run's first request holds ``system_prompt``, the scope's history, and ``full_prompt`` as its turn. ``model``
+    is the provider the run's requests go to; without one, history is sized by estimate alone.
+    """
+    resolved_scope = scope or HistoryScope(kind="agent", scope_id=agent_name)
+    model = model or estimate_only_model()
+    model_name = active_model_name or entity_model_name(config, agent_name)
+    resolved_inputs = resolve_entity_preparation_inputs(
         config=config,
-        history_settings=history_settings,
-        compaction_config=compaction_config,
-        has_authored_compaction_config=has_authored_compaction_config,
-        active_model_name=active_model_name,
+        runtime_paths=runtime_paths,
+        history_settings=history_settings or config.resolve_scope(agent_name).history_settings,
+        active_model_name=model_name,
         active_context_window=active_context_window,
-        static_prompt_tokens=static_prompt_tokens,
-        execution_plan=execution_plan,
     )
-    if available_history_budget is not None:
-        # prepare_scope_history reads its trigger/hard budgets from the execution
-        # plan, so express the test budget override through the plan itself.
-        resolved_inputs = replace(
-            resolved_inputs,
-            execution_plan=replace(
-                resolved_inputs.execution_plan,
-                replay_budget_tokens=available_history_budget,
-                hard_replay_budget_tokens=available_history_budget,
-            ),
-        )
+    if execution_plan is not None:
+        resolved_inputs = replace(resolved_inputs, execution_plan=execution_plan)
+    frame = request_frame(full_prompt, system=system_prompt)
     scope_history_kwargs = {
-        "agent": agent,
-        "agent_name": agent_name,
+        "sizer": request_sizer(model, config, model_name),
+        "frame": frame,
         "resolved_inputs": resolved_inputs,
         "runtime_paths": runtime_paths,
         "config": config,
-        "scope": resolved_scope,
         "compaction_lifecycle": compaction_lifecycle,
+        "pipeline_timing": None,
+        "allow_native_compaction": True,
     }
-    if storage is not None and resolved_scope is not None and session_id is not None:
+    if storage is not None and session_id is not None:
         persisted_session = session
         if persisted_session is None:
-            persisted_session = (
-                get_team_session(storage, session_id)
-                if resolved_scope.kind == "team"
-                else get_agent_session(storage, session_id)
-            )
+            persisted_session = storage.load_session(session_id)
         scope_context = ScopeSessionContext(
             scope=resolved_scope,
             storage=storage,
             session=persisted_session,
             session_id=session_id,
+            storage_factory=lambda: storage,
         )
         prepared_scope_history = await prepare_scope_history(scope_context=scope_context, **scope_history_kwargs)
     else:
-        with open_scope_session_context(
-            agent=agent,
-            agent_name=agent_name,
-            session_id=session_id,
-            runtime_paths=runtime_paths,
-            config=config,
-            execution_identity=execution_identity,
-            scope=resolved_scope,
-        ) as scope_context:
-            prepared_scope_history = await prepare_scope_history(scope_context=scope_context, **scope_history_kwargs)
+        scope_context = (
+            load_scope_session(
+                session_id=session_id,
+                runtime_paths=runtime_paths,
+                config=config,
+                execution_identity=execution_identity,
+                scope=resolved_scope,
+            )
+            if session_id is not None
+            else None
+        )
+        prepared_scope_history = await prepare_scope_history(scope_context=scope_context, **scope_history_kwargs)
     return finalize_history_preparation(
         prepared_scope_history=prepared_scope_history,
-        config=config,
-        static_prompt_tokens=static_prompt_tokens,
-        available_history_budget=available_history_budget,
-    )
-
-
-def dispatch_context_result(context: MessageContext) -> DispatchContextResult:
-    """Wrap a stable message context in the dispatch extraction result shape."""
-    return DispatchContextResult(context=context, thread_context=None)
-
-
-def prepared_dispatch_result(dispatch: PreparedDispatch) -> _DispatchPreparation:
-    """Wrap a prepared dispatch in the private turn-controller preparation result shape."""
-    return _DispatchPreparation(
-        dispatch=dispatch,
-        replay_guard=_ReplayGuardContext(
-            history=dispatch.context.replay_guard_history,
-            degraded=is_thread_history_degraded(dispatch.context.replay_guard_history),
-            thread_id=dispatch.target.resolved_thread_id,
-        ),
+        frame=frame,
+        pipeline_timing=None,
     )
 
 
@@ -654,26 +906,66 @@ def request_envelope(
     )
 
 
+def live_turn_claim(*source_event_ids: str) -> TurnClaim:
+    """Return a live claim on these sources, alone in its own registry, for gate and lane cleanup tests."""
+    return _ClaimRegistry().register(frozenset(source_event_ids), frozenset())
+
+
+def turn_claim_is_live(claim: TurnClaim) -> bool:
+    """Return whether a claim from ``live_turn_claim`` is still held."""
+    return any(claim._registry.owns(event_id) for event_id in claim.source_event_ids)
+
+
+def make_ingress_facts(
+    sender: str,
+    *,
+    source_kind: str = MESSAGE_SOURCE_KIND,
+    requester_user_id: str | None = None,
+    acting_requester_id: str | None = None,
+    original_sender: str | None = None,
+    original_sender_is_human: bool = False,
+    hook_source: str | None = None,
+    message_received_depth: int = 0,
+    discovery_event_id: str | None = None,
+    sender_entity_name: str | None = None,
+    requester_entity_name: str | None = None,
+) -> IngressFacts:
+    """Build the provenance ingress classifies for one event; the lane requester defaults to its sender."""
+    return IngressFacts(
+        physical_sender=sender,
+        source_kind=source_kind,
+        lane_requester_id=requester_user_id or sender,
+        original_sender=original_sender,
+        original_sender_is_human=original_sender_is_human,
+        acting_requester_id=acting_requester_id,
+        hook_source=hook_source,
+        message_received_depth=message_received_depth,
+        discovery_event_id=discovery_event_id,
+        sender_entity_name=sender_entity_name,
+        requester_entity_name=requester_entity_name,
+    )
+
+
 def make_pending_event(
     event: PreparedIngress | nio.RoomMessageFormatted | MediaDispatchEvent,
     room: nio.MatrixRoom,
     *,
     source_kind: str,
-    dispatch_policy_source_kind: str | None = None,
+    active_follow_up: bool = False,
     hook_source: str | None = None,
     message_received_depth: int = 0,
-    trust_internal_payload_metadata: bool = False,
+    payload_trusted: bool = False,
     requester_user_id: str | None = None,
     discovery_event_id: str | None = None,
     turn_dispatch_recovery: bool = False,
     enqueue_time: float | None = None,
-    dispatch_metadata: tuple[PendingDispatchMetadata, ...] = (),
+    notice: QueuedHumanNoticeReservation | None = None,
+    facts: IngressFacts | None = None,
 ) -> PendingEvent:
-    """Build one PendingEvent with per-source evidence stamped on its PreparedIngress.
+    """Build one PendingEvent with its admission facts beside its PreparedIngress.
 
-    Mirrors the pre-refactor PendingEvent constructor: raw nio text events are
-    normalized into PreparedIngress form and raw nio media events are wrapped
-    with their caption and retained protocol reference.
+    Raw nio text events are normalized into PreparedIngress form and raw nio
+    media events are wrapped with their caption and retained protocol reference.
     """
     if isinstance(event, PreparedIngress):
         prepared = event
@@ -692,18 +984,21 @@ def make_pending_event(
         raise TypeError(msg)
     prepared = replace(
         prepared,
+        active_follow_up=active_follow_up or prepared.active_follow_up,
+        payload_trusted=payload_trusted or prepared.payload_trusted,
+        turn_dispatch_recovery=turn_dispatch_recovery or prepared.turn_dispatch_recovery,
+    )
+    facts = facts or make_ingress_facts(
+        prepared.sender,
         source_kind=source_kind,
-        dispatch_policy_source_kind=dispatch_policy_source_kind,
+        requester_user_id=requester_user_id,
         hook_source=hook_source,
         message_received_depth=message_received_depth,
-        trust_internal_payload_metadata=trust_internal_payload_metadata,
-        requester_user_id=requester_user_id,
         discovery_event_id=discovery_event_id,
-        turn_dispatch_recovery=turn_dispatch_recovery,
     )
     if enqueue_time is None:
-        return PendingEvent(event=prepared, room=room, dispatch_metadata=dispatch_metadata)
-    return PendingEvent(event=prepared, room=room, enqueue_time=enqueue_time, dispatch_metadata=dispatch_metadata)
+        return PendingEvent(event=prepared, room=room, facts=facts, notice=notice)
+    return PendingEvent(event=prepared, room=room, facts=facts, enqueue_time=enqueue_time, notice=notice)
 
 
 def requires_linux(
@@ -737,9 +1032,9 @@ async def drain_coalescing(*bots: RuntimeBot) -> None:
             # runner drain settles.
             await asyncio.gather(
                 bot._coalescing_gate.drain_all(),
-                runner.drain_inbox_responses(),
+                runner.inbox.drain_inbox_responses(),
             )
-            if not runner._inbox_response_tasks and not bot._coalescing_gate._gates:
+            if not runner.inbox._inbox_response_tasks and not bot._coalescing_gate._gates:
                 break
 
 
@@ -824,9 +1119,15 @@ def _postgres_container_name(run_id: str, prefix: str) -> str:
     return f"{prefix}{run_id}"
 
 
+# The controller creates the pipe and every worker mounts it, so they must agree
+# on its directory. Captured at import, before pytest-shm points each process's
+# temp root into that process's own pytest base directory at session start.
+_OWNER_PIPE_ROOT = Path(tempfile.gettempdir())
+
+
 def _owner_pipe_dir(run_id: str) -> Path:
     """Return the host directory holding one run's owner pipe."""
-    return Path(tempfile.gettempdir()) / f"mindroom-pytest-owner-{run_id}"
+    return _OWNER_PIPE_ROOT / f"mindroom-pytest-owner-{run_id}"
 
 
 def _hold_owner_pipe(run_id: str) -> None:
@@ -1006,7 +1307,7 @@ def postgres_journal_schema_url(database_url: str) -> str:
 async def journal_database(
     request: pytest.FixtureRequest,
     tmp_path: Path,
-) -> AsyncGenerator[Callable[[], "EventJournalStore"], None]:
+) -> AsyncGenerator[Callable[[], "EventJournalStore"]]:
     """Return an opener onto one empty database, per supported backend.
 
     Parametrized rather than duplicated so a rule can only be proven for one
@@ -1056,7 +1357,7 @@ def journal_store(journal_database: Callable[[], "EventJournalStore"]) -> "Event
     return journal_database()
 
 
-async def _empty_async_iterator() -> AsyncGenerator[object, None]:
+async def _empty_async_iterator() -> AsyncGenerator[object]:
     """Yield nothing while preserving async-iterator semantics for nio relations APIs."""
     if False:
         yield None
@@ -1087,28 +1388,23 @@ def _make_room_get_event_response(
 
 
 def _outcome(
-    terminal_status: str,
+    ending: TurnEnding,
     event_id: str | None = None,
     is_visible_response: bool = False,
     final_visible_body: str | None = None,
     delivery_kind: str | None = None,
-    failure_reason: str | None = None,
-    suppressed: bool = False,
     tool_trace: tuple[object, ...] = (),
     extra_content: Mapping[str, object] | None = None,
     option_map: dict[str, str] | None = None,
     options_list: tuple[dict[str, str], ...] | None = None,
 ) -> FinalDeliveryOutcome:
     """Build one compact terminal outcome for tests."""
-    resolved_suppressed = suppressed or (failure_reason == "suppressed_by_hook" and not is_visible_response)
     return FinalDeliveryOutcome(
-        terminal_status=terminal_status,
+        ending=ending,
         event_id=event_id,
         is_visible_response=is_visible_response,
         final_visible_body=final_visible_body,
         delivery_kind=delivery_kind,
-        failure_reason=failure_reason,
-        suppressed=resolved_suppressed,
         tool_trace=tool_trace,
         extra_content=dict(extra_content or {}),
         interactive_metadata=InteractiveMetadata._from_parts(option_map, options_list),
@@ -1145,10 +1441,81 @@ class _AutoRoomCache(MutableMapping[str, nio.MatrixRoom]):
         return len(self._rooms)
 
 
+@dataclass
+class FakeMediaResponse:
+    """The part of an aiohttp response that a streamed Matrix media download reads."""
+
+    body: bytes
+    status: int = 200
+    headers: dict[str, str] = field(default_factory=dict)
+    streamed_bytes: int = 0
+    released: bool = False
+
+    @property
+    def content(self) -> "FakeMediaResponse":
+        """Stand in for the response's payload stream."""
+        return self
+
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        """Yield the body in chunks, counting what the reader actually took."""
+        for start in range(0, len(self.body), size):
+            chunk = self.body[start : start + size]
+            self.streamed_bytes += len(chunk)
+            yield chunk
+
+    def release(self) -> None:
+        """Record that the reader gave the connection back."""
+        self.released = True
+
+
+async def serve_media_download(download: Callable[..., Awaitable[object]], path: str) -> FakeMediaResponse:
+    """Answer one streamed media download request from a test's ``download(mxc=...)`` fake."""
+    server_name, media_id = urlsplit(path).path.split("/")[-2:]
+    response = await download(mxc=f"mxc://{unquote(server_name)}/{unquote(media_id)}")
+    if isinstance(response, nio.DownloadResponse):
+        return FakeMediaResponse(response.body)
+    return FakeMediaResponse(b'{"errcode": "M_NOT_FOUND"}', status=404)
+
+
+def serve_media_from_download(client: AsyncMock) -> None:
+    """Answer streamed media requests on ``client.send`` from ``client.download`` as it is when each is sent."""
+
+    async def send(_method: str, path: str, *_args: object, **_kwargs: object) -> object:
+        if "/media/download/" not in path:
+            return DEFAULT
+        return await serve_media_download(client.download, path)
+
+    client.access_token = TEST_ACCESS_TOKEN
+    client.send = AsyncMock(side_effect=send)
+
+
+async def push_stream_chunk(streaming: "StreamingResponse", chunk: str, client: object) -> None:
+    """Apply one visible chunk to a stream and let its throttle decide whether to deliver it."""
+    prior_delta_at = streaming.last_delta_at
+    streaming._update(chunk)
+    await streaming._throttled_send(client, prior_delta_at=prior_delta_at)
+
+
+def legacy_default_store_client(
+    homeserver: str,
+    user_id: str,
+    device_id: str,
+    access_token: str,
+    runtime_paths: RuntimePaths,
+) -> MindRoomAsyncClient:
+    """Open a client on the ordinary nio DefaultStore that MindRoom wrote before owned sessions existed."""
+    store_dir = olm_store_dir(user_id, runtime_paths)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    client = MindRoomAsyncClient(homeserver, user_id, store_path=str(store_dir), config=matrix_client_config())
+    client.restore_login(user_id, device_id, access_token)
+    return client
+
+
 def make_matrix_client_mock(*, user_id: str = "@mindroom_test:example.com") -> AsyncMock:
     """Return an AsyncClient-shaped mock with safe defaults for sync nio APIs."""
     client = AsyncMock(spec=nio.AsyncClient)
     client.user_id = user_id
+    client.homeserver = "https://localhost"
     # A logged-in client always has one, and delivery records it on every claim
     # so a resend can tell whether its frozen transaction ID still deduplicates.
     client.device_id = "TESTDEVICE"
@@ -1170,6 +1537,8 @@ def make_matrix_client_mock(*, user_id: str = "@mindroom_test:example.com") -> A
     client.room_get_event_relations = MagicMock(return_value=_empty_async_iterator())
     client.room_messages = AsyncMock(return_value=room_messages_response)
     client.joined_rooms = AsyncMock(return_value=nio.JoinedRoomsResponse(rooms=[]))
+    client.list_direct_rooms = AsyncMock(return_value=nio.DirectRoomsErrorResponse("No direct rooms", "M_NOT_FOUND"))
+    serve_media_from_download(client)
 
     return client
 
@@ -1225,6 +1594,13 @@ def delivered_matrix_side_effect(event_id: str) -> Callable[..., Awaitable[Deliv
     return _deliver
 
 
+def summarized_lines(request: "ModelRequest") -> list[str]:
+    """Return the thread lines one summary request asked the model to summarize."""
+    prompt = request.messages[-1].get_content_string()
+    start = prompt.index("<thread_messages>\n") + len("<thread_messages>\n")
+    return prompt[start : prompt.index("\n</thread_messages>")].splitlines()
+
+
 def serve_conversation_reader(
     reader: ConversationReader,
     messages: Sequence[ResolvedVisibleMessage],
@@ -1240,19 +1616,34 @@ def serve_conversation_reader(
                 room_id=room_id,
                 thread_id=thread_id,
                 sender=message.sender,
-                # `or ordinal` would rewrite a real timestamp of 0.
-                created_ts=ordinal if message.timestamp is None else message.timestamp,
-                revision_event_id=message.event_id,
-                revision_ts=ordinal if message.timestamp is None else message.timestamp,
+                created_ts=message.timestamp,
+                revision_event_id=message.latest_event_id,
+                revision_ts=message.edited_timestamp if message.edited_timestamp is not None else message.timestamp,
                 content=dict(message.content),
             )
-            for ordinal, message in enumerate(messages, start=1)
+            for message in messages
         ),
         refresh_pending=(),
         next_cursor=None,
     )
     reader.read.return_value = page
     reader.read_strict.return_value = page
+
+
+class _NoReplyRecords:
+    """Reply records of an outbox that never writes a reply row."""
+
+    async def with_pending_work(self) -> tuple[object, ...]:
+        return ()
+
+    async def for_event(self, _event_id: str) -> None:
+        return None
+
+    async def for_sources(self, _event_ids: tuple[str, ...]) -> None:
+        return None
+
+    async def load(self, _reply_id: str) -> None:
+        return None
 
 
 class FakeOutbox:
@@ -1266,11 +1657,7 @@ class FakeOutbox:
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], MatrixDelivery] = {}
-        # What each acknowledgement carried alongside it, so a test can
-        # assert the terminal record and the acknowledgement are one write.
-        self.acknowledged_terminal_turns: list[tuple[str, TerminalTurnWrite | None]] = []
         self.acknowledged_projections: list[tuple[ProjectedEvent, ...]] = []
-        self.attempted: set[tuple[str, str]] = set()
         # Turns whose membership has ended, as the journal would report it.
         self.ended_membership_turn_ids: set[str] = set()
         # The journal sources each FINAL enqueue handed over, in order.
@@ -1281,6 +1668,11 @@ class FakeOutbox:
     def principal_id(self) -> str:
         """Return the principal this in-memory delivery store represents."""
         return "agent@alice"
+
+    @property
+    def replies(self) -> _NoReplyRecords:
+        """Return the reply records this outbox never writes."""
+        return _NoReplyRecords()
 
     async def membership_epoch(self, room_id: str) -> int:
         """Return the fake room's current membership epoch."""
@@ -1302,7 +1694,6 @@ class FakeOutbox:
         result: Mapping[str, object] | None = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
-        settle_source_event_ids: tuple[str, ...] = (),
         permanent_failure_reason: str | None = None,
     ) -> str | None:
         """Record intent, leaving an already-attempted row's payload alone.
@@ -1318,14 +1709,7 @@ class FakeOutbox:
         to go out under the frozen transaction rather than strand whatever it
         may already have made visible.
 
-        The handed-over sources are kept rather than dropped, because they are
-        a durable effect of this call in production and a double that swallowed
-        them would let a lost handoff pass unnoticed. There is no journal here
-        to settle them in; whether the settlement really shares this
-        transaction is pinned against the real backends.
         """
-        if settle_source_event_ids:
-            self.handed_over.append(settle_source_event_ids)
         membership_epoch = await self.membership_epoch(room_id)
         existing_owner = next(
             (
@@ -1344,14 +1728,14 @@ class FakeOutbox:
         key = (delivery_id, stage.value)
         existing = self.rows.get(key)
         if existing is not None:
-            if key in self.attempted or existing.permanently_failed:
+            if existing.attempted or existing.permanently_failed:
                 return existing.transaction_id
             self.rows[key] = replace(
                 existing,
                 room_id=room_id,
                 thread_id=thread_id,
                 payload=matrix_delivery_payload(self.principal_id, delivery_id, stage, payload),
-                result=dict(result) if result is not None else _inline_final_result(payload),
+                result=dict(result) if result is not None else None,
                 event_type=event_type,
                 edits_event_id=edits_event_id,
                 permanent_failure_reason=permanent_failure_reason,
@@ -1369,7 +1753,7 @@ class FakeOutbox:
             thread_id=thread_id,
             transaction_id=transaction_id,
             payload=matrix_delivery_payload(self.principal_id, delivery_id, stage, payload),
-            result=dict(result) if result is not None else _inline_final_result(payload),
+            result=dict(result) if result is not None else None,
             edits_event_id=edits_event_id,
             acknowledged_event_id=None,
             created_at_ns=len(self.rows),
@@ -1408,7 +1792,6 @@ class FakeOutbox:
             and initial.acknowledged_event_id is None
         ):
             return None
-        self.attempted.add(key)
         claimed = replace(
             row,
             attempted=True,
@@ -1439,18 +1822,18 @@ class FakeOutbox:
         delivery_id: str,
         stage: DeliveryStage,
         reason: str,
-    ) -> str | None:
-        """Stop retrying one definitively refused immutable payload, or return its ACK."""
+    ) -> PermanentDeliveryFailure:
+        """Stop retrying one definitively refused immutable payload, or report its ACK."""
         if not reason:
             msg = "A permanent Matrix delivery failure requires a reason"
             raise ValueError(msg)
         key = (delivery_id, stage.value)
         row = self.rows.get(key)
         if row is None or row.acknowledged_event_id is not None:
-            return None if row is None else row.acknowledged_event_id
+            return PermanentDeliveryFailure(acknowledged_event_id=None if row is None else row.acknowledged_event_id)
         if not row.retired and not row.permanently_failed:
             self.rows[key] = replace(row, permanent_failure_reason=reason)
-        return None
+        return PermanentDeliveryFailure()
 
     async def retire_matrix_delivery(
         self,
@@ -1471,6 +1854,43 @@ class FakeOutbox:
         self.rows[key] = replace(row, retired=True)
         return None
 
+    async def enqueue_final_answer(
+        self,
+        *,
+        delivery_id: str,
+        room_id: str,
+        thread_id: str | None,
+        payload: Mapping[str, object],
+        turn_key: str | None,
+        result: Mapping[str, object] | None = None,
+        event_type: str = "m.room.message",
+        edits_event_id: str | None = None,
+        permanent_failure_reason: str | None = None,
+    ) -> FinalAnswerEnqueue | None:
+        """Record a FINAL answer and hand over its delivery's own source.
+
+        There is no turn store here to bind, so only the delivery id is handed
+        over and kept, because the handoff is a durable effect of this call in
+        production and a double that swallowed it would let a lost handoff pass
+        unnoticed; what a bound turn settles is pinned against the real backends.
+        """
+        del turn_key
+        transaction_id = await self.enqueue_matrix_delivery(
+            delivery_id=delivery_id,
+            stage=DeliveryStage.FINAL,
+            room_id=room_id,
+            thread_id=thread_id,
+            payload=payload,
+            result=result,
+            event_type=event_type,
+            edits_event_id=edits_event_id,
+            permanent_failure_reason=permanent_failure_reason,
+        )
+        if transaction_id is None:
+            return None
+        self.handed_over.append((delivery_id,))
+        return FinalAnswerEnqueue(transaction_id=transaction_id, settled_event_ids=(delivery_id,))
+
     async def acknowledge_matrix_delivery(
         self,
         *,
@@ -1478,29 +1898,23 @@ class FakeOutbox:
         stage: DeliveryStage,
         event_id: str,
         delivered_projections: tuple[ProjectedEvent, ...],
-        terminal_turn: TerminalTurnWrite | None = None,
+        terminal_response_event_id: str | None = None,  # noqa: ARG002 - this fake keeps no turns
     ) -> DeliveryAcknowledgement:
-        """Record the Matrix event one claimed delivery produced, and the turn it completes.
-
-        The terminal record is kept rather than discarded so a test can assert
-        it travelled *with* the acknowledgement. Dropping it here would let the
-        two drift apart again without anything noticing.
-        """
+        """Record the Matrix event one claimed delivery produced."""
         key = (delivery_id, stage.value)
         already = self.rows[key].acknowledged_event_id
         if already is not None:
             # First-writer-wins, like the real store: a loser is told the event
             # the row already names rather than its own, and told it bound
             # nothing -- which stays true even when the two events are equal.
-            return DeliveryAcknowledgement(settled_event_id=already, bound=False)
+            return DeliveryAcknowledgement(settled_event_id=already)
         self.rows[key] = replace(
             self.rows[key],
             acknowledged_event_id=event_id,
             permanent_failure_reason=None,
         )
-        self.acknowledged_terminal_turns.append((delivery_id, terminal_turn))
         self.acknowledged_projections.append(delivered_projections)
-        return DeliveryAcknowledgement(settled_event_id=event_id, bound=True, terminal_turn=terminal_turn)
+        return DeliveryAcknowledgement(settled_event_id=event_id)
 
     async def unacknowledged_matrix_deliveries(
         self,
@@ -1610,7 +2024,6 @@ class DiesAfterAcknowledgement:
         result: Mapping[str, object] | None = None,
         event_type: str = "m.room.message",
         edits_event_id: str | None = None,
-        settle_source_event_ids: tuple[str, ...] = (),
         permanent_failure_reason: str | None = None,
     ) -> str | None:
         """Record delivery intent."""
@@ -1623,7 +2036,32 @@ class DiesAfterAcknowledgement:
             result=result,
             event_type=event_type,
             edits_event_id=edits_event_id,
-            settle_source_event_ids=settle_source_event_ids,
+            permanent_failure_reason=permanent_failure_reason,
+        )
+
+    async def enqueue_final_answer(
+        self,
+        *,
+        delivery_id: str,
+        room_id: str,
+        thread_id: str | None,
+        payload: Mapping[str, object],
+        turn_key: str | None,
+        result: Mapping[str, object] | None = None,
+        event_type: str = "m.room.message",
+        edits_event_id: str | None = None,
+        permanent_failure_reason: str | None = None,
+    ) -> FinalAnswerEnqueue | None:
+        """Record a FINAL answer and its handoff."""
+        return await self.inner.enqueue_final_answer(
+            delivery_id=delivery_id,
+            room_id=room_id,
+            thread_id=thread_id,
+            payload=payload,
+            turn_key=turn_key,
+            result=result,
+            event_type=event_type,
+            edits_event_id=edits_event_id,
             permanent_failure_reason=permanent_failure_reason,
         )
 
@@ -1669,8 +2107,8 @@ class DiesAfterAcknowledgement:
         delivery_id: str,
         stage: DeliveryStage,
         reason: str,
-    ) -> str | None:
-        """Stop retrying one definitively refused immutable payload, or return its ACK."""
+    ) -> PermanentDeliveryFailure:
+        """Stop retrying one definitively refused immutable payload, or report its ACK."""
         return await self.inner.record_permanent_matrix_delivery_failure(
             delivery_id=delivery_id,
             stage=stage,
@@ -1700,7 +2138,7 @@ class DiesAfterAcknowledgement:
         stage: DeliveryStage,
         event_id: str,
         delivered_projections: tuple[ProjectedEvent, ...],
-        terminal_turn: TerminalTurnWrite | None = None,
+        terminal_response_event_id: str | None = None,
     ) -> DeliveryAcknowledgement:
         """Record the Matrix outcome, then die before anything else can run."""
         await self.inner.acknowledge_matrix_delivery(
@@ -1708,7 +2146,7 @@ class DiesAfterAcknowledgement:
             stage=stage,
             event_id=event_id,
             delivered_projections=delivered_projections,
-            terminal_turn=terminal_turn,
+            terminal_response_event_id=terminal_response_event_id,
         )
         msg = "crashed the instant the outcome was recorded"
         raise CrashError(msg)
@@ -1728,14 +2166,13 @@ class DiesAfterAcknowledgement:
         )
 
 
-# Drops contract 2's journal handoff, for tests that are not about it. Named
-# rather than a bare lambda so a reader can see that the handoff was
-# deliberately stubbed here, not forgotten. Tests that care what the handoff
-# settles use a real journal store instead.
-ignore_final_delivery_handoff = TurnHandoff(
-    sources_for_turn=lambda _turn_id: (),
-    released=lambda _event_ids: None,
-)
+def ignore_final_delivery_handoff(_event_ids: tuple[str, ...]) -> None:
+    """Drop the outbox-enqueue journal handoff, for tests that are not about it.
+
+    Named so a reader can see that the handoff was deliberately stubbed here,
+    not forgotten. Tests that care what the handoff settles use a real journal
+    store instead.
+    """
 
 
 async def ignore_delivered_projection(
@@ -1744,34 +2181,6 @@ async def ignore_delivered_projection(
 ) -> tuple[ProjectedEvent, ...]:
     """Return no projection for outbox-only tests."""
     return ()
-
-
-@dataclass
-class FakePendingTurnStore:
-    """A journal holding no unfinished work, for tests that are not about the replay guard.
-
-    The empty answer is the one that changes nothing: the degraded replay
-    guard acts only on positive proof, so a store with nothing pending never
-    suppresses a turn. Tests that are about the guard admit into a real journal
-    instead, because the filtering they exercise happens in SQL.
-    """
-
-    async def pending_thread_events_after(
-        self,
-        *,
-        room_id: str,  # noqa: ARG002 - part of the view's shape
-        thread_id: str,  # noqa: ARG002 - part of the view's shape
-        after_origin_server_ts: int,  # noqa: ARG002 - part of the view's shape
-        excluding_event_id: str,  # noqa: ARG002 - part of the view's shape
-        limit: int = 256,  # noqa: ARG002 - part of the view's shape
-    ) -> tuple[JournalEvent, ...]:
-        """Return no unsettled events in this thread."""
-        return ()
-
-
-def make_pending_turn_view() -> PendingTurnView:
-    """Return a journal view that reports no unfinished work in any conversation."""
-    return cast("PendingTurnView", FakePendingTurnStore())
 
 
 @dataclass
@@ -1825,6 +2234,7 @@ def make_relation_lookup(
     *,
     threads: dict[str, str | None] | None = None,
     client: object | None = None,
+    failure: Exception | None = None,
 ) -> RelationLookup:
     """Return a real relation lookup over an in-memory set of admitted events.
 
@@ -1836,9 +2246,47 @@ def make_relation_lookup(
     """
     resolved_client = SimpleNamespace(client=client) if client is not None else _serving_client()
     return RelationLookup(
-        store=cast("RelationView", FakeRelationStore(threads=dict(threads or {}))),
+        store=cast("RelationView", FakeRelationStore(threads=dict(threads or {}), failure=failure)),
         runtime=resolved_client,  # type: ignore[arg-type]
     )
+
+
+def event_serving_client(
+    event_id: str,
+    *,
+    content: dict[str, object],
+    event_type: str = "m.room.message",
+) -> MagicMock:
+    """Return a homeserver that serves one event for every point lookup."""
+    client = MagicMock()
+    client.room_get_event = AsyncMock(
+        return_value=nio.RoomGetEventResponse.from_dict(
+            {
+                "event_id": event_id,
+                "sender": "@user:localhost",
+                "origin_server_ts": 1,
+                "room_id": "!room:localhost",
+                "type": event_type,
+                "content": content,
+            },
+        ),
+    )
+    return client
+
+
+def thread_reply_client(reply_event_id: str, thread_root_id: str) -> MagicMock:
+    """Return a homeserver that answers every event lookup with one reply inside a thread."""
+    content = {
+        "msgtype": "m.text",
+        "body": "reply",
+        "m.relates_to": {"rel_type": "m.thread", "event_id": thread_root_id},
+    }
+    return event_serving_client(reply_event_id, content=content)
+
+
+def make_thread_reply_lookup(reply_event_id: str, thread_root_id: str) -> RelationLookup:
+    """Return a relation lookup whose homeserver answers every event lookup with one reply inside a thread."""
+    return make_relation_lookup(client=thread_reply_client(reply_event_id, thread_root_id))
 
 
 def _serving_client() -> SimpleNamespace:
@@ -1884,6 +2332,8 @@ def make_conversation_reader_mock() -> ConversationReader:
             read=AsyncMock(return_value=page),
             read_strict=AsyncMock(return_value=page),
             latest_thread_event_id=AsyncMock(return_value=None),
+            # A walk on the server again that read the whole conversation.
+            hydrator=SimpleNamespace(rewalk=AsyncMock(return_value=True)),
         ),
     )
 
@@ -1945,18 +2395,72 @@ def install_runtime_journal_support(bot: RuntimeBot) -> RuntimeBot:
         change_membership=change_membership,
     )
     bot.change_local_membership = change_membership  # type: ignore[method-assign]
+    bot.personal_rooms.change_membership = change_membership
     sync_bot_runtime_state(bot)
     return bot
 
 
-def install_call_manager_mock(bot: RuntimeBot, call_manager: object | None) -> None:
-    """Install a call-manager fake through the shared test seam."""
-    bot._call_manager = cast("CallManager | None", call_manager)
+async def start_call_manager(bot: RuntimeBot) -> MagicMock:
+    """Start ``bot``'s call wiring as startup does, with a spec'd call-manager fake built for its config; return it."""
+    call_manager = MagicMock(spec=CallManager)
+    with patch("mindroom.bot.maybe_build_call_manager", new=AsyncMock(return_value=call_manager)):
+        await bot._register_call_manager_callbacks(MagicMock(spec=nio.AsyncClient))
+    return call_manager
 
 
 def normalize_console_output(text: str) -> str:
     """Collapse wrapped console output for stable substring assertions."""
     return " ".join(_SOFT_WRAP_RE.sub("", _ANSI_RE.sub("", text)).split())
+
+
+def fresh_thread_summary_baselines(monkeypatch: pytest.MonkeyPatch) -> _ThreadSummaryBaselines:
+    """Install fresh process-wide thread-summary baselines and locks, as a restart starts with."""
+    fresh = _ThreadSummaryBaselines()
+    monkeypatch.setattr(thread_summary_schedule, "THREAD_SUMMARY_BASELINES", fresh)
+    return fresh
+
+
+@pytest.fixture
+def thread_summary_baselines(monkeypatch: pytest.MonkeyPatch) -> _ThreadSummaryBaselines:
+    """Give the test its own process-wide thread-summary baselines and locks."""
+    return fresh_thread_summary_baselines(monkeypatch)
+
+
+_CLI_CONSOLES = (
+    cli_config_module.console,
+    cli_config_module._err_console,
+    cli_desktop_module._console,
+    cli_desktop_module._error_console,
+    cli_service_module._console,
+    cli_service_module._err_console,
+)
+
+
+@pytest.fixture
+def wide_cli_consoles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Render the CLI's consoles at a width no output line with a temporary path reaches.
+
+    `normalize_console_output` rejoins a line wrapped at a space without that space, so a temporary path in the middle
+    of a line breaks the assertion at some path lengths. The CLI builds its consoles at import, which fixes a `COLUMNS`
+    exported when pytest starts, and with `FORCE_COLOR` set the root conftest's dumb terminal makes Rich use 80 columns.
+    Rich takes a pinned width and height before either.
+    """
+    for console in _CLI_CONSOLES:
+        monkeypatch.setattr(console, "_width", 1000)
+        monkeypatch.setattr(console, "_height", 25)
+
+
+@pytest.fixture
+def narrow_markup_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Return a folder whose path Rich would read as markup and that passes 80 columns, with the CLI at 80 columns.
+
+    On a console that reads the path as markup, `[work]` disappears and `[/x]` raises `MarkupError`.
+    """
+    directory = tmp_path / "[work]" / "[" / "x]" / ("a-folder-name-that-pushes-the-path-past-eighty-columns-" * 2)
+    directory.mkdir(parents=True)
+    for console in _CLI_CONSOLES:
+        monkeypatch.setattr(console, "_width", 80)
+    return directory
 
 
 class _ExtractedCollaboratorProxy[CollaboratorT]:
@@ -1981,37 +2485,6 @@ class _ExtractedCollaboratorProxy[CollaboratorT]:
             return
         msg = f"{type(self).__name__!s} has no attribute {name!r}"
         raise AttributeError(msg)
-
-
-class FakeModel(Model):
-    """Minimal model returning one canned response, for deterministic agent tests."""
-
-    def invoke(self, *_args: object, **_kwargs: object) -> ModelResponse:
-        """Return one successful fake response."""
-        return ModelResponse(content="ok")
-
-    async def ainvoke(self, *_args: object, **_kwargs: object) -> ModelResponse:
-        """Return one successful fake async response."""
-        return ModelResponse(content="ok")
-
-    def invoke_stream(self, *_args: object, **_kwargs: object) -> Iterator[ModelResponse]:
-        """Yield one successful fake streaming response."""
-        yield ModelResponse(content="ok")
-
-    async def ainvoke_stream(self, *_args: object, **_kwargs: object) -> AsyncIterator[ModelResponse]:
-        """Yield one successful fake async streaming response."""
-        yield ModelResponse(content="ok")
-
-    def _parse_provider_response(self, response: ModelResponse, *_args: object, **_kwargs: object) -> ModelResponse:
-        return response
-
-    def _parse_provider_response_delta(
-        self,
-        response: ModelResponse,
-        *_args: object,
-        **_kwargs: object,
-    ) -> ModelResponse:
-        return response
 
 
 class FakeCredentialsManager:
@@ -2054,17 +2527,16 @@ class FakeCredentialsManager:
         """Return the shared credential layer for this fake manager."""
         return self
 
+    def for_primary_runtime_agent_scope(self, agent_name: str) -> "FakeCredentialsManager":
+        """Return an empty primary agent-scoped store."""
+        return FakeCredentialsManager({}, storage_root=self.storage_root / "primary" / agent_name)
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Skip tests marked with requires_matrix unless MATRIX_SERVER_URL is set."""
-    if os.environ.get("MATRIX_SERVER_URL"):
-        # Matrix server available, don't skip
-        return
-
-    skip_marker = pytest.mark.skip(reason="requires_matrix: no MATRIX_SERVER_URL set")
-    for item in items:
-        if "requires_matrix" in item.keywords:
-            item.add_marker(skip_marker)
+    def for_primary_runtime_scope(self, requester_id: str, agent_name: str | None) -> "FakeCredentialsManager":
+        """Return an empty primary requester-scoped store."""
+        return FakeCredentialsManager(
+            {},
+            storage_root=self.storage_root / "primary" / requester_id / (agent_name or ""),
+        )
 
 
 # Test credentials constants - not real credentials, safe for testing
@@ -2088,6 +2560,21 @@ def test_runtime_paths(tmp_root: Path) -> RuntimePaths:
 
 
 test_runtime_paths.__test__ = False
+
+
+def install_bots(orchestrator: "_MultiAgentOrchestrator", bots: Mapping[str, object]) -> None:
+    """Register test bots with a real orchestrator's entity fleet, which owns every managed bot."""
+    for entity_name, bot in bots.items():
+        orchestrator.fleet.add(entity_name, cast("AgentBot", bot))
+
+
+def swap_fleet_bot(orchestrator: "_MultiAgentOrchestrator", entity_name: str, bot: object | None) -> None:
+    """Swap or drop one fleet bot in place, as a finished replacement or removal leaves it, without its lifecycle."""
+    slots = orchestrator.fleet._slots
+    if bot is None:
+        del slots[entity_name]
+    else:
+        slots[entity_name].bot = cast("AgentBot", bot)
 
 
 def orchestrator_runtime_paths(
@@ -2117,6 +2604,110 @@ def load_config_yaml(config_path: Path) -> Config:
     return load_config(resolve_runtime_paths(config_path=Path(config_path).expanduser().resolve()))
 
 
+def published_config_load(config: Config) -> ConfigLoad:
+    """Return a successful load of ``config`` that no newer API commit superseded."""
+    return ConfigLoad(
+        config=config,
+        source_fingerprint=config.source_fingerprint,
+        source_files=config.source_files,
+        uses_includes=config.uses_includes,
+    )
+
+
+async def initialize_from_config_file(runtime_paths: RuntimePaths) -> "_MultiAgentOrchestrator":
+    """Load the config file the way `mindroom run` startup does, then build and initialize the runtime from that load."""
+    from mindroom.orchestrator import _MultiAgentOrchestrator  # noqa: PLC0415
+
+    config = await load_startup_config(runtime_paths, api_enabled=True)
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=runtime_paths, config=config)
+    await orchestrator.initialize()
+    return orchestrator
+
+
+def make_config_reload_lifecycle(
+    runtime_paths: RuntimePaths,
+    *,
+    current_config: Config | None = None,
+    agent_bots: Mapping[str, AgentBot] | None = None,
+    response_admission_gate: ResponseAdmissionGate | None = None,
+    load_config: Callable[[], ConfigLoad] | None = None,
+) -> ConfigReloadLifecycle:
+    """Return a running reload lifecycle with stubbed runtime hooks; it loads the config file unless told otherwise."""
+    runtime_config = current_config if current_config is not None else Config()
+    return ConfigReloadLifecycle(
+        runtime_paths=runtime_paths,
+        is_running=lambda: True,
+        current_config=lambda: runtime_config,
+        agent_bots=lambda: agent_bots if agent_bots is not None else {},
+        load_config=load_config or partial(load_published_config, runtime_paths, api_enabled=False),
+        apply_update_plan=AsyncMock(return_value=True),
+        response_admission_gate=response_admission_gate or ResponseAdmissionGate(),
+        before_runtime_replacement=AsyncMock(),
+        rebind_published_config_consumers=MagicMock(),
+        finish_reload=AsyncMock(),
+        after_reload=AsyncMock(),
+    )
+
+
+def write_concurrent_edit_while_validating(monkeypatch: pytest.MonkeyPatch, config_path: Path, agent_name: str) -> str:
+    """Rename ``agent_name`` on disk, as a dashboard save would, while a candidate carrying "Agent change" validates.
+
+    Returns the concurrently written source.
+    """
+    concurrent = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    concurrent["agents"][agent_name]["display_name"] = "Saved from the dashboard"
+    concurrent_source = yaml.safe_dump(concurrent, sort_keys=True)
+    validate = Config.validate_with_runtime
+
+    def validate_after_concurrent_edit(data: object, runtime_paths: RuntimePaths, **kwargs: object) -> Config:
+        if (
+            "Agent change" in json.dumps(data, default=str)
+            and config_path.read_text(encoding="utf-8") != concurrent_source
+        ):
+            config_path.write_text(concurrent_source, encoding="utf-8")
+        return validate(data, runtime_paths, **kwargs)
+
+    monkeypatch.setattr(Config, "validate_with_runtime", staticmethod(validate_after_concurrent_edit))
+    return concurrent_source
+
+
+def assert_refused_for_concurrent_edit(result: str, config_path: Path, concurrent_source: str) -> None:
+    """Assert a change was refused because the file changed, keeping the concurrent edit on disk."""
+    assert "configuration file changed" in result
+    assert "NOT applied" in result
+    assert "Invalid configuration" not in result
+    assert config_path.read_text(encoding="utf-8") == concurrent_source
+
+
+def write_demo_tool_plugin(plugin_root: Path, tool_name: str) -> None:
+    """Write a plugin at ``plugin_root`` whose tools module registers one tool named ``tool_name``."""
+    plugin_root.mkdir(parents=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        json.dumps({"name": "demo_plugin", "tools_module": "tools.py", "skills": []}),
+        encoding="utf-8",
+    )
+    (plugin_root / "tools.py").write_text(
+        "from agno.tools import Toolkit\n"
+        "from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess\n"
+        "from mindroom.tool_system.registration import register_tool_with_metadata\n"
+        "\n"
+        "class DemoTool(Toolkit):\n"
+        "    def __init__(self) -> None:\n"
+        "        super().__init__(name='demo', tools=[])\n"
+        "\n"
+        "@register_tool_with_metadata(\n"
+        f"    name='{tool_name}',\n"
+        "    file_access=ToolFileAccess.NONE,\n"
+        "    display_name='Plugin Tool',\n"
+        "    description='Plugin-defined tool',\n"
+        "    category=ToolCategory.DEVELOPMENT,\n"
+        ")\n"
+        "def demo_plugin_tools():\n"
+        "    return DemoTool\n",
+        encoding="utf-8",
+    )
+
+
 def write_config_yaml(config: Config, config_path: Path) -> None:
     """Write a test config using the authored YAML representation."""
     path = Path(config_path)
@@ -2134,28 +2725,41 @@ def write_config_yaml(config: Config, config_path: Path) -> None:
     safe_replace(tmp_path, path)
 
 
+def plant_workspace_entry(path: Path, kind: str, victim: Path | None = None) -> None:
+    """Put what worker code could plant at ``path``: a ``link`` to ``victim`` or a ``fifo``."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    else:
+        assert victim is not None
+        path.symlink_to(victim, target_is_directory=victim.is_dir())
+
+
 def bind_runtime_paths(
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> Config:
-    """Return a runtime-bound copy of a test config."""
-    bound = Config.validate_with_runtime(config.authored_model_dump(), runtime_paths)
-    _persist_bound_entity_accounts(bound, runtime_paths)
+    """Return a runtime-bound copy of a test config.
+
+    Unless the test config authors them, a reply waits no coalescing debounce and starts no automatic thread summary.
+    A summary builds a model by name in the background, usually the reply's own ``default``, so it would take a turn
+    that the test scripted for the reply. A config that authors no models gets the ``default`` model its entities name.
+    """
+    data = config.authored_model_dump()
+    if not data.get("models"):
+        data["models"] = {"default": {"provider": "openai", "id": "test-model"}}
+    bound = Config.validate_with_runtime(data, runtime_paths)
+    persist_entity_accounts(bound, runtime_paths)
     authored_coalescing = config.defaults.coalescing
     if "debounce_ms" not in authored_coalescing.model_fields_set:
         bound.defaults.coalescing.debounce_ms = 0
+    if "thread_summary_first_threshold" not in config.defaults.model_fields_set:
+        # No test thread reaches this many messages.
+        bound.defaults.thread_summary_first_threshold = sys.maxsize
     _TEST_RUNTIME_PATHS_BY_CONFIG_ID[id(bound)] = runtime_paths
     return bound
-
-
-def _persist_bound_entity_accounts(config: Config, runtime_paths: RuntimePaths) -> None:
-    """Prepare managed Matrix accounts for tests that bind runtime config."""
-    persist_entity_accounts(config, runtime_paths)
-
-
-def bind_mock_config_event_journal(mock_config: MagicMock) -> None:
-    """Give a config mock the durable-store contract the bot runtime reads."""
-    mock_config.event_journal.backend = "sqlite"
 
 
 def runtime_paths_for(config: Config) -> RuntimePaths:
@@ -2165,6 +2769,230 @@ def runtime_paths_for(config: Config) -> RuntimePaths:
         msg = "Test config is missing bound RuntimePaths"
         raise KeyError(msg)
     return runtime_paths
+
+
+def cached_plugin_entry(module_path: Path) -> plugin_imports._ModuleCacheEntry:
+    """Return the one plugin module cache entry for a file, whatever other plugins earlier tests left cached."""
+    (entry,) = (
+        cached for cached in plugin_imports._MODULE_IMPORT_CACHE.values() if cached.module.__file__ == str(module_path)
+    )
+    return entry
+
+
+def cached_plugin_module(module_path: Path) -> ModuleType:
+    """Return the one cached plugin module imported from a file."""
+    return cached_plugin_entry(module_path).module
+
+
+def register_test_tool(monkeypatch: pytest.MonkeyPatch, metadata: ToolMetadata) -> None:
+    """Register ``metadata`` as one built-in tool for the rest of the test.
+
+    Built-in tools never change in a running process, so views composed before the change are dropped.
+    """
+    tool_registry_module.builtin_tool_registry()
+    monkeypatch.setitem(tool_registry_module._BUILTIN_TOOLS, metadata.name, metadata)
+    plugins_module._CONFIG_PLUGINS.clear()
+
+
+def replace_test_tool_factory(monkeypatch: pytest.MonkeyPatch, tool_name: str, factory: Callable[[], type]) -> None:
+    """Build the built-in tool ``tool_name`` from ``factory`` for the rest of the test."""
+    metadata = tool_registry_module.builtin_tool_registry().entries[tool_name]
+    register_test_tool(monkeypatch, replace(metadata, factory=factory))
+
+
+def publish_test_plugins(config: Config, runtime_paths: RuntimePaths) -> plugins_module.ConfigPlugins:
+    """Publish ``config``'s plugins as startup does and return its view, failing on a plugin that does not load.
+
+    The autouse restore of the plugin state undoes the publication after the test.
+    """
+    generation = plugins_module.prepare_plugins(config, runtime_paths)
+    if generation.skipped:
+        plugins_module.dispose_plugins(generation)
+        raise generation.skipped[0].error
+    plugins_module.publish_plugins(generation)
+    return plugins_module.config_plugins(config, runtime_paths)
+
+
+# Plugin code a test writes reaches the test's own objects through probe modules under this prefix; the autouse
+# plugin-state restore removes them after the test.
+_TEST_PROBE_PREFIX = "mindroom_test_probe_"
+
+
+def write_hook_plugin(plugin_root: Path, name: str, callbacks: Sequence[object]) -> None:
+    """Write plugin ``name`` at ``plugin_root`` whose hooks module offers the test's ``@hook`` functions ``callbacks``.
+
+    The hooks module takes them from a probe module, so a test observes its own hooks through a real plugin publication.
+    """
+    probe = ModuleType(f"{_TEST_PROBE_PREFIX}{uuid.uuid4().hex}")
+    probe.callbacks = tuple(callbacks)
+    sys.modules[probe.__name__] = probe
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        json.dumps({"name": name, "hooks_module": "hooks.py", "skills": []}),
+        encoding="utf-8",
+    )
+    exports = "".join(f"hook_{index} = _probe.callbacks[{index}]\n" for index in range(len(callbacks)))
+    (plugin_root / "hooks.py").write_text(
+        f"import sys\n\n_probe = sys.modules[{probe.__name__!r}]\n{exports}",
+        encoding="utf-8",
+    )
+
+
+def publish_hook_plugin(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    name: str,
+    callbacks: Sequence[object],
+) -> plugins_module.ConfigPlugins:
+    """Publish plugin ``name``, whose hooks are ``callbacks``, as one of ``config``'s plugins and return its view.
+
+    The view's hooks are the registry the orchestrator activates for ``config`` and every later turn's context
+    captures. Publishing ``name`` again replaces its hooks.
+    """
+    write_hook_plugin(runtime_paths.config_dir / "plugins" / name, name, callbacks)
+    entry = PluginEntryConfig(path=f"./plugins/{name}")
+    if entry not in config.plugins:
+        config.plugins.append(entry)
+    return publish_test_plugins(config, runtime_paths)
+
+
+GENERATION_PROBE_TOOL = "generation_probe"
+_GENERATION_PROBE_MODULE = f"{_TEST_PROBE_PREFIX}generation"
+
+
+def write_generation_probe_plugin(plugin_root: Path, generation: int) -> list[tuple[str, int]]:
+    """Write plugin ``generation-probe`` at ``plugin_root`` as of ``generation`` and return what its calls report.
+
+    Its tool ``generation_probe`` offers ``which_generation``, whose body appends ``("tool", generation)`` and whose
+    before-call hook appends ``("hook", generation)`` to the returned list, so a test tells which publication each
+    half of one call came from. Rewriting the plugin with another ``generation`` keeps the list.
+    """
+    probe = sys.modules.get(_GENERATION_PROBE_MODULE)
+    if probe is None:
+        probe = ModuleType(_GENERATION_PROBE_MODULE)
+        probe.seen = []
+        sys.modules[_GENERATION_PROBE_MODULE] = probe
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    (plugin_root / "mindroom.plugin.json").write_text(
+        json.dumps(
+            {"name": "generation-probe", "tools_module": "tools.py", "hooks_module": "hooks.py", "skills": []},
+        ),
+        encoding="utf-8",
+    )
+    header = f"import sys\n\nGENERATION = {generation}\n_seen = sys.modules[{_GENERATION_PROBE_MODULE!r}].seen\n\n"
+    (plugin_root / "tools.py").write_text(
+        header + "from agno.tools import Toolkit\n"
+        "\n"
+        "from mindroom.plugin_api import ToolCategory, ToolFileAccess, register_tool_with_metadata\n"
+        "\n"
+        "class GenerationProbeTools(Toolkit):\n"
+        "    def __init__(self) -> None:\n"
+        f"        super().__init__(name={GENERATION_PROBE_TOOL!r}, tools=[self.which_generation])\n"
+        "\n"
+        "    async def which_generation(self) -> str:\n"
+        '        """Return the plugin generation this tool came from."""\n'
+        "        _seen.append(('tool', GENERATION))\n"
+        "        return str(GENERATION)\n"
+        "\n"
+        "@register_tool_with_metadata(\n"
+        f"    name={GENERATION_PROBE_TOOL!r},\n"
+        "    file_access=ToolFileAccess.NONE,\n"
+        "    display_name='Generation Probe',\n"
+        "    description='Report the plugin generation',\n"
+        "    category=ToolCategory.DEVELOPMENT,\n"
+        ")\n"
+        "def generation_probe_tools():\n"
+        "    return GenerationProbeTools\n",
+        encoding="utf-8",
+    )
+    (plugin_root / "hooks.py").write_text(
+        header + "from mindroom.plugin_api import hook\n"
+        "\n"
+        "@hook('tool:before_call')\n"
+        "async def record_generation(ctx):\n"
+        "    if ctx.tool_name == 'which_generation':\n"
+        "        _seen.append(('hook', GENERATION))\n",
+        encoding="utf-8",
+    )
+    return probe.seen
+
+
+def snapshot_builtin_tools() -> dict[str, ToolMetadata]:
+    """Return a copy of the built-in tools, for `restore_builtin_tools`."""
+    return dict(tool_registry_module.builtin_tool_registry().entries)
+
+
+def restore_builtin_tools(snapshot: Mapping[str, ToolMetadata]) -> None:
+    """Make the built-in tools the ones ``snapshot`` copied, dropping every tool registered since."""
+    tool_registry_module._BUILTIN_TOOLS.clear()
+    tool_registry_module._BUILTIN_TOOLS.update(snapshot)
+
+
+@contextmanager
+def preserved_builtin_tools() -> Iterator[None]:
+    """Restore the built-in tools a block registers or replaces.
+
+    Built-in tools never change in a running process, so config views composed before the change are dropped.
+    """
+    snapshot = snapshot_builtin_tools()
+    plugins_module._CONFIG_PLUGINS.clear()
+    try:
+        yield
+    finally:
+        restore_builtin_tools(snapshot)
+        plugins_module._CONFIG_PLUGINS.clear()
+
+
+@pytest.fixture
+def restored_builtin_tools() -> Iterator[None]:
+    """Restore the built-in tools the test registers or replaces when it ends."""
+    with preserved_builtin_tools():
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_published_plugins() -> Iterator[None]:
+    """Restore the published plugin generation and the installed plugin modules a test loads or publishes.
+
+    The probe modules a test's plugins read go too.
+    """
+    published = plugins_module._PUBLISHED
+    module_cache = dict(plugin_imports._MODULE_IMPORT_CACHE)
+    manifest_cache = dict(plugin_imports._PLUGIN_CACHE)
+    root_packages = dict(plugins_module._ROOT_PACKAGES)
+    modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name.startswith(tool_registry_module.PLUGIN_MODULE_PREFIX)
+    }
+    imported = set(sys.modules)
+    yield
+    # The modules the test's package plugins loaded under their package names go too.
+    test_packages = tuple(set(plugins_module._ROOT_PACKAGES) - set(root_packages))
+    for name in set(plugins_module._modules_named(test_packages)) - imported:
+        del sys.modules[name]
+    plugins_module._PUBLISHED = published
+    plugins_module._PROCESS_STATE.clear()
+    plugin_imports._MODULE_IMPORT_CACHE.clear()
+    plugin_imports._MODULE_IMPORT_CACHE.update(module_cache)
+    plugin_imports._PLUGIN_CACHE.clear()
+    plugin_imports._PLUGIN_CACHE.update(manifest_cache)
+    plugins_module._ROOT_PACKAGES.clear()
+    plugins_module._ROOT_PACKAGES.update(root_packages)
+    for name in [
+        name
+        for name in sys.modules
+        if name.startswith(
+            (
+                tool_registry_module.PLUGIN_MODULE_PREFIX,
+                tool_registry_module.CANDIDATE_PLUGIN_MODULE_PREFIX,
+                _TEST_PROBE_PREFIX,
+            ),
+        )
+    ]:
+        if name not in modules:
+            del sys.modules[name]
+    sys.modules.update(modules)
 
 
 def create_mock_room(
@@ -2182,6 +3010,33 @@ def create_mock_room(
     else:
         room.users = {}
     return room
+
+
+def completing(respond: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[mindroom_ai.TurnResult]]:
+    """Return an ``ai_response`` stand-in that answers as ``respond`` does, in a turn that completed.
+
+    A blocking caller reads a turn that holds no completed attempt as failed, so a bare ``TurnResult`` is a failed turn.
+    """
+
+    async def complete(*args: object, **kwargs: object) -> mindroom_ai.TurnResult:
+        text = await respond(*args, **kwargs)
+        return mindroom_ai.TurnResult(
+            text=text,
+            completed=CompletedAttempt(replayable_text=text, has_visible_content=bool(text)),
+        )
+
+    return complete
+
+
+def completed_ai_response_mock(**kwargs: object) -> AsyncMock:
+    """Return an ``AsyncMock`` ``ai_response`` whose turn completes with its ``return_value``."""
+    mock = AsyncMock(**kwargs)
+
+    async def respond(*_args: object, **_kwargs: object) -> str:
+        return mock.return_value
+
+    mock.side_effect = completing(respond)
+    return mock
 
 
 def make_turn_context(
@@ -2290,7 +3145,7 @@ def _sync_request_payload_preparer(bot: RuntimeBot) -> None:
         logger=runner.deps.logger,
     )
     bot._request_payload_preparer = preparer
-    runner.deps = replace(runner.deps, request_preparer=preparer)
+    runner.locked.deps = replace(runner.deps, request_preparer=preparer)
 
 
 async def prepare_payload_via_seam(bot: RuntimeBot, execute_args: tuple[object, ...]) -> None:
@@ -2300,6 +3155,10 @@ async def prepare_payload_via_seam(bot: RuntimeBot, execute_args: tuple[object, 
     payload_inputs = cast("DispatchPayloadInputs", execute_args[4])
     await bot._request_payload_preparer.prepare(
         ResponseRequest(
+            sources=ResponseSources(
+                pending_event_ids=(dispatch.envelope.source_event_id,),
+                logical_source_event_ids=(dispatch.envelope.source_event_id,),
+            ),
             thread_history=dispatch.context.thread_history,
             prompt=event.body,
             response_envelope=dispatch.envelope,
@@ -2317,15 +3176,10 @@ async def prepare_payload_via_seam(bot: RuntimeBot, execute_args: tuple[object, 
 
 
 def sync_bot_runtime_state(bot: RuntimeBot) -> None:
-    """Update the extracted runtime state after tests mutate bot internals."""
-    runtime = bot._runtime_view
+    """Give a client a test swapped in the bot's user id, as a logged-in client has."""
     client = bot.client
     if client is not None and getattr(client, "user_id", None) is None:
         client.user_id = bot.matrix_id.full_id
-    runtime.client = bot.client
-    runtime.config = bot.config
-    runtime.enable_streaming = bot.enable_streaming
-    runtime.orchestrator = bot.orchestrator
 
 
 def replace_turn_policy_deps(bot: RuntimeBot, **changes: object) -> TurnPolicy:
@@ -2341,15 +3195,14 @@ def replace_turn_policy_deps(bot: RuntimeBot, **changes: object) -> TurnPolicy:
     store_changes = {name: value for name, value in changes.items() if name in store_field_names}
     if store_changes:
         replace_turn_store_deps(bot, **store_changes)
-    controller = unwrap_extracted_collaborator(bot._turn_controller)
-    controller_field_names = set(controller.deps.__dataclass_fields__)
-    controller_changes = {name: value for name, value in changes.items() if name in controller_field_names}
+    owner_field_names = _turn_owner_field_names(bot)
+    owner_changes = {name: value for name, value in changes.items() if name in owner_field_names}
     if policy_changes:
-        controller_changes["turn_policy"] = bot._turn_policy
+        owner_changes["turn_policy"] = bot._turn_policy
     if store_changes:
-        controller_changes["turn_store"] = bot._turn_store
-    if controller_changes:
-        replace_turn_controller_deps(bot, **controller_changes)
+        owner_changes["turn_store"] = bot._turn_store
+    if owner_changes:
+        replace_turn_deps(bot, **owner_changes)
     return rebuilt
 
 
@@ -2370,7 +3223,7 @@ def replace_delivery_gateway_deps(bot: RuntimeBot, **changes: object) -> Deliver
     rebuilt = DeliveryGateway(replace(gateway.deps, **changes))
     bot._delivery_gateway = rebuilt
     wrap_extracted_collaborators(bot, "_delivery_gateway")
-    replace_turn_controller_deps(bot, delivery_gateway=bot._delivery_gateway)
+    replace_turn_deps(bot, delivery_gateway=bot._delivery_gateway)
     replace_response_runner_deps(bot, delivery_gateway=bot._delivery_gateway)
     return rebuilt
 
@@ -2379,11 +3232,17 @@ def replace_response_runner_deps(bot: RuntimeBot, **changes: object) -> Response
     """Rebuild the response runner after swapping captured collaborators."""
     sync_bot_runtime_state(bot)
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    rebuilt = ResponseRunner(replace(coordinator.deps, **changes))
-    bot._response_runner = rebuilt
+    bot._build_reply_turn_owners(replace(coordinator.deps, **changes))
+    rebuilt = bot._response_runner
     wrap_extracted_collaborators(bot, "_response_runner")
-    replace_turn_controller_deps(bot, response_runner=bot._response_runner)
+    replace_turn_deps(bot, response_runner=bot._response_runner)
     return rebuilt
+
+
+async def finish_edit_regenerations(bot: RuntimeBot) -> None:
+    """Wait for the regenerations edits started off the room's lane, as a test checks their effects."""
+    runner = unwrap_extracted_collaborator(bot._response_runner)
+    await asyncio.gather(*tuple(runner.inbox._inbox_response_tasks), return_exceptions=True)
 
 
 def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditRegenerator:
@@ -2391,12 +3250,10 @@ def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditReg
     install_runtime_journal_support(bot)
     regenerator = unwrap_extracted_collaborator(bot._edit_regenerator)
     regenerator_field_names = set(regenerator.deps.__dataclass_fields__)
-    rebuilt_changes = {
-        name: value for name, value in changes.items() if name in regenerator_field_names or name == "logger"
-    }
-    if "logger" in rebuilt_changes:
-        logger = rebuilt_changes.pop("logger")
-        rebuilt_changes["get_logger"] = lambda logger=logger: logger
+    store_field_names = set(unwrap_extracted_collaborator(bot._turn_store).deps.__dataclass_fields__)
+    unknown = set(changes) - regenerator_field_names - store_field_names
+    assert not unknown, f"not an edit regenerator or turn store collaborator: {sorted(unknown)}"
+    rebuilt_changes = {name: value for name, value in changes.items() if name in regenerator_field_names}
     if "receipt_order" not in rebuilt_changes:
         receipt_orders = count(1)
 
@@ -2404,7 +3261,6 @@ def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditReg
             return next(receipt_orders)
 
         rebuilt_changes["receipt_order"] = next_receipt_order
-    store_field_names = set(unwrap_extracted_collaborator(bot._turn_store).deps.__dataclass_fields__)
     store_changes = {name: value for name, value in changes.items() if name in store_field_names}
     if store_changes:
         replace_turn_store_deps(bot, **store_changes)
@@ -2412,8 +3268,18 @@ def replace_edit_regenerator_deps(bot: RuntimeBot, **changes: object) -> EditReg
     rebuilt = EditRegenerator(replace(regenerator.deps, **rebuilt_changes))
     bot._edit_regenerator = rebuilt
     wrap_extracted_collaborators(bot, "_edit_regenerator")
-    replace_turn_controller_deps(bot, edit_regenerator=bot._edit_regenerator)
+    replace_turn_deps(bot, edit_regenerator=bot._edit_regenerator)
     return rebuilt
+
+
+def install_edit_regeneration_mock(
+    bot: RuntimeBot,
+    generate_response: Callable[[ResponseRequest], Awaitable[object]],
+) -> EditRegenerator:
+    """Answer the bot's edit regenerations of an agent's turns through ``generate_response``, as its runner would."""
+    runner = _ExtractedCollaboratorProxy(unwrap_extracted_collaborator(bot._response_runner))
+    runner.generate_response = generate_response
+    return replace_edit_regenerator_deps(bot, response_runner=runner)
 
 
 def replace_reaction_dispatcher_deps(bot: RuntimeBot, **changes: object) -> ReactionDispatcher:
@@ -2429,20 +3295,67 @@ def replace_interactive_selection_handlers(
     handle: Callable[..., Awaitable[bool]] | None = None,
     start: Callable[..., Awaitable[None]] | None = None,
 ) -> None:
-    """Replace controller-owned interactive handlers for one test bot."""
-    controller = unwrap_extracted_collaborator(bot._turn_controller)
+    """Replace the interactive-selection handlers for one test bot."""
+    selections = bot._interactive_selections
     if handle is not None:
-        controller._handle_interactive_selection = handle  # type: ignore[method-assign]
+        selections._handle_interactive_selection = handle  # type: ignore[method-assign]
     if start is not None:
-        controller._start_interactive_selection = start  # type: ignore[method-assign]
+        selections._start_interactive_selection = start  # type: ignore[method-assign]
 
 
-def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnController:
-    """Rebuild the turn controller after swapping collaborators captured at construction."""
+def _changes_for(deps: "DataclassInstance", changes: Mapping[str, object]) -> dict[str, object]:
+    """Return the changes that name one owner's deps fields."""
+    return {name: value for name, value in changes.items() if name in deps.__dataclass_fields__}
+
+
+_VOICE_READINESS_CHANGES = {
+    "normalizer": "normalizer",
+    "turn_store": "turn_store",
+    "visible_voice_echo": "visible_echo",
+    "logger": "logger",
+}
+
+
+def _turn_owners(bot: RuntimeBot) -> tuple[TurnIngress, TurnDispatcher, InteractiveSelections, VoiceIngress]:
+    """Return the bot's turn owners: ingress, dispatch, interactive selections, and voice ingress."""
+    return bot._turn_ingress, bot._turn_dispatcher, bot._interactive_selections, bot._voice_ingress
+
+
+def _turn_owner_field_names(bot: RuntimeBot) -> set[str]:
+    """Return every deps field some turn owner has."""
+    return set().union(*(owner.deps.__dataclass_fields__ for owner in _turn_owners(bot)))
+
+
+def _held_turn_collaborator(bot: RuntimeBot, field_name: str) -> object:
+    """Return the collaborator the turn owners hold for one deps field."""
+    return next(
+        getattr(owner.deps, field_name) for owner in _turn_owners(bot) if field_name in owner.deps.__dataclass_fields__
+    )
+
+
+def update_turn_owner_deps(bot: RuntimeBot, **changes: object) -> None:
+    """Swap collaborators in place on every turn owner whose deps name them, voice readiness included.
+
+    In place, because the gate and the reaction dispatcher keep the owners they were built with.
+    """
+    owners = _turn_owners(bot)
+    known = set(_VOICE_READINESS_CHANGES) | _turn_owner_field_names(bot)
+    unknown = set(changes) - known
+    assert not unknown, f"not a turn owner collaborator: {sorted(unknown)}"
+    for owner in owners:
+        if owner_changes := _changes_for(owner.deps, changes):
+            owner.deps = replace(owner.deps, **owner_changes)
+    readiness_changes = {field: changes[name] for name, field in _VOICE_READINESS_CHANGES.items() if name in changes}
+    if readiness_changes:
+        voice = bot._voice_ingress
+        voice.deps = replace(voice.deps, readiness=replace(voice.deps.readiness, **readiness_changes))
+
+
+def replace_turn_deps(bot: RuntimeBot, **changes: object) -> None:
+    """Swap turn collaborators captured at construction, rebuilding the collaborators that capture them too."""
     sync_bot_runtime_state(bot)
-    controller = unwrap_extracted_collaborator(bot._turn_controller)
-    controller_field_names = set(controller.deps.__dataclass_fields__)
-    rebuilt_changes = {name: value for name, value in changes.items() if name in controller_field_names}
+    owner_field_names = _turn_owner_field_names(bot)
+    rebuilt_changes = {name: value for name, value in changes.items() if name in owner_field_names}
     default_collaborators = {
         "resolver": "_conversation_resolver",
         "normalizer": "_inbound_turn_normalizer",
@@ -2451,15 +3364,19 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
         "ingress_hook_runner": "_ingress_hook_runner",
         "response_runner": "_response_runner",
         "delivery_gateway": "_delivery_gateway",
-        "tool_runtime": "_tool_runtime_support",
         "turn_store": "_turn_store",
         "edit_regenerator": "_edit_regenerator",
         "visible_responses": "_visible_responses",
     }
+    # The owners are updated in place, so a collaborator a test passed in stays until
+    # the test passes another; only a bot attribute swapped since the last call replaces it.
+    propagated = bot.__dict__.setdefault("_propagated_turn_collaborators", {})
     for field_name, attr_name in default_collaborators.items():
-        if field_name in rebuilt_changes:
-            continue
-        rebuilt_changes[field_name] = getattr(bot, attr_name)
+        held = _held_turn_collaborator(bot, field_name)
+        propagated.setdefault(attr_name, held)
+        if field_name not in rebuilt_changes:
+            current = getattr(bot, attr_name)
+            rebuilt_changes[field_name] = current if current is not propagated[attr_name] else held
     store_field_names = set(unwrap_extracted_collaborator(bot._turn_store).deps.__dataclass_fields__)
     store_changes = {name: value for name, value in changes.items() if name in store_field_names}
     if store_changes:
@@ -2468,11 +3385,13 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
     if "edit_regenerator" not in rebuilt_changes:
         rebuilt_changes["edit_regenerator"] = bot._edit_regenerator
     if "ingress" not in rebuilt_changes:
+        validator_deps = bot._ingress_validator.deps
         rebuilt_changes["ingress"] = IngressValidator(
             replace(
-                bot._ingress_validator.deps,
+                validator_deps,
                 turn_store=rebuilt_changes["turn_store"],
                 turn_policy=rebuilt_changes["turn_policy"],
+                **{name: changes[name] for name in ("settle_ignored_sources",) if name in changes},
             ),
         )
     bot._ingress_validator = rebuilt_changes["ingress"]
@@ -2480,16 +3399,15 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
     bot._visible_voice_echo = VisibleVoiceEchoLifecycle(
         replace(
             visible_voice_echo.deps,
-            runtime=rebuilt_changes.get("runtime", controller.deps.runtime),
-            logger=rebuilt_changes.get("logger", controller.deps.logger),
-            agent_name=rebuilt_changes.get("agent_name", controller.deps.agent_name),
+            runtime=rebuilt_changes.get("runtime", _held_turn_collaborator(bot, "runtime")),
+            logger=rebuilt_changes.get("logger", _held_turn_collaborator(bot, "logger")),
+            agent_name=rebuilt_changes.get("agent_name", _held_turn_collaborator(bot, "agent_name")),
             delivery_gateway=rebuilt_changes["delivery_gateway"],
             turn_store=rebuilt_changes["turn_store"],
             ingress=rebuilt_changes["ingress"],
         ),
     )
     wrap_extracted_collaborators(bot, "_visible_voice_echo")
-    rebuilt_changes["visible_voice_echo"] = bot._visible_voice_echo
     visible_responses = unwrap_extracted_collaborator(bot._visible_responses)
     visible_response_changes = {
         name: value
@@ -2500,8 +3418,8 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
     bot._visible_responses = VisibleResponseReconciler(
         replace(
             visible_responses.deps,
-            runtime=rebuilt_changes.get("runtime", controller.deps.runtime),
-            logger=rebuilt_changes.get("logger", controller.deps.logger),
+            runtime=rebuilt_changes.get("runtime", _held_turn_collaborator(bot, "runtime")),
+            logger=rebuilt_changes.get("logger", _held_turn_collaborator(bot, "logger")),
             turn_store=rebuilt_changes["turn_store"],
             delivery_gateway=rebuilt_changes["delivery_gateway"],
             **visible_response_changes,
@@ -2529,10 +3447,10 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
     bot._command_turn_executor = CommandTurnExecutor(
         replace(
             command_executor.deps,
-            runtime=rebuilt_changes.get("runtime", controller.deps.runtime),
-            logger=rebuilt_changes.get("logger", controller.deps.logger),
-            runtime_paths=rebuilt_changes.get("runtime_paths", controller.deps.runtime_paths),
-            agent_name=rebuilt_changes.get("agent_name", controller.deps.agent_name),
+            runtime=rebuilt_changes.get("runtime", _held_turn_collaborator(bot, "runtime")),
+            logger=rebuilt_changes.get("logger", _held_turn_collaborator(bot, "logger")),
+            runtime_paths=rebuilt_changes.get("runtime_paths", _held_turn_collaborator(bot, "runtime_paths")),
+            agent_name=rebuilt_changes.get("agent_name", _held_turn_collaborator(bot, "agent_name")),
             normalizer=rebuilt_changes["normalizer"],
             turn_policy=rebuilt_changes["turn_policy"],
             turn_store=rebuilt_changes["turn_store"],
@@ -2547,33 +3465,29 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
         replace(
             user_stop_reconciler.deps,
             turn_store=rebuilt_changes["turn_store"],
-            response_runner=rebuilt_changes["response_runner"],
             delivery_gateway=rebuilt_changes["delivery_gateway"],
         ),
     )
     wrap_extracted_collaborators(bot, "_user_stop_reconciler")
-    rebuilt = TurnController(replace(controller.deps, **rebuilt_changes))
-    bot._turn_controller = rebuilt
+    update_turn_owner_deps(bot, **rebuilt_changes, visible_voice_echo=bot._visible_voice_echo)
+    ingress = bot._turn_ingress
     reaction_dispatcher = bot._reaction_dispatcher
     replace_reaction_dispatcher_deps(
         bot,
-        runtime=rebuilt.deps.runtime,
-        logger=rebuilt.deps.logger,
-        runtime_paths=rebuilt.deps.runtime_paths,
-        agent_name=rebuilt.deps.agent_name,
-        turn_policy=rebuilt.deps.turn_policy,
-        turn_store=rebuilt.deps.turn_store,
+        runtime=ingress.deps.runtime,
+        logger=ingress.deps.logger,
+        runtime_paths=ingress.deps.runtime_paths,
+        agent_name=ingress.deps.agent_name,
         user_stop_reconciler=bot._user_stop_reconciler,
-        ingress=rebuilt.deps.ingress,
-        stop_manager=bot.stop_manager,
-        reserve_prompt_ingress_order=rebuilt.reserve_prompt_ingress_order,
-        enqueue_interactive_selection=rebuilt.enqueue_interactive_selection,
+        ingress=ingress.deps.ingress,
+        reserve_prompt_ingress_order=ingress.reserve_prompt_ingress_order,
+        enqueue_interactive_selection=bot._interactive_selections.enqueue_interactive_selection,
         config_confirmation=replace(
             reaction_dispatcher.deps.config_confirmation,
-            runtime=rebuilt.deps.runtime,
-            runtime_paths=rebuilt.deps.runtime_paths,
-            build_message_target=rebuilt.deps.resolver.build_message_target,
-            delivery_gateway=rebuilt.deps.delivery_gateway,
+            runtime=ingress.deps.runtime,
+            runtime_paths=ingress.deps.runtime_paths,
+            build_message_target=ingress.deps.resolver.build_message_target,
+            delivery_gateway=ingress.deps.delivery_gateway,
         ),
     )
     edit_changes = {
@@ -2583,19 +3497,39 @@ def replace_turn_controller_deps(bot: RuntimeBot, **changes: object) -> TurnCont
     }
     if edit_changes:
         replace_edit_regenerator_deps(bot, **edit_changes)
-    return rebuilt
+    propagated.update({attr_name: getattr(bot, attr_name) for attr_name in default_collaborators.values()})
 
 
 @contextmanager
-def patch_response_runner_module(**changes: object) -> Generator[None, None, None]:
-    """Patch module-level response coordinator seams on the real current owner."""
+def patch_response_runner_module(**changes: object) -> Generator[None]:
+    """Patch module-level response runner seams on the real current owners.
+
+    A seam is patched in every reply module that imports it, so a resumed approval sees the replacement too.
+    """
     with ExitStack() as stack:
         for name, replacement in changes.items():
-            module_name = (
-                "mindroom.response_lifecycle" if name == "apply_post_response_effects" else "mindroom.response_runner"
-            )
-            stack.enter_context(patch(f"{module_name}.{name}", new=replacement))
+            if name == "apply_post_response_effects":
+                module_names = ["mindroom.response_lifecycle"]
+            else:
+                module_names = [
+                    module.__name__
+                    for module in (
+                        response_runner_module,
+                        reply_request_module,
+                        locked_turn_module,
+                        continuation_runner_module,
+                    )
+                    if name in vars(module)
+                ]
+            for module_name in module_names:
+                stack.enter_context(patch(f"{module_name}.{name}", new=replacement))
         yield
+
+
+def install_personal_room_shutdown_mock(bot: AgentBot) -> None:
+    """Install lifecycle cancellation for partial shutdown fixtures through one seam; they build no router duties."""
+    bot._personal_room_lifecycle = MagicMock(spec=PersonalRoomLifecycle)
+    bot._router = None
 
 
 def install_shutdown_drain_mocks(
@@ -2606,14 +3540,12 @@ def install_shutdown_drain_mocks(
     response_recovery_complete: bool,
 ) -> None:
     """Install exact shutdown drain outcomes through stable collaborator seams."""
-    wrap_extracted_collaborators(bot, "_coalescing_gate", "_response_runner")
+    wrap_extracted_collaborators(bot, "_coalescing_gate")
     bot._coalescing_gate.drain_all = AsyncMock(
         return_value=coalescing_drain_result,
     )
-    bot._response_runner.drain_inbox_responses = AsyncMock(return_value=responses_drained)
-    unwrap_extracted_collaborator(
-        bot._response_runner,
-    )._incomplete_inbox_responses_recoverable = response_recovery_complete
+    bot._response_runner.inbox.drain_inbox_responses = AsyncMock(return_value=responses_drained)
+    bot._response_runner.inbox._incomplete_inbox_responses_recoverable = response_recovery_complete
 
 
 def install_send_response_mock(bot: RuntimeBot, send_response: AsyncMock) -> None:
@@ -2643,19 +3575,15 @@ def install_send_response_mock(bot: RuntimeBot, send_response: AsyncMock) -> Non
         if event_id is None:
             if request.existing_event_id is not None:
                 return _outcome(
-                    terminal_status="error",
+                    Failed(FailureCause.DELIVERY_FAILED),
                     event_id=request.existing_event_id,
                     is_visible_response=True,
                     final_visible_body=request.response_text,
-                    failure_reason="test_mock_no_visible_response",
                     extra_content=request.extra_content,
                 )
-            return _outcome(
-                terminal_status="error",
-                failure_reason="test_mock_no_visible_response",
-            )
+            return _outcome(Failed(FailureCause.DELIVERY_FAILED))
         return _outcome(
-            terminal_status="completed",
+            Completed(),
             event_id=event_id,
             is_visible_response=True,
             final_visible_body=request.response_text,
@@ -2664,8 +3592,15 @@ def install_send_response_mock(bot: RuntimeBot, send_response: AsyncMock) -> Non
         )
 
     bot._delivery_gateway.deliver_final = AsyncMock(side_effect=_deliver_final)
-    replace_turn_controller_deps(bot, delivery_gateway=bot._delivery_gateway)
+    replace_turn_deps(bot, delivery_gateway=bot._delivery_gateway)
     replace_response_runner_deps(bot, delivery_gateway=bot._delivery_gateway)
+
+
+async def record_turn_answered(bot: RuntimeBot, request: ResponseRequest) -> None:
+    """Settle a faked response's sources and record its turn answered, as a real reply's records do."""
+    await bot._journal_dispatcher.store.settle_many(request.sources.pending_event_ids)
+    turn_store = unwrap_extracted_collaborator(bot._turn_store)
+    await turn_store.deps.turn_records.write(turn_rows.complete_turn_of, request.sources.logical_source_event_ids)
 
 
 def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock) -> None:
@@ -2679,18 +3614,18 @@ def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock
             return result.final_visible_event_id
         return result
 
-    async def _generate(request: ResponseRequest) -> str | None:
+    async def _generate(request: ResponseRequest) -> SourceFate:
         if request.payload_preparation is not None:
             try:
                 request = await bot._request_payload_preparer.prepare(request)
-            except Exception as exc:
-                raise PostLockRequestPreparationError from exc
+            except Exception:
+                # A real reply's records would show the failure and settle its sources.
+                return Owned()
         attachment_ids = list(request.attachment_ids) if request.attachment_ids is not None else None
         result = await generate_response(
             prompt=request.prompt,
             thread_history=request.thread_history,
             existing_event_id=request.existing_event_id,
-            existing_event_is_placeholder=request.existing_event_is_placeholder,
             user_id=request.user_id,
             media=request.media,
             attachment_ids=attachment_ids,
@@ -2701,10 +3636,17 @@ def install_generate_response_mock(bot: RuntimeBot, generate_response: AsyncMock
             correlation_id=request.correlation_id,
             matrix_run_metadata=request.matrix_run_metadata,
         )
-        return _resolved_event_id_from_test_result(result)
+        if isinstance(result, Owned | Unclaimed):
+            # The mock says what its response did with the sources.
+            return result
+        event_id = _resolved_event_id_from_test_result(result)
+        if event_id is not None:
+            await record_turn_answered(bot, request)
+        # A faked answer's sources are settled above; a faked silence leaves them pending, as a released reply does.
+        return Owned()
 
     bot._response_runner.generate_response = AsyncMock(side_effect=_generate)
-    replace_turn_controller_deps(bot, response_runner=bot._response_runner)
+    replace_turn_deps(bot, response_runner=bot._response_runner)
 
 
 def install_edit_message_mock(bot: RuntimeBot, edit_message: AsyncMock) -> None:
@@ -2722,8 +3664,33 @@ def install_edit_message_mock(bot: RuntimeBot, edit_message: AsyncMock) -> None:
         )
 
     bot._delivery_gateway.edit_text = AsyncMock(side_effect=_edit_text)
-    replace_turn_controller_deps(bot, delivery_gateway=bot._delivery_gateway)
+    replace_turn_deps(bot, delivery_gateway=bot._delivery_gateway)
     replace_response_runner_deps(bot, delivery_gateway=bot._delivery_gateway)
+
+
+def install_model_providers(monkeypatch: pytest.MonkeyPatch, providers: Mapping[str, "ModelProvider"]) -> None:
+    """Build the models ``providers`` names as the providers it maps them to, and every other model as before.
+
+    An earlier install builds the other models; a model no install maps raises ``LookupError`` instead of building
+    a real provider. ``providers`` is read at every build, so a test may replace a provider between two turns.
+    """
+    earlier = provider_registry.build_model_provider
+
+    def build(
+        config: Config,
+        paths: RuntimePaths,
+        model_name: str = "default",
+        *,
+        execution_identity: "ToolExecutionIdentity | None" = None,
+    ) -> "ModelProvider":
+        if model_name in providers:
+            return providers[model_name]
+        if earlier is _REAL_BUILD_MODEL_PROVIDER:
+            msg = f"no provider installed for model {model_name!r}"
+            raise LookupError(msg)
+        return earlier(config, paths, model_name, execution_identity=execution_identity)
+
+    monkeypatch.setattr(provider_registry, "build_model_provider", build)
 
 
 @pytest.fixture
@@ -2752,25 +3719,65 @@ def build_private_template_dir(tmp_path: Path) -> Callable[..., Path]:
     return _build
 
 
+@pytest.fixture
+def test_ca_pem() -> str:
+    """Return a valid test CA certificate in PEM format."""
+    return make_test_ca_pem()
+
+
 @pytest_asyncio.fixture
-async def aioresponse() -> AsyncGenerator[aioresponses, None]:
+async def aioresponse() -> AsyncGenerator[aioresponses]:
     """Async fixture for mocking HTTP responses in tests."""
     # Based on https://github.com/matrix-nio/matrix-nio/blob/main/tests/conftest_async.py
     with aioresponses() as m:
         yield m
 
 
+# Deadline for a test wait that should finish. A passing wait returns as soon as its work is done,
+# so the deadline only bounds a hang; it is generous because parallel runs stall background work.
+SETTLE_TIMEOUT_SECONDS = 30.0
+
+
+def loop_runs_while_blocked(loop: asyncio.AbstractEventLoop) -> bool:
+    """From inside a blocking call, return whether ``loop`` runs a callback meanwhile, as it can only when the call runs off the loop.
+
+    A call on the loop's own thread gets False at once, so a test whose calls moved onto the loop fails without waiting.
+    """
+    with suppress(RuntimeError):
+        if asyncio.get_running_loop() is loop:
+            return False
+    loop_ran = threading.Event()
+    loop.call_soon_threadsafe(loop_ran.set)
+    return loop_ran.wait(timeout=SETTLE_TIMEOUT_SECONDS)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_structlog_configuration(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
-) -> Generator[None, None, None]:
+) -> Generator[None]:
     """Silence incidental logs and prevent global logging configuration leaks."""
     _configure_quiet_structlog()
     if request.node.path.name != "test_logging_config.py":
         monkeypatch.setattr(structlog, "configure", _configure_uncached_structlog)
+    # `setup_logging` reroutes Agno's loggers; give later tests on this worker Agno's own setup back.
+    agno_loggers = [
+        (agno_logger, agno_logger.handlers[:], agno_logger.filters[:], agno_logger.level, agno_logger.propagate)
+        for agno_logger in (agno_log.agent_logger, agno_log.team_logger, agno_log.workflow_logger)
+    ]
+    # `setup_logging` also sets the root level and handlers; a DEBUG root makes every later test on this worker
+    # render and capture each debug record, which took team turns past the timeout.
+    root_logger = logging.getLogger()
+    root_handlers, root_level = root_logger.handlers[:], root_logger.level
     yield
+    root_logger.handlers[:] = root_handlers
+    root_logger.setLevel(root_level)
     _configure_quiet_structlog()
+    for agno_logger, handlers, filters, level, propagate in agno_loggers:
+        agno_logger.handlers[:] = handlers
+        agno_logger.filters[:] = filters
+        agno_logger.setLevel(level)
+        agno_logger.propagate = propagate
 
 
 @pytest.fixture(autouse=True)
@@ -2780,11 +3787,101 @@ def _pin_matrix_homeserver(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests use ':localhost' Matrix IDs and non-namespaced localparts unless they
     explicitly opt into a different runtime context.
     """
-    monkeypatch.delenv("MATRIX_HOMESERVER", raising=False)
+    monkeypatch.setenv("MATRIX_HOMESERVER", "http://localhost:8008")
     monkeypatch.delenv("MATRIX_SERVER_NAME", raising=False)
     monkeypatch.delenv("MINDROOM_NAMESPACE", raising=False)
     monkeypatch.delenv("MINDROOM_CONFIG_PATH", raising=False)
     monkeypatch.delenv("MINDROOM_STORAGE_PATH", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _homeserver_without_live_frames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep streams from asking a homeserver whether it relays live frames; a test that needs frames opts in."""
+
+    async def no_live_frames(_homeserver_url: str) -> bool:
+        return False
+
+    monkeypatch.setattr(streaming_module, "homeserver_relays_live_frames", no_live_frames)
+
+
+@pytest.fixture(autouse=True)
+def _shell_runs_without_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let shells in the test process run commands, and minimal mode use them, as `allow_shell_without_worker` does.
+
+    A test of the refusal requests `real_shell_refusal`.
+    """
+    for module in (shell_tool_module, agent_cli_shell_access_module):
+        monkeypatch.setattr(module, "shell_refuses_commands", lambda *_args, **_kwargs: False)
+
+
+@pytest.fixture
+def real_shell_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the real `shell_refuses_commands` back where `_shell_runs_without_worker` replaced it."""
+    for module in (shell_tool_module, agent_cli_shell_access_module):
+        monkeypatch.setattr(module, "shell_refuses_commands", _real_shell_refuses_commands)
+
+
+@pytest.fixture(autouse=True)
+def _reset_memory_entrypoint_snapshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a conversation's kept MEMORY.md copy from leaking into later tests."""
+    monkeypatch.setattr(memory_entrypoint_snapshots_module, "_snapshots", {})
+
+
+@pytest.fixture(autouse=True)
+def _reset_livekit_service_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a LiveKit service URL one test discovered from answering a later test's discovery."""
+    monkeypatch.setattr("mindroom.matrix_rtc.focus._discovered_service_urls", {})
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _loaded_o200k() -> None:
+    """Load the token encoder once, so no test's estimates depend on how far its background load has come."""
+    load_o200k()
+
+
+@pytest.fixture(autouse=True)
+def _withdraw_embedded_runtime_from_the_shared_api_app() -> Generator[None]:
+    """Withdraw a runtime a test lent the shared dashboard app, so each test binds the runtime it needs."""
+    yield
+    api_main = sys.modules.get("mindroom.api.main")
+    if api_main is not None:
+        api_main.unbind_embedded_runtime(api_main.app)
+
+
+@pytest.fixture(autouse=True)
+def _reset_active_mcp_server_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep an orchestrator's process-wide MCP manager from leaking into later tests."""
+    monkeypatch.setattr(mcp_toolkit_module, "_ACTIVE_MCP_SERVER_MANAGER", None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_refresh_scheduler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a test's process-wide knowledge refresh scheduler, bound to its event loop, from leaking into later tests."""
+    monkeypatch.setattr(knowledge_refresh_scheduler_module, "_runtime_scheduler", None)
+
+
+@pytest.fixture(autouse=True)
+def _restore_gil_switch_interval() -> Generator[None]:
+    """Keep a primary started by one test from shortening the GIL switch interval for later tests."""
+    interval = sys.getswitchinterval()
+    yield
+    sys.setswitchinterval(interval)
+
+
+@pytest.fixture(autouse=True)
+def _restore_gc_thresholds() -> Generator[None]:
+    """Keep a runtime refreeze in one test from raising the full-collection threshold for later tests."""
+    thresholds = gc.get_threshold()
+    yield
+    gc.set_threshold(*thresholds)
+
+
+@pytest.fixture(autouse=True)
+def _reopen_primary_worker_manager() -> Generator[None]:
+    """Reopen the process-wide primary worker manager after a test runs a real shutdown."""
+    yield
+    if not workers_runtime_module._PRIMARY_WORKER_MANAGER_ACCEPTING_BUILDS:
+        workers_runtime_module.reset_primary_worker_manager()
 
 
 @pytest.fixture(autouse=True)
@@ -2806,8 +3903,303 @@ def _never_build_the_dashboard(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINDROOM_AUTO_BUILD_FRONTEND", "0")
 
 
+def _refuse_connection(request: httpx.Request) -> NoReturn:
+    message = "network disabled in tests"
+    raise httpx.ConnectError(message, request=request)
+
+
+def _refuse_model_connection(request: httpx2.Request) -> NoReturn:
+    """Refuse a model SDK's request as its httpx2 transport refuses an unreachable host."""
+    message = "network disabled in tests"
+    raise httpx2.ConnectError(message, request=request)
+
+
 @pytest.fixture(autouse=True)
-def _reset_runtime_paths() -> Generator[None, None, None]:
+def _never_download_stock_avatars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep bot startup and room creation from fetching stock avatars over the network.
+
+    Tests behave like an offline machine, which leaves entities without a stock avatar.
+    `tests/test_managed_avatars.py` installs its own downloader to cover the real behavior.
+    """
+
+    async def offline(url: str) -> bytes:
+        _refuse_connection(httpx.Request("GET", url))
+
+    monkeypatch.setattr(managed_avatars_module, "_download_stock_avatar", offline)
+
+
+@pytest.fixture
+def current_static_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer the static sandbox runner's health probe as a runner of this release, for tests that fake no runner."""
+
+    def current(runner_root: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=asdict(worker_health_payload(mindroom_version="test")),
+            request=httpx.Request("GET", f"{runner_root}/healthz"),
+        )
+
+    monkeypatch.setattr(static_runner_module, "_read_runner_health", current)
+
+
+# Captured before any test patches them, so the offline clients below still start from the production ones.
+_PRODUCTION_EMBEDDER_CLIENT = OpenAIEmbedder._sdk_client
+_PRODUCTION_EMBEDDER_ACLIENT = OpenAIEmbedder._async_sdk_client
+
+
+def _offline_sync_client(embedder: OpenAIEmbedder) -> OpenAI:
+    if embedder.client is None:
+        # Without retries, because the SDK would back off for seconds before reporting the refusal.
+        embedder.client = _PRODUCTION_EMBEDDER_CLIENT(embedder).with_options(
+            http_client=httpx2.Client(transport=httpx2.MockTransport(_refuse_model_connection)),
+            max_retries=0,
+        )
+    return embedder.client
+
+
+def _offline_async_client(embedder: OpenAIEmbedder) -> AsyncOpenAI:
+    if embedder.async_client is None:
+        embedder.async_client = _PRODUCTION_EMBEDDER_ACLIENT(embedder).with_options(
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(_refuse_model_connection)),
+            max_retries=0,
+        )
+    return embedder.async_client
+
+
+@pytest.fixture
+def real_embedder_clients() -> None:
+    """Keep the OpenAI embedder SDK clients on their real transport, for tests that serve embeddings locally."""
+
+
+@pytest.fixture(autouse=True)
+def _offline_openai_embedders(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep OpenAI-compatible embedders from sending real embedding requests.
+
+    The default config pairs mem0 memory with the OpenAI embedder, so any test that searches memory
+    or probes embedder health builds one. Its requests would go to `OPENAI_BASE_URL` or
+    api.openai.com with the keyless placeholder key. Here an embedder without an injected SDK client
+    builds its clients the production way, then moves them onto a transport that fails every request
+    the way an unreachable endpoint does. Those failures never reach httpcore, so the network guard
+    does not report them: a test that uses such an embedder sees a down endpoint, as it would in
+    production. Tests that need vectors inject a client or their own embedder.
+    """
+    if "real_embedder_clients" in request.fixturenames:
+        return
+    monkeypatch.setattr(OpenAIEmbedder, "_sdk_client", _offline_sync_client)
+    monkeypatch.setattr(OpenAIEmbedder, "_async_sdk_client", _offline_async_client)
+
+
+_OLLAMA_DEFAULT_PORT = urlsplit(OLLAMA_HOST_DEFAULT).port
+
+
+def _dial_leaves_the_test(host: str, port: int) -> bool:
+    """Return whether to refuse dialing ``host:port``.
+
+    Refused: any host except localhost, ``*.localhost``, or a loopback or unspecified IP literal, plus port 11434,
+    where a locally running Ollama listens, on every host. Hostnames are never resolved, so every other name is
+    refused, and so are this machine's non-loopback addresses.
+    """
+    if host == "localhost" or host.endswith(".localhost"):
+        local = True
+    else:
+        try:
+            address = ipaddress.ip_address(host.strip("[]"))
+        except ValueError:
+            local = False
+        else:
+            local = address.is_loopback or address.is_unspecified
+    # Test servers on other local ports stay reachable.
+    return not local or port == _OLLAMA_DEFAULT_PORT
+
+
+@dataclass
+class _RefusedDial:
+    """One refused dial, the thread that made it, and whether a test failure has named it."""
+
+    address: str
+    thread: str
+    reported: bool = False
+
+
+def _refuse_dial_off_the_test(
+    host: str,
+    port: int,
+    connect_error: type[Exception],
+    dials: list[_RefusedDial],
+) -> None:
+    if _dial_leaves_the_test(host, port):
+        # httpcore passes IPv6 hosts unbracketed.
+        address = f"[{host.strip('[]')}]:{port}" if ":" in host else f"{host}:{port}"
+        dials.append(_RefusedDial(address, threading.current_thread().name))
+        message = f"network disabled in tests: {address}"
+        raise connect_error(message)
+
+
+def _describe_dials(dials: Iterable[_RefusedDial]) -> str:
+    return ", ".join(sorted({f"{dial.address} (thread {dial.thread})" for dial in dials}))
+
+
+def _report_test_dials(dials: list[_RefusedDial], start: int, test_thread: str) -> str | None:
+    """Mark the dials recorded from index ``start`` on as reported, and return the failure for their test."""
+    made_during_test = dials[start:]
+    if not made_during_test:
+        return None
+    for dial in made_during_test:
+        dial.reported = True
+    message = f"test tried to reach the network: {_describe_dials(made_during_test)}"
+    if any(dial.thread != test_thread for dial in made_during_test):
+        message += (
+            f"; a dial from a thread other than the test's own ({test_thread})"
+            " may come from an earlier test's background work"
+        )
+    return message
+
+
+def _unreported_dials_failure(dials: list[_RefusedDial]) -> str | None:
+    """Return the failure for dials no test reported, which were made between tests or after the last one."""
+    unreported = [dial for dial in dials if not dial.reported]
+    if not unreported:
+        return None
+    return (
+        "background work tried to reach the network between tests or after the last test: "
+        f"{_describe_dials(unreported)}"
+    )
+
+
+def _refusing_sync_connect[R](
+    connect_tcp: Callable[..., R],
+    connect_error: type[Exception],
+    dials: list[_RefusedDial],
+) -> Callable[..., R]:
+    def refusing_connect_tcp(backend: object, host: str, port: int, *args: object, **kwargs: object) -> R:
+        _refuse_dial_off_the_test(host, port, connect_error, dials)
+        return connect_tcp(backend, host, port, *args, **kwargs)
+
+    return refusing_connect_tcp
+
+
+def _refusing_async_connect[R](
+    connect_tcp: Callable[..., Awaitable[R]],
+    connect_error: type[Exception],
+    dials: list[_RefusedDial],
+) -> Callable[..., Awaitable[R]]:
+    async def refusing_connect_tcp(backend: object, host: str, port: int, *args: object, **kwargs: object) -> R:
+        _refuse_dial_off_the_test(host, port, connect_error, dials)
+        return await connect_tcp(backend, host, port, *args, **kwargs)
+
+    return refusing_connect_tcp
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _refused_dials() -> Generator[list[_RefusedDial]]:
+    """Refuse every HTTP client dial that ``_dial_leaves_the_test`` rejects, for the whole session.
+
+    The patch outlives each test so that a background thread or task finishing after its test is still refused.
+    A dial no test reported, made between tests or after the last one, fails the session at teardown.
+    """
+    dials: list[_RefusedDial] = []
+    with pytest.MonkeyPatch.context() as patcher:
+        for core in (httpcore, httpcore2):
+            patcher.setattr(
+                core.SyncBackend,
+                "connect_tcp",
+                _refusing_sync_connect(core.SyncBackend.connect_tcp, core.ConnectError, dials),
+            )
+            patcher.setattr(
+                core.AnyIOBackend,
+                "connect_tcp",
+                _refusing_async_connect(core.AnyIOBackend.connect_tcp, core.ConnectError, dials),
+            )
+        yield dials
+    failure = _unreported_dials_failure(dials)
+    if failure is not None:
+        pytest.fail(failure, pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _fail_tests_that_reach_the_network(_refused_dials: list[_RefusedDial]) -> Generator[None]:
+    """Fail a test whose HTTP client made a dial that ``_dial_leaves_the_test`` rejects.
+
+    The refusal surfaces as a connect error, which the code under test may swallow, so the attempt
+    is recorded and checked here. This covers clients built on httpx and httpx2, which include the
+    OpenAI, Anthropic, and Ollama SDKs. Raw sockets, aiohttp, and requests are not covered: google-genai's
+    async path uses aiohttp, and tiktoken downloads its encodings through requests when its cache is cold.
+    """
+    start = len(_refused_dials)
+    yield
+    failure = _report_test_dials(_refused_dials, start, threading.current_thread().name)
+    if failure is not None:
+        pytest.fail(failure, pytrace=False)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep Google client libraries and Git from acting as the developer.
+
+    With no credentials named, google-auth reads gcloud's application default credentials file and asks the GCE
+    metadata server, and it refreshes tokens through ``requests``, which the network guard does not cover. An
+    empty gcloud config directory, ``NO_GCE_CHECK``, and no inherited ``GOOGLE_APPLICATION_CREDENTIALS`` make a
+    test that builds a Google client without credentials fail instead. The helper below also drops the inherited
+    Google keys that MindRoom and google-genai read.
+    This is a configure hook, not a fixture, because google-auth reads ``NO_GCE_CHECK`` once, when collection first
+    imports ``google.auth.compute_engine``.
+    Git also ignores the developer's global and system config, so commits in test repositories never sign or run
+    template hooks.
+    """
+    gcloud_config = tempfile.mkdtemp(prefix="mindroom-test-gcloud-")
+    config.add_cleanup(lambda: shutil.rmtree(gcloud_config, ignore_errors=True))
+    hide_developer_google_credentials(os.environ, gcloud_config)
+    os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+    os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+
+
+def hide_developer_google_credentials(environ: MutableMapping[str, str], gcloud_config: str) -> None:
+    """Point google-auth at an empty gcloud config, skip the GCE metadata server, and drop inherited Google keys.
+
+    google-genai reads ``GOOGLE_API_KEY`` and ``GEMINI_API_KEY`` itself, and its async client uses aiohttp, which the
+    network guard does not see either; MindRoom also reads ``GOOGLE_API_KEY_FILE``, and its Google Workspace tools sign
+    in with ``GOOGLE_SERVICE_ACCOUNT_FILE`` and ``GOOGLE_DELEGATED_USER``.
+    """
+    environ["CLOUDSDK_CONFIG"] = gcloud_config
+    environ["NO_GCE_CHECK"] = "true"
+    for name in (
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY",
+        "GOOGLE_API_KEY_FILE",
+        "GEMINI_API_KEY",
+        "GOOGLE_SERVICE_ACCOUNT_FILE",
+        "GOOGLE_DELEGATED_USER",
+    ):
+        environ.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def _never_freeze_the_test_heap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep orchestrator initialization from freezing the pytest worker's heap.
+
+    Cycles among frozen objects are never collected, so every test that
+    initializes an orchestrator would pin its own fixtures, mocks, and
+    orchestrator for the rest of the worker's life.
+    `tests/test_heap_probe.py` covers the real freeze against a fake `gc`.
+    """
+    monkeypatch.setattr(gc, "freeze", lambda: None)
+
+
+@pytest.fixture(scope="session")
+def _worker_tmpdir_link_root() -> Generator[Path]:
+    """Hold this session's worker TMPDIR links in one short directory removed at the end."""
+    path = Path(tempfile.mkdtemp(prefix="mr-links-", dir="/tmp"))
+    yield path
+    shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_worker_tmpdir_links(monkeypatch: pytest.MonkeyPatch, _worker_tmpdir_link_root: Path) -> None:
+    """Keep the worker TMPDIR links that tool subprocess envs create out of the machine's shared /tmp."""
+    monkeypatch.setattr(sandbox_exec_module, "_TMPDIR_LINK_ROOT", _worker_tmpdir_link_root)
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_paths() -> Generator[None]:
     """Restore process env and bound test runtime mappings after each test."""
     original_env = os.environ.copy()
     original_bound_configs = dict(_TEST_RUNTIME_PATHS_BY_CONFIG_ID)
@@ -2819,70 +4211,41 @@ def _reset_runtime_paths() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_model_media_capabilities() -> Generator[None, None, None]:
+def _isolate_tool_job_registrations(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Separate each test's pinned instances; tests still own shutdown of live resources."""
+    monkeypatch.setattr(tool_jobs_instances, "_instances", {})
+
+
+@pytest.fixture(autouse=True)
+def _reset_model_media_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep process-local learned media support isolated per test."""
-    reset_model_media_capability_cache()
-    yield
-    reset_model_media_capability_cache()
-
-
-_LEDGER_LOADING_TEST_MODULES = frozenset(
-    {
-        "test_handled_turns.py",
-        "test_turn_store.py",
-        "test_user_stop_convergence.py",
-    },
-)
+    monkeypatch.setattr(media_pipeline, "_LEARNED_UNSUPPORTED", {})
 
 
 @pytest.fixture(autouse=True)
-def _reset_handled_turn_ledger_state(
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-) -> Generator[None, None, None]:
-    """Give every test a cold handled-turn map, pre-warmed where startup is skipped.
-
-    The map is process-global and ``load`` fills it once per process. Left over
-    from a previous test it would satisfy that check, so a ledger opened onto a
-    fresh database would answer from the previous test's records and never read
-    its own.
-
-    Production warms the ledger during startup and every read refuses until it
-    has. Most tests build a bot and drive its callbacks directly without ever
-    reaching startup, and their database is empty, so starting the map loaded
-    is exactly the state warming it would produce.
-
-    A test whose database is *not* empty must opt out, with the
-    ``ledger_loads_from_disk`` marker or by living in one of the modules
-    below, and warm for real -- pre-warming would leave it answering from an
-    empty map while the rows it cares about sit unread.
-    """
-    _reset_handled_turn_ledger_runtime()
-    loads_from_disk = (
-        request.node.path.name in _LEDGER_LOADING_TEST_MODULES
-        or request.node.get_closest_marker("ledger_loads_from_disk") is not None
-    )
-    if not loads_from_disk:
-        shared_ledger_state = handled_turns_module._shared_ledger_state
-
-        def pre_warmed_ledger_state(*state_key: str) -> handled_turns_module._LedgerState:
-            state = shared_ledger_state(*state_key)
-            state.loaded = True
-            return state
-
-        monkeypatch.setattr(handled_turns_module, "_shared_ledger_state", pre_warmed_ledger_state)
+def _reset_oversized_nonterminal_streaming_edit_rate_limit() -> Generator[None]:
+    """Keep the process-global oversized streaming-edit cadence isolated per test, even when one fails."""
+    _oversized_nonterminal_streaming_edit_next_allowed_at.clear()
     yield
-    _reset_handled_turn_ledger_runtime()
+    _oversized_nonterminal_streaming_edit_next_allowed_at.clear()
 
 
 @pytest.fixture(autouse=True)
-def _reset_approval_manager_runtime() -> Generator[None, None, None]:
+def _reset_turn_claims() -> Generator[None]:
+    """Give every test an empty claim registry: it is process-global, shared by every turn store of an agent."""
+    _CLAIM_REGISTRIES.clear()
+    yield
+    _CLAIM_REGISTRIES.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_approval_manager_runtime() -> Generator[None]:
     """Give every test a cold approval manager.
 
     The manager is module-global and outlives the test that initialized it. It
     holds Matrix transport hooks, including the approval-card store every
     inbound message consults to recover a click on a card this process has
-    forgotten. A test that builds a bot without an orchestrator never sets
+    forgotten. A test that builds a bot without starting its runtime never sets
     those hooks, so it inherits whichever ones the previous test on this
     worker left behind -- and awaiting a previous test's mock raises inside a
     message callback nothing is watching, which surfaces as an unrelated test
@@ -2894,7 +4257,7 @@ def _reset_approval_manager_runtime() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_voice_echo_barriers() -> Generator[None, None, None]:
+def _reset_voice_echo_barriers() -> Generator[None]:
     """Keep cross-bot voice echo ordering state, and its loop bindings, per test."""
     _reset_visible_voice_echo_barriers()
     yield
@@ -2902,7 +4265,7 @@ def _reset_voice_echo_barriers() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None]:
     """Bypass authorization checks in tests by default.
 
     This allows test users like @user:example.com to interact with agents
@@ -2910,6 +4273,18 @@ def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None, None
 
     Tests in test_authorization.py are excluded since they test authorization itself.
     """
+
+    # These defaults never need call tracking. Plain stubs avoid creating six
+    # MagicMocks (and their reference cycles) for every test in the suite.
+    def allow_reply(*_args: object, **_kwargs: object) -> _ReplyAuthorizationDecision:
+        return _ReplyAuthorizationDecision.ALLOWED
+
+    def allow_sender(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def allow_target_room(*_args: object, **_kwargs: object) -> bool:
+        return True
+
     # Don't bypass authorization for tests that are specifically testing it
     if "test_authorization" in request.node.parent.name:
         yield
@@ -2919,27 +4294,43 @@ def bypass_authorization(request: pytest.FixtureRequest) -> Generator[None, None
                 stack.enter_context(
                     patch(
                         "mindroom.authorization._responder_reply_authorization",
-                        return_value=_ReplyAuthorizationDecision.ALLOWED,
+                        new=allow_reply,
                     ),
                 )
-                stack.enter_context(patch("mindroom.authorization.is_sender_allowed_for_responder", return_value=True))
+                stack.enter_context(patch("mindroom.authorization.is_sender_allowed_for_responder", new=allow_sender))
                 stack.enter_context(
                     patch(
                         "mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room",
-                        return_value=True,
+                        new=allow_sender,
                     ),
                 )
                 stack.enter_context(
-                    patch("mindroom.approval_inbound.is_sender_allowed_for_responder", return_value=True),
+                    patch("mindroom.approval.inbound.is_sender_allowed_for_responder", new=allow_sender),
                 )
                 stack.enter_context(
                     patch(
                         "mindroom.custom_tools.attachment_helpers.is_sender_allowed_for_responder",
-                        return_value=True,
+                        new=allow_sender,
                     ),
                 )
                 stack.enter_context(
-                    patch("mindroom.custom_tools.delegate.is_sender_allowed_for_responder", return_value=True),
+                    patch(
+                        "mindroom.custom_tools.attachment_helpers.requester_joined_target_room",
+                        new=allow_target_room,
+                    ),
+                )
+                stack.enter_context(
+                    patch(
+                        "mindroom.custom_tools.matrix_message_idempotency.requester_joined_target_room",
+                        new=allow_target_room,
+                    ),
+                )
+                stack.enter_context(
+                    patch("mindroom.delegation.lifecycle.is_sender_allowed_for_responder", new=allow_sender),
+                )
+                # The module is imported at collection, so it binds the real check before this bypass starts.
+                stack.enter_context(
+                    patch.object(todo_tool_module, "is_sender_allowed_for_responder", new=allow_sender),
                 )
             yield
 
@@ -2949,16 +4340,183 @@ def enforce_turn_authorization() -> None:
     """Keep final TurnPolicy authorization active for tests that exercise it."""
 
 
-def seed_session[SessionT: "AgentSession | TeamSession"](storage: "BaseDb", session: SessionT) -> SessionT:
-    """Persist a session row and every run it holds, in order, and return the session.
+@pytest.fixture
+def squad_probe() -> Iterator[type["ProbeToolkit"]]:
+    """Register the probe toolkit the team suites' ``squad`` members offer, with cleared records, for the test."""
+    from tests.team_turn_helpers import registered_probe  # noqa: PLC0415 - team_turn_helpers imports this module
 
-    Production code writes runs explicitly (``save_runs``/``replace_runs``);
-    tests seed whole histories with this instead.
+    with registered_probe() as toolkit:
+        yield toolkit
+
+
+def unstored_team_scope_context(
+    config: Config,
+    member_names: Sequence[str],
+    *,
+    team_name: str | None,
+) -> ScopeSessionContext:
+    """Return the scope context of a team with no stored session, whose store keeps nothing, for building a team."""
+    storage = MagicMock()
+    return ScopeSessionContext(
+        scope=resolve_bound_team_scope(member_names=member_names, config=config, team_name=team_name),
+        storage=storage,
+        session=None,
+        session_id="session-1",
+        storage_factory=lambda: storage,
+    )
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> "ConversationStore":
+    """Open the conversation database ``code`` under ``tmp_path`` as production opens one, with every table."""
+    return create_state_storage("code", tmp_path, HistoryScope(kind="agent", scope_id="code"))
+
+
+@pytest.fixture
+def team_store(tmp_path: Path) -> "ConversationStore":
+    """Open team ``crew``'s conversation database, named ``code`` as ``store``'s is, so tests query the same tables."""
+    return create_state_storage("code", tmp_path / "team", HistoryScope(kind="team", scope_id="crew"))
+
+
+def record_store_threads(monkeypatch: pytest.MonkeyPatch, *method_names: str) -> dict[str, list[str]]:
+    """Record the name of the thread each call of the named ``ConversationStore`` methods runs on, by method.
+
+    A database's lane runs its operations on a thread named ``conversation-store``.
     """
-    storage.upsert_session(session)
-    for run in session.runs or []:
-        storage.upsert_run(run=run, session_id=session.session_id, user_id=run.user_id)
+    threads: dict[str, list[str]] = {name: [] for name in method_names}
+
+    def recording(real: Callable[..., Any], calls: list[str]) -> Callable[..., Any]:
+        def recorded(self: "ConversationStore", *args: object, **kwargs: object) -> object:
+            calls.append(threading.current_thread().name)
+            return real(self, *args, **kwargs)
+
+        return recorded
+
+    for name in method_names:
+        monkeypatch.setattr(ConversationStore, name, recording(getattr(ConversationStore, name), threads[name]))
+    return threads
+
+
+def seed_session_row(storage: "ConversationStore", session: "ConversationSession") -> None:
+    """Create the session's row from its fields unless one exists, as the store's first write of a session does."""
+    with storage.transaction(write=True) as connection:
+        created = ensure_session_row(connection, storage.names, session)
+    if created is not None:
+        session.stored_session_state = created
+
+
+def seed_session_state(storage: "ConversationStore", session: "ConversationSession", state: "dict[str, Any]") -> None:
+    """Store ``state`` as the session row's ``session_state``, creating the row if needed, and leave the rest alone.
+
+    No store method writes the state alone: a run save carries it. Tests stand in for another run's save with this.
+    ``session.stored_session_state`` then records it as the row's, as the store's writes do, so ``state`` must not
+    change afterwards.
+    """
+    with storage.transaction(write=True) as connection:
+        ensure_session_row(connection, storage.names, session)
+        _write_session_state(connection, storage.names, session.session_id, state)
+    session.stored_session_state = state
+
+
+def stored_session_state(storage: "ConversationStore", session_id: str) -> "dict[str, Any]":
+    """Return the ``session_state`` the row of session ``session_id`` holds, as a load reads it, without its runs."""
+    with storage.transaction(write=False) as connection:
+        (session_state,) = connection.execute(
+            f"SELECT session_state FROM {quote_identifier(storage.names.sessions)} WHERE session_id = ?",  # noqa: S608
+            (session_id,),
+        ).fetchone()
+    return _session_state(session_state)
+
+
+def seed_session(storage: "ConversationStore", session: "ConversationSession") -> "ConversationSession":
+    """Create the session's row from its fields, then save every run it holds with ``save_run``, and return the session.
+
+    Production code saves runs one at a time as they finish; tests seed whole histories with this instead. The runs
+    are saved as conversation writes, so the usage ledger and session totals stay empty; ``persist_session`` seeds
+    those too. A row that already exists keeps its fields; change them through the store's field writers.
+    """
+    seed_session_row(storage, session)
+    for run in _in_save_order(session.runs):
+        storage.save_run(session, run, record_usage=False)
     return session
+
+
+def persist_session(storage: "ConversationStore", session: "ConversationSession") -> "ConversationSession":
+    """Seed the session as ``seed_session`` does, but save each run as its turn's terminal record, usage included."""
+    seed_session_row(storage, session)
+    persist_runs(storage, session, *_in_save_order(session.runs))
+    return session
+
+
+def _in_save_order(runs: "Sequence[AnyRunRecord]") -> "list[AnyRunRecord]":
+    """Return ``runs`` with each team run's members moved right before it, the order a team turn saves them in.
+
+    Members finish before their team run, and a member saved after its finished team run is final, so it writes
+    nothing. A member whose team run is not among ``runs`` keeps its place.
+    """
+    top_level_ids = {run.run_id for run in runs if run.parent_run_id is None}
+    ordered: list[AnyRunRecord] = []
+    for run in runs:
+        if run.parent_run_id is None:
+            ordered += [*(member for member in runs if member.parent_run_id == run.run_id), run]
+        elif run.parent_run_id not in top_level_ids:
+            ordered.append(run)
+    return ordered
+
+
+def persist_runs(storage: "ConversationStore", session: "ConversationSession", *runs: "AnyRunRecord") -> None:
+    """Hand each run to ``persist_to`` in order, as a turn hands over its terminal record, recording its usage too.
+
+    Only that save writes the usage ledger. The saves run on an event loop of their own, so sync and async tests
+    alike can call this.
+    """
+    persist = persist_to(storage, session)
+
+    async def persist_all() -> None:
+        for run in runs:
+            await persist(run)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(asyncio.run, persist_all()).result()
+
+
+def delete_runs(
+    storage: "ConversationStore",
+    run_ids: Collection[str],
+    *,
+    session_id: str,
+    session: "ConversationSession | None" = None,
+) -> set[str]:
+    """Delete the session's runs ``run_ids`` with their member runs and messages, as another writer's delete does.
+
+    No summary row goes and no removed run is recorded, as when a run that holds a fold's row ends as no turn.
+    ``session``, when given, then holds none of the runs; returns the deleted ids.
+    """
+    with storage.transaction(write=True) as connection:
+        deleted = delete_runs_in_transaction(connection, storage.names, run_ids, session_id=session_id)
+    if session is not None:
+        session.runs = runs_without(session.runs, run_ids)
+    return deleted
+
+
+def seed_session_metrics(storage: "ConversationStore", session_id: str, totals: "Mapping[str, object]") -> None:
+    """Write ``totals`` as the session row's stored usage totals, as an older release's run saves left them.
+
+    The step to layout version 7 then keeps what they count beyond the session's run rows, as opening the database
+    at this release does.
+    """
+    with storage.transaction(write=True) as connection:
+        (raw,) = connection.execute(
+            f"SELECT session_data FROM {quote_identifier(storage.names.sessions)} WHERE session_id = ?",  # noqa: S608
+            (session_id,),
+        ).fetchone()
+        session_data = json.loads(raw) if raw else {}
+        session_data["session_metrics"] = dict(totals)
+        connection.execute(
+            f"UPDATE {quote_identifier(storage.names.sessions)} SET session_data = ? WHERE session_id = ?",  # noqa: S608
+            (json.dumps(session_data), session_id),
+        )
+        add_pre_ledger_baselines(connection, storage.names)
 
 
 def create_agno_2_sessions_db(path: "Path") -> "Path":

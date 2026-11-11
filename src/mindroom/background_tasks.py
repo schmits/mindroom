@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any
 
 from mindroom.cancellation import request_task_cancel
@@ -10,12 +11,16 @@ from mindroom.logging_config import get_logger
 from mindroom.runtime_shutdown import GENERIC_SHUTDOWN, RuntimeShutdownIntent
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine
+    from collections.abc import Awaitable, Callable, Collection, Coroutine
     from contextvars import Context
 
 logger = get_logger(__name__)
 _MAX_BACKGROUND_TASK_CANCEL_ROUNDS = 3
 _BACKGROUND_TASK_CANCEL_ROUND_TIMEOUT_SECONDS = 0.1
+_LOOP_RESTART_INITIAL_DELAY_SECONDS = 1.0
+_LOOP_RESTART_MAX_DELAY_SECONDS = 30.0
+# A loop that ran this long before it ended counts as healthy, so its next restart waits the initial delay again.
+_LOOP_HEALTHY_RUN_SECONDS = 30.0
 
 # Global registries keep strong references to background tasks and optional owners.
 _background_tasks: set[asyncio.Task[Any]] = set()
@@ -76,6 +81,105 @@ async def run_blocking_until_complete[Result](
     return await run_coroutine_until_complete(asyncio.to_thread(operation, *args))
 
 
+async def run_blocking_or_compensate[Result](
+    operation: Callable[[], Result],
+    compensate: Callable[[Result], object],
+) -> Result:
+    """Run one blocking operation off the loop; when cancelled, finish it and compensate for its result.
+
+    The cancelled caller never receives the result, so ``compensate`` undoes what nobody can see, on a thread
+    and before the cancellation propagates. An operation that raised needs no compensation.
+    """
+    running = asyncio.ensure_future(asyncio.to_thread(operation))
+    try:
+        return await wait_for_future_until_complete(running)
+    except asyncio.CancelledError:
+        if running.exception() is None:
+            await run_blocking_until_complete(compensate, running.result())
+        raise
+
+
+async def drain_tasks(tasks: Collection[asyncio.Future[Any]]) -> None:
+    """Wait, without cancelling or raising them, until no task in ``tasks`` runs, including tasks added meanwhile.
+
+    A done callback that discards a finished task from ``tasks`` runs only once this coroutine yields, and gathering
+    finished tasks never yields, so whether a task still runs is read from the task, not from ``tasks``.
+    """
+    while running := [task for task in tasks if not task.done()]:
+        await asyncio.gather(*(asyncio.shield(task) for task in running), return_exceptions=True)
+
+
+def retry_delay_seconds(
+    attempt: int,
+    *,
+    initial_delay_seconds: float,
+    max_delay_seconds: float,
+) -> float:
+    """Return capped exponential backoff delay for a retry attempt.
+
+    Doubling stops at the cap, so an owner that retries for days never overflows.
+    """
+    delay = initial_delay_seconds
+    for _ in range(max(0, attempt - 1)):
+        if delay >= max_delay_seconds:
+            break
+        delay *= 2
+    return min(max_delay_seconds, delay)
+
+
+class SupervisedLoop:
+    """Run one long-running loop that restarts with backoff whenever it crashes or returns before ``stop``."""
+
+    def __init__(self, name: str, run: Callable[[], Awaitable[None]]) -> None:
+        self.name = name
+        self._run = run
+        self._task: asyncio.Task[None] | None = None
+
+    @property
+    def running(self) -> bool:
+        """Return whether the loop is started and not stopped."""
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        """Start the loop once; calls while it runs are no-ops."""
+        if not self.running:
+            self._task = asyncio.create_task(self._supervise(), name=self.name)
+
+    async def stop(self) -> None:
+        """Cancel the loop and wait until it has finished."""
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _supervise(self) -> None:
+        task = asyncio.current_task()
+        restarts = 0
+        while True:
+            started_at = time.monotonic()
+            try:
+                await self._run()
+            except Exception:
+                if self._task is not task:
+                    return
+                logger.exception("Supervised loop crashed; restarting", task_name=self.name)
+            else:
+                # A loop that swallowed the cancellation of ``stop`` returns here, and must not restart.
+                if self._task is not task:
+                    return
+                logger.warning("Supervised loop exited; restarting", task_name=self.name)
+            if time.monotonic() - started_at >= _LOOP_HEALTHY_RUN_SECONDS:
+                restarts = 0
+            restarts += 1
+            await asyncio.sleep(
+                retry_delay_seconds(
+                    restarts,
+                    initial_delay_seconds=_LOOP_RESTART_INITIAL_DELAY_SECONDS,
+                    max_delay_seconds=_LOOP_RESTART_MAX_DELAY_SECONDS,
+                ),
+            )
+
+
 def create_background_task(
     coro: Coroutine[Any, Any, Any],
     name: str | None = None,
@@ -93,8 +197,8 @@ def create_background_task(
         error_handler: Optional error handler function
         owner: Optional logical owner used for scoped shutdown waits
         log_exceptions: Whether unhandled task exceptions should be logged automatically
-        context: Execution context for the task. ``None`` preserves asyncio's normal
-            caller-context inheritance.
+        context: Execution context for the task and its completion callback. ``None``
+            preserves asyncio's normal caller-context inheritance.
 
     Returns:
         The created task
@@ -129,7 +233,8 @@ def create_background_task(
                 except Exception as handler_error:
                     logger.exception("Error handler for task failed", task_name=task_name, error=str(handler_error))
 
-    task.add_done_callback(_task_done_callback)
+    # Otherwise the callback captures the creator's context, which a detached task would keep until it finishes.
+    task.add_done_callback(_task_done_callback, context=context)
     return task
 
 
@@ -153,7 +258,7 @@ async def _cancel_and_drain_background_tasks(
             request_task_cancel(
                 task,
                 cancel_source=shutdown_intent.cancel_source,
-                process_shutdown=shutdown_intent.stop_reason == "shutdown",
+                process_shutdown=shutdown_intent.hands_off_unfinished_work,
             )
         done, _pending = await asyncio.wait(
             pending_tasks,

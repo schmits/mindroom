@@ -105,6 +105,7 @@ async def test_snapshot_preserves_power_levels_and_existing_topic(tmp_path: Path
             ("m.room.topic", ""): {"topic": "Existing human topic"},
             ("m.room.encryption", ""): {"algorithm": "m.megolm.v1.aes-sha2"},
         },
+        frozenset(),
     )
     client.room_put_state.return_value = nio.RoomPutStateResponse("$power", room_id)
     client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
@@ -140,6 +141,7 @@ async def test_power_write_does_not_restore_revoked_admin_from_snapshot() -> Non
         {
             ("m.room.power_levels", ""): {"users": {"@revoked:example.com": 100}},
         },
+        frozenset(),
     )
     client.room_get_state_event.return_value = nio.RoomGetStateEventResponse(
         {"users": {}, "new_custom": "preserve"},
@@ -215,7 +217,7 @@ async def test_root_space_reuses_one_fresh_snapshot(tmp_path: Path, monkeypatch:
     client.homeserver = "https://example.com"
     space_id = "!space:example.com"
     monkeypatch.setattr(matrix_rooms, "_ensure_root_space_exists", AsyncMock(return_value=space_id))
-    monkeypatch.setattr(matrix_rooms, "_set_room_avatar_if_available", AsyncMock())
+    monkeypatch.setattr(matrix_rooms, "_set_room_avatar", AsyncMock())
     client.room_get_state.return_value = nio.RoomGetStateResponse(
         [
             {"type": "m.room.name", "state_key": "", "content": {"name": config.matrix_space.name}},

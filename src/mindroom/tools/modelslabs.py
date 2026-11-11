@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,9 +13,10 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="modelslabs",
+    file_access=ToolFileAccess.NONE,
     display_name="ModelsLabs",
     description="AI model marketplace for generating images, videos, audio, and GIFs from text prompts",
-    category=ToolCategory.DEVELOPMENT,  # From docs URL: /tools/toolkits/others/
+    category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,  # Requires API key
     setup_type=SetupType.API_KEY,  # Uses api_key parameter
     icon="Video",  # React icon for video generation
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
         # Authentication parameter
         ConfigField(
             name="api_key",
+            env=("MODELS_LAB_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -85,7 +87,7 @@ if TYPE_CHECKING:
             required=False,
             default=15,
             placeholder="15",
-            description="Time in seconds to add to the ETA to account for the time it takes to fetch the media",
+            description="Extra one-second polling attempts added to the provider ETA; fractional attempt budgets round up",
         ),
         ConfigField(
             name="max_wait_time",
@@ -94,19 +96,20 @@ if TYPE_CHECKING:
             required=False,
             default=60,
             placeholder="60",
-            description="Maximum time in seconds to wait for the media to be ready",
+            description="Cap on polling attempts, rounded up; zero skips polling and HTTP request time is additional",
         ),
     ],
     dependencies=["requests"],  # Already in pyproject.toml
-    docs_url="https://docs.agno.com/tools/toolkits/others/models_labs",
+    docs_url="https://docs.mindroom.chat/tools/ai-and-generation/#modelslabs",
     function_names=("generate_media",),
 )
 def modelslabs_tools() -> type[ModelsLabTools]:
     """Return ModelsLabs tool for AI-powered media generation."""
     from agno.models.response import FileType
-    from agno.tools.models_labs import ModelsLabTools
 
-    class MindRoomModelsLabTools(ModelsLabTools):
+    from mindroom.tools.agno_compat_modelslabs import ModelsLabCompletionTools
+
+    class MindRoomModelsLabTools(ModelsLabCompletionTools):
         """ModelsLab toolkit that accepts authored string file types."""
 
         def __init__(

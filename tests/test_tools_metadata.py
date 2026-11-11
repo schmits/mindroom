@@ -1,142 +1,102 @@
 """Test tool metadata JSON snapshot for dashboard consumption."""
 
+import asyncio
+import contextlib
 import gc
+import gzip
+import inspect
 import json
-import sys
-from dataclasses import replace
+import os
+import re
+import shutil
+import socket
+import subprocess
+import threading
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from typing import Never
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlsplit
 
 import agno.tools.crawl4ai as agno_crawl4ai
+import httpcore
+import httpx
 import pytest
 from agno.tools import Toolkit
+from agno.tools.mcp import MCPTools
+from aiohttp import web
+from crawl4ai.models import CrawlResult, MarkdownGenerationResult
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import async_playwright
 
-import mindroom.tool_system.metadata as metadata_module
+import mindroom.tool_system.plugins as plugins_module
 
 # Import tools to trigger tool registration
 import mindroom.tools  # noqa: F401
 import mindroom.tools.custom_api as custom_api_module
+from mindroom import public_fetch
 from mindroom.config.main import Config, ConfigRuntimeValidationError, load_config
 from mindroom.constants import resolve_runtime_paths
+from mindroom.public_fetch import PublicFetchError
 from mindroom.redaction import REDACTED
 from mindroom.server_fetch_url import ServerFetchUrlError
-from mindroom.tool_system.bootstrap import ensure_tool_registry_loaded
-from mindroom.tool_system.declarations import SetupType
+from mindroom.tool_system.agno_toolkits import toolkit_function_names
+from mindroom.tool_system.declarations import (
+    SetupType,
+    ToolCategory,
+    ToolExecutionTarget,
+    ToolFileAccess,
+    ToolValidationInfo,
+)
 from mindroom.tool_system.metadata import (
     _AUTHORED_OVERRIDE_INHERIT,
     ConfigField,
     ToolAuthoredOverrideValidator,
-    ToolCategory,
     ToolConfigOverrideError,
     ToolManagedInitArg,
-    _execute_validation_plugin_module,
-    _validate_authored_overrides,
     deserialize_tool_validation_snapshot,
     export_tools_metadata,
     get_tool_by_name,
-    resolved_tool_validation_snapshot_for_runtime,
     serialize_tool_validation_snapshot,
+    validate_authored_tool_entry_overrides,
 )
+from mindroom.tool_system.plugins import config_plugins, prepare_plugins, publish_plugins
 from mindroom.tool_system.registration import register_tool_with_metadata
-from mindroom.tool_system.registry_state import (
-    BUILTIN_TOOL_METADATA,
-    BUILTIN_TOOL_REGISTRY,
-    PLUGIN_MODULE_PREFIX,
-    TOOL_METADATA,
-    TOOL_REGISTRY,
-    capture_tool_registry_snapshot,
-    reconcile_dynamic_tool_state,
-    restore_tool_registry_snapshot,
-)
+from mindroom.tool_system.registry import ToolMetadataValidationError, builtin_tool_registry
 from mindroom.tool_system.worker_routing import (
+    ResolvedWorkerTarget,
     ToolExecutionIdentity,
     resolve_worker_target,
 )
+from mindroom.tools import crawl4ai as crawl4ai_module
 from mindroom.tools.crawl4ai import crawl4ai_tools
 from mindroom.tools.custom_api import custom_api_tools
+from mindroom.tools.newspaper4k import newspaper4k_tools
+from mindroom.tools.trafilatura import trafilatura_tools
+from mindroom.worker_computer.browser_proxy import BrowserDestinationProxy, BrowserEgress, _UpstreamProxy
+from tests.browser_egress_helpers import socks5_connect
+from tests.conftest import SETTLE_TIMEOUT_SECONDS, preserved_builtin_tools
+from tests.public_fetch_helpers import TrickleBody, public_dns, serve
 
-_BASE_TOOL_REGISTRY = TOOL_REGISTRY.copy()
-_BASE_TOOL_METADATA = TOOL_METADATA.copy()
-
-
-def _restore_builtin_tool_metadata_state() -> None:
-    """Reset tool registries to the built-in metadata snapshot."""
-    TOOL_REGISTRY.clear()
-    TOOL_REGISTRY.update(_BASE_TOOL_REGISTRY)
-    TOOL_METADATA.clear()
-    TOOL_METADATA.update(_BASE_TOOL_METADATA)
+_BUILTINS = builtin_tool_registry()
+_CRAWL4AI_RUNTIME_PATHS = resolve_runtime_paths(config_path=Path("config.yaml"), process_env={})
 
 
-def _clear_module_origin_caches() -> None:
-    """Clear module-origin caches between tests."""
-    metadata_module._resolved_module_file.cache_clear()
-    metadata_module._module_file_within_root.cache_clear()
-
-
-def test_reconcile_dynamic_tool_state_replaces_only_owned_entries() -> None:
-    """Dynamic registry reconciliation should preserve unrelated tools and remove stale owned entries."""
-    factory = TOOL_REGISTRY["shell"]
-    replacement_factory = TOOL_REGISTRY["python"]
-    unrelated_metadata = replace(TOOL_METADATA["shell"], name="unrelated")
-    stale_metadata = replace(TOOL_METADATA["shell"], name="stale_owned")
-    desired_metadata = replace(TOOL_METADATA["python"], name="owned")
-    metadata_only = replace(TOOL_METADATA["shell"], name="metadata_only")
-    current_registry = {
-        "unrelated": factory,
-        "stale_owned": factory,
-        "owned": factory,
-        "metadata_only": factory,
-    }
-    current_metadata = {
-        "unrelated": unrelated_metadata,
-        "stale_owned": stale_metadata,
-        "owned": stale_metadata,
-        "metadata_only": stale_metadata,
-    }
-
-    reconciled_tool_names = reconcile_dynamic_tool_state(
-        current_registry,
-        current_metadata,
-        {"owned": replacement_factory},
-        {"owned": desired_metadata, "metadata_only": metadata_only},
-        owned_tool_names={"stale_owned", "owned", "metadata_only"},
-        collision_error=ValueError,
-    )
-
-    assert reconciled_tool_names == {"owned", "metadata_only"}
-    assert current_registry == {"unrelated": factory, "owned": replacement_factory}
-    assert current_metadata == {
-        "unrelated": unrelated_metadata,
-        "owned": desired_metadata,
-        "metadata_only": metadata_only,
-    }
-
-
-def test_reconcile_dynamic_tool_state_rejects_non_owned_collisions() -> None:
-    """Desired dynamic entries must not overwrite tools outside the owned namespace."""
-    factory = TOOL_REGISTRY["shell"]
-    metadata = replace(TOOL_METADATA["shell"], name="shared")
-
-    with pytest.raises(ValueError, match="shared collision"):
-        reconcile_dynamic_tool_state(
-            {"shared": factory},
-            {"shared": metadata},
-            {"shared": factory},
-            {"shared": metadata},
-            owned_tool_names=set(),
-            collision_error=lambda tool_name: ValueError(f"{tool_name} collision"),
-        )
+@pytest.fixture(autouse=True)
+def _restore_tool_registry() -> Iterator[None]:
+    """Drop test-only registrations, which otherwise outlive the test in the built-in registry."""
+    with preserved_builtin_tools():
+        yield
 
 
 def test_export_tools_metadata_json() -> None:
     """Verify committed tool metadata JSON matches the current registry export."""
     output_path = Path(__file__).parent.parent / "src/mindroom/tools_metadata.json"
-    _restore_builtin_tool_metadata_state()
 
     committed_content = output_path.read_text(encoding="utf-8")
-    tools = export_tools_metadata()
+    tools = export_tools_metadata(builtin_tool_registry().entries)
     expected_content = json.dumps({"tools": tools}, indent=2, sort_keys=True) + "\n"
 
     assert committed_content == expected_content, (
@@ -144,8 +104,9 @@ def test_export_tools_metadata_json() -> None:
         './.venv/bin/python -c "import json; import mindroom.tools; '
         "from pathlib import Path; "
         "from mindroom.tool_system.metadata import export_tools_metadata; "
+        "from mindroom.tool_system.registry import builtin_tool_registry; "
         "Path('src/mindroom/tools_metadata.json').write_text("
-        "json.dumps({'tools': export_tools_metadata()}, indent=2, sort_keys=True) + '\\n', "
+        "json.dumps({'tools': export_tools_metadata(builtin_tool_registry().entries)}, indent=2, sort_keys=True) + '\\n', "
         "encoding='utf-8')\""
     )
 
@@ -162,45 +123,155 @@ def test_export_tools_metadata_json() -> None:
         assert "managed_init_args" not in first_tool
 
 
+def _icon_generator(expression: str, *args: str) -> str:
+    """Return what Node prints for ``expression``, evaluated with the frontend's icon generator loaded as ``generator``."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node required to run the icon generator")
+    script = Path(__file__).parent.parent / "frontend/scripts/generate-icon-imports.cjs"
+    result = subprocess.run(
+        [
+            node,
+            "-e",
+            f"const generator = require(process.argv[1]); process.stdout.write({expression});",
+            str(script),
+            *args,
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_icon_mapping_matches_what_the_frontend_build_generates() -> None:
+    """A frontend build regenerates iconMapping.tsx from the tool metadata, so the committed copy must be that output."""
+    root = Path(__file__).parent.parent
+    rendered = _icon_generator(
+        "generator.renderIconMapping(generator.groupIcons(JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'))))",
+        str(root / "src/mindroom/tools_metadata.json"),
+    )
+
+    committed = (root / "frontend/src/components/Integrations/iconMapping.tsx").read_text(encoding="utf-8")
+    assert rendered == committed, (
+        "iconMapping.tsx is out of date, regenerate it with `node frontend/scripts/generate-icon-imports.cjs`"
+    )
+
+
+def test_icon_generator_gives_each_library_the_names_its_prefix_starts_and_lucide_the_rest() -> None:
+    """A library prefix claims an icon only when an uppercase letter or a digit follows it, so lucide keeps lookalikes."""
+    libraries = {
+        "react-icons/fa": ["FaGithub"],
+        "react-icons/fi": ["FiHome"],
+        "react-icons/si": ["Si1Password"],
+        "react-icons/gi": ["Gi3dStairs"],
+        "react-icons/tb": ["TbBrain"],
+        "react-icons/vsc": ["VscAccount"],
+        "react-icons/wi": ["WiDaySunny"],
+        "./awsIcons": ["AwsRedshift"],
+        "lucide-react": ["Factory", "FileCode2", "Signal", "GitBranch", "Wifi", "Globe"],
+    }
+    tools = json.dumps({"tools": [{"icon": icon} for icons in libraries.values() for icon in icons if icon != "Globe"]})
+
+    groups = json.loads(_icon_generator(f"JSON.stringify(generator.groupIcons({tools}))"))
+
+    assert {library: icons for library, icons in groups if icons} == libraries
+
+
+_DOCS_ROOT = Path(__file__).parent.parent / "docs"
+
+
+def _docs_page(url_path: str) -> Path:
+    """Return the Markdown page the docs site serves at ``url_path``."""
+    route = url_path.strip("/")
+    page = _DOCS_ROOT / f"{route}.md"
+    return page if route and page.is_file() else _DOCS_ROOT / route / "index.md"
+
+
+def _heading_anchors(page: Path) -> set[str]:
+    """Return the anchors the docs site gives a page's headings: an explicit ``{#id}``, else the slugged text."""
+    anchors: set[str] = set()
+    in_fence = False
+    for line in page.read_text(encoding="utf-8").splitlines():
+        if line.startswith(("```", "~~~")):
+            in_fence = not in_fence
+        if in_fence or (heading := re.match(r"#{1,6} (.+)", line)) is None:
+            continue
+        text = heading.group(1)
+        if (explicit := re.search(r"\{#([\w-]+)\}\s*$", text)) is not None:
+            anchors.add(explicit.group(1))
+            continue
+        # An inline link keeps its text; the slug keeps word characters, spaces, and hyphens.
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+        anchors.add(re.sub(r"[-\s]+", "-", re.sub(r"[^\w\s-]", "", text).strip().lower()))
+    return anchors
+
+
+def test_every_builtin_tool_links_an_existing_heading_of_mindroom_docs() -> None:
+    """Every built-in tool's dashboard docs button opens MindRoom's docs, on a page and heading the docs have."""
+    tools = export_tools_metadata(builtin_tool_registry().entries)
+
+    assert tools
+    unlinked = sorted(tool["name"] for tool in tools if not tool.get("docs_url"))
+    assert not unlinked, f"Built-in tools without a MindRoom docs link: {unlinked}"
+    for name, link in sorted((tool["name"], urlsplit(tool["docs_url"])) for tool in tools):
+        assert link.netloc == "docs.mindroom.chat", f"{name} links to {link.geturl()}, outside MindRoom's docs"
+        page = _docs_page(link.path)
+        assert page.is_file(), f"{name} links to {link.geturl()}, which has no page"
+        if link.fragment:
+            assert link.fragment in _heading_anchors(page), f"{name} links to {link.geturl()}, which has no heading"
+
+
+def test_every_builtin_tool_docs_page_names_the_environment_variables_its_settings_read() -> None:
+    """A tool's settings fall back to the environment variables its page names, so the page names each of them."""
+    unnamed: dict[str, list[str]] = {}
+    for tool in export_tools_metadata(builtin_tool_registry().entries):
+        page = _docs_page(urlsplit(tool["docs_url"]).path).read_text(encoding="utf-8")
+        variables = [variable for field in tool["config_fields"] or () for variable in field["env"]]
+        if missing := [variable for variable in variables if f"`{variable}`" not in page]:
+            unnamed[tool["name"]] = missing
+
+    assert unnamed == {}
+
+
+def test_heading_anchors_follow_the_docs_slugs(tmp_path: Path) -> None:
+    """Anchors match the docs site's: code and links keep their text, spaces become hyphens, fences hold none."""
+    page = tmp_path / "page.md"
+    page.write_text(
+        "# [`shell`]\n\n## MindRoom Update Awareness\n\n### Anything at all {#custom-id}\n\n"
+        "```bash\n# Not a heading\n```\n\n#### [`google_drive`](https://example.com) setup\n",
+        encoding="utf-8",
+    )
+
+    assert _heading_anchors(page) == {"shell", "mindroom-update-awareness", "custom-id", "google_drive-setup"}
+
+
 def test_oauth_connections_requires_live_room_context() -> None:
     """OAuth reset must not be advertised without a requester-bound live context."""
-    assert TOOL_METADATA["oauth_connections"].requires_room_context is True
+    assert _BUILTINS.entries["oauth_connections"].requires_room_context is True
 
 
-def test_export_tools_metadata_json_resets_leaked_registry_entries() -> None:
-    """Export should ignore temporary registry contamination from earlier tests."""
-    tool_name = "test_leaked_tool"
-
-    class LeakedTool(Toolkit):
-        def __init__(self) -> None:
-            super().__init__(name="leaked", tools=[])
+def test_registration_preserves_primary_runtime_requirement() -> None:
+    """The registration surface must carry the non-overridable routing declaration into the catalog."""
 
     @register_tool_with_metadata(
-        name=tool_name,
-        display_name="Leaked Tool",
-        description="Temporary leaked tool metadata",
+        name="test_primary_runtime_registration",
+        file_access=ToolFileAccess.NONE,
+        display_name="Primary Runtime Registration",
+        description="Test-only primary-runtime declaration.",
         category=ToolCategory.DEVELOPMENT,
+        requires_primary_runtime=True,
     )
-    def leaked_tool_factory() -> type[Toolkit]:
-        return LeakedTool
+    def _primary_runtime_registration() -> type[Toolkit]:
+        return Toolkit
 
-    try:
-        assert tool_name in TOOL_METADATA
-
-        _restore_builtin_tool_metadata_state()
-
-        exported_names = {tool["name"] for tool in export_tools_metadata()}
-        assert tool_name not in exported_names
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
-        _restore_builtin_tool_metadata_state()
+    assert _BUILTINS.entries["test_primary_runtime_registration"].requires_primary_runtime is True
 
 
 def test_homeassistant_private_url_metadata_defaults_to_false() -> None:
     """The private Home Assistant URL opt-in should expose an explicit secure default."""
-    _restore_builtin_tool_metadata_state()
-    homeassistant = TOOL_METADATA["homeassistant"]
+    homeassistant = _BUILTINS.entries["homeassistant"]
     fields = {field.name: field for field in homeassistant.config_fields or []}
 
     assert fields["HOMEASSISTANT_ALLOW_PRIVATE_URL"].default is False
@@ -227,60 +298,214 @@ def test_custom_api_tool_rejects_unsafe_url_before_request(
     assert exc_info.value.reason == reason
 
 
+class _TrackedStream(httpx.AsyncByteStream):
+    """A response body that records whether anything read it."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.read = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.read = True
+        yield self.body
+
+
+def _install_custom_api_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    respond: Callable[[httpx.Request], httpx.Response],
+) -> list[httpx.Request]:
+    """Route custom_api requests to an in-memory handler and record every request it sends."""
+    sent: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        response = respond(request)
+        if isinstance(response.stream, httpx.ByteStream):
+            # Responses built from bytes are preloaded; a network transport streams its body instead.
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=_TrackedStream(response.content),
+            )
+        return response
+
+    monkeypatch.setattr(
+        custom_api_module,
+        "ServerFetchAsyncHTTPTransport",
+        lambda **_kwargs: httpx.MockTransport(handle),
+    )
+    return sent
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"api_key": "sk-operator"},
+        {"username": "operator", "password": "operator-password"},
+        {"headers": {"X-Api-Key": "operator-secret"}},
+    ],
+)
+def test_custom_api_tool_refuses_configured_credentials_without_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+    credentials: dict[str, object],
+) -> None:
+    """Configured credentials are never sent to a URL the model chooses."""
+    sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={}))
+    tool = custom_api_tools()(**credentials)
+
+    payload = json.loads(tool.make_request("https://attacker.example/collect"))
+
+    assert "base_url" in payload["error"]
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    ("base_url", "location", "keeps_credentials"),
+    [
+        ("https://api.example.com/v1", "https://api.example.com/v1/current", True),
+        ("http://api.example.com/v1", "https://api.example.com/v1/current", True),
+        ("https://api.example.com/v1", "https://cdn.example/object?signature=abc", False),
+        ("https://api.example.com/v1", "http://api.example.com/v1/current", False),
+        ("https://api.example.com/v1", "https://api.example.com:8443/v1/current", False),
+    ],
+)
+def test_custom_api_tool_strips_configured_credentials_from_hops_off_the_base_url_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str,
+    location: str,
+    *,
+    keeps_credentials: bool,
+) -> None:
+    """Redirects are followed; only the base_url origin and its direct https upgrade still receive credentials."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/start":
+            return httpx.Response(302, headers={"Location": location})
+        return httpx.Response(200, json={"ok": True})
+
+    sent = _install_custom_api_transport(monkeypatch, respond)
+    tool = custom_api_tools()(
+        base_url=base_url,
+        api_key="sk-operator",
+        headers={"X-Api-Key": "operator-secret", "Accept": "application/json"},
+    )
+
+    payload = json.loads(tool.make_request("start", headers={"X-Request-Id": "req-1"}))
+
+    assert payload["data"] == {"ok": True}
+    first, followed = sent
+    assert str(followed.url) == location
+    for request in (first, followed) if keeps_credentials else (first,):
+        assert request.headers["Authorization"] == "Bearer sk-operator"
+        assert request.headers["X-Api-Key"] == "operator-secret"
+    if not keeps_credentials:
+        assert "Authorization" not in followed.headers
+        assert "X-Api-Key" not in followed.headers
+        assert "Accept" not in followed.headers
+    assert followed.headers["X-Request-Id"] == "req-1"
+
+
+def test_custom_api_tool_sends_dashboard_json_headers_to_the_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Headers saved in the dashboard arrive as JSON text and are sent as default headers to base_url."""
+    sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={"ok": True}))
+    tool = custom_api_tools()(base_url="https://api.example.com", headers='{"X-Api-Key": "operator-secret"}')
+
+    assert json.loads(tool.make_request("data"))["data"] == {"ok": True}
+    assert sent[0].headers["X-Api-Key"] == "operator-secret"
+
+
+@pytest.mark.parametrize("verify_ssl", [True, False])
+def test_custom_api_tool_hands_its_tls_verification_setting_to_the_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    verify_ssl: bool,
+) -> None:
+    """An API with a self-signed certificate can be called by turning verification off."""
+    transport_options: list[dict[str, object]] = []
+
+    def transport(**options: object) -> httpx.MockTransport:
+        transport_options.append(options)
+        return httpx.MockTransport(lambda _request: httpx.Response(200, stream=httpx.ByteStream(b'{"ok": true}')))
+
+    monkeypatch.setattr(custom_api_module, "ServerFetchAsyncHTTPTransport", transport)
+
+    payload = json.loads(custom_api_tools()(verify_ssl=verify_ssl).make_request("https://93.184.216.34/data"))
+
+    assert payload["data"] == {"ok": True}
+    assert transport_options == [{"verify": verify_ssl}]
+
+
+@pytest.mark.parametrize("headers", ['["X-Api-Key"]', '{"X-Retries": 3}', "X-Api-Key: abc"])
+def test_custom_api_tool_rejects_headers_that_are_not_a_json_object_of_strings(headers: str) -> None:
+    """A malformed headers value fails when the tool is built instead of on every request."""
+    with pytest.raises(ValueError, match="headers must be a JSON object with string keys and values"):
+        custom_api_tools()(base_url="https://api.example.com", headers=headers)
+
+
+def test_custom_api_tool_strips_basic_auth_from_hops_off_the_base_url_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Basic auth pair reaches the base_url origin but not a presigned download on another host."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.example.com":
+            return httpx.Response(302, headers={"Location": "https://cdn.example/object"})
+        return httpx.Response(200, json={"ok": True})
+
+    sent = _install_custom_api_transport(monkeypatch, respond)
+    tool = custom_api_tools()(base_url="https://api.example.com", username="operator", password="operator-password")  # noqa: S106
+
+    assert json.loads(tool.make_request("download"))["data"] == {"ok": True}
+    assert sent[0].headers["Authorization"].startswith("Basic ")
+    assert [request.url.host for request in sent] == ["api.example.com", "cdn.example"]
+    assert "Authorization" not in sent[1].headers
+
+
+def test_custom_api_tool_without_credentials_follows_redirects_anywhere_public(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An uncredentialed request has nothing to leak, so full URLs and cross-origin redirects keep working."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "start.example":
+            return httpx.Response(302, headers={"Location": "https://cdn.example/data"})
+        return httpx.Response(200, json={"ok": True})
+
+    sent = _install_custom_api_transport(monkeypatch, respond)
+
+    payload = json.loads(custom_api_tools()().make_request("https://start.example/data"))
+
+    assert payload["data"] == {"ok": True}
+    assert [request.url.host for request in sent] == ["start.example", "cdn.example"]
+
+
 def test_custom_api_tool_filters_sensitive_response_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Custom API output should keep safe response headers without exposing credentials."""
+    response_headers = {
+        "content-type": "application/json",
+        "x-request-id": "req-123",
+        "set-cookie": "session=secret",
+        "authorization": "Bearer secret",
+        "proxy-authorization": "Basic secret",
+        "cookie": "session=secret",
+        "www-authenticate": "Bearer challenge",
+        "authentication-info": "nextnonce=secret",
+        "x-api-key": "secret",
+        "x-auth-token": "secret",
+        "x-api-token": "secret",
+        "api-token": "secret",
+        "x-token": "secret",
+        "token": "secret",
+        "x-amz-security-token": "secret",
+        "x_api_token": "secret",
+        "x-ratelimit-remaining-tokens": "99",
+        "x-total-tokens": "100",
+    }
+    _install_custom_api_transport(
+        monkeypatch,
+        lambda _request: httpx.Response(200, headers=response_headers, content=b'{"ok": "true"}'),
+    )
 
-    class FakeResponse:
-        status_code = 200
-        text = "{}"
-        is_success = True
+    payload = json.loads(custom_api_tools()().make_request("https://example.com/data"))
 
-        def __init__(self) -> None:
-            self.headers = {
-                "content-type": "application/json",
-                "x-request-id": "req-123",
-                "set-cookie": "session=secret",
-                "authorization": "Bearer secret",
-                "proxy-authorization": "Basic secret",
-                "cookie": "session=secret",
-                "www-authenticate": "Bearer challenge",
-                "authentication-info": "nextnonce=secret",
-                "x-api-key": "secret",
-                "x-auth-token": "secret",
-                "x-api-token": "secret",
-                "api-token": "secret",
-                "x-token": "secret",
-                "token": "secret",
-                "x-amz-security-token": "secret",
-                "x_api_token": "secret",
-                "x-ratelimit-remaining-tokens": "99",
-                "x-total-tokens": "100",
-            }
-
-        def json(self) -> dict[str, str]:
-            return {"ok": "true"}
-
-    class FakeClient:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        def __enter__(self) -> object:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            pass
-
-        def request(self, **_kwargs: object) -> FakeResponse:
-            return FakeResponse()
-
-    monkeypatch.setattr(custom_api_module, "validate_server_fetch_url", lambda url: url)
-    monkeypatch.setattr(custom_api_module.httpx, "Client", FakeClient)
-
-    tool = custom_api_tools()()
-
-    payload = json.loads(tool.make_request("https://example.com/data"))
-
-    assert payload["headers"] == {
+    assert payload["data"] == {"ok": "true"}
+    assert {name: value for name, value in payload["headers"].items() if name != "content-length"} == {
         "content-type": "application/json",
         "x-request-id": "req-123",
         "set-cookie": REDACTED,
@@ -302,6 +527,228 @@ def test_custom_api_tool_filters_sensitive_response_headers(monkeypatch: pytest.
     }
 
 
+def test_custom_api_tool_drops_a_model_host_header_from_credentialed_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The base_url alone picks the virtual host that receives configured credentials, in any header casing."""
+    sent = _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={}))
+    tool = custom_api_tools()(base_url="https://api.example.com", api_key="sk-operator")
+
+    tool.make_request("data", headers={"Host": "internal.example", "hOST": "admin.example"})
+
+    assert sent[0].headers.get_list("Host") == ["api.example.com"]
+    assert sent[0].headers["Authorization"] == "Bearer sk-operator"
+
+
+_GZIP_BOMB = gzip.compress(b"\0" * (32 * 1024 * 1024))
+
+
+def test_custom_api_tool_never_inflates_a_compressed_final_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Identity is requested even over a model header, and a server that compresses anyway gets an error, not an inflate."""
+    sent = _install_custom_api_transport(
+        monkeypatch,
+        lambda _request: httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=_TrackedStream(_GZIP_BOMB)),
+    )
+
+    payload = json.loads(
+        custom_api_tools()().make_request("https://example.com/data", headers={"accept-encoding": "br"}),
+    )
+
+    assert sent[0].headers.get_list("Accept-Encoding") == ["identity"]
+    assert payload["status_code"] == 200
+    assert "Content-Encoding gzip" in payload["error"]
+    assert "data" not in payload
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "refused"),
+    [
+        ("x-gzip", "x-gzip"),
+        ("identity, DEFLATE", "deflate"),
+        ("br", "br"),
+        ("zstd, gzip", "gzip, zstd"),
+        ("none", None),
+        ("utf-8", None),
+        ("binary", None),
+        ("", None),
+    ],
+)
+def test_custom_api_tool_refuses_only_codings_httpx_would_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str,
+    refused: str | None,
+) -> None:
+    """Each listed coding counts, while tokens HTTPX passes through leave the body readable as plain bytes."""
+    _install_custom_api_transport(
+        monkeypatch,
+        lambda _request: httpx.Response(
+            200,
+            headers={"Content-Encoding": content_encoding},
+            stream=_TrackedStream(b'{"ok": true}'),
+        ),
+    )
+
+    payload = json.loads(custom_api_tools()().make_request("https://example.com/data"))
+
+    if refused is None:
+        assert payload["data"] == {"ok": True}
+        assert "error" not in payload
+    else:
+        assert payload["error"] == f"Response used Content-Encoding {refused} although identity was requested"
+        assert "data" not in payload
+
+
+def test_custom_api_tool_follows_redirects_without_reading_their_bodies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compressed redirect body is closed unread, and only the final body is collected."""
+    redirect_body = _TrackedStream(_GZIP_BOMB)
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://example.com/final", "Content-Encoding": "gzip"},
+                stream=redirect_body,
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    sent = _install_custom_api_transport(monkeypatch, respond)
+
+    payload = json.loads(custom_api_tools()().make_request("https://example.com/start"))
+
+    assert payload["data"] == {"ok": True}
+    assert [request.url.path for request in sent] == ["/start", "/final"]
+    assert redirect_body.read is False
+
+
+def test_custom_api_tool_caps_the_final_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An identity body over the cap is reported as an error instead of being buffered whole."""
+    monkeypatch.setattr(custom_api_module, "_MAX_RESPONSE_BYTES", 1024)
+    _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, content=b"x" * 4096))
+
+    payload = json.loads(custom_api_tools()().make_request("https://example.com/large"))
+
+    assert payload["error"] == "Response body exceeds 1024 bytes"
+    assert "data" not in payload
+
+
+def test_custom_api_tool_caps_redirect_hops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A redirect loop stops after the hop limit."""
+    sent = _install_custom_api_transport(
+        monkeypatch,
+        lambda _request: httpx.Response(302, headers={"Location": "https://example.com/loop"}),
+    )
+
+    payload = json.loads(custom_api_tools()().make_request("https://example.com/loop"))
+
+    assert payload["error"] == "Request failed: more than 10 redirects"
+    assert len(sent) == 11
+
+
+@pytest.mark.parametrize(
+    ("tool_function", "error"),
+    [
+        pytest.param(
+            lambda: trafilatura_tools()().extract_text,
+            "Error: Could not fetch content from URL: http://93.184.216.34/slow",
+            id="trafilatura",
+        ),
+        pytest.param(
+            lambda: newspaper4k_tools()().read_article,
+            "Error reading article from http://93.184.216.34/slow: No data found.",
+            id="newspaper",
+        ),
+        pytest.param(
+            lambda: custom_api_tools()(timeout=0.3).make_request,
+            json.dumps({"error": "Request failed: the request did not finish within 0.3 seconds"}, indent=2),
+            id="custom_api",
+        ),
+    ],
+)
+def test_web_tools_give_up_on_a_server_that_trickles_its_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_function: Callable[[], Callable[[str], str]],
+    error: str,
+) -> None:
+    """A server that keeps sending slowly ends the tool call at the download deadline with the tool's error."""
+    monkeypatch.setattr(public_fetch, "_DEADLINE_SECONDS", 0.3)
+    call = tool_function()
+    requests = serve(monkeypatch, lambda _request: httpx.Response(200, stream=TrickleBody()))
+    started = time.monotonic()
+
+    result = call("http://93.184.216.34/slow")
+
+    assert time.monotonic() - started < 2
+    assert result == error
+    assert len(requests) == 1
+
+
+def test_custom_api_tool_returns_at_its_timeout_while_a_hostname_lookup_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The timeout covers resolving the API's hostname, not only the request after it."""
+    released = threading.Event()
+
+    def hang(*_args: object, **_kwargs: object) -> object:
+        released.wait(10)
+        raise socket.gaierror(socket.EAI_NONAME, "lookup released")
+
+    monkeypatch.setattr(socket, "getaddrinfo", hang)
+    tool = custom_api_tools()(base_url="https://api.example.com", timeout=0.3)
+    started = time.monotonic()
+    try:
+        payload = json.loads(tool.make_request("data"))
+        elapsed = time.monotonic() - started
+    finally:
+        released.set()
+
+    assert payload == {"error": "Request failed: the request did not finish within 0.3 seconds"}
+    assert elapsed < 2
+
+
+def test_custom_api_tool_tries_the_next_address_when_one_never_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An address that drops connection attempts uses up only its own connect limit, not the request's timeout."""
+    monkeypatch.setattr(custom_api_module, "CONNECT_TIMEOUT_SECONDS", 0.1)
+    dead, live = "93.184.216.34", "93.184.216.35"
+    public_dns(monkeypatch, (dead, live))
+    dialed: list[tuple[str, float | None]] = []
+
+    async def connect_tcp(
+        _backend: object,
+        host: str,
+        _port: int,
+        timeout: float | None = None,  # noqa: ASYNC109 - Signature must match httpcore.
+        **_kwargs: object,
+    ) -> None:
+        dialed.append((host, timeout))
+        if host == dead:
+            # Nothing answers, so the attempt lasts until its connect limit.
+            await asyncio.sleep(timeout or 0)
+            raise httpcore.ConnectTimeout
+        msg = "connection refused"
+        raise httpcore.ConnectError(msg)
+
+    monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", connect_tcp)
+
+    payload = json.loads(
+        custom_api_tools()(timeout=SETTLE_TIMEOUT_SECONDS).make_request("https://api.example.com/data"),
+    )
+
+    assert dialed == [(dead, 0.1), (live, 0.1)]
+    assert payload == {"error": "Request failed: connection refused"}
+
+
+def test_custom_api_tool_returns_a_response_that_arrived_before_closing_the_connection_outlasted_its_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout bounds the request, so a response read in time is returned even when closing takes longer."""
+    _install_custom_api_transport(monkeypatch, lambda _request: httpx.Response(200, json={"ok": True}))
+
+    async def close_slowly(_transport: httpx.MockTransport) -> None:
+        await asyncio.sleep(0.5)
+
+    monkeypatch.setattr(httpx.MockTransport, "aclose", close_slowly)
+
+    payload = json.loads(custom_api_tools()(timeout=0.2).make_request("https://example.com/data"))
+
+    assert payload["data"] == {"ok": True}
+
+
 def test_crawl4ai_tool_rejects_private_url_before_crawl(monkeypatch: pytest.MonkeyPatch) -> None:
     """Crawl4AI should reject unsafe URLs before starting browser-backed crawling."""
 
@@ -309,7 +756,7 @@ def test_crawl4ai_tool_rejects_private_url_before_crawl(monkeypatch: pytest.Monk
         msg = "unsafe crawl4ai URL should be rejected before crawling starts"
         raise AssertionError(msg)
 
-    tool = crawl4ai_tools()()
+    tool = crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)
     monkeypatch.setattr(tool, "_async_crawl", forbidden_crawl)
 
     with pytest.raises(ServerFetchUrlError) as exc_info:
@@ -318,10 +765,107 @@ def test_crawl4ai_tool_rejects_private_url_before_crawl(monkeypatch: pytest.Monk
     assert exc_info.value.reason == "private_address"
 
 
+def _crawl_result(raw_markdown: str, *, fit_markdown: str | None = None) -> CrawlResult:
+    return CrawlResult(
+        url="https://example.com",
+        html=f"<p>{raw_markdown}</p>",
+        success=True,
+        markdown=MarkdownGenerationResult(
+            raw_markdown=raw_markdown,
+            markdown_with_citations=raw_markdown,
+            references_markdown="",
+            fit_markdown=fit_markdown,
+        ),
+    )
+
+
 @pytest.mark.asyncio
-async def test_crawl4ai_tool_installs_server_fetch_route_guard(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Crawl4AI should install a Playwright route guard before crawling."""
+@pytest.mark.parametrize(("fit_markdown", "expected"), [("filtered text", "filtered text"), (None, "raw text")])
+async def test_crawl4ai_returns_filtered_markdown_before_raw_markdown(
+    monkeypatch: pytest.MonkeyPatch,
+    fit_markdown: str | None,
+    expected: str,
+) -> None:
+    """Crawl4AI results expose page text only through their markdown result."""
+
+    class FakeAsyncWebCrawler:
+        def __init__(self, *, config: object) -> None:
+            del config
+            self.crawler_strategy = SimpleNamespace(set_hook=lambda *_args: None)
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def arun(self, *, url: str, config: object) -> object:
+            del url, config
+            return _crawl_result("raw text", fit_markdown=fit_markdown)
+
+    monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
+
+    assert await crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)._async_crawl("https://example.com") == expected
+
+
+@pytest.mark.asyncio
+async def test_crawl4ai_context_guard_runs_under_playwright_route_dispatch() -> None:
+    """Playwright's own dispatch reaches the guard, which blocks loopback pages throughout the context."""
+    executable = os.environ.get("MINDROOM_TEST_BROWSER_EXECUTABLE") or shutil.which("chromium")
+    if executable is None:
+        pytest.skip("Chromium required for Playwright route dispatch")
+    hits: list[str] = []
+
+    async def serve(request: web.Request) -> web.Response:
+        hits.append(request.path)
+        return web.Response(text="<title>Internal service</title>", content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/{path:.*}", serve)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    tool = crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)
+    try:
+        await site.start()
+        assert site._server is not None
+        port = site._server.sockets[0].getsockname()[1]
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(executable_path=executable)
+            try:
+                context = await browser.new_context()
+                page = await context.new_page()
+                await tool._guard_page_context(page, context=context, config=None)
+                popup = await context.new_page()
+                for target in (page, popup):
+                    with pytest.raises(PlaywrightError, match="ERR_BLOCKED_BY_CLIENT"):
+                        await target.goto(f"http://127.0.0.1:{port}/", timeout=10_000)
+            finally:
+                await browser.close()
+    finally:
+        await runner.cleanup()
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_crawl4ai_browser_dials_through_destination_proxy_and_guards_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every Crawl4AI browser connection passes the connect-time relay, and every context page the route guard."""
+    for name in ("all_proxy", "http_proxy", "https_proxy", "no_proxy", "auto_proxy", "socks_server"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
     installed_hook = None
+    endpoints: list[str] = []
+    loopback_connections = 0
+
+    async def loopback_service(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal loopback_connections
+        loopback_connections += 1
+        writer.close()
+
+    service = await asyncio.start_server(loopback_service, "127.0.0.1", 0)
+    service_port = service.sockets[0].getsockname()[1]
 
     class FakeCrawlerStrategy:
         def set_hook(self, name: str, hook: object) -> None:
@@ -331,7 +875,7 @@ async def test_crawl4ai_tool_installs_server_fetch_route_guard(monkeypatch: pyte
 
     class FakeAsyncWebCrawler:
         def __init__(self, *, config: object) -> None:
-            del config
+            self.config = config
             self.crawler_strategy = FakeCrawlerStrategy()
 
         async def __aenter__(self) -> object:
@@ -343,10 +887,26 @@ async def test_crawl4ai_tool_installs_server_fetch_route_guard(monkeypatch: pyte
         async def arun(self, *, url: str, config: object) -> object:
             del config
             assert url == "https://example.com"
+            proxy_config = self.config.proxy_config
+            assert proxy_config is not None
+            endpoints.append(proxy_config.server)
+            # UDP cannot pass the relay, and no environment switch may let loopback skip it.
+            assert {
+                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--proxy-bypass-list=<-loopback>",
+            } <= set(self.config.extra_args)
+            for host, port in (("127.0.0.1", service_port), ("169.254.169.254", 80)):
+                _reader, writer, status = await socks5_connect(proxy_config.server, host, port, literal=True)
+                writer.close()
+                await writer.wait_closed()
+                assert status != 0
             assert installed_hook is not None
             page = SimpleNamespace(route=AsyncMock())
-            await installed_hook(page)
-            route_handler = page.route.await_args.args[1]
+            context = SimpleNamespace(route=AsyncMock())
+            await installed_hook(page, context=context, config=None)
+            page.route.assert_not_called()
+            route_pattern, route_handler = context.route.await_args.args
+            assert route_pattern == "**/*"
             unsafe_route = SimpleNamespace(
                 request=SimpleNamespace(url="http://127.0.0.1/admin"),
                 abort=AsyncMock(),
@@ -355,141 +915,212 @@ async def test_crawl4ai_tool_installs_server_fetch_route_guard(monkeypatch: pyte
             await route_handler(unsafe_route)
             unsafe_route.abort.assert_awaited_once_with("blockedbyclient")
             unsafe_route.continue_.assert_not_called()
-            return SimpleNamespace(fit_markdown="", markdown="", text="public content", html="", success=True)
+            return _crawl_result("public content")
 
     monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
-    tool = crawl4ai_tools()()
+    tool = crawl4ai_tools()(runtime_paths=_CRAWL4AI_RUNTIME_PATHS)
 
-    result = await tool._async_crawl("https://example.com")
+    try:
+        result = await tool._async_crawl("https://example.com")
+    finally:
+        service.close()
+        await service.wait_closed()
 
     assert result == "public content"
+    assert loopback_connections == 0
+    assert len(endpoints) == 1
+    endpoint = urlsplit(endpoints[0])
+    assert (endpoint.scheme, endpoint.hostname) == ("socks5", "127.0.0.1")
+    with pytest.raises(ConnectionRefusedError):
+        await asyncio.open_connection(endpoint.hostname, endpoint.port)
 
 
-def test_plugin_validation_uses_sys_modules_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Plugin validation should snapshot sys.modules before iterating over it."""
-
-    class SnapshotOnlyModules(dict[str, ModuleType]):
-        def items(self) -> Never:
-            msg = "live sys.modules.items() should not be used"
-            raise RuntimeError(msg)
-
-        def copy(self) -> dict[str, ModuleType]:
-            return dict(self)
-
-    plugin_root = tmp_path / "plugins" / "demo"
-    plugin_root.mkdir(parents=True)
-    module_path = plugin_root / "tools.py"
-    module_path.write_text("VALUE = 1\n", encoding="utf-8")
-
-    snapshot_modules = SnapshotOnlyModules(sys.modules.copy())
-    monkeypatch.setattr(metadata_module.sys, "modules", snapshot_modules)
-
-    snapshot = capture_tool_registry_snapshot()
-    assert isinstance(snapshot.plugin_modules, dict)
-
-    module_name = _execute_validation_plugin_module("demo", plugin_root, module_path, {})
-    assert module_name
-    assert "demo" in module_name
-    assert "__validation__" in module_name
+_UPSTREAM = _UpstreamProxy(host="127.0.0.1", port=3128, tls=False)
 
 
-def test_module_origin_within_root_caches_path_resolution(
-    tmp_path: Path,
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_env", "runner", "expected"),
+    [
+        ({}, False, BrowserEgress()),
+        ({"ALL_PROXY": "http://127.0.0.1:3128"}, False, BrowserEgress(http=_UPSTREAM, https=_UPSTREAM)),
+        (
+            {"HTTP_PROXY": "http://127.0.0.1:3128/"},
+            True,
+            BrowserEgress(http=_UPSTREAM, https=_UPSTREAM, by_hostname=True),
+        ),
+        (
+            {
+                "HTTP_PROXY": "http://127.0.0.1:3128",
+                "HTTPS_PROXY": "http://127.0.0.1:3128",
+                "ALL_PROXY": "socks5://x:1",
+            },
+            False,
+            BrowserEgress(http=_UPSTREAM, https=_UPSTREAM),
+        ),
+        ({"HTTP_PROXY": "http://one:3128", "HTTPS_PROXY": "http://two:3128"}, True, None),
+    ],
+)
+async def test_crawl4ai_browser_egress_route(
     monkeypatch: pytest.MonkeyPatch,
+    proxy_env: dict[str, str],
+    runner: bool,
+    expected: BrowserEgress | None,
 ) -> None:
-    """Repeated origin checks for one module file should not re-resolve the path."""
-    plugin_root = tmp_path / "plugins" / "demo"
-    plugin_root.mkdir(parents=True)
-    module_path = plugin_root / "helper.py"
-    module_path.write_text("VALUE = 1\n", encoding="utf-8")
-    module = ModuleType("demo.helper")
-    module.__file__ = str(module_path)
-    resolve_calls = 0
-    original_resolve = Path.resolve
+    """Crawl4AI's relay chains the operator egress proxy, and a runner refuses an ambiguous one."""
+    for name in ("all_proxy", "http_proxy", "https_proxy", "no_proxy", "auto_proxy", "socks_server"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    for name, value in proxy_env.items():
+        monkeypatch.setenv(name, value)
+    servers: list[str] = []
+    relays: list[BrowserDestinationProxy] = []
 
-    def counted_resolve(self: Path, *args: object, **kwargs: object) -> Path:
-        nonlocal resolve_calls
-        if self == Path(str(module_path)):
-            resolve_calls += 1
-        return original_resolve(self, *args, **kwargs)
+    class RecordingRelay(BrowserDestinationProxy):
+        def __init__(self, **kwargs: BrowserEgress) -> None:
+            super().__init__(**kwargs)
+            relays.append(self)
 
-    _clear_module_origin_caches()
-    monkeypatch.setattr(metadata_module.Path, "resolve", counted_resolve)
+    class FakeAsyncWebCrawler:
+        def __init__(self, *, config: object) -> None:
+            servers.append(config.proxy_config.server)
+            self.crawler_strategy = SimpleNamespace(set_hook=lambda *_args: None)
+
+        async def __aenter__(self) -> object:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def arun(self, *, url: str, config: object) -> object:
+            del url, config
+            return _crawl_result("public content")
+
+    monkeypatch.setattr(agno_crawl4ai, "AsyncWebCrawler", FakeAsyncWebCrawler)
+    monkeypatch.setattr(crawl4ai_module, "BrowserDestinationProxy", RecordingRelay)
+    runtime_paths = resolve_runtime_paths(
+        config_path=Path("config.yaml"),
+        process_env={"MINDROOM_SANDBOX_RUNNER_MODE": "true"} if runner else {},
+    )
+
+    result = await crawl4ai_tools()(runtime_paths=runtime_paths)._async_crawl("https://example.com")
+
+    if expected is None:
+        assert "cannot choose one egress proxy" in result
+        assert servers == []
+    else:
+        assert result == "public content"
+        assert len(relays) == 1
+        assert servers == [relays[0].endpoint]
+        assert relays[0]._egress == expected
+
+
+# Research toolkits whose URL functions download pages from the MindRoom process through the server-fetch guard.
+_LOCAL_URL_FETCH_TOOLS = ("agentql", "crawl4ai", "newspaper", "trafilatura", "website")
+# Research toolkits that forward URLs to a hosted service instead of downloading them locally.
+_HOSTED_URL_FETCH_TOOLS = (
+    "brightdata",
+    "browserbase",
+    "exa",
+    "firecrawl",
+    "jina",
+    "oxylabs",
+    "scrapegraph",
+    "serper",
+    "spider",
+    "tavily",
+)
+
+
+def _url_functions(tool_name: str) -> list[tuple[str, str]]:
+    """Return each statically defined toolkit function and the URL parameter it accepts."""
+    toolkit_class = _BUILTINS.factory(tool_name)()
+    functions: list[tuple[str, str]] = []
+    for function_name in _BUILTINS.entries[tool_name].function_names:
+        method = getattr(toolkit_class, function_name, None)
+        if method is None:
+            continue
+        functions.extend(
+            (function_name, parameter)
+            for parameter in inspect.signature(method).parameters
+            if "url" in parameter.lower()
+        )
+    return functions
+
+
+@contextlib.contextmanager
+def _recording_loopback_server() -> Iterator[tuple[str, list[object]]]:
+    """Serve a loopback page that records every accepted connection."""
+    connections: list[object] = []
+
+    class RecordingHandler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            connections.append(self.client_address)
+            super().setup()
+
+        def do_GET(self) -> None:
+            body = b"<html><body><article><p>loopback secret</p></article></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *_args: object) -> None:  # noqa: A002, ARG002
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), RecordingHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     try:
-        assert metadata_module._module_origin_within_root(module, plugin_root)
-        assert metadata_module._module_origin_within_root(module, plugin_root)
+        yield f"http://127.0.0.1:{server.server_port}/api/config/raw", connections
     finally:
-        _clear_module_origin_caches()
+        server.shutdown()
+        server.server_close()
 
-    assert resolve_calls == 1
+
+def test_research_url_tools_declare_their_fetch_path() -> None:
+    """Every research toolkit taking URLs must be classified as a guarded or hosted fetcher."""
+    url_tools = sorted(
+        tool_name
+        for tool_name, metadata in _BUILTINS.entries.items()
+        if metadata.factory is not None and metadata.category is ToolCategory.RESEARCH and _url_functions(tool_name)
+    )
+
+    assert url_tools == sorted((*_LOCAL_URL_FETCH_TOOLS, *_HOSTED_URL_FETCH_TOOLS))
 
 
-def test_module_origin_within_root_caches_containment_checks(
+@pytest.mark.parametrize("tool_name", _LOCAL_URL_FETCH_TOOLS)
+def test_local_url_fetch_tools_do_not_contact_loopback_targets(
+    tool_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plugin validation rescans all of sys.modules, so containment must resolve once."""
-    plugin_root = tmp_path / "plugins" / "demo"
-    plugin_root.mkdir(parents=True)
-    module_path = plugin_root / "helper.py"
-    module_path.write_text("VALUE = 1\n", encoding="utf-8")
-    module = ModuleType("demo.helper")
-    module.__file__ = str(module_path)
-    outside_module = ModuleType("outside.helper")
-    outside_module.__file__ = str(tmp_path / "outside.py")
-    containment_calls = 0
-    original_is_relative_to = Path.is_relative_to
+    """Local page fetchers must refuse loopback targets before connecting unless they default to a worker."""
+    if _BUILTINS.entries[tool_name].default_execution_target is ToolExecutionTarget.WORKER:
+        pytest.skip("Worker execution keeps downloads behind the worker egress policy.")
+    # AgentQL refuses to build without a key; the unsafe URL is refused before any request could use it.
+    monkeypatch.setenv("AGENTQL_API_KEY", "unused")
+    toolkit = get_tool_by_name(
+        tool_name,
+        resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage"),
+        runs_in_worker=False,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
 
-    def counted_is_relative_to(self: Path, *args: object, **kwargs: object) -> bool:
-        nonlocal containment_calls
-        containment_calls += 1
-        return original_is_relative_to(self, *args, **kwargs)
+    with _recording_loopback_server() as (url, connections):
+        for function_name, parameter in _url_functions(tool_name):
+            argument = [url] if parameter.endswith("urls") else url
+            with contextlib.suppress(ServerFetchUrlError, PublicFetchError):
+                getattr(toolkit, function_name)(**{parameter: argument})
 
-    _clear_module_origin_caches()
-    monkeypatch.setattr(metadata_module.Path, "is_relative_to", counted_is_relative_to)
-    try:
-        for _ in range(5):
-            assert metadata_module._module_origin_within_root(module, plugin_root)
-            assert not metadata_module._module_origin_within_root(outside_module, plugin_root)
-    finally:
-        _clear_module_origin_caches()
-
-    assert containment_calls == 2
-
-
-def test_restore_tool_registry_snapshot_uses_sys_modules_snapshot(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Restoring registry state should snapshot sys.modules before iterating over it."""
-
-    class SnapshotOnlyModules(dict[str, ModuleType]):
-        def __iter__(self) -> Never:
-            msg = "live sys.modules iteration should not be used"
-            raise RuntimeError(msg)
-
-        def copy(self) -> dict[str, ModuleType]:
-            return dict(self)
-
-    snapshot = capture_tool_registry_snapshot()
-    leaked_module_name = f"{PLUGIN_MODULE_PREFIX}leaked"
-    assert leaked_module_name not in snapshot.plugin_modules
-
-    leaked_module = ModuleType(leaked_module_name)
-    leaked_module.__file__ = str(tmp_path / "leaked.py")
-
-    snapshot_modules = SnapshotOnlyModules(sys.modules.copy())
-    snapshot_modules[leaked_module_name] = leaked_module
-    monkeypatch.setattr(metadata_module.sys, "modules", snapshot_modules)
-
-    restore_tool_registry_snapshot(snapshot)
-
-    assert leaked_module_name not in metadata_module.sys.modules
+    assert connections == []
 
 
 def test_tool_metadata_consistency() -> None:
     """Verify that all tool metadata is properly configured."""
-    for tool_name, metadata in TOOL_METADATA.items():
+    for tool_name, metadata in _BUILTINS.entries.items():
         # Check that all required fields are present
         assert metadata.name == tool_name, f"Tool name mismatch: {tool_name} != {metadata.name}"
         assert metadata.display_name, f"Tool {tool_name} missing display_name"
@@ -497,7 +1128,7 @@ def test_tool_metadata_consistency() -> None:
         assert metadata.category, f"Tool {tool_name} missing category"
         assert metadata.status, f"Tool {tool_name} missing status"
         assert metadata.setup_type, f"Tool {tool_name} missing setup_type"
-        if tool_name not in TOOL_REGISTRY:
+        if metadata.factory is None:
             assert metadata.managed_init_args == (), (
                 f"{tool_name} is metadata-only and should not declare managed init args: "
                 f"{[managed_arg.value for managed_arg in metadata.managed_init_args]}"
@@ -506,7 +1137,7 @@ def test_tool_metadata_consistency() -> None:
 
 def test_github_metadata_declares_oauth_and_manual_token_fallback() -> None:
     """GitHub metadata should describe both managed OAuth and manual-token construction."""
-    metadata = TOOL_METADATA["github"]
+    metadata = _BUILTINS.entries["github"]
 
     assert metadata.setup_type == SetupType.OAUTH
     assert metadata.auth_provider == "github"
@@ -519,7 +1150,7 @@ def test_github_metadata_declares_oauth_and_manual_token_fallback() -> None:
     )
     assert {field.name for field in metadata.config_fields or []} == {"access_token", "base_url"}
 
-    exported = next(tool for tool in export_tools_metadata() if tool["name"] == "github")
+    exported = next(tool for tool in export_tools_metadata(builtin_tool_registry().entries) if tool["name"] == "github")
     assert exported["oauth_fallback_fields"] == ["access_token"]
     assert "managed_init_args" not in exported
 
@@ -530,6 +1161,7 @@ def test_registration_rejects_missing_oauth_fallback_config_field() -> None:
 
         @register_tool_with_metadata(
             name="invalid_oauth_fallback",
+            file_access=ToolFileAccess.NONE,
             display_name="Invalid OAuth Fallback",
             description="Invalid test metadata.",
             category=ToolCategory.DEVELOPMENT,
@@ -543,11 +1175,9 @@ def test_registration_rejects_missing_oauth_fallback_config_field() -> None:
 
 def test_dynamic_tools_is_durable_metadata_only_builtin(tmp_path: Path) -> None:
     """Dynamic tools metadata should survive runtime registry rebuilding without a factory."""
-    metadata = TOOL_METADATA["dynamic_tools"]
+    metadata = _BUILTINS.entries["dynamic_tools"]
 
-    assert BUILTIN_TOOL_METADATA["dynamic_tools"] == metadata
-    assert "dynamic_tools" not in BUILTIN_TOOL_REGISTRY
-    assert "dynamic_tools" not in TOOL_REGISTRY
+    assert metadata.factory is None
 
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
@@ -555,7 +1185,7 @@ def test_dynamic_tools_is_durable_metadata_only_builtin(tmp_path: Path) -> None:
         process_env={},
     )
 
-    assert metadata_module.resolved_tool_metadata_for_runtime(runtime_paths, Config())["dynamic_tools"] == metadata
+    assert config_plugins(Config(), runtime_paths).tools.get("dynamic_tools") == metadata
 
 
 def test_tool_metadata_does_not_advertise_env_var_fallbacks() -> None:
@@ -565,7 +1195,7 @@ def test_tool_metadata_does_not_advertise_env_var_fallbacks() -> None:
         "can also be set via",
     )
 
-    for tool_name, metadata in TOOL_METADATA.items():
+    for tool_name, metadata in _BUILTINS.entries.items():
         text_snippets = [metadata.description, metadata.helper_text]
         text_snippets.extend(field.description for field in metadata.config_fields or [])
 
@@ -587,6 +1217,7 @@ def test_get_tool_by_name_does_not_infer_hidden_constructor_kwargs(tmp_path: Pat
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Hidden Runtime Tool",
         description="Test-only toolkit for constructor contract coverage.",
         category=ToolCategory.DEVELOPMENT,
@@ -600,17 +1231,74 @@ def test_get_tool_by_name_does_not_infer_hidden_constructor_kwargs(tmp_path: Pat
         process_env={},
     )
 
-    try:
-        with pytest.raises(TypeError, match="runtime_paths"):
-            get_tool_by_name(
-                tool_name,
-                runtime_paths,
-                runtime_overrides={"runtime_paths": runtime_paths},
-                worker_target=None,
-            )
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+    with pytest.raises(TypeError, match="runtime_paths"):
+        get_tool_by_name(
+            tool_name,
+            runtime_paths,
+            runtime_overrides={"runtime_paths": runtime_paths},
+            worker_target=None,
+            tools=builtin_tool_registry(),
+        )
+
+
+def test_get_tool_by_name_refuses_an_agno_mcp_toolkit_and_names_mcp_servers(tmp_path: Path) -> None:
+    """MindRoom runs MCP servers only from ``mcp_servers:``, so a toolkit wrapping Agno ``MCPTools`` is never built."""
+    tool_name = "test_mcp_wrapper"
+    constructed: list[str] = []
+
+    class ServerTools(MCPTools):
+        def __init__(self) -> None:
+            constructed.append(tool_name)
+            super().__init__(command="true")
+
+    @register_tool_with_metadata(
+        name=tool_name,
+        file_access=ToolFileAccess.UNCONFINED,
+        display_name="MCP Wrapper",
+        description="Test-only wrapper around an Agno MCP toolkit.",
+        category=ToolCategory.DEVELOPMENT,
+    )
+    def _mcp_wrapper_factory() -> type[ServerTools]:
+        return ServerTools
+
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={},
+    )
+
+    with pytest.raises(ToolMetadataValidationError, match=r"'test_mcp_wrapper' subclasses Agno MCPTools.*mcp_servers:"):
+        get_tool_by_name(tool_name, runtime_paths, worker_target=None, tools=builtin_tool_registry())
+    assert constructed == []
+
+
+def test_get_tool_by_name_builds_a_plugin_toolkit_that_only_shares_the_mcp_tools_name(tmp_path: Path) -> None:
+    """Only Agno's own ``MCPTools`` is refused; a plugin's unrelated toolkit with that class name still builds."""
+    tool_name = "test_mcp_named_toolkit"
+
+    class MCPTools(Toolkit):
+        def __init__(self) -> None:
+            super().__init__(name=tool_name, tools=[])
+
+    @register_tool_with_metadata(
+        name=tool_name,
+        file_access=ToolFileAccess.NONE,
+        display_name="MCP Named Toolkit",
+        description="Test-only toolkit whose class name matches Agno's MCP toolkit.",
+        category=ToolCategory.DEVELOPMENT,
+    )
+    def _mcp_named_factory() -> type[MCPTools]:
+        return MCPTools
+
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={},
+    )
+
+    assert (
+        get_tool_by_name(tool_name, runtime_paths, worker_target=None, tools=builtin_tool_registry()).name == tool_name
+    )
 
 
 def test_get_tool_by_name_passes_declared_managed_init_args(tmp_path: Path) -> None:
@@ -632,6 +1320,7 @@ def test_get_tool_by_name_passes_declared_managed_init_args(tmp_path: Path) -> N
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Explicit Runtime Tool",
         description="Test-only toolkit for explicit constructor contract coverage.",
         category=ToolCategory.DEVELOPMENT,
@@ -650,35 +1339,32 @@ def test_get_tool_by_name_passes_declared_managed_init_args(tmp_path: Path) -> N
         process_env={},
     )
 
-    try:
-        execution_identity = ToolExecutionIdentity(
-            channel="matrix",
-            agent_name="general",
-            requester_id="@user:localhost",
-            room_id="!room:localhost",
-            thread_id="$thread:localhost",
-            resolved_thread_id="$thread:localhost",
-            session_id="session",
-        )
-        worker_target = resolve_worker_target(
-            "shared",
-            "general",
-            execution_identity=execution_identity,
-            tenant_id=runtime_paths.env_value("CUSTOMER_ID"),
-            account_id=runtime_paths.env_value("ACCOUNT_ID"),
-        )
-        tool = get_tool_by_name(
-            tool_name,
-            runtime_paths,
-            worker_target=worker_target,
-        )
-        assert isinstance(tool, ExplicitRuntimeToolkit)
-        assert tool.runtime_paths == runtime_paths
-        assert tool.worker_target == worker_target
-        assert tool.current_room_id == execution_identity.room_id
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+    execution_identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name="general",
+        requester_id="@user:localhost",
+        room_id="!room:localhost",
+        thread_id="$thread:localhost",
+        resolved_thread_id="$thread:localhost",
+        session_id="session",
+    )
+    worker_target = resolve_worker_target(
+        "shared",
+        "general",
+        execution_identity=execution_identity,
+        tenant_id=runtime_paths.env_value("CUSTOMER_ID"),
+        account_id=runtime_paths.env_value("ACCOUNT_ID"),
+    )
+    tool = get_tool_by_name(
+        tool_name,
+        runtime_paths,
+        worker_target=worker_target,
+        tools=builtin_tool_registry(),
+    )
+    assert isinstance(tool, ExplicitRuntimeToolkit)
+    assert tool.runtime_paths == runtime_paths
+    assert tool.worker_target == worker_target
+    assert tool.current_room_id == execution_identity.room_id
 
 
 def test_validate_authored_overrides_accepts_declared_field_types_and_nulls() -> None:
@@ -691,6 +1377,7 @@ def test_validate_authored_overrides_accepts_declared_field_types_and_nulls() ->
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Authored Override Tool",
         description="Test-only toolkit for authored override validation.",
         category=ToolCategory.DEVELOPMENT,
@@ -704,25 +1391,22 @@ def test_validate_authored_overrides_accepts_declared_field_types_and_nulls() ->
     def _fake_tool_factory() -> type[_FakeToolkit]:
         return _FakeToolkit
 
-    try:
-        assert _validate_authored_overrides(
-            tool_name,
-            {
-                "enabled": True,
-                "count": 3.5,
-                "label": None,
-                "endpoint": "https://example.com",
-            },
-            config_path_prefix="agents.code.tools[0]",
-        ) == {
+    assert validate_authored_tool_entry_overrides(
+        tool_name,
+        {
             "enabled": True,
             "count": 3.5,
             "label": None,
             "endpoint": "https://example.com",
-        }
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+        },
+        config_path_prefix="agents.code.tools[0]",
+        tool_metadata=builtin_tool_registry().entries,
+    ) == {
+        "enabled": True,
+        "count": 3.5,
+        "label": None,
+        "endpoint": "https://example.com",
+    }
 
 
 def test_validate_authored_overrides_accepts_inherit_sentinel_for_required_fields() -> None:
@@ -735,6 +1419,7 @@ def test_validate_authored_overrides_accepts_inherit_sentinel_for_required_field
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Authored Override Inherit Required",
         description="Test-only toolkit for inherit sentinel coverage.",
         category=ToolCategory.DEVELOPMENT,
@@ -745,15 +1430,12 @@ def test_validate_authored_overrides_accepts_inherit_sentinel_for_required_field
     def _fake_tool_factory() -> type[_FakeToolkit]:
         return _FakeToolkit
 
-    try:
-        assert _validate_authored_overrides(
-            tool_name,
-            {"workspace_id": _AUTHORED_OVERRIDE_INHERIT},
-            config_path_prefix="agents.code.tools[0]",
-        ) == {"workspace_id": _AUTHORED_OVERRIDE_INHERIT}
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+    assert validate_authored_tool_entry_overrides(
+        tool_name,
+        {"workspace_id": _AUTHORED_OVERRIDE_INHERIT},
+        config_path_prefix="agents.code.tools[0]",
+        tool_metadata=builtin_tool_registry().entries,
+    ) == {"workspace_id": _AUTHORED_OVERRIDE_INHERIT}
 
 
 def test_validate_authored_overrides_accepts_string_lists_for_text_fields_with_agent_override_arrays() -> None:
@@ -766,6 +1448,7 @@ def test_validate_authored_overrides_accepts_string_lists_for_text_fields_with_a
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Authored Override String Array Compat",
         description="Test-only toolkit for string-array compatibility coverage.",
         category=ToolCategory.DEVELOPMENT,
@@ -779,15 +1462,12 @@ def test_validate_authored_overrides_accepts_string_lists_for_text_fields_with_a
     def _fake_tool_factory() -> type[_FakeToolkit]:
         return _FakeToolkit
 
-    try:
-        assert _validate_authored_overrides(
-            tool_name,
-            {"patterns": ["GITEA_*", "WHISPER_URL"]},
-            config_path_prefix="agents.code.tools[0]",
-        ) == {"patterns": "GITEA_*, WHISPER_URL"}
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+    assert validate_authored_tool_entry_overrides(
+        tool_name,
+        {"patterns": ["GITEA_*", "WHISPER_URL"]},
+        config_path_prefix="agents.code.tools[0]",
+        tool_metadata=builtin_tool_registry().entries,
+    ) == {"patterns": "GITEA_*, WHISPER_URL"}
 
 
 def test_validate_authored_overrides_rejects_bad_types_and_password_fields() -> None:
@@ -800,6 +1480,7 @@ def test_validate_authored_overrides_rejects_bad_types_and_password_fields() -> 
 
     @register_tool_with_metadata(
         name=tool_name,
+        file_access=ToolFileAccess.NONE,
         display_name="Authored Override Errors",
         description="Test-only toolkit for override error coverage.",
         category=ToolCategory.DEVELOPMENT,
@@ -812,40 +1493,74 @@ def test_validate_authored_overrides_rejects_bad_types_and_password_fields() -> 
     def _fake_tool_factory() -> type[_FakeToolkit]:
         return _FakeToolkit
 
-    try:
-        with pytest.raises(
-            ToolConfigOverrideError,
-            match=r"agents.code.tools\[0\].test_authored_override_errors.flag",
-        ):
-            _validate_authored_overrides(
-                tool_name,
-                {"flag": "yes"},
-                config_path_prefix="agents.code.tools[0]",
-            )
+    with pytest.raises(
+        ToolConfigOverrideError,
+        match=r"agents.code.tools\[0\].test_authored_override_errors.flag",
+    ):
+        validate_authored_tool_entry_overrides(
+            tool_name,
+            {"flag": "yes"},
+            config_path_prefix="agents.code.tools[0]",
+            tool_metadata=builtin_tool_registry().entries,
+        )
 
-        with pytest.raises(ToolConfigOverrideError, match="authored overrides are not allowed for this field"):
-            _validate_authored_overrides(
-                tool_name,
-                {"base_dir": "/workspace"},
-                config_path_prefix="agents.code.tools[0]",
-            )
+    with pytest.raises(ToolConfigOverrideError, match="authored overrides are not allowed for this field"):
+        validate_authored_tool_entry_overrides(
+            tool_name,
+            {"base_dir": "/workspace"},
+            config_path_prefix="agents.code.tools[0]",
+            tool_metadata=builtin_tool_registry().entries,
+        )
 
-        with pytest.raises(ToolConfigOverrideError, match="password fields"):
-            _validate_authored_overrides(
-                tool_name,
-                {"api_key": "sk-test"},
-                config_path_prefix="agents.code.tools[0]",
-            )
+    with pytest.raises(ToolConfigOverrideError, match="password fields"):
+        validate_authored_tool_entry_overrides(
+            tool_name,
+            {"api_key": "sk-test"},
+            config_path_prefix="agents.code.tools[0]",
+            tool_metadata=builtin_tool_registry().entries,
+        )
 
-        with pytest.raises(ToolConfigOverrideError, match="unknown authored override field"):
-            _validate_authored_overrides(
-                tool_name,
-                {"missing": True},
-                config_path_prefix="agents.code.tools[0]",
-            )
-    finally:
-        TOOL_REGISTRY.pop(tool_name, None)
-        TOOL_METADATA.pop(tool_name, None)
+    with pytest.raises(
+        ToolConfigOverrideError,
+        match=r"unknown authored override field.*Allowed fields: exclude_tools, flag, include_tools\.$",
+    ):
+        validate_authored_tool_entry_overrides(
+            tool_name,
+            {"missing": True},
+            config_path_prefix="agents.code.tools[0]",
+            tool_metadata=builtin_tool_registry().entries,
+        )
+
+
+def test_password_fields_are_never_authorable() -> None:
+    """A password field holds a secret, so the tool metadata the dashboard reads marks it non-authorable."""
+    assert (
+        ConfigField(name="api_key", label="API Key", type="password", authored_override=True).authored_override is False
+    )
+
+    reddit = next(tool for tool in export_tools_metadata(_BUILTINS.entries) if tool["name"] == "reddit")
+    authorable = {field["name"]: field["authored_override"] for field in reddit["config_fields"]}
+    assert authorable == {
+        "client_id": True,
+        "client_secret": False,
+        "user_agent": True,
+        "username": True,
+        "password": False,
+        "allowed_subreddits": True,
+    }
+
+
+@pytest.mark.parametrize("config_path_prefix", ["agents.code.tools[0]", "defaults.tools[0]"])
+@pytest.mark.parametrize("actions", [None, [], [" "], "", " , "])
+def test_validate_authored_overrides_rejects_an_empty_required_list(config_path_prefix: str, actions: object) -> None:
+    """Composio cannot build without actions, so its required list must hold a value when the config loads."""
+    with pytest.raises(ToolConfigOverrideError, match=r"composio\.actions: this field is required"):
+        validate_authored_tool_entry_overrides(
+            "composio",
+            {"actions": actions},
+            config_path_prefix=config_path_prefix,
+            tool_metadata=_BUILTINS.entries,
+        )
 
 
 def test_searxng_include_tools_override_filters_registered_functions(tmp_path: Path) -> None:
@@ -862,11 +1577,12 @@ def test_searxng_include_tools_override_filters_registered_functions(tmp_path: P
         tool_config_overrides={
             "include_tools": ["search_web", "news_search", "image_search"],
         },
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
-    assert set(tool.functions) == {"search_web", "news_search", "image_search"}
+    assert set(toolkit_function_names(tool)) == {"search_web", "news_search", "image_search"}
 
 
 def test_searxng_empty_include_tools_override_filters_all_functions(tmp_path: Path) -> None:
@@ -881,11 +1597,12 @@ def test_searxng_empty_include_tools_override_filters_all_functions(tmp_path: Pa
         runtime_paths,
         credential_overrides={"host": "https://search.example.com"},
         tool_config_overrides={"include_tools": []},
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
-    assert not tool.functions
+    assert not toolkit_function_names(tool)
 
 
 def test_file_empty_exclude_patterns_override_reaches_constructor(tmp_path: Path) -> None:
@@ -899,8 +1616,9 @@ def test_file_empty_exclude_patterns_override_reaches_constructor(tmp_path: Path
         "file",
         runtime_paths,
         tool_config_overrides={"exclude_patterns": []},
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
     assert tool.exclude_patterns == []
@@ -920,12 +1638,64 @@ def test_script_integral_number_overrides_reach_integer_limits(tmp_path: Path) -
             "max_concurrent_runs": 3.0,
             "max_tool_calls_per_minute": 30.0,
         },
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
     assert tool.limits.max_concurrent_runs == 3
     assert tool.limits.max_tool_calls_per_minute == 30
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ("false", False),
+        ("true", True),
+        (False, False),
+        (True, True),
+    ],
+)
+def test_stored_boolean_tool_config_reaches_constructor_as_boolean(
+    tmp_path: Path,
+    stored: object,
+    expected: bool,
+) -> None:
+    """Credential seeds resolve to strings, so a stored "false" must not enable a boolean option."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+    )
+
+    tool = get_tool_by_name(
+        "browser",
+        runtime_paths,
+        credential_overrides={"allow_private_networks": stored},
+        runs_in_worker=False,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+
+    assert tool._allow_private_networks is expected
+
+
+@pytest.mark.parametrize("stored", ["maybe", "", "False", " true", "1", "no", 1, 0.0, ["true"]])
+def test_stored_boolean_tool_config_rejects_non_boolean_values(tmp_path: Path, stored: object) -> None:
+    """Unrecognized stored values for a boolean option fail instead of silently choosing a truthiness."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+    )
+
+    with pytest.raises(ToolConfigOverrideError, match=r"'browser\.allow_private_networks' must be a boolean"):
+        get_tool_by_name(
+            "browser",
+            runtime_paths,
+            credential_overrides={"allow_private_networks": stored},
+            runs_in_worker=False,
+            worker_target=None,
+            tools=builtin_tool_registry(),
+        )
 
 
 def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path: Path) -> None:
@@ -939,12 +1709,15 @@ def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path:
         "scheduler",
         runtime_paths,
         tool_config_overrides={"exclude_tools": ["cancel_schedule"]},
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
-    assert set(tool.async_functions) == {
+    assert set(toolkit_function_names(tool)) == {
         "schedule",
+        "schedule_tool_call",
+        "run_scheduled_call",
         "edit_schedule",
         "list_schedules",
     }
@@ -954,10 +1727,11 @@ def test_custom_toolkit_exclude_tools_override_filters_async_functions(tmp_path:
 def test_non_toolkit_registration_rejects_universal_filters(tool_name: str) -> None:
     """Universal filters should not validate for non-Toolkit catalog entries."""
     with pytest.raises(ToolConfigOverrideError, match="unknown authored override field"):
-        _validate_authored_overrides(
+        validate_authored_tool_entry_overrides(
             tool_name,
             {"include_tools": ["GITHUB_CREATE_ISSUE"]},
             config_path_prefix="agents.code.tools[0]",
+            tool_metadata=builtin_tool_registry().entries,
         )
 
 
@@ -1027,12 +1801,28 @@ def test_tool_validation_snapshot_round_trips_mcp_override_validation(tmp_path: 
         context={"runtime_paths": runtime_paths},
     )
 
-    snapshot = resolved_tool_validation_snapshot_for_runtime(runtime_paths, config)
+    snapshot = config_plugins(config, runtime_paths).tools.validation_snapshot
     payload = serialize_tool_validation_snapshot(snapshot)
     restored_snapshot = deserialize_tool_validation_snapshot(payload)
 
     assert restored_snapshot["mcp_demo"].authored_override_validator == ToolAuthoredOverrideValidator.MCP
     assert restored_snapshot["mcp_demo"].agent_override_fields is not None
+
+
+def test_tool_validation_snapshot_round_trips_primary_runtime_requirement() -> None:
+    """Worker validation caches must retain the catalog's non-overridable runtime boundary."""
+    snapshot = {
+        "host_only": ToolValidationInfo(
+            name="host_only",
+            requires_primary_runtime=True,
+        ),
+    }
+
+    payload = serialize_tool_validation_snapshot(snapshot)
+    restored_snapshot = deserialize_tool_validation_snapshot(payload)
+
+    assert payload["host_only"]["requires_primary_runtime"] is True
+    assert restored_snapshot["host_only"].requires_primary_runtime is True
 
 
 def test_deserialize_tool_validation_snapshot_rejects_non_boolean_runtime_loadable() -> None:
@@ -1045,6 +1835,22 @@ def test_deserialize_tool_validation_snapshot_rejects_non_boolean_runtime_loadab
                     "agent_override_fields": [],
                     "authored_override_validator": "default",
                     "runtime_loadable": "yes",
+                },
+            },
+        )
+
+
+def test_deserialize_tool_validation_snapshot_rejects_non_boolean_primary_runtime() -> None:
+    """Validation snapshot payloads should type-check primary-runtime requirements strictly."""
+    with pytest.raises(TypeError, match="requires_primary_runtime to a boolean"):
+        deserialize_tool_validation_snapshot(
+            {
+                "host_only": {
+                    "config_fields": [],
+                    "agent_override_fields": [],
+                    "authored_override_validator": "default",
+                    "requires_primary_runtime": "yes",
+                    "runtime_loadable": True,
                 },
             },
         )
@@ -1110,23 +1916,19 @@ def test_get_tool_by_name_rejects_invalid_mcp_assignment_overrides(tmp_path: Pat
     )
     runtime_paths = resolve_runtime_paths(config_path=config_path, storage_path=tmp_path / "storage")
     config = load_config(runtime_paths)
-    try:
-        ensure_tool_registry_loaded(runtime_paths, config)
 
-        with pytest.raises(ToolConfigOverrideError, match="include_tools and exclude_tools overlap"):
-            get_tool_by_name(
-                "mcp_demo",
-                runtime_paths,
-                tool_config_overrides={
-                    "include_tools": ["echo"],
-                    "exclude_tools": ["echo"],
-                },
-                disable_sandbox_proxy=True,
-                worker_target=None,
-            )
-    finally:
-        TOOL_REGISTRY.pop("mcp_demo", None)
-        TOOL_METADATA.pop("mcp_demo", None)
+    with pytest.raises(ToolConfigOverrideError, match="include_tools and exclude_tools overlap"):
+        get_tool_by_name(
+            "mcp_demo",
+            runtime_paths,
+            tool_config_overrides={
+                "include_tools": ["echo"],
+                "exclude_tools": ["echo"],
+            },
+            runs_in_worker=False,
+            worker_target=None,
+            tools=config_plugins(config, runtime_paths).tools,
+        )
 
 
 def test_secret_like_config_fields_are_marked_password() -> None:
@@ -1143,7 +1945,7 @@ def test_secret_like_config_fields_are_marked_password() -> None:
         "bearer_token",
     }
 
-    for tool_name, metadata in TOOL_METADATA.items():
+    for tool_name, metadata in _BUILTINS.entries.items():
         for field in metadata.config_fields or []:
             lowered = field.name.lower()
             if "url" in lowered or lowered.endswith("_id") or lowered == "client_id":
@@ -1152,76 +1954,382 @@ def test_secret_like_config_fields_are_marked_password() -> None:
                 assert field.type == "password", f"{tool_name}.{field.name} should use type='password'"
 
 
-def test_resolved_tool_state_cached_per_config_object(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """One config object should resolve its tool state once across all consumers."""
-    compute_calls = 0
-    dummy_state = metadata_module._ResolvedToolState({}, {}, {})
-
-    def counted_compute(*_args: object, **_kwargs: object) -> metadata_module._ResolvedToolState:
-        nonlocal compute_calls
-        compute_calls += 1
-        return dummy_state
-
-    monkeypatch.setattr(metadata_module, "_compute_resolved_tool_state_for_runtime", counted_compute)
-    metadata_module.clear_resolved_tool_state_cache()
+def test_one_config_composes_its_plugin_view_once_per_published_generation(tmp_path: Path) -> None:
+    """Every operation on one config object shares its view until another generation is published."""
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
         storage_path=tmp_path / "storage",
         process_env={},
     )
     config = Config.model_validate({})
-    try:
-        first = metadata_module._resolved_tool_state_for_runtime(runtime_paths, config)
-        second = metadata_module._resolved_tool_state_for_runtime(runtime_paths, config)
-        assert first is dummy_state
-        assert second is dummy_state
-        assert compute_calls == 1
+    other_runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "other" / "config.yaml",
+        storage_path=tmp_path / "other" / "storage",
+        process_env={},
+    )
 
-        # A different tolerate flag, config object, or runtime context recomputes.
-        metadata_module._resolved_tool_state_for_runtime(runtime_paths, config, tolerate_plugin_load_errors=True)
-        assert compute_calls == 2
-        metadata_module._resolved_tool_state_for_runtime(runtime_paths, Config.model_validate({}))
-        assert compute_calls == 3
-        other_runtime_paths = resolve_runtime_paths(
-            config_path=tmp_path / "other" / "config.yaml",
-            storage_path=tmp_path / "other" / "storage",
-            process_env={},
+    first = config_plugins(config, runtime_paths)
+
+    assert config_plugins(config, runtime_paths) is first
+    assert config_plugins(Config.model_validate({}), runtime_paths) is not first
+    assert config_plugins(config, other_runtime_paths) is not first
+    publish_plugins(prepare_plugins(config, runtime_paths))
+    assert config_plugins(config, runtime_paths) is not first
+    assert first.tools is first.tools
+
+
+def test_a_config_s_plugin_view_does_not_outlive_the_config(tmp_path: Path) -> None:
+    """The latest view of a config object goes when the config goes, so a reused id never finds it."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={},
+    )
+    config = Config.model_validate({})
+    config_id = id(config)
+    config_plugins(config, runtime_paths)
+    assert config_id in plugins_module._CONFIG_PLUGINS
+
+    del config
+    gc.collect()
+
+    assert config_id not in plugins_module._CONFIG_PLUGINS
+
+
+def test_code_execution_tools_declare_unconfined_file_access() -> None:
+    """Tools that run arbitrary programs cannot be confined in-process."""
+    for name in ("shell", "python", "docker", "claude_agent"):
+        assert _BUILTINS.entries[name].file_access is ToolFileAccess.UNCONFINED, name
+        assert _BUILTINS.entries[name].executes_code, name
+
+
+_UNCONFINED_LOCAL_FILE_TOOLS = (
+    "browserbase",
+    "composio",
+    "csv",
+    "duckdb",
+    "pandas",
+    "postgres",
+    "redshift",
+    "sql",
+)
+
+
+def test_tools_reaching_local_files_outside_file_access_are_declared_unconfined() -> None:
+    """Tools whose queries, paths, or URLs reach local files without file_access confinement must say so."""
+    for name in _UNCONFINED_LOCAL_FILE_TOOLS:
+        metadata = _BUILTINS.entries[name]
+        assert metadata.file_access is ToolFileAccess.UNCONFINED, name
+        assert not metadata.executes_code, name
+
+
+def test_only_code_execution_tools_execute_code() -> None:
+    """The executes_code flag stays independent of the file_access class."""
+    assert {name for name, metadata in _BUILTINS.entries.items() if metadata.executes_code} == {
+        "claude_agent",
+        "docker",
+        "python",
+        "script",
+        "shell",
+        "terminal",
+    }
+
+
+def test_path_tools_follow_agent_file_access_and_receive_it() -> None:
+    """Tools that take model-supplied paths follow and receive the agent file_access."""
+    for name in (
+        "file",
+        "coding",
+        "attachments",
+        "matrix_message",
+        "gmail",
+        "google_drive",
+        "microsoft_files",
+        "outlook_mail",
+        "browser",
+        "e2b",
+        "airflow",
+        "groq",
+        "moviepy_video_tools",
+        "openai",
+    ):
+        metadata = _BUILTINS.entries[name]
+        assert metadata.file_access is ToolFileAccess.AGENT, name
+        assert ToolManagedInitArg.FILE_ACCESS in metadata.managed_init_args, name
+
+
+def test_tools_default_to_no_file_access() -> None:
+    """Tools without local file paths declare no file access."""
+    assert _BUILTINS.entries["calculator"].file_access is ToolFileAccess.NONE
+
+
+def _file_access_worker_target(agent_name: str) -> ResolvedWorkerTarget:
+    return resolve_worker_target(
+        None,
+        agent_name,
+        execution_identity=ToolExecutionIdentity(
+            channel="matrix",
+            agent_name=agent_name,
+            requester_id="@user:localhost",
+            room_id="!room:localhost",
+            thread_id=None,
+            resolved_thread_id=None,
+            session_id="session",
+        ),
+        tenant_id=None,
+        account_id=None,
+    )
+
+
+def test_get_tool_by_name_passes_agent_file_access(tmp_path: Path) -> None:
+    """The managed file_access arg resolves the constructing agent's setting; unknown agents inherit the default and no config stays confined."""
+    tool_name = "test_file_access_tool"
+
+    class FileAccessToolkit(Toolkit):
+        def __init__(self, *, file_access: str) -> None:
+            self.file_access = file_access
+            super().__init__(name=tool_name, tools=[])
+
+    @register_tool_with_metadata(
+        name=tool_name,
+        display_name="File Access Tool",
+        description="Test-only toolkit for file_access injection.",
+        category=ToolCategory.DEVELOPMENT,
+        file_access=ToolFileAccess.AGENT,
+        managed_init_args=(ToolManagedInitArg.FILE_ACCESS,),
+    )
+    def _file_access_tool_factory() -> type[FileAccessToolkit]:
+        return FileAccessToolkit
+
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path / "storage",
+        process_env={},
+    )
+    config = Config.model_validate(
+        {
+            "defaults": {"file_access": "unrestricted"},
+            "agents": {
+                "admin": {"display_name": "Admin", "file_access": "unrestricted"},
+                "plain": {"display_name": "Plain", "file_access": "workspace"},
+            },
+        },
+    )
+
+    def build(runtime_config: Config | None, worker_target: ResolvedWorkerTarget | None) -> str:
+        tool = get_tool_by_name(
+            tool_name,
+            runtime_paths,
+            runtime_config=runtime_config,
+            worker_target=worker_target,
+            runs_in_worker=False,
+            tools=builtin_tool_registry(),
         )
-        metadata_module._resolved_tool_state_for_runtime(other_runtime_paths, config)
-        assert compute_calls == 4
+        assert isinstance(tool, FileAccessToolkit)
+        return tool.file_access
 
-        metadata_module.clear_resolved_tool_state_cache()
-        metadata_module._resolved_tool_state_for_runtime(runtime_paths, config)
-        assert compute_calls == 5
-    finally:
-        metadata_module.clear_resolved_tool_state_cache()
+    assert build(config, _file_access_worker_target("admin")) == "unrestricted"
+    assert build(config, _file_access_worker_target("plain")) == "workspace"
+    assert build(None, _file_access_worker_target("admin")) == "workspace"
+    assert build(config, None) == "unrestricted"
+    assert build(config, _file_access_worker_target("stranger")) == "unrestricted"
 
 
-def test_resolved_tool_state_cache_evicts_on_config_gc(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cached tool state must not outlive its config object (id-reuse safety)."""
-    monkeypatch.setattr(
-        metadata_module,
-        "_compute_resolved_tool_state_for_runtime",
-        lambda *_args, **_kwargs: metadata_module._ResolvedToolState({}, {}, {}),
+def test_file_access_on_code_tool_accepts_only_unconfined() -> None:
+    """Code tools accept an explicit no-op unconfined file_access and nothing else."""
+    validated = validate_authored_tool_entry_overrides(
+        "shell",
+        {"file_access": "unconfined"},
+        config_path_prefix="agents.a.tools",
+        tool_metadata=builtin_tool_registry().entries,
     )
-    metadata_module.clear_resolved_tool_state_cache()
+    assert "file_access" not in validated
+    for value in ("workspace", "unrestricted", True, None):
+        with pytest.raises(ToolConfigOverrideError, match="worker_tools"):
+            validate_authored_tool_entry_overrides(
+                "shell",
+                {"file_access": value},
+                config_path_prefix="agents.a.tools",
+                tool_metadata=builtin_tool_registry().entries,
+            )
+
+
+def test_file_access_on_primary_only_unconfined_tool_does_not_suggest_worker_routing() -> None:
+    """Tools that cannot run in a worker must not be told to isolate themselves with worker_tools."""
+    validate_authored_tool_entry_overrides(
+        "duckdb",
+        {"file_access": "unconfined"},
+        config_path_prefix="agents.a.tools",
+        tool_metadata=builtin_tool_registry().entries,
+    )
+    with pytest.raises(ToolConfigOverrideError, match="trusted with the primary runtime") as exc_info:
+        validate_authored_tool_entry_overrides(
+            "duckdb",
+            {"file_access": "workspace"},
+            config_path_prefix="agents.a.tools",
+            tool_metadata=builtin_tool_registry().entries,
+        )
+    assert "worker_tools" not in str(exc_info.value)
+
+
+def test_file_access_on_other_tools_points_to_agent_setting() -> None:
+    """Per-tool file_access is refused for tools that follow or ignore the agent setting."""
+    for tool_name in ("gmail", "calculator"):
+        with pytest.raises(ToolConfigOverrideError, match=r"agents\.<name>\.file_access|defaults\.file_access"):
+            validate_authored_tool_entry_overrides(
+                tool_name,
+                {"file_access": "unconfined"},
+                config_path_prefix="agents.a.tools",
+                tool_metadata=builtin_tool_registry().entries,
+            )
+
+
+def test_restrict_to_base_dir_is_rejected_with_file_access_hint() -> None:
+    """The removed per-tool restriction field points authors to the agent file_access setting."""
+    for tool_name in ("file", "coding", "python"):
+        with pytest.raises(
+            ToolConfigOverrideError,
+            match=rf"agents\.a\.tools\.{tool_name}\.restrict_to_base_dir was removed; use agents\.<name>\.file_access",
+        ):
+            validate_authored_tool_entry_overrides(
+                tool_name,
+                {"restrict_to_base_dir": False},
+                config_path_prefix="agents.a.tools",
+                tool_metadata=builtin_tool_registry().entries,
+            )
+
+
+def test_script_file_access_override_is_rejected_with_removal_hint(tmp_path: Path) -> None:
+    """A config that still marks script unconfined fails to load and is told to remove the key."""
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "test-model"}},
+                "agents": {
+                    "watcher": {"display_name": "Watcher", "tools": [{"script": {"file_access": "unconfined"}}]},
+                },
+            },
+            runtime_paths,
+        )
+
+    expected = (
+        "agents.watcher.tools[0].script.file_access was removed; script reads only its workspace source and declares"
+        " no file access, so remove the setting."
+    )
+    assert expected in str(exc_info.value)
+
+
+@pytest.mark.parametrize("tool_name", ["reasoning", "zep", "daytona"])
+def test_add_instructions_is_rejected_because_instructions_always_show(tool_name: str) -> None:
+    """The retired switch of Agno's toolkits is named and the author told to remove it, wherever a tool is authored."""
+    for prefix in ("agents.a.tools", "defaults.tools"):
+        with pytest.raises(ToolConfigOverrideError) as exc_info:
+            validate_authored_tool_entry_overrides(
+                tool_name,
+                {"add_instructions": True},
+                config_path_prefix=prefix,
+                tool_metadata=builtin_tool_registry().entries,
+            )
+
+        assert str(exc_info.value) == (
+            f"{prefix}.{tool_name}.add_instructions was removed; a toolkit's instructions always reach the prompt,"
+            " so remove the setting."
+        )
+    assert "add_instructions" not in {field.name for field in _BUILTINS.entries[tool_name].config_fields or ()}
+
+
+def test_config_load_rejects_a_retired_add_instructions_setting(tmp_path: Path) -> None:
+    """An old ``config.yaml`` that still switches on ``reasoning``'s instructions fails to load, naming the key."""
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+
+    with pytest.raises(ConfigRuntimeValidationError) as exc_info:
+        Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "test-model"}},
+                "agents": {
+                    "researcher": {
+                        "display_name": "Researcher",
+                        "tools": [{"reasoning": {"add_instructions": True, "add_few_shot": True}}],
+                    },
+                },
+            },
+            runtime_paths,
+        )
+
+    expected = (
+        "agents.researcher.tools[0].reasoning.add_instructions was removed; a toolkit's instructions always reach"
+        " the prompt, so remove the setting."
+    )
+    assert expected in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "field_name"),
+    [
+        ("openbb", "openbb_pat"),
+        ("sql", "db_url"),
+        ("custom_api", "headers"),
+        ("daytona", "sandbox_env_vars"),
+        ("baidusearch", "headers"),
+    ],
+)
+def test_credential_bearing_tool_fields_cannot_be_authored_inline(tool_name: str, field_name: str) -> None:
+    """Fields that can carry credentials are only stored through the credential store, never inline in config."""
+    with pytest.raises(ToolConfigOverrideError, match="authored overrides are not allowed"):
+        validate_authored_tool_entry_overrides(
+            tool_name,
+            {field_name: "credential-sentinel"},
+            config_path_prefix="agents.a.tools",
+            tool_metadata=builtin_tool_registry().entries,
+        )
+
+
+def test_file_access_rules_survive_the_validation_snapshot() -> None:
+    """Worker validation snapshots keep each tool's file-access class."""
+    snapshot = {
+        "runner": ToolValidationInfo(name="runner", file_access=ToolFileAccess.UNCONFINED),
+        "reader": ToolValidationInfo(name="reader", file_access=ToolFileAccess.AGENT),
+    }
+    restored = deserialize_tool_validation_snapshot(serialize_tool_validation_snapshot(snapshot))
+    assert restored["runner"].file_access is ToolFileAccess.UNCONFINED
+    assert restored["reader"].file_access is ToolFileAccess.AGENT
+    validate_authored_tool_entry_overrides("runner", {"file_access": "unconfined"}, tool_metadata=restored)
+    with pytest.raises(ToolConfigOverrideError, match=r"defaults\.file_access"):
+        validate_authored_tool_entry_overrides("reader", {"file_access": "unconfined"}, tool_metadata=restored)
+
+
+def test_deserialize_tool_validation_snapshot_rejects_unknown_file_access() -> None:
+    """Validation snapshot payloads type-check the file-access class strictly."""
+    with pytest.raises(TypeError, match="file_access"):
+        deserialize_tool_validation_snapshot({"shell": {"file_access": "sometimes"}})
+
+
+def test_config_load_rejects_workspace_file_access_on_shell(tmp_path: Path) -> None:
+    """Config runtime validation applies the file_access authored-key rules."""
     runtime_paths = resolve_runtime_paths(
         config_path=tmp_path / "config.yaml",
         storage_path=tmp_path / "storage",
-        process_env={},
     )
-    config = Config.model_validate({})
-    try:
-        metadata_module._resolved_tool_state_for_runtime(runtime_paths, config)
-        assert metadata_module._RESOLVED_TOOL_STATE_CACHE
-        del config
-        gc.collect()
-        assert not metadata_module._RESOLVED_TOOL_STATE_CACHE
-    finally:
-        metadata_module.clear_resolved_tool_state_cache()
+
+    def validate(value: str) -> None:
+        Config.validate_with_runtime(
+            {
+                "models": {"default": {"provider": "openai", "id": "gpt-6-astra"}},
+                "router": {"model": "default"},
+                "agents": {
+                    "code": {
+                        "display_name": "Code",
+                        "model": "default",
+                        "tools": [{"shell": {"file_access": value}}],
+                    },
+                },
+            },
+            runtime_paths,
+        )
+
+    validate("unconfined")
+    for value in ("workspace", "unrestricted"):
+        with pytest.raises(ConfigRuntimeValidationError, match="worker_tools"):
+            validate(value)

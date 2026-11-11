@@ -2,9 +2,12 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { useAuth } from '@/hooks/useAuth'
+import { useSubscription } from '@/hooks/useSubscription'
+import { planAction, planState } from '@/lib/plan-state'
 import { Loader2, RefreshCw, CheckCircle, AlertCircle, Clock, Play, Pause, ExternalLink, Server, MessageCircle, Globe } from 'lucide-react'
-import { listInstances, startInstance, stopInstance, restartInstance as apiRestartInstance, type Instance } from '@/lib/api'
-import { cache } from '@/lib/cache'
+import { provisionInstance, startInstance, stopInstance, restartInstance as apiRestartInstance, type Instance } from '@/lib/api'
+import { getCachedInstance, loadInstance } from '@/lib/instance-resource'
 import { buildCinnyLoginUrl } from '@/lib/cinny'
 import { getRuntimeConfig } from '@/lib/runtime-config'
 import { logger } from '@/lib/logger'
@@ -13,16 +16,27 @@ import { Card, CardHeader, CardSection } from '@/components/ui/Card'
 type InstanceStatus = Instance['status']
 
 export default function InstancePage() {
+  const { user, loading: authLoading } = useAuth()
+  const userId = user?.id ?? null
+  return <InstanceDetails key={userId ?? ''} userId={userId} authLoading={authLoading} />
+}
+
+function InstanceDetails({ userId, authLoading }: { userId: string | null; authLoading: boolean }) {
   const router = useRouter()
-  const cachedInstance = cache.get('user-instance') as Instance | null
+  const { subscription, loading: subscriptionLoading } = useSubscription()
+  const state = planState(subscription)
+  // What the account must do before its plan can run the instance, or null while it can
+  const nextStep = state === 'active' ? null : planAction(state)
+  const cachedInstance = getCachedInstance(userId)
   const [instance, setInstance] = useState<Instance | null>(cachedInstance)
   const [loading, setLoading] = useState(!cachedInstance)
   const [refreshing, setRefreshing] = useState(false)
   const [actionLoading, setActionLoading] = useState<string | null>(null)
-  const { platformDomain, apiUrl } = useMemo(() => getRuntimeConfig(), [])
+  const { platformDomain } = useMemo(() => getRuntimeConfig(), [])
 
 
   useEffect(() => {
+    if (authLoading || !userId) return
     // Only fetch if no cached data, otherwise fetch silently in background
     if (!cachedInstance) {
       fetchInstance()
@@ -30,9 +44,10 @@ export default function InstancePage() {
       // Fetch silently in background to get fresh data
       fetchInstance(true)
     }
-  }, []) // Run only on mount
+  }, [userId, authLoading])
 
   useEffect(() => {
+    if (authLoading || !userId) return
     // Poll for updates while provisioning or restarting
     if (instance?.status === 'provisioning' || instance?.status === 'restarting') {
       const interval = setInterval(() => {
@@ -41,21 +56,14 @@ export default function InstancePage() {
 
       return () => clearInterval(interval)
     }
-  }, [instance?.status])
+  }, [instance?.status, userId, authLoading])
 
   const fetchInstance = async (silent = false) => {
+    if (authLoading || !userId) return
     if (!silent) setLoading(true)
 
     try {
-      const data = await listInstances()
-
-      if (data.instances && data.instances.length > 0) {
-        const newInstance = data.instances[0]
-        setInstance(newInstance)
-        cache.set('user-instance', newInstance)
-      } else {
-        setInstance(null)
-      }
+      setInstance(await loadInstance(userId))
     } catch (error) {
       logger.error('Error fetching instance:', error)
     } finally {
@@ -69,7 +77,7 @@ export default function InstancePage() {
     setRefreshing(false)
   }
 
-  const handleAction = async (action: 'start' | 'stop' | 'restart' | 'delete' | 'reprovision') => {
+  const handleAction = async (action: 'start' | 'stop' | 'restart' | 'reprovision') => {
     if (!instance) return
 
     setActionLoading(action)
@@ -86,13 +94,8 @@ export default function InstancePage() {
           await apiRestartInstance(instance.instance_id)
           break
         case 'reprovision':
-          // Use the provision endpoint which now handles reprovisioning
-          const { provisionInstance } = await import('@/lib/api')
           await provisionInstance()
           break
-        case 'delete':
-          // Delete not implemented yet
-          throw new Error('Delete not implemented')
       }
 
       // Refresh instance status
@@ -125,7 +128,7 @@ export default function InstancePage() {
         return <CheckCircle className="w-5 h-5 text-green-500" />
       case 'provisioning':
       case 'restarting':
-        return <Loader2 className="w-5 h-5 text-orange-500 animate-spin" />
+        return <Loader2 className="w-5 h-5 text-brand-600 dark:text-brand-400 animate-spin" />
       case 'stopped':
       case 'deprovisioned':
         return <Clock className="w-5 h-5 text-yellow-500" />
@@ -146,22 +149,26 @@ export default function InstancePage() {
       case 'restarting':
         return 'Restarting your instance... This will take a moment.'
       case 'stopped':
-        return 'Instance is stopped. Start it to access your MindRoom.'
+        if (subscriptionLoading) return 'Instance is stopped.'
+        if (!nextStep) return 'Instance is stopped. Start it to access your MindRoom.'
+        return `Instance is stopped. ${nextStep.step} to start it again.`
       case 'failed':
         return 'Instance provisioning failed. Please contact support.'
       case 'error':
         return 'Instance not found in cluster. It may have been removed during maintenance. Please contact support to reprovision your instance.'
       case 'deprovisioned':
-        return 'Instance has been removed. Click "Reprovision Instance" to restore it.'
+        if (subscriptionLoading) return 'Instance has been removed.'
+        if (!nextStep) return 'Instance has been removed. Click "Reprovision Instance" to set it up again.'
+        return `Instance has been removed. ${nextStep.step} to set it up again.`
       default:
         return 'Unknown status'
     }
   }
 
-  if (loading) {
+  if (loading || (!instance && subscriptionLoading)) {
     return (
       <div className="flex items-center justify-center h-96">
-        <Loader2 className="w-8 h-8 animate-spin text-orange-500" />
+        <Loader2 className="w-8 h-8 animate-spin text-brand-600 dark:text-brand-400" />
       </div>
     )
   }
@@ -173,13 +180,13 @@ export default function InstancePage() {
           <Server className="w-20 h-20 text-gray-400 dark:text-gray-500 mx-auto mb-6" />
           <CardHeader className="mb-3">No Instance Found</CardHeader>
           <p className="text-gray-600 dark:text-gray-400 mb-8 text-lg">
-            You don't have a MindRoom instance yet. Upgrade to a paid plan to get your own instance.
+            You don't have a MindRoom instance yet. {nextStep ? `${nextStep.step} to run a hosted instance.` : 'Create it from the dashboard.'}
           </p>
           <button
-            onClick={() => router.push('/dashboard/billing/upgrade')}
-            className="px-8 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
+            onClick={() => router.push(nextStep?.href ?? '/dashboard')}
+            className="px-8 py-3 bg-gradient-to-r from-brand-600 to-brand-700 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all"
           >
-            Upgrade Plan
+            {nextStep?.label ?? 'Go to dashboard'}
           </button>
         </Card>
       </div>
@@ -224,8 +231,8 @@ export default function InstancePage() {
               <span className={`
                 font-medium capitalize
                 ${instance.status === 'running' ? 'text-green-600' : ''}
-                ${instance.status === 'provisioning' ? 'text-orange-600' : ''}
-                ${instance.status === 'restarting' ? 'text-orange-600' : ''}
+                ${instance.status === 'provisioning' ? 'text-brand-700 dark:text-brand-300' : ''}
+                ${instance.status === 'restarting' ? 'text-brand-700 dark:text-brand-300' : ''}
                 ${instance.status === 'stopped' ? 'text-yellow-600' : ''}
                 ${instance.status === 'deprovisioned' ? 'text-gray-600' : ''}
                 ${instance.status === 'failed' ? 'text-red-600' : ''}
@@ -241,7 +248,7 @@ export default function InstancePage() {
 
           {/* Action Buttons */}
           {instance.status === 'restarting' && (
-            <div className="flex items-center gap-2 text-orange-600">
+            <div className="flex items-center gap-2 text-brand-700 dark:text-brand-300">
               <Loader2 className="w-4 h-4 animate-spin" />
               <span className="text-sm font-medium">Restarting...</span>
             </div>
@@ -276,7 +283,16 @@ export default function InstancePage() {
             </div>
           )}
 
-          {instance.status === 'stopped' && (
+          {!subscriptionLoading && nextStep && (instance.status === 'stopped' || instance.status === 'deprovisioned') && (
+            <button
+              onClick={() => router.push(nextStep.href)}
+              className="flex items-center gap-2 px-4 py-2 bg-brand-700 text-white rounded-lg hover:bg-brand-800 transition-colors"
+            >
+              {nextStep.label}
+            </button>
+          )}
+
+          {!nextStep && instance.status === 'stopped' && (
             <button
               onClick={() => handleAction('start')}
               disabled={actionLoading !== null}
@@ -291,11 +307,11 @@ export default function InstancePage() {
             </button>
           )}
 
-          {instance.status === 'deprovisioned' && (
+          {!nextStep && instance.status === 'deprovisioned' && (
             <button
               onClick={() => handleAction('reprovision')}
               disabled={actionLoading !== null}
-              className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50 transition-colors"
+              className="flex items-center gap-2 px-4 py-2 bg-brand-700 text-white rounded-lg hover:bg-brand-800 disabled:opacity-50 transition-colors"
             >
               {actionLoading === 'reprovision' ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
@@ -310,7 +326,7 @@ export default function InstancePage() {
             <div className="flex gap-2">
               <a
                 href={supportMailtoHref}
-                className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 transition-colors"
+                className="flex items-center gap-2 px-4 py-2 bg-brand-700 text-white rounded-lg hover:bg-brand-800 transition-colors"
               >
                 <AlertCircle className="w-4 h-4" />
                 Contact Support
@@ -354,9 +370,9 @@ export default function InstancePage() {
         <Card>
           <CardHeader className="mb-6">Access Your MindRoom</CardHeader>
           <div className="space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 p-5 bg-gradient-to-r from-orange-50 to-yellow-50 dark:from-orange-900/10 dark:to-yellow-900/10 rounded-2xl border border-orange-200/50 dark:border-orange-800/30">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 p-5 bg-gradient-to-r from-brand-50 to-white dark:from-brand-900/20 dark:to-transparent rounded-2xl border border-brand-200/50 dark:border-brand-800/30">
               <div className="flex items-center gap-3">
-                <Globe className="w-5 h-5 text-orange-600 dark:text-orange-400" />
+                <Globe className="w-5 h-5 text-brand-700 dark:text-brand-400" />
                 <div>
                   <p className="font-medium dark:text-white">MindRoom App</p>
                   <p className="text-sm text-gray-600 dark:text-gray-400 break-all">{instance.frontend_url}</p>
@@ -366,7 +382,7 @@ export default function InstancePage() {
                 href={instance.frontend_url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center justify-center gap-2 px-6 py-2.5 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all whitespace-nowrap"
+                className="flex items-center justify-center gap-2 px-6 py-2.5 bg-gradient-to-r from-brand-600 to-brand-700 text-white rounded-xl font-semibold hover:shadow-lg hover:scale-105 transition-all whitespace-nowrap"
               >
                 Open MindRoom
                 <ExternalLink className="w-4 h-4" />

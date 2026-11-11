@@ -1,9 +1,11 @@
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { availableParallelism } from "os";
 import path from "path";
+import { svgzPlugin } from "./svgz.config";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), svgzPlugin],
   test: {
     environment: "jsdom",
     globals: true,
@@ -17,7 +19,9 @@ export default defineConfig({
       "**/tests/e2e/**", // Exclude E2E tests which are Playwright tests
     ],
     pool: "threads",
-    maxWorkers: 12,
+    // More workers than cores starve each other into timeouts, and past about 12 threads the main thread serving
+    // them chokes.
+    maxWorkers: Math.min(12, availableParallelism()),
   },
   resolve: {
     alias: {

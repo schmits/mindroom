@@ -22,11 +22,16 @@ class CommandType(Enum):
     LIST_SCHEDULES = "list_schedules"
     CANCEL_SCHEDULE = "cancel_schedule"
     EDIT_SCHEDULE = "edit_schedule"
+    JOBS = "jobs"  # List the conversation's background jobs
+    CANCEL_JOB = "cancel_job"  # Cancel background jobs
     CONFIG = "config"  # Configuration command
     DESKTOP = "desktop"  # Requester-scoped Desktop pairing
+    MODE = "mode"
     MODEL = "model"  # Per-thread model override command
     ROOM_MODEL = "room_model"  # Room-level model override command
     THREAD_MODE = "thread_mode"  # Room-level thread mode override command
+    REPLY_MODE = "reply_mode"  # Room-level reply mode override command
+    AUTO_APPROVE = "auto_approve"  # Per-thread window that skips tool approval
     ENCRYPT = "encrypt"  # Room encryption enablement command
     E2EE = "e2ee"  # Encryption diagnostics command
     HI = "hi"  # Welcome message command
@@ -35,10 +40,16 @@ class CommandType(Enum):
 
 # Command documentation for each command type
 _COMMAND_DOCS = {
+    CommandType.MODE: (
+        "!mode <agent> minimal|standard|show|reset",
+        "Switch one agent between standard tools and a Bash-only interface",
+    ),
     CommandType.SCHEDULE: ("!schedule <task>", "Schedule a task"),
     CommandType.LIST_SCHEDULES: ("!list_schedules", "List scheduled tasks"),
     CommandType.CANCEL_SCHEDULE: ("!cancel_schedule <id>", "Cancel a scheduled task"),
     CommandType.EDIT_SCHEDULE: ("!edit_schedule <id> <task>", "Edit an existing scheduled task"),
+    CommandType.JOBS: ("!jobs", "List the background jobs running here"),
+    CommandType.CANCEL_JOB: ("!cancel_job <id|all>", "Cancel a background job, or all of them here"),
     CommandType.HELP: ("!help [topic]", "Get help"),
     CommandType.RELOAD_PLUGINS: ("!reload-plugins", "Reload configured plugins (admin only)"),
     CommandType.CONFIG: ("!config <operation>", "Manage configuration"),
@@ -51,6 +62,14 @@ _COMMAND_DOCS = {
     CommandType.THREAD_MODE: (
         "!thread_mode [room|thread|reset|show]",
         "Show or switch the thread mode used in the current room (room admin only)",
+    ),
+    CommandType.REPLY_MODE: (
+        "!reply_mode [auto|mentions|reset|show]",
+        "Show or switch whether agents need a mention to start a conversation here (set/reset require a room admin)",
+    ),
+    CommandType.AUTO_APPROVE: (
+        "!auto_approve [<minutes>|<hours>h|off]",
+        "Run your tool calls in this thread without approval for a while, or show or end that window",
     ),
     CommandType.ENCRYPT: (
         "!encrypt [confirm]",
@@ -123,16 +142,21 @@ class _CommandParser:
     LIST_SCHEDULES_PATTERN = re.compile(r"^!(?:list|inspect)[_-]?schedules?$", re.IGNORECASE)
     CANCEL_SCHEDULE_PATTERN = re.compile(r"^!cancel[_-]?schedule\s+(.+)$", re.IGNORECASE)
     EDIT_SCHEDULE_PATTERN = re.compile(r"^!edit[_-]?schedule\s+(\S+)\s+(.+)$", re.IGNORECASE | re.DOTALL)
+    JOBS_PATTERN = re.compile(r"^!jobs$", re.IGNORECASE)
+    CANCEL_JOB_PATTERN = re.compile(r"^!cancel[_-]?job\s+(\S+)$", re.IGNORECASE)
     CONFIG_PATTERN = re.compile(r"^!config(?:\s+(.+))?$", re.IGNORECASE)
     DESKTOP_PATTERN = re.compile(r"^!desktop(?:\s+(.+))?$", re.IGNORECASE)
+    MODE_PATTERN = re.compile(r"^!mode(?:\s+(.+))?$", re.IGNORECASE)
     MODEL_PATTERN = re.compile(r"^!model(?:\s+(.+))?$", re.IGNORECASE)
     ROOM_MODEL_PATTERN = re.compile(r"^!room[_-]?model(?:\s+(.+))?$", re.IGNORECASE)
     THREAD_MODE_PATTERN = re.compile(r"^!thread[_-]?mode(?:\s+(.+))?$", re.IGNORECASE)
+    REPLY_MODE_PATTERN = re.compile(r"^!reply[_-]?mode(?:\s+(.+))?$", re.IGNORECASE)
+    AUTO_APPROVE_PATTERN = re.compile(r"^!auto[_-]?approve(?:\s+(.+))?$", re.IGNORECASE)
     ENCRYPT_PATTERN = re.compile(r"^!encrypt(?:\s+(.+))?$", re.IGNORECASE)
     E2EE_PATTERN = re.compile(r"^!e2ee$", re.IGNORECASE)
     HI_PATTERN = re.compile(r"^!hi$", re.IGNORECASE)
 
-    def parse(self, message: str) -> Command | None:  # noqa: C901, PLR0911, PLR0912
+    def parse(self, message: str) -> Command | None:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Parse a message for commands.
 
         Args:
@@ -193,6 +217,18 @@ class _CommandParser:
                 raw_text=message,
             )
 
+        if self.JOBS_PATTERN.match(message):
+            return Command(type=CommandType.JOBS, args={}, raw_text=message)
+
+        match = self.CANCEL_JOB_PATTERN.match(message)
+        if match:
+            target = match.group(1).strip()
+            return Command(
+                type=CommandType.CANCEL_JOB,
+                args={"job_id": None if target.lower() == "all" else target},
+                raw_text=message,
+            )
+
         match = self.EDIT_SCHEDULE_PATTERN.match(message)
         if match:
             task_id = match.group(1).strip()
@@ -221,6 +257,10 @@ class _CommandParser:
                 raw_text=message,
             )
 
+        match = self.MODE_PATTERN.match(message)
+        if match:
+            return Command(type=CommandType.MODE, args={"args_text": (match.group(1) or "").strip()}, raw_text=message)
+
         match = self.MODEL_PATTERN.match(message)
         if match:
             args_text = match.group(1).strip() if match.group(1) else ""
@@ -248,6 +288,22 @@ class _CommandParser:
                 raw_text=message,
             )
 
+        match = self.REPLY_MODE_PATTERN.match(message)
+        if match:
+            return Command(
+                type=CommandType.REPLY_MODE,
+                args={"args_text": (match.group(1) or "").strip()},
+                raw_text=message,
+            )
+
+        match = self.AUTO_APPROVE_PATTERN.match(message)
+        if match:
+            return Command(
+                type=CommandType.AUTO_APPROVE,
+                args={"args_text": (match.group(1) or "").strip()},
+                raw_text=message,
+            )
+
         match = self.ENCRYPT_PATTERN.match(message)
         if match:
             args_text = match.group(1).strip() if match.group(1) else ""
@@ -268,7 +324,7 @@ class _CommandParser:
         )
 
 
-def get_command_help(topic: str | None = None) -> str:  # noqa: C901, PLR0911
+def get_command_help(topic: str | None = None) -> str:  # noqa: C901, PLR0911, PLR0912
     """Get help text for commands.
 
     Args:
@@ -395,7 +451,7 @@ Usage: `!config <operation>` - View and modify MindRoom configuration
 - `!config set <path> <value>` - Set a configuration value
 - `!config set agents.analyst.display_name "Research Expert"` - Change display name
 - `!config set models.default.id my-model` - Change default model
-- `!config set defaults.markdown false` - Disable markdown by default
+- `!config set defaults.markdown false` - Stop telling agents their replies are shown as Markdown
 - `!config set timezone America/New_York` - Set timezone
 
 **Path Syntax:**
@@ -408,18 +464,37 @@ Set `authorization.config_command_enabled: true`; the caller must also be a plat
 
 **Note:** Configuration changes are immediately saved to config.yaml and affect all new agent interactions."""
 
+    if topic == "mode":
+        return """**Agent Mode Command**
+
+Usage: `!mode <agent> minimal|standard|show|reset`
+
+- `!mode helper minimal` - Use a Bash-only model interface with the agent's configured tools available through the CLI
+- `!mode helper standard` - Restore the standard tool interface
+- `!mode helper show` - Show the saved choice
+- `!mode helper reset` - Remove the choice and return to standard mode
+
+How it works:
+- Applies to this agent's next Matrix response in the same conversation and survives restarts
+- Thread agents require an existing thread; room-mode agents use one choice for the whole room
+- Private agents keep a separate choice for each requester; other agents and conversations are unaffected
+- Teams and OpenAI-compatible API requests do not use this selection
+- Minimal mode requires existing run/check/kill shell permissions and MindRoom's API server, reachable from wherever the agent's shell runs; a refusal lists everything missing
+- If deployment settings change and minimal mode becomes unavailable, use `!mode <agent> standard` in the same conversation"""
+
     if topic == "model":
         return """**Model Command**
 
 Usage: `!model [name|list|reset]` - Show or switch the model used in the current thread
 
 **Examples:**
-- `!model` or `!model list` - Show the current thread's model override and the available models
-- `!model opus` - Make every agent and team in this thread use the `opus` model
-- `!model reset` - Remove the override so room-level model selection applies again
+- `!model` or `!model list` - Show the current thread's model overrides, each with the entities it applies to, and the available models
+- `!model opus` - Make the agents and teams you may address in this thread use the `opus` model
+- `!model reset` - Remove the override of the agents and teams you may address so room-level model selection applies to them again
 
 How it works:
-- The override applies to all agents, teams, and the router from the next message in the thread
+- The override applies from the next message in the thread to the agents, teams, and router you may address
+- Every other entity keeps its own thread override or room-level model
 - Model names come from the `models:` section of config.yaml
 - The override is scoped to one thread and survives restarts; other threads and rooms are unaffected
 - Use `!room_model` for a runtime room default, or `room_models` in config.yaml for an authored room default"""
@@ -472,6 +547,40 @@ How it works:
 - The override applies to future agent replies in the current Matrix room
 - The override is stored in MindRoom runtime state, not config.yaml
 - Only Matrix room admins can set or reset the override"""
+
+    if topic in {"reply_mode", "reply-mode", "replymode"}:
+        return """**Reply Mode Command**
+
+Usage: `!reply_mode [auto|mentions|reset|show]` - Show or switch whether agents need a mention to start a conversation
+
+**Examples:**
+- `!reply_mode` or `!reply_mode show` - Show the reply mode this room uses
+- `!reply_mode mentions` - Answer only messages that mention an agent or team, and follow-ups in threads an agent or team already replied in or is still answering
+- `!reply_mode auto` - Also let the router or the room's only agent answer messages that mention no one
+- `!reply_mode reset` - Remove the room override and use `rooms.<room>.reply_mode` from config.yaml again
+
+How it works:
+- The override applies to future messages in the current Matrix room
+- The override is stored in MindRoom runtime state, not config.yaml, and takes precedence over config.yaml
+- Only Matrix room admins can set or reset the override"""
+
+    if topic in {"auto_approve", "auto-approve", "autoapprove"}:
+        return """**Auto-Approve Command**
+
+Usage: `!auto_approve [<minutes>|<hours>h|off]` - Run your tool calls in this thread without approval for a while
+
+**Examples:**
+- `!auto_approve 30` - Skip approval cards for your tool calls in this thread for 30 minutes
+- `!auto_approve 2h` - Do the same for 2 hours (at most 24 hours)
+- `!auto_approve` - Show when the current window ends
+- `!auto_approve off` - End the window now
+
+How it works:
+- Every tool call you request in this thread runs without an approval card until the window ends
+- In a room without threads, the window covers the whole room
+- Approval cards already waiting for you in this thread are approved when you turn it on
+- Other people in the thread still approve their own calls
+- `!auto_approve off` does not stop auto-approval started from an approval card; stop that on the card"""
 
     # General help - dynamically generated from COMMAND_DOCS
     commands_text = "\n".join(_get_command_entries(format_code=True))

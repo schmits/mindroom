@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="email",
+    file_access=ToolFileAccess.NONE,
     display_name="Email",
     description="Send emails via SMTP (Gmail)",
     category=ToolCategory.EMAIL,
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=[],  # Uses built-in smtplib
-    docs_url="https://docs.agno.com/tools/toolkits/social/email",
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#email",
     function_names=("email_user",),
 )
 def email_tools() -> type[EmailTools]:

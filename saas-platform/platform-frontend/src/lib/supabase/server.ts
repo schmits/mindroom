@@ -1,14 +1,13 @@
 import { createServerClient } from '@supabase/ssr'
 import { cookies } from 'next/headers'
 import { getServerRuntimeConfig } from '@/lib/runtime-config'
-import type { Database } from './types'
 
 export async function createServerClientSupabase() {
   const cookieStore = await cookies()
 
   const { supabaseUrl, supabaseAnonKey } = getServerRuntimeConfig()
 
-  return createServerClient<Database>(
+  return createServerClient(
     supabaseUrl,
     supabaseAnonKey,
     {
@@ -22,9 +21,8 @@ export async function createServerClientSupabase() {
               cookieStore.set(name, value, options)
             })
           } catch (error) {
-            // The `set` method was called from a Server Component.
-            // This can be ignored if you have middleware refreshing
-            // user sessions.
+            // The `set` method was called from a Server Component, which cannot set cookies.
+            // The browser Supabase client refreshes the session and its cookies instead.
           }
         },
       },

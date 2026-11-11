@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolManagedInitArg, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolManagedInitArg, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,15 +13,17 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="oauth_connections",
+    file_access=ToolFileAccess.NONE,
     display_name="OAuth Connections",
     description="Get a confirmation link to reset an account connection for this agent",
+    docs_url="https://docs.mindroom.chat/oauth-framework/#oauth_connections",
     category=ToolCategory.INTEGRATIONS,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
+    requires_primary_runtime=True,
     icon="Unplug",
     icon_color="text-amber-500",
     config_fields=[],
-    dependencies=["agno"],
     managed_init_args=(ToolManagedInitArg.RUNTIME_PATHS, ToolManagedInitArg.WORKER_TARGET),
     function_names=("reset_oauth_connection",),
     requires_room_context=True,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="linear",
+    file_access=ToolFileAccess.NONE,
     display_name="Linear",
     description="Issue tracking and project management",
     category=ToolCategory.DEVELOPMENT,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("LINEAR_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["requests"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/linear",
+    docs_url="https://docs.mindroom.chat/tools/project-management/#linear",
     function_names=(
         "create_issue",
         "get_high_priority_issues",

@@ -1,39 +1,50 @@
-"""Regenerate edited turns through a per-response newest-wins mailbox."""
+"""Regenerate the reply to an edited message when it is the latest in its conversation."""
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from mindroom.coalescing_batch import coalesced_prompt, tagged_coalesced_prompt
-from mindroom.conversation_resolver import MessageContext
-from mindroom.dispatch_source import EDIT_SOURCE_KIND
-from mindroom.entity_resolution import entity_identity_registry
+from mindroom.coalescing.batch import coalesced_prompt, tagged_coalesced_prompt
+from mindroom.entity_resolution import persisted_bot_user_ids
 from mindroom.hooks import hook_ingress_policy
+from mindroom.logging_config import get_logger
 from mindroom.matrix.client_visible_messages import extract_visible_edit_body
 from mindroom.matrix.member_display_names import room_member_display_names
-from mindroom.response_runner import ResponseRequest
+from mindroom.reply_lifecycle import ReplyState
+from mindroom.reply_turn.request import ResponseRequest
+from mindroom.response_admission import ResponseAdmissionRefusedError
+from mindroom.response_sources import ResponseSources, Unclaimed
 from mindroom.runtime_protocols import SupportsClientConfig  # noqa: TC001
 from mindroom.timestamp_formatting import normalize_timestamp_ms
-from mindroom.turn_record import EditPreparation, RevisionSnapshotChangedError, canonicalize_turn_record
-from mindroom.turn_store import record_deferred_outcome_response, record_user_stop_terminal
+from mindroom.turn_policy import ResponseAction
+from mindroom.turn_record import canonicalize_turn_record
+from mindroom.turn_store import SourcePreparation
+from mindroom.turns.dispatch import run_response_action
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     import nio
 
+    from mindroom.coalescing.batch import TimestampFormatter
     from mindroom.constants import RuntimePaths
-    from mindroom.conversation_resolver import ConversationResolver
-    from mindroom.handled_turns import SourceEventRevision, TurnRecord
+    from mindroom.conversation_resolver import ConversationResolver, MessageContext
+    from mindroom.event_journal import PrincipalStore
     from mindroom.hooks import MessageEnvelope
+    from mindroom.hooks.ingress import IngressHookRunner
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.matrix.event_info import EventInfo
-    from mindroom.message_target import MessageTarget
-    from mindroom.sync_restart_retry import InterruptedTurnRooms
-    from mindroom.turn_policy import IngressHookRunner
+    from mindroom.reply_lifecycle import Reply
+    from mindroom.response_runner import ResponseRunner
+    from mindroom.response_sources import SourceFate
+    from mindroom.turn_policy import TurnPolicy
+    from mindroom.turn_record import SourceEventRevision, TurnRecord
     from mindroom.turn_store import TurnStore
+    from mindroom.turns.facts import IngressFacts
+
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,54 +57,53 @@ class EditRegeneratorDeps:
     resolver: ConversationResolver
     turn_store: TurnStore
     ingress_hook_runner: IngressHookRunner
-    generate_response: Callable[[ResponseRequest], Awaitable[str | None]]
-    wait_for_turn_settled: Callable[[tuple[str, ...]], Awaitable[None]]
+    # Runs each regeneration as the entity answers now, on a task of its own off the room's lane.
+    response_runner: ResponseRunner
+    turn_policy: TurnPolicy
+    # Settles sources nothing will answer, as the room's lane does for an event it ignores.
+    settle_sources: Callable[[tuple[str, ...]], Awaitable[None]]
+    # Records a Stop on a reply that still runs, as a Stop reaction would.
+    stop_reply: Callable[[Reply, int], Awaitable[object]]
     receipt_order: Callable[[], Awaitable[int]]
-    interrupted_turn_rooms: InterruptedTurnRooms
-    timestamp_formatter: Callable[[float | None], str | None]
+    timestamp_formatter: TimestampFormatter
+    # The reply records and the stored conversation an edit is checked against.
+    store: PrincipalStore
 
 
 @dataclass(frozen=True)
-class _Edit:
-    original_event_id: str
-    body: str
-    context: MessageContext
-    envelope: MessageEnvelope
+class _EditedSource:
+    """The message an edit changed, the edit's revision and text, the answer it regenerates, and its live sources."""
+
+    source_event_id: str
     revision: SourceEventRevision
-    receipt_order: int
-    suppressed: bool
+    reply_event_id: str | None
+    content: str
+    # The turn's sources nobody deleted when the regeneration was built.
+    live_source_event_ids: tuple[str, ...]
 
 
-def _edit_remains_active(
-    record: TurnRecord,
-    edit: _Edit,
-    source_event_id: str,
-    suppressed_revisions: dict[str, SourceEventRevision],
-) -> bool:
-    """Update suppression state and reject revisions covered by a durable STOP."""
-    if edit.suppressed:
-        suppressed_revisions[source_event_id] = edit.revision
-        return False
-    suppressed_revisions.pop(source_event_id, None)
-    cutoff = record.user_stop_receipt_order
-    return cutoff is None or edit.receipt_order > cutoff
+def _not_regenerable(reply: Reply | None) -> str | None:
+    """Return why an edit regenerates no reply, or ``None`` for one that may show something and is not gone.
 
-
-@dataclass
-class _Mailbox:
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    pending: dict[str, _Edit] = field(default_factory=dict)
-    reserved_revisions: dict[str, SourceEventRevision] = field(default_factory=dict)
-    participants: int = 0
-    rebuild_requested: bool = False
+    A create Matrix has not acknowledged yet may show. A reply that recorded
+    nothing yet, as a participation turn that has not sent anything yet, is
+    not stopped: it would leave a cancel note where nothing showed, and its
+    regeneration would answer without the participation decision.
+    """
+    if reply is None:
+        return "no_reply"
+    if reply.state is ReplyState.GONE:
+        return "gone"
+    if reply.event_id is None and reply.possibly_shown is None:
+        return "reply_not_shown"
+    return None
 
 
 @dataclass
 class EditRegenerator:
-    """Re-run the owned response for one edited user turn."""
+    """Re-run the reply to the latest message of a conversation when its author edits it."""
 
     deps: EditRegeneratorDeps
-    _mailboxes: dict[tuple[str, str, str], _Mailbox] = field(default_factory=dict, init=False, repr=False)
 
     def _client(self) -> nio.AsyncClient:
         client = self.deps.runtime.client
@@ -102,32 +112,17 @@ class EditRegenerator:
             raise RuntimeError(msg)
         return client
 
-    async def _edit_regeneration_context(
-        self,
-        context: MessageContext,
-        room: nio.MatrixRoom,
-        *,
-        conversation_target: MessageTarget,
-    ) -> MessageContext:
-        """Return edit context aligned with the recorded thread root."""
-        if (
-            conversation_target.resolved_thread_id is None
-            or context.thread_id == conversation_target.resolved_thread_id
-        ):
-            return context
-        thread_history = await self.deps.resolver.fetch_thread_history(
-            room.room_id,
-            conversation_target.resolved_thread_id,
-        )
-        return MessageContext(
-            am_i_mentioned=context.am_i_mentioned,
-            is_thread=True,
-            thread_id=conversation_target.resolved_thread_id,
-            thread_history=thread_history,
-            mentioned_agents=context.mentioned_agents,
-            has_non_agent_mentions=context.has_non_agent_mentions,
-            replay_guard_history=thread_history,
-            requires_model_history_refresh=context.requires_model_history_refresh,
+    async def _later_human_message(self, record: TurnRecord) -> bool:
+        """Return whether a human wrote in the turn's conversation after it, so an edit of it regenerates nothing."""
+        target = record.conversation_target
+        assert target is not None, "an edit regenerates only a turn with a conversation"
+        return await self.deps.store.later_message_exists(
+            room_id=target.room_id,
+            thread_id=target.resolved_thread_id,
+            source_event_ids=record.source_event_ids,
+            excluded_senders=persisted_bot_user_ids(self.deps.runtime_paths),
+            # In room mode the room is one conversation, threads included.
+            whole_room=self.deps.resolver.room_is_one_conversation(target.room_id),
         )
 
     async def handle_message_edit(  # noqa: C901, PLR0911, PLR0912
@@ -135,73 +130,71 @@ class EditRegenerator:
         room: nio.MatrixRoom,
         event: nio.RoomMessageFormatted,
         event_info: EventInfo,
-        requester_user_id: str,
-    ) -> None:
-        """Handle an edited message by regenerating the owned response."""
-        if not event_info.original_event_id:
-            return
-        original_event_id = event_info.original_event_id
-        registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
-        if registry.current_entity_name_for_user_id(event.sender):
-            return
+        facts: IngressFacts,
+    ) -> bool | None:
+        """Regenerate the reply an edit's message got; True when its regeneration owns the edit.
 
-        context = await self.deps.resolver.extract_message_context(
-            room,
-            event,
-        )
-        # A search hint, and only that. The thread an edit names inside its ``m.new_content`` is
-        # ignored on application, so it places nothing - here it merely points the recovery read at
-        # one more conversation session to probe, on top of the room session it always probes. The
-        # record that comes back still has to name this event as a source authored by this
-        # requester, and every durable or visible decision below is taken from that record's own
-        # conversation target rather than from the claim that found it.
-        turn_lookup_thread_id = context.thread_id or event_info.thread_id_from_edit
-        turn_record = await self.deps.turn_store.load_turn(
-            room=room,
-            thread_id=turn_lookup_thread_id,
-            original_event_id=original_event_id,
-            requester_user_id=requester_user_id,
-        )
+        Only the latest message of its conversation regenerates; a reply that
+        still runs, or one an approval holds, is stopped first, which cancels
+        that approval. Any other edit changes nothing the agent did.
+        """
+        if not event_info.original_event_id:
+            return None
+        original_event_id = event_info.original_event_id
+        requester_user_id = facts.lane_requester_id
+
+        # Every decision below is taken from the record's own conversation target, never from the thread the
+        # edit names.
+        turn_record = await self.deps.turn_store.get_turn_record_after_writes(original_event_id)
         if turn_record is None:
-            await self.deps.wait_for_turn_settled((original_event_id,))
-            turn_record = await self.deps.turn_store.load_turn(
-                room=room,
-                thread_id=turn_lookup_thread_id,
-                original_event_id=original_event_id,
-                requester_user_id=requester_user_id,
+            # Usually this agent never took the message; it may also still wait for media or voice before its turn.
+            logger.info(
+                "edit_not_regenerated",
+                room_id=room.room_id,
+                source_event_id=original_event_id,
+                reason="no_turn_record",
             )
-        if turn_record is None:
-            return
+            return None
         if (
             turn_record.conversation_target is None
             or turn_record.history_scope is None
-            or turn_record.response_owner is None
+            or turn_record.response_owner != self.deps.agent_name
         ):
-            return
+            return None
         if turn_record.requester_id_for_source(original_event_id) != requester_user_id:
-            return
-        context = await self._edit_regeneration_context(
-            context,
-            room,
-            conversation_target=turn_record.conversation_target,
+            return None
+        deleted = await self.deps.turn_store.deleted_sources(turn_record)
+        # Regeneration replays every source under the editor's identity, so a
+        # record mixing senders would run their messages as the editor.
+        if not turn_record.sources_all_from_requester(requester_user_id, deleted=deleted):
+            return None
+        # A requester owns replies an entity wrote for them without having written them.
+        if any(metadata.speaker is not None for metadata in (turn_record.source_event_metadata or {}).values()):
+            return None
+        if turn_record.prompt_source_event_id(original_event_id) in deleted:
+            return None
+        reply = await self.deps.store.replies.for_sources(turn_record.source_event_ids)
+        reason = _not_regenerable(reply) or (
+            "later_human_message" if await self._later_human_message(turn_record) else None
         )
-        if turn_record.response_owner != self.deps.agent_name:
-            return
-        if original_event_id in turn_record.redacted_source_event_ids:
-            return
-        receipt_order = await self.deps.receipt_order()
+        if reason is not None:
+            logger.info("edit_not_regenerated", room_id=room.room_id, source_event_id=original_event_id, reason=reason)
+            return None
+        assert reply is not None
+
         revision = (event.server_timestamp, event.event_id)
-        committed = (turn_record.source_event_revisions or {}).get(original_event_id)
+        # The edited message can be the human message a relay answers for; its revisions live on the relay's source.
+        prompt_source = turn_record.prompt_source_event_id(original_event_id)
+        committed = (turn_record.source_event_revisions or {}).get(prompt_source)
         watermark = turn_record.revision_watermark(original_event_id)
         if watermark is not None and revision < watermark:
-            return
-        registered = await self.deps.turn_store.register_edit_revision(original_event_id, revision)
-        if registered is None:
-            return
-        replay = (registered.revision_replay or {}).get(revision[1])
-        if replay is not None and replay.redacted:
-            return
-
+            return None
+        registered = await self.deps.turn_store.register_edit_revision(turn_record, original_event_id, revision)
+        if registered is None or await self.deps.turn_store.redacted_event_ids(
+            turn_record.conversation_target.room_id,
+            (revision[1],),
+        ):
+            return None
         edited_content, _ = await extract_visible_edit_body(
             event.source,
             self._client(),
@@ -209,349 +202,197 @@ class EditRegenerator:
             runtime_paths=self.deps.runtime_paths,
         )
         if edited_content is None:
-            return
-        envelope = self.deps.resolver.build_message_envelope(
-            event=event,
-            requester_user_id=requester_user_id,
-            context=context,
-            target=turn_record.conversation_target,
-            body=edited_content,
-            source_kind=EDIT_SOURCE_KIND,
+            return None
+        context = await self.deps.resolver.extract_message_context(
+            room,
+            event,
+            thread_id=turn_record.conversation_target.resolved_thread_id,
         )
-        assert turn_record.anchor_event_id is not None
-        key = (turn_record.conversation_target.room_id, turn_record.anchor_event_id, envelope.requester_id)
-        mailbox = self._mailboxes.setdefault(key, _Mailbox())
-        reserved_revision = mailbox.reserved_revisions.get(original_event_id)
-        if reserved_revision is not None and revision <= reserved_revision:
-            return
-        mailbox.reserved_revisions[original_event_id] = revision
-        mailbox.participants += 1
-        try:
-            suppressed = revision == (turn_record.suppressed_source_event_revisions or {}).get(
-                original_event_id,
-            ) or (
-                revision != committed
-                and await self.deps.ingress_hook_runner.emit_message_received_hooks(
-                    envelope=envelope,
-                    correlation_id=event.event_id,
-                    policy=hook_ingress_policy(envelope),
-                )
-            )
-            if mailbox.reserved_revisions.get(original_event_id) != revision:
-                return
-            mailbox.pending[original_event_id] = _Edit(
-                original_event_id=original_event_id,
-                body=edited_content,
-                context=context,
-                envelope=envelope,
-                revision=revision,
-                receipt_order=receipt_order,
-                suppressed=suppressed,
-            )
-            async with mailbox.lock:
-                await self._drain(room, turn_record, mailbox)
-        finally:
-            mailbox.participants -= 1
-            if mailbox.participants == 0 and self._mailboxes.get(key) is mailbox:
-                self._mailboxes.pop(key)
+        envelope = self.deps.resolver.build_envelope(
+            event=event,
+            facts=facts,
+            target=turn_record.conversation_target,
+            mentioned_agents=context.mentioned_agents,
+            body=edited_content,
+        )
+        if revision != committed and await self.deps.ingress_hook_runner.emit_message_received_hooks(
+            envelope=envelope,
+            correlation_id=event.event_id,
+            policy=hook_ingress_policy(envelope),
+        ):
+            return None
 
-    async def _build_request(  # noqa: C901, PLR0912, PLR0915
+        record = canonicalize_turn_record(
+            registered,
+            source_event_prompts={**(registered.source_event_prompts or {}), prompt_source: edited_content},
+            source_event_revisions={**(registered.source_event_revisions or {}), prompt_source: revision},
+        )
+        live_sources = tuple(source for source in record.source_event_ids if source not in deleted)
+        prompt, structured = self._prompt(room, record, live_sources, edited_content)
+        if prompt is None:
+            # A sibling's text is no longer known: nothing regenerates from a partial turn.
+            return None
+        if reply.current_span_id is not None or reply.approval_id is not None:
+            # The answer still runs or waits for an approval: the edit stops it, which cancels that approval,
+            # and the regeneration takes its place.
+            await self.deps.stop_reply(reply, await self.deps.receipt_order())
+        request = self._request(
+            room,
+            record,
+            context,
+            envelope,
+            _EditedSource(original_event_id, revision, reply.event_id, edited_content, live_sources),
+            prompt,
+            structured=structured,
+        )
+        self._regenerate(request)
+        return True
+
+    def _prompt(
         self,
         room: nio.MatrixRoom,
-        mailbox: _Mailbox,
-    ) -> tuple[ResponseRequest | None, TurnRecord | None, dict[str, SourceEventRevision]]:
-        latest = max(mailbox.pending.values(), key=lambda edit: edit.revision)
-        record = await self.deps.turn_store.load_turn(
-            room=room,
-            thread_id=latest.context.thread_id,
-            original_event_id=latest.original_event_id,
-            requester_user_id=latest.envelope.requester_id,
-        )
-        if (
-            record is None
-            or record.conversation_target is None
-            or record.history_scope is None
-            or record.response_owner != self.deps.agent_name
-            or record.response_event_id is None
-        ):
-            return None, None, {}
-        revisions = dict(record.source_event_revisions or {})
-        suppressed_revisions = dict(record.suppressed_source_event_revisions or {})
-        applied: dict[str, SourceEventRevision] = {}
-        active: dict[str, _Edit] = {}
+        record: TurnRecord,
+        live_sources: tuple[str, ...],
+        edited_content: str,
+    ) -> tuple[str | None, bool]:
+        """Return the prompt the edited turn runs with from its sources nobody deleted, and whether it is structured."""
+        if not record.is_coalesced:
+            return edited_content, False
         prompt_map = dict(record.source_event_prompts or {})
-        retrying = True
-        for source_event_id, edit in mailbox.pending.items():
-            committed = revisions.get(source_event_id)
-            watermark = record.revision_watermark(source_event_id)
-            replay = (record.revision_replay or {}).get(edit.revision[1])
-            if (
-                source_event_id in record.redacted_source_event_ids
-                or (watermark is not None and edit.revision < watermark)
-                or (replay is not None and replay.redacted)
-            ):
-                applied[source_event_id] = edit.revision
-                continue
-            revisions[source_event_id] = edit.revision
-            applied[source_event_id] = edit.revision
-            prompt_map[record.prompt_source_event_id(source_event_id)] = edit.body
-            if _edit_remains_active(record, edit, source_event_id, suppressed_revisions):
-                active[source_event_id] = edit
-                retrying &= edit.revision == committed
-        if not active:
-            if revisions != dict(record.source_event_revisions or {}) or suppressed_revisions != dict(
-                record.suppressed_source_event_revisions or {},
-            ):
-                record = canonicalize_turn_record(
-                    record,
-                    source_event_prompts=prompt_map,
-                    source_event_revisions=revisions,
-                    suppressed_source_event_revisions=suppressed_revisions,
-                )
-                await self.deps.turn_store.record_turn(record)
-            return None, None, applied
+        parts = [prompt_map.get(source_event_id) for source_event_id in live_sources]
+        if any(part is None for part in parts):
+            return None, False
+        if record.source_event_metadata is not None:
+            tagged = tagged_coalesced_prompt(
+                list(live_sources),
+                prompt_map,
+                dict(record.source_event_metadata),
+                timestamp_formatter=self.deps.timestamp_formatter,
+                member_display_names=room_member_display_names(room),
+            )
+            if tagged is not None:
+                return tagged, True
+        return coalesced_prompt([part for part in parts if part is not None]), False
 
-        record = await self._refill_invalidated_prompts(record, active)
-        prompt_map = {**(record.source_event_prompts or {}), **prompt_map}
-        revisions = {**(record.source_event_revisions or {}), **revisions}
-        driving_edit = max(active.values(), key=lambda edit: edit.revision)
-        if any(
-            self.deps.turn_store.is_revision_redacted(message.latest_event_id)
-            for message in driving_edit.context.thread_history or ()
-        ):
-            target = record.conversation_target
-            assert target is not None
-            if target.resolved_thread_id is not None:
-                history = await self.deps.resolver.fetch_thread_history(target.room_id, target.resolved_thread_id)
-                driving_edit = replace(driving_edit, context=replace(driving_edit.context, thread_history=history))
-        active_receipt_order = max(edit.receipt_order for edit in active.values())
-        retry_source_event_id = record.prompt_source_event_id(driving_edit.original_event_id) if retrying else None
-        if record.is_coalesced:
-            prompt_parts = [prompt_map.get(source_event_id) for source_event_id in record.replay_source_event_ids]
-            if any(part is None for part in prompt_parts):
-                return None, None, applied
-            prompt = coalesced_prompt([part for part in prompt_parts if part is not None])
-            structured = False
-            if record.source_event_metadata is not None:
-                tagged_prompt = tagged_coalesced_prompt(
-                    list(record.replay_source_event_ids),
-                    prompt_map,
-                    dict(record.source_event_metadata),
-                    timestamp_formatter=self.deps.timestamp_formatter,
-                    member_display_names=room_member_display_names(room),
-                )
-                if tagged_prompt is not None:
-                    prompt, structured = tagged_prompt, True
-        else:
-            prompt, structured = driving_edit.body, False
-        record = canonicalize_turn_record(
-            record,
-            source_event_prompts=prompt_map,
-            source_event_revisions=revisions,
-            suppressed_source_event_revisions=suppressed_revisions,
-            latest_edit_receipt_order=active_receipt_order,
-        )
-        target = record.conversation_target
-        assert target is not None
-        requester_id = driving_edit.envelope.requester_id
-        metadata = self.deps.turn_store.build_run_metadata(
-            record,
-            additional_discovery_event_ids=(
-                (driving_edit.original_event_id,)
-                if not record.is_coalesced and driving_edit.original_event_id != record.anchor_event_id
-                else ()
-            ),
-        )
+    def _request(
+        self,
+        room: nio.MatrixRoom,
+        record: TurnRecord,
+        context: MessageContext,
+        envelope: MessageEnvelope,
+        edited: _EditedSource,
+        prompt: str,
+        *,
+        structured: bool,
+    ) -> ResponseRequest:
+        requester_id = envelope.requester_id
+        revision = edited.revision
 
-        record_interrupted_turn, record_deferred_outcome, record_user_stop = self._settlement_callbacks(
-            room,
-            record=record,
-            driving_edit=driving_edit,
-            applied=applied,
-        )
-
-        stale_runs_removed = False
-
-        async def prepare_snapshot(history: Sequence[ResolvedVisibleMessage]) -> bool | EditPreparation:
-            nonlocal stale_runs_removed
-            result = await self.deps.turn_store.prepare_edit_snapshot(
+        async def prepare_snapshot(history: Sequence[ResolvedVisibleMessage]) -> SourcePreparation:
+            stale = await self.deps.turn_store.prepare_edit_snapshot(
                 record=record,
-                driving_revision_id=driving_edit.revision[1],
-                edit_receipt_order=active_receipt_order,
-                consumed_revision_ids=tuple(message.latest_event_id for message in history),
+                live_source_event_ids=edited.live_source_event_ids,
+                driving_revision_id=revision[1],
                 thread_history=history,
             )
-            mailbox.rebuild_requested = result is EditPreparation.REBUILD
-            if result is False and not stale_runs_removed:
-                self.deps.turn_store.remove_stale_runs_for_edit(
-                    turn_record=record,
-                    requester_user_id=requester_id,
-                )
-                stale_runs_removed = True
-            return result
+            return SourcePreparation(invalid=record.source_event_ids) if stale else SourcePreparation()
 
-        return (
-            ResponseRequest(
-                thread_history=driving_edit.context.thread_history,
-                member_display_names=room_member_display_names(room),
-                prompt=prompt,
-                response_envelope=driving_edit.envelope,
-                existing_event_id=record.response_event_id,
-                user_id=requester_id,
-                correlation_id=driving_edit.revision[1],
-                matrix_run_metadata=metadata,
-                current_timestamp_ms=normalize_timestamp_ms(driving_edit.revision[0]),
-                current_prompt_is_structured=structured,
-                prepare_source_turn=prepare_snapshot,
-                prepared_edit_record=record,
-                on_interrupted_response_recoverable=record_interrupted_turn,
-                sync_restart_retry_source_event_id=retry_source_event_id,
-                on_deferred_outcome_handled=record_deferred_outcome,
-                on_user_stop_handled=record_user_stop,
+        async def commit_edit() -> None:
+            # The claimed reply answers the edited text from now on, so the turn holds it and the history run
+            # this edit replaces may go.
+            await self.deps.turn_store.record_edit(
+                record,
+                edited_event_id=edited.source_event_id,
+                prompt=edited.content,
+                revision=revision,
+            )
+            await self.deps.turn_store.remove_stale_runs_for_edit(turn_record=record, requester_user_id=requester_id)
+
+        return ResponseRequest(
+            thread_history=context.thread_history,
+            member_display_names=room_member_display_names(room),
+            prompt=prompt,
+            response_envelope=envelope,
+            sources=ResponseSources(
+                pending_event_ids=(revision[1],),
+                logical_source_event_ids=record.source_event_ids,
+                discovery_event_ids=record.discovery_event_ids,
             ),
-            record,
-            applied,
+            existing_event_id=edited.reply_event_id,
+            user_id=requester_id,
+            correlation_id=revision[1],
+            matrix_run_metadata=self.deps.turn_store.build_run_metadata(record),
+            current_timestamp_ms=normalize_timestamp_ms(revision[0]),
+            current_prompt_is_structured=structured,
+            prepare_source_turn=prepare_snapshot,
+            on_reply_claimed=commit_edit,
+            edit_regeneration=True,
         )
 
-    async def _refill_invalidated_prompts(self, record: TurnRecord, active: dict[str, _Edit]) -> TurnRecord:
-        """Refill invalidated siblings while pending edits supply their own fresh bodies."""
-        while True:
-            sources = record.invalidated_prompt_sources.difference(
-                record.prompt_source_event_id(source) for source in active
-            )
-            if not sources:
-                return record
-            assert record.conversation_target is not None
-            source = next(iter(sources))
-            requester = record.requester_id_for_source(source)
-            if requester is None:
-                msg = "Cannot prove the requester for a canonical edit refill"
-                raise ValueError(msg)
-            message = await self.deps.resolver.resolve_exact_source(
-                target=record.conversation_target,
-                source_event_id=source,
-                requester_id=requester,
-            )
-            if message is None:
-                updated = await self.deps.turn_store.mark_source_redacted(source)
-                assert updated is not None
-                record = updated
-                continue
-            updated = await self.deps.turn_store.refill_source_prompt(record, source, message)
-            if updated == record and source in updated.invalidated_prompt_sources:
-                msg = "Canonical source revision changed during strict refill"
-                raise RevisionSnapshotChangedError(msg)
-            record = updated
+    def _regenerate(self, request: ResponseRequest) -> None:
+        """Start the regeneration off the room's lane, which hands it the edit.
 
-    def _settlement_callbacks(
-        self,
-        room: nio.MatrixRoom,
-        *,
-        record: TurnRecord,
-        driving_edit: _Edit,
-        applied: dict[str, SourceEventRevision],
-    ) -> tuple[
-        Callable[[], None],
-        Callable[[str], Awaitable[None]],
-        Callable[[str, int], Awaitable[None]],
-    ]:
-        """Build the interrupted-turn and terminal-outcome callbacks for one regeneration.
-
-        Both outcome callbacks read ``applied`` when they fire rather than when
-        the request is built, because ``record_interrupted_turn`` can empty it
-        in between: an interrupted revision must stay uncommitted so the
-        replacement runtime re-drives it instead of treating it as applied.
+        Its claim waits for the conversation, which another reply of this agent
+        holds for as long as that reply runs, so the lane does not wait for it.
+        A regeneration whose response left the edit unclaimed settles it; one
+        that fails settles it only before a claim, since a claimed reply's
+        records own the edit from then on.
         """
+        claimed = False
+        commit_edit = request.on_reply_claimed
+        assert commit_edit is not None
 
-        def record_interrupted_turn() -> None:
-            if self.deps.interrupted_turn_rooms.register(driving_edit.revision[1], room_id=room.room_id):
-                applied.clear()
+        async def on_claimed() -> None:
+            nonlocal claimed
+            claimed = True
+            await commit_edit()
 
-        async def record_deferred_outcome(response_event_id: str) -> None:
-            if applied:
-                await record_deferred_outcome_response(
-                    self.deps.turn_store,
-                    record,
-                    response_event_id,
-                )
+        edit_sources = request.sources.pending_event_ids
+        room_id = request.response_envelope.target.room_id
 
-        async def record_user_stop(response_event_id: str, stop_receipt_order: int) -> None:
-            if applied:
-                await record_user_stop_terminal(
-                    self.deps.turn_store,
-                    record,
-                    response_event_id,
-                    stop_receipt_order,
-                )
+        async def regenerate() -> None:
+            try:
+                fate = await self._run_regeneration(replace(request, on_reply_claimed=on_claimed))
+            except ResponseAdmissionRefusedError:
+                # Refused by a runtime being replaced, the edit stays pending, as it does when cancelled at shutdown,
+                # so the replacement or a restart regenerates again.
+                raise
+            except Exception:
+                if not claimed:
+                    await self.deps.settle_sources(edit_sources)
+                raise
+            if isinstance(fate, Unclaimed):
+                # An edit's source check reports its own sources stale or none, so no other source survives it.
+                await self.deps.settle_sources(edit_sources)
 
-        return record_interrupted_turn, record_deferred_outcome, record_user_stop
+        self.deps.response_runner.inbox.track_inbox_response(
+            regenerate(),
+            name=f"edit_regeneration:{request.correlation_id}",
+            room_id=room_id,
+            # The edit stays pending until a span settles it, so a restart regenerates again.
+            recovery_proof_ready=lambda: True,
+            source_event_ids=edit_sources,
+        )
 
-    @staticmethod
-    def _discard(mailbox: _Mailbox, revisions: dict[str, SourceEventRevision]) -> None:
-        for source_event_id, revision in revisions.items():
-            pending = mailbox.pending.get(source_event_id)
-            if pending is not None and pending.revision <= revision:
-                mailbox.pending.pop(source_event_id)
+    async def _run_regeneration(self, request: ResponseRequest) -> SourceFate:
+        """Answer the edited turn as this entity answers now, or end its reply without an answer.
 
-    async def _drain(self, room: nio.MatrixRoom, initial_record: TurnRecord, mailbox: _Mailbox) -> None:
-        claimed_record = initial_record
-        while True:
-            if self.deps.turn_store.try_claim_turn(claimed_record):
-                break
-            await self.deps.wait_for_turn_settled(claimed_record.indexed_event_ids)
-            latest = max(mailbox.pending.values(), key=lambda edit: edit.revision)
-            refreshed_record = self.deps.turn_store.get_turn_record(latest.original_event_id)
-            if refreshed_record is None:
-                return
-            same_identity = (
-                refreshed_record.source_event_ids == claimed_record.source_event_ids
-                and refreshed_record.anchor_event_id == claimed_record.anchor_event_id
+        An edit that leaves no prompt ends the reply empty before any team is
+        resolved. A configured team that cannot answer now shows why in the
+        reply it regenerates.
+        """
+        runner = self.deps.response_runner
+        if not request.prompt.strip():
+            response_kind = "team" if self.deps.agent_name in self.deps.runtime.config.teams else "ai"
+            return await runner.generate_response_for_empty_prompt(request, response_kind=response_kind)
+        action = self.deps.turn_policy.effective_response_action(ResponseAction(kind="individual"))
+        if action.kind == "reject":
+            assert action.form_team is not None
+            assert action.rejection_message is not None
+            return await runner.deliver_team_rejection(
+                request,
+                member_names=[member.name for member in action.form_team.member_statuses],
+                team_mode=self.deps.runtime.config.teams[self.deps.agent_name].mode,
+                rejection_message=action.rejection_message,
             )
-            claimed_record = refreshed_record
-            if same_identity:
-                if not self.deps.turn_store.try_claim_turn(claimed_record):
-                    return
-                break
-        try:
-            await self._drain_claimed(room, mailbox)
-        finally:
-            self.deps.turn_store.release_pending_turn_claim(claimed_record)
-
-    async def _drain_claimed(self, room: nio.MatrixRoom, mailbox: _Mailbox) -> None:
-        while mailbox.pending:
-            latest = max(mailbox.pending.values(), key=lambda edit: edit.revision)
-            request, record, applied = await self._build_request(room, mailbox)
-            if request is None or record is None:
-                self._discard(mailbox, applied)
-                if not applied:
-                    return
-                continue
-            regenerated_event_id = await self.deps.generate_response(request)
-            if mailbox.rebuild_requested:
-                mailbox.rebuild_requested = False
-                continue
-            if regenerated_event_id is not None:
-                if not applied:
-                    return
-                self._discard(mailbox, applied)
-                continue
-            fresh_record = self.deps.turn_store.get_turn_record(latest.original_event_id)
-            deleted_revisions = {
-                source: revision
-                for source, revision in applied.items()
-                if self.deps.turn_store.is_revision_redacted(revision[1])
-            }
-            if deleted_revisions:
-                self._discard(mailbox, deleted_revisions)
-                continue
-            if fresh_record is not None and fresh_record.redacted_source_event_ids != record.redacted_source_event_ids:
-                self._discard(
-                    mailbox,
-                    {
-                        source_event_id: revision
-                        for source_event_id, revision in applied.items()
-                        if source_event_id in fresh_record.redacted_source_event_ids
-                    },
-                )
-                continue
-            self._discard(mailbox, applied)
+        return await run_response_action(runner, request, action)

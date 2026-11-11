@@ -6,28 +6,42 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
-from typing import TypeGuard, cast
-from urllib.parse import quote
+from typing import TypeGuard, cast, overload
 
 from dotenv import dotenv_values
 
 from mindroom import runtime_env_policy
+from mindroom.atomic_file import atomic_write_bytes_at
+from mindroom.providers.names import provider_route
 
 # Agent names
 ROUTER_AGENT_NAME = "router"
+ROUTER_DISPLAY_NAME = "RouterAgent"
+AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
+# "_shared" is the requester-store directory part for `user` scope in CredentialsManager.for_primary_runtime_scope.
+RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user", "_shared"})
 VISIBLE_ROUTER_VOICE_ECHO_KEY = "com.mindroom.visible_router_voice_echo"
 CONFIG_CONFIRMATION_REACTION_KEY = "com.mindroom.config_confirmation_reaction"
 DEFAULT_MINDROOM_URL = "http://127.0.0.1:8765"
+DEFAULT_MATRIX_HOMESERVER = "https://mindroom.chat"
 # Raise the per-room Classic Sync timeline limit above the homeserver default
 # (~10) so a room has to flood much harder before the server truncates its
 # timeline and forces a limited-sync gap backfill.
 CLASSIC_SYNC_TIMELINE_LIMIT = 5000
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 600.0
+# Idle time after which a thread's provider prompt cache counts as cold; most provider prompt caches expire
+# within an hour idle.
+PROMPT_CACHE_IDLE_SECONDS = 3600
 DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES = 50 * 1024
+DEFAULT_TOOL_OUTPUT_MAX_BYTES = 64 * 1024 * 1024
+# Largest attachment MindRoom retains, received from Matrix or registered by a tool;
+# also the default inline primary-to-worker save cap, so every retained attachment can reach a worker.
+RETAINED_MEDIA_MAX_BYTES = 64 * 1024 * 1024
 KNOWLEDGE_FILE_INDEX_CONCURRENCY_ENV = "MINDROOM_KNOWLEDGE_FILE_INDEX_CONCURRENCY"
 DEFAULT_MAX_CONCURRENT_KNOWLEDGE_FILE_INDEXES = 4
 MAX_ALLOWED_CONCURRENT_KNOWLEDGE_FILE_INDEXES = 128
@@ -35,8 +49,6 @@ KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV = "MINDROOM_KNOWLEDGE_REFRESH_SUBPROCES
 # Generous enough for a cold full index of a large corpus, short enough that a
 # wedged child cannot outlive the day.
 DEFAULT_KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_SECONDS = 3600.0
-_STANDARD_HISTORY_ROLES = frozenset({"user", "assistant", "tool"})
-_PROMPT_HISTORY_STORAGE_ROLES = frozenset({"system", "developer"})
 
 # Search order for existing files: env var > ./config.yaml > ~/.mindroom/config.yaml
 _CONFIG_SEARCH_PATHS = [Path("config.yaml"), Path.home() / ".mindroom" / "config.yaml"]
@@ -63,19 +75,11 @@ WORKER_RUNTIME_PATH_ENV_NAMES = frozenset(
         "PIP_CACHE_DIR",
         "UV_CACHE_DIR",
         "PYTHONPYCACHEPREFIX",
+        "TMPDIR",
         "VIRTUAL_ENV",
     },
 )
 WORKSPACE_HOME_CONTRACT_ENV_NAMES = _WORKSPACE_HOME_IDENTITY_ENV_NAMES | WORKER_RUNTIME_PATH_ENV_NAMES
-
-
-def prompt_roles_for_history_storage(system_message_role: str = "system") -> frozenset[str]:
-    """Return prompt roles that should be stripped before durable history storage."""
-    roles = set(_PROMPT_HISTORY_STORAGE_ROLES)
-    configured_role = system_message_role.strip()
-    if configured_role and configured_role not in _STANDARD_HISTORY_ROLES:
-        roles.add(configured_role)
-    return frozenset(roles)
 
 
 def workspace_home_identity_env(workspace: Path | str) -> dict[str, str]:
@@ -154,19 +158,56 @@ class RuntimePaths:
     process_env: Mapping[str, str] = field(default_factory=dict, repr=False)
     env_file_values: Mapping[str, str] = field(default_factory=dict, repr=False)
 
+    @overload
+    def env_value(self, name: str, *, default: str) -> str: ...
+
+    @overload
+    def env_value(self, name: str, *, default: None = None) -> str | None: ...
+
     def env_value(self, name: str, *, default: str | None = None) -> str | None:
-        """Resolve one env value against this runtime context."""
+        """Resolve one env value against this runtime context, read as ``plain_env_value`` reads it, else ``default``.
+
+        The runtime's own config, storage, and control-state paths answer for their variables.
+        """
         if name == "MINDROOM_CONFIG_PATH":
             return str(self.config_path)
         if name == "MINDROOM_STORAGE_PATH":
             return str(self.storage_root)
         if name == CONTROL_STATE_PATH_ENV:
             return str(self.control_state_root) if self.control_state_root is not None else default
-        if name in self.process_env:
-            return self.process_env[name]
-        if name in self.env_file_values:
-            return self.env_file_values[name]
-        return default
+        plain = self.plain_env_value((name,))
+        return default if plain is None else plain[0]
+
+    def plain_env_value(self, names: Sequence[str]) -> tuple[str, str] | None:
+        """Return the first usable value of ``names`` in the process env, then the `.env`, and the variable that set it.
+
+        A blank or unedited starter-template placeholder value counts as unset, so an exported one does not hide a
+        `.env` value.
+        """
+        for layer in (self.process_env, self.env_file_values):
+            for name in names:
+                value = layer.get(name, "")
+                if not runtime_env_policy.is_unset_env_value(name, value):
+                    return value, name
+        return None
+
+    def first_env_value(self, names: Sequence[str]) -> tuple[str, str] | None:
+        """Return the first usable value of ``names`` and the variable that supplied it.
+
+        Tries ``plain_env_value``, then the stripped contents of the file each name's `<NAME>_FILE` names, so an
+        earlier value never resolves a file path; a file's blank or placeholder contents count as unset too.
+        """
+        if (plain := self.plain_env_value(names)) is not None:
+            return plain
+        for name in names:
+            path = runtime_env_path(self, f"{name}_FILE")
+            try:
+                value = "" if path is None else read_secret_file(path)
+            except (OSError, UnicodeDecodeError):
+                value = ""
+            if not runtime_env_policy.is_unset_env_value(name, value):
+                return value, f"{name}_FILE"
+        return None
 
     def env_flag(self, name: str, *, default: bool = False) -> bool:
         """Resolve one boolean env value against this runtime context."""
@@ -175,11 +216,21 @@ class RuntimePaths:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
 
+    @cached_property
+    def env_digest(self) -> str:
+        """Return a digest of every env input this snapshot resolves against, computed once per snapshot."""
+        inputs = {
+            "config_dir": str(self.config_dir),
+            "process_env": sorted(self.process_env.items()),
+            "env_file_values": sorted(self.env_file_values.items()),
+        }
+        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode("utf-8")).hexdigest()
+
 
 def resolve_session_state_root(state_root: Path, runtime_paths: RuntimePaths) -> Path:
     """Map a canonical state root into optional dedicated session storage."""
     configured_root = runtime_paths.env_value(runtime_env_policy.SESSION_STORAGE_PATH_ENV)
-    if configured_root is None or not configured_root.strip():
+    if configured_root is None:
         return state_root
 
     session_storage_root = Path(configured_root).expanduser()
@@ -200,17 +251,31 @@ def resolve_session_state_root(state_root: Path, runtime_paths: RuntimePaths) ->
     return resolved_session_state_root
 
 
+def llm_request_log_dir(configured: str | None, storage_root: Path) -> Path:
+    """Return the LLM request-log directory: the configured one as given, else ``<storage_root>/logs/llm_requests``."""
+    return Path(configured) if configured else storage_root / "logs" / "llm_requests"
+
+
 def _copy_process_env(process_env: dict[str, str] | None = None) -> dict[str, str]:
     if process_env is not None:
         return dict(process_env)
     return dict(os.environ)
 
 
+class RuntimeEnvFileError(ValueError):
+    """The `.env` beside `config.yaml` cannot be read; its message names the file and the fix."""
+
+
 def _runtime_env_file_values_for_path(env_path: Path) -> dict[str, str]:
-    """Read string env values from one runtime-adjacent `.env` file."""
+    """Read string env values from one runtime-adjacent `.env` file, naming it when it is not UTF-8 text."""
     if not env_path.is_file():
         return {}
-    return {key: value for key, value in dotenv_values(env_path).items() if isinstance(value, str)}
+    try:
+        values = dotenv_values(env_path, encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        msg = f"{env_path} is not UTF-8 text ({exc.reason} at byte {exc.start}); save it as UTF-8."
+        raise RuntimeEnvFileError(msg) from exc
+    return {key: value for key, value in values.items() if isinstance(value, str)}
 
 
 def _resolve_runtime_relative_path(raw_value: str, *, base_dir: Path) -> Path:
@@ -229,9 +294,10 @@ def _configured_config_path(process_env: Mapping[str, str]) -> Path | None:
 
 
 def config_search_locations(process_env: Mapping[str, str]) -> list[Path]:
-    """Return the ordered list of locations where MindRoom looks for config.
+    """Return the resolved config locations in search order, without duplicates.
 
-    This is the single source of truth for config file discovery.
+    A set `MINDROOM_CONFIG_PATH` comes first.
+    This list owns the search order; `find_config_path` picks from it.
     """
     seen: set[Path] = set()
     locations: list[Path] = []
@@ -277,9 +343,7 @@ def resolve_runtime_paths(
     """
     resolved_config_arg = Path(config_path).expanduser().resolve() if config_path is not None else None
     resolved_process_env = _copy_process_env(process_env)
-    resolved_config_path = (
-        Path(resolved_config_arg or _find_config(process_env=resolved_process_env)).expanduser().resolve()
-    )
+    resolved_config_path = resolved_config_arg or find_config_path(process_env=resolved_process_env)
     config_dir = resolved_config_path.parent
     env_path = config_dir / ".env"
     env_file_values = _runtime_env_file_values_for_path(env_path)
@@ -437,15 +501,34 @@ def write_startup_manifest(
     """Write one sandbox-runner startup manifest and return its path."""
     manifest_path = sandbox_startup_manifest_path(storage_root)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
+    _write_manifest_without_following_symlinks(
+        manifest_path,
         _startup_manifest_json(
             runtime_paths,
             tool_validation_snapshot=tool_validation_snapshot,
             public_runtime=public_runtime,
         ),
-        encoding="utf-8",
     )
     return manifest_path
+
+
+def _write_manifest_without_following_symlinks(manifest_path: Path, payload: str) -> None:
+    """Atomically replace the manifest without following symlinks planted in the worker's own root.
+
+    The manifest directory sits inside the runtime root a dedicated worker mounts
+    read-write, so a symlink left there would otherwise redirect this write onto
+    any file the primary can reach. Publishing through a rename replaces a planted
+    file symlink instead of following it, and a worker never observes a partial manifest.
+    """
+    try:
+        directory_fd = os.open(manifest_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        msg = f"Sandbox startup manifest directory must be a real directory: {manifest_path.parent}"
+        raise OSError(msg) from exc
+    try:
+        atomic_write_bytes_at(directory_fd, manifest_path.name, payload.encode("utf-8"), file_mode=0o644)
+    finally:
+        os.close(directory_fd)
 
 
 def _is_json_object(value: object) -> TypeGuard[dict[str, object]]:
@@ -527,10 +610,23 @@ def exported_process_env() -> dict[str, str]:
     return _copy_process_env()
 
 
+def _merged_env_layers(process_env: Mapping[str, str], env_file_values: Mapping[str, str]) -> dict[str, str]:
+    """Merge the process env over the `.env` as ``RuntimePaths.env_value`` reads them.
+
+    A usable exported value wins. A blank one lands only when neither layer has a usable value, for the readers that
+    give an empty value its own meaning, and a starter-template placeholder never lands.
+    """
+    merged_env: dict[str, str] = {}
+    for layer in (env_file_values, process_env):
+        for name, value in layer.items():
+            if not runtime_env_policy.is_unset_env_value(name, value) or (name not in merged_env and not value.strip()):
+                merged_env[name] = value
+    return merged_env
+
+
 def runtime_env_values(runtime_paths: RuntimePaths) -> Mapping[str, str]:
     """Return the effective runtime env mapping for one explicit runtime context."""
-    merged_env = dict(runtime_paths.env_file_values)
-    merged_env.update(runtime_paths.process_env)
+    merged_env = _merged_env_layers(runtime_paths.process_env, runtime_paths.env_file_values)
     merged_env["MINDROOM_CONFIG_PATH"] = str(runtime_paths.config_path)
     merged_env["MINDROOM_STORAGE_PATH"] = str(runtime_paths.storage_root)
     return cast("Mapping[str, str]", MappingProxyType(merged_env))
@@ -591,22 +687,6 @@ def _trusted_tool_runtime_env_layers(
     return process_env, env_file_values
 
 
-def _isolated_runtime_env_layers(
-    runtime_paths: RuntimePaths,
-) -> tuple[dict[str, str], dict[str, str]]:
-    env_file_values = {
-        key: value
-        for key, value in runtime_paths.env_file_values.items()
-        if runtime_env_policy.is_isolated_worker_runtime_env_name(key)
-    }
-    process_env = {
-        key: value
-        for key, value in runtime_paths.process_env.items()
-        if runtime_env_policy.is_isolated_worker_runtime_env_name(key)
-    }
-    return process_env, env_file_values
-
-
 def _shell_extra_env_patterns(extra_env_passthrough: str | None) -> tuple[str, ...]:
     if extra_env_passthrough is None:
         return ()
@@ -647,27 +727,14 @@ def trusted_tool_runtime_env_values(
     - exported process env is filtered to the committed runtime contract
     - internal control env such as sandbox auth tokens stay excluded
     """
-    process_env, env_file_values = _trusted_tool_runtime_env_layers(runtime_paths)
-    merged_env = dict(env_file_values)
-    merged_env.update(process_env)
+    merged_env = _merged_env_layers(*_trusted_tool_runtime_env_layers(runtime_paths))
     for name in tuple(merged_env):
         if name != "GOOGLE_APPLICATION_CREDENTIALS" and not name.endswith("_FILE"):
             continue
-        source_path = _runtime_env_source_path(runtime_paths, name)
+        source_path = runtime_env_path(runtime_paths, name)
         if source_path is None:
             continue
-        merged_env[name] = str(source_path.resolve())
-    merged_env["MINDROOM_CONFIG_PATH"] = str(runtime_paths.config_path)
-    merged_env["MINDROOM_STORAGE_PATH"] = str(runtime_paths.storage_root)
-    return cast("Mapping[str, str]", MappingProxyType(merged_env))
-
-
-def _execution_tool_runtime_env_values(runtime_paths: RuntimePaths) -> Mapping[str, str]:
-    """Return the stricter env visible to sandbox-proxied execution tools."""
-    process_env = runtime_env_policy.execution_tool_runtime_env(runtime_paths.process_env)
-    env_file_values = runtime_env_policy.execution_tool_runtime_env(runtime_paths.env_file_values)
-    merged_env = dict(env_file_values)
-    merged_env.update(process_env)
+        merged_env[name] = str(source_path)
     merged_env["MINDROOM_CONFIG_PATH"] = str(runtime_paths.config_path)
     merged_env["MINDROOM_STORAGE_PATH"] = str(runtime_paths.storage_root)
     return cast("Mapping[str, str]", MappingProxyType(merged_env))
@@ -675,15 +742,20 @@ def _execution_tool_runtime_env_values(runtime_paths: RuntimePaths) -> Mapping[s
 
 def isolated_runtime_paths(runtime_paths: RuntimePaths) -> RuntimePaths:
     """Return one runtime view filtered for isolated worker execution."""
-    process_env, env_file_values = _isolated_runtime_env_layers(runtime_paths)
     return RuntimePaths(
         config_path=runtime_paths.config_path,
         config_dir=runtime_paths.config_dir,
         env_path=runtime_paths.env_path,
         storage_root=runtime_paths.storage_root,
         control_state_root=None,
-        process_env=cast("Mapping[str, str]", MappingProxyType(process_env)),
-        env_file_values=cast("Mapping[str, str]", MappingProxyType(env_file_values)),
+        process_env=cast(
+            "Mapping[str, str]",
+            MappingProxyType(runtime_env_policy.isolated_worker_runtime_env(runtime_paths.process_env)),
+        ),
+        env_file_values=cast(
+            "Mapping[str, str]",
+            MappingProxyType(runtime_env_policy.isolated_worker_runtime_env(runtime_paths.env_file_values)),
+        ),
     )
 
 
@@ -704,17 +776,6 @@ def shell_execution_runtime_env_values(
     return cast("Mapping[str, str]", MappingProxyType(merged_env))
 
 
-def _runtime_env_source_path(runtime_paths: RuntimePaths, name: str) -> Path | None:
-    """Return one runtime env var as a lexical filesystem path without resolving symlinks."""
-    raw_value = runtime_paths.env_value(name)
-    if raw_value is None or not raw_value.strip():
-        return None
-    path = Path(raw_value).expanduser()
-    if not path.is_absolute():
-        path = runtime_paths.config_dir / path
-    return path
-
-
 def _sandbox_shell_execution_runtime_env_values(
     *,
     extra_env_passthrough: str | None = None,
@@ -733,100 +794,6 @@ def _sandbox_shell_execution_runtime_env_values(
 
 EXECUTION_ENV_TOOL_NAMES = frozenset({"python", "shell"})
 
-# Worker pod env (set by the Kubernetes backend) that lets the runner compose
-# the Agent Vault egress proxy for python/shell. The token never reaches the
-# primary; it is minted into the worker pod and read here at execution time.
-_WORKER_EGRESS_PROXY_URL_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["proxy_url"]
-_WORKER_EGRESS_PROXY_TOKEN_FILE_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["token_file"]
-_WORKER_EGRESS_PROXY_VAULT_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["vault"]
-_WORKER_EGRESS_PROXY_CA_FILE_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["ca_file"]
-_WORKER_EGRESS_NO_PROXY = "localhost,127.0.0.1,::1,.svc,.cluster.local"
-
-
-def _git_config_env(process_env: Mapping[str, str], entries: list[tuple[str, str]]) -> dict[str, str]:
-    """Append entries to any well-formed environment-backed Git config.
-
-    A malformed incoming block is discarded so Git never receives an
-    inconsistent count/key/value set.
-    """
-    existing_entries: list[tuple[str, str]] = []
-    try:
-        existing_count = int(process_env.get("GIT_CONFIG_COUNT", "0"))
-    except ValueError:
-        existing_count = 0
-    if existing_count > 0:
-        for index in range(existing_count):
-            key = process_env.get(f"GIT_CONFIG_KEY_{index}")
-            value = process_env.get(f"GIT_CONFIG_VALUE_{index}")
-            if key is None or value is None:
-                existing_entries = []
-                break
-            existing_entries.append((key, value))
-
-    merged_entries = [*existing_entries, *entries]
-    env = {"GIT_CONFIG_COUNT": str(len(merged_entries))}
-    for index, (key, value) in enumerate(merged_entries):
-        env[f"GIT_CONFIG_KEY_{index}"] = key
-        env[f"GIT_CONFIG_VALUE_{index}"] = value
-    return env
-
-
-def worker_proxy_execution_env(process_env: Mapping[str, str]) -> dict[str, str]:
-    """Return the per-worker egress proxy env overlay for python/shell, or ``{}``.
-
-    General mechanism, provider-agnostic: reads a per-worker proxy endpoint plus
-    a token file written into the worker pod and composes proxy basic-auth
-    userinfo. The token becomes the username; when configured, the vault name
-    becomes the password. Returns empty when no per-worker egress proxy is
-    configured for this worker or the token is not yet present.
-    """
-    proxy_url = (process_env.get(_WORKER_EGRESS_PROXY_URL_ENV) or "").strip()
-    token_file = (process_env.get(_WORKER_EGRESS_PROXY_TOKEN_FILE_ENV) or "").strip()
-    if not proxy_url or "://" not in proxy_url or not token_file:
-        return {}
-    try:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
-    except OSError:
-        return {}
-    if not token:
-        return {}
-    vault = (process_env.get(_WORKER_EGRESS_PROXY_VAULT_ENV) or "").strip()
-    scheme, _, rest = proxy_url.partition("://")
-    # Percent-encode proxy basic-auth userinfo so URL-significant characters
-    # (@ : / # ? % +, whitespace) cannot make HTTP clients mis-parse auth.
-    authed = f"{scheme}://{quote(token, safe='')}:{quote(vault, safe='')}@{rest}"
-    env = {
-        "HTTP_PROXY": authed,
-        "HTTPS_PROXY": authed,
-        "http_proxy": authed,
-        "https_proxy": authed,
-        # Git/libcurl does not always preemptively send proxy credentials from
-        # HTTPS_PROXY userinfo on CONNECT. Environment-backed Git config makes
-        # the same proxy explicit without writing user/global git config.
-        "NO_PROXY": _WORKER_EGRESS_NO_PROXY,
-        "no_proxy": _WORKER_EGRESS_NO_PROXY,
-    }
-    env.update(
-        _git_config_env(
-            process_env,
-            [
-                ("http.proxy", authed),
-                ("http.proxyAuthMethod", "basic"),
-            ],
-        ),
-    )
-    ca_file = (process_env.get(_WORKER_EGRESS_PROXY_CA_FILE_ENV) or "").strip()
-    if ca_file:
-        env["REQUESTS_CA_BUNDLE"] = ca_file
-        env["CURL_CA_BUNDLE"] = ca_file
-        env["SSL_CERT_FILE"] = ca_file
-        # git and node do not honor the bundles above: git needs GIT_SSL_CAINFO
-        # (else `git clone` over HTTPS rejects the MITM proxy's certificate)
-        # and node only *adds* roots via NODE_EXTRA_CA_CERTS.
-        env["GIT_SSL_CAINFO"] = ca_file
-        env["NODE_EXTRA_CA_CERTS"] = ca_file
-    return env
-
 
 def build_execution_tool_env(
     tool_name: str,
@@ -843,51 +810,57 @@ def build_execution_tool_env(
     so it is supplied by the caller.
     """
     if tool_name == "shell":
-        env = dict(
+        return dict(
             _sandbox_shell_execution_runtime_env_values(
                 extra_env_passthrough=extra_env_passthrough,
                 process_env=shell_process_env,
             ),
         )
-        env.update(worker_proxy_execution_env(shell_process_env or runtime_paths.process_env))
-        return env
-    env = dict(_execution_tool_runtime_env_values(runtime_paths))
-    env.update(worker_proxy_execution_env(runtime_paths.process_env))
-    return env
+    return dict(runtime_env_values(isolated_runtime_paths(runtime_paths)))
+
+
+def read_secret_file(path: Path) -> str:
+    """Return a secret file's text without a UTF-8 byte order mark or surrounding whitespace, as the `.env` reads."""
+    return path.read_text(encoding="utf-8-sig").strip()
 
 
 def runtime_env_path(runtime_paths: RuntimePaths, name: str) -> Path | None:
-    """Resolve one runtime env var as a filesystem path.
+    """Resolve one runtime env var, read as ``RuntimePaths.env_value`` reads it, as a filesystem path.
 
     Relative paths are interpreted relative to the runtime config directory.
     """
-    source_path = _runtime_env_source_path(runtime_paths, name)
-    if source_path is None:
+    if (value := runtime_paths.env_value(name)) is None:
         return None
-    return source_path.resolve()
+    return _resolve_runtime_relative_path(value, base_dir=runtime_paths.config_dir)
 
 
-def runtime_env_flag(
-    name: str,
-    runtime_paths: RuntimePaths,
-    *,
-    default: bool = False,
-) -> bool:
-    """Read a boolean runtime env flag with config-adjacent `.env` fallback."""
-    value = runtime_paths.env_value(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def secret_path_env_names(runtime_paths: RuntimePaths) -> frozenset[str]:
+    """Return the variables naming the primary's secret files: every `<NAME>_FILE`, and a set credentials path."""
+    names = {name for name in {*runtime_paths.process_env, *runtime_paths.env_file_values} if name.endswith("_FILE")}
+    if runtime_env_path(runtime_paths, "GOOGLE_APPLICATION_CREDENTIALS") is not None:
+        names.add("GOOGLE_APPLICATION_CREDENTIALS")
+    return frozenset(names)
+
+
+def is_hosted_matrix_homeserver(homeserver: str) -> bool:
+    """Return whether a homeserver matches the hosted provisioning service's configured URL."""
+    # The service binds registration to its exact homeserver URL, allowing only
+    # surrounding whitespace and trailing slashes (_normalize_homeserver_url in
+    # scripts/local_mindroom_provisioning_service.py).
+    return homeserver.strip().rstrip("/") == DEFAULT_MATRIX_HOMESERVER
 
 
 def runtime_matrix_homeserver(runtime_paths: RuntimePaths) -> str:
     """Return the effective Matrix homeserver for one runtime context."""
-    return runtime_paths.env_value("MATRIX_HOMESERVER", default="http://localhost:8008") or "http://localhost:8008"
+    homeserver = runtime_paths.env_value("MATRIX_HOMESERVER", default=DEFAULT_MATRIX_HOMESERVER)
+    if is_hosted_matrix_homeserver(homeserver):
+        return DEFAULT_MATRIX_HOMESERVER
+    return homeserver
 
 
 def runtime_matrix_ssl_verify(runtime_paths: RuntimePaths) -> bool:
     """Return whether Matrix HTTPS requests should verify certificates."""
-    return runtime_env_flag("MATRIX_SSL_VERIFY", default=True, runtime_paths=runtime_paths)
+    return runtime_paths.env_flag("MATRIX_SSL_VERIFY", default=True)
 
 
 def runtime_matrix_server_name(runtime_paths: RuntimePaths) -> str | None:
@@ -898,10 +871,7 @@ def runtime_matrix_server_name(runtime_paths: RuntimePaths) -> str | None:
 def runtime_mindroom_namespace(runtime_paths: RuntimePaths) -> str | None:
     """Return the optional installation namespace for one runtime context."""
     value = runtime_paths.env_value("MINDROOM_NAMESPACE")
-    if value is None:
-        return None
-    normalized = value.strip().lower()
-    return normalized or None
+    return None if value is None else value.strip().lower()
 
 
 def matrix_state_file(runtime_paths: RuntimePaths) -> Path:
@@ -914,9 +884,23 @@ def tracking_dir(runtime_paths: RuntimePaths) -> Path:
     return runtime_paths.storage_root / "tracking"
 
 
+def primary_records_dir(state_root: Path, runtime_paths: RuntimePaths) -> Path:
+    """Map a canonical state root to the primary-only directory for the records the primary trusts about it.
+
+    The Kubernetes sandbox runner sidecar mounts `agents` and `private_instances` read-write,
+    so these records keep the state root's storage-relative path below the tracking directory, which no worker mounts.
+    """
+    return tracking_dir(runtime_paths) / state_root.relative_to(runtime_paths.storage_root.expanduser().resolve())
+
+
 def encryption_keys_dir(runtime_paths: RuntimePaths) -> Path:
     """Return the encryption-keys directory for one runtime context."""
     return runtime_paths.storage_root / "encryption_keys"
+
+
+def subagent_sessions_dir(runtime_paths: RuntimePaths) -> Path:
+    """Return the primary-only directory that holds each subagent's session file, ``<subagent_id>.json``."""
+    return runtime_paths.storage_root / "subagent_sessions"
 
 
 def config_relative_path(
@@ -1027,56 +1011,73 @@ def resolve_avatar_path(
     return workspace_path
 
 
-def _find_config(*, process_env: Mapping[str, str]) -> Path:
-    """Find the first existing config file, or fall back to ~/.mindroom/config.yaml.
+def find_config_path(*, process_env: Mapping[str, str]) -> Path:
+    """Return the resolved config path without reading any `.env`.
 
-    Returns the original (possibly relative) path, not a resolved one,
-    so CLI-facing defaults still display cleanly.
+    A set `MINDROOM_CONFIG_PATH` wins even when the file is missing.
+    Otherwise the first existing search location wins, falling back to ~/.mindroom/config.yaml.
     """
-    if configured_path := _configured_config_path(process_env):
-        return configured_path
-    for path in _CONFIG_SEARCH_PATHS:
-        if path.exists():
-            return path
-    return _CONFIG_SEARCH_PATHS[-1]  # default to ~/.mindroom/config.yaml for creation
+    locations = config_search_locations(process_env)
+    if _configured_config_path(process_env) is not None:
+        return locations[0]
+    return next((path for path in locations if path.exists()), locations[-1])
 
 
 # Other constants
 VOICE_PREFIX = "🎤 "
 ORIGINAL_SENDER_KEY = "com.mindroom.original_sender"
+# The human or configured bot account an entity's reply was written for; entities it mentions act for that requester.
+ACTING_REQUESTER_KEY = "com.mindroom.acting_requester"
 SOURCE_KIND_KEY = "com.mindroom.source_kind"
 PER_FIRE_THREAD_ROOT_KEY = "com.mindroom.per_fire_thread_root"
 PER_FIRE_THREAD_ROOT_EVENT_ID_KEY = "com.mindroom.per_fire_thread_root_event_id"
 SCHEDULED_HISTORY_LIMIT_KEY = "com.mindroom.history_limit"
+SCHEDULED_MODEL_KEY = "com.mindroom.scheduled_model"
 SILENT_SCHEDULE_EVENT_TYPE = "io.mindroom.scheduled.trigger"
+# Room state holding one scheduled task, keyed by its task ID.
+SCHEDULED_TASK_EVENT_TYPE = "com.mindroom.scheduled.task"
 SILENT_SCHEDULE_NO_REPLY_TOKEN = "NO_REPLY"  # noqa: S105 - Public no-report marker, not a credential.
 HOOK_SOURCE_KEY = "com.mindroom.hook_source"
 HOOK_MESSAGE_RECEIVED_DEPTH_KEY = "com.mindroom.message_received_depth"
 SKIP_MENTIONS_KEY = "com.mindroom.skip_mentions"
+# On a thread-move copy, which is skip-marked: the user IDs its original counted as mentioning earlier in its thread,
+# which the copy keeps counting while waking nobody.
+COPIED_MENTIONS_KEY = "io.mindroom.copied_mentions"
+# Marks a message's ``m.mentions`` as every mention it makes, so receivers do not look for more in its text.
+EXACT_MENTIONS_KEY = "io.mindroom.exact_mentions"
+# False on a message whose mentions must not wake the agents among them.
+WAKE_MENTIONED_KEY = "io.mindroom.wake_mentioned"
 VOICE_RAW_AUDIO_FALLBACK_KEY = "com.mindroom.voice_raw_audio_fallback"
 VOICE_TRANSCRIPT_KEY = "com.mindroom.voice_transcript"
 ATTACHMENT_IDS_KEY = "com.mindroom.attachment_ids"
 AI_RUN_METADATA_KEY = "io.mindroom.ai_run"
-MATRIX_TURN_SCHEMA_VERSION_METADATA_KEY = "matrix_turn_schema_version"
 MATRIX_TURN_DISCOVERY_EVENT_IDS_METADATA_KEY = "matrix_turn_discovery_event_ids"
-MATRIX_TURN_REDACTED_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_turn_redacted_source_event_ids"
 MATRIX_EVENT_ID_METADATA_KEY = "matrix_event_id"
+# Run metadata key holding the trusted hook source of the message that started the run, such as an automation prompt.
+HOOK_SOURCE_RUN_METADATA_KEY = "hook_source"
+# Run metadata key holding the intent of the message that started the run, such as a background job follow-up.
+TURN_INTENT_RUN_METADATA_KEY = "turn_intent"
+# Run metadata key holding the usage of the attempts the run's turn spent before it, summed, as run metrics are stored.
+PRIOR_USAGE_RUN_METADATA_KEY = "mindroom_prior_usage"
 MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY = "matrix_message_target"
 MATRIX_RESPONSE_EVENT_ID_METADATA_KEY = "matrix_response_event_id"
-MATRIX_RESPONSE_OWNER_METADATA_KEY = "matrix_response_owner"
 MATRIX_SEEN_EVENT_IDS_METADATA_KEY = "matrix_seen_event_ids"
-MATRIX_HISTORY_SCOPE_METADATA_KEY = "matrix_history_scope"
-MATRIX_CONVERSATION_TARGET_METADATA_KEY = "matrix_conversation_target"
 MATRIX_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_source_event_ids"
 MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY = "matrix_source_event_prompts"
 MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY = "matrix_source_event_revisions"
-MATRIX_SOURCE_EVENT_METADATA_KEY = "matrix_source_event_metadata"
-MINDROOM_COMPACTION_METADATA_KEY = "mindroom_compaction"
-MINDROOM_MATRIX_HISTORY_METADATA_KEY = "mindroom_matrix_history"
+# Session metadata key holding the database owner's history state: its force-compaction flag.
+MINDROOM_HISTORY_METADATA_KEY = "mindroom_history"
 COMPACTION_NOTICE_CONTENT_KEY = "io.mindroom.compaction"
+SKILL_REVIEW_NOTICE_CONTENT_KEY = "io.mindroom.skill_review"
+UI_ACTION_CONTENT_KEY = "io.mindroom.ui_action"
+THREAD_SUMMARY_CONTENT_KEY = "io.mindroom.thread_summary"
+# Marks a notice that asks its reader to reply in its thread, so clients show it as a conversation, not a status.
+CONVERSATION_CONTENT_KEY = "io.mindroom.conversation"
+# A finished call's duration and spoken turns by sender ID, on its transcript message.
+CALL_TRANSCRIPT_CONTENT_KEY = "io.mindroom.call_transcript"
 STREAM_STATUS_KEY = "io.mindroom.stream_status"
-DURABLE_FINAL_OUTCOME_KEY = "io.mindroom.final_delivery"
-DURABLE_FINAL_OUTCOME_VERSION = 2
+# The model reasoning a streamed reply showed, with how long it was observed, on the reply's terminal update.
+REASONING_CONTENT_KEY = "io.mindroom.reasoning"
 STREAM_VISIBLE_BODY_KEY = "io.mindroom.visible_body"
 STREAM_WARMUP_SUFFIX_KEY = "io.mindroom.warmup_suffix"
 TOOL_TRACE_CONTENT_KEY = "io.mindroom.tool_trace"
@@ -1087,6 +1088,10 @@ STREAM_STATUS_COMPLETED = "completed"
 STREAM_STATUS_CANCELLED = "cancelled"
 STREAM_STATUS_INTERRUPTED = "interrupted"
 STREAM_STATUS_ERROR = "error"
+# A reply with one of these statuses is still being written or waits for a tool approval.
+UNFINISHED_REPLY_STATUSES = frozenset(
+    {STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING, STREAM_STATUS_APPROVAL_PENDING},
+)
 
 # Placeholder used in starter config templates. `mindroom connect` can
 # automatically replace this token with the owner Matrix user ID returned
@@ -1095,10 +1100,23 @@ OWNER_MATRIX_USER_ID_PLACEHOLDER = "__MINDROOM_OWNER_USER_ID_FROM_PAIRING__"
 OWNER_MATRIX_USER_ID_ENV = "MINDROOM_OWNER_USER_ID"
 
 
+def _is_no_report_line(line: str) -> bool:
+    """Return whether one line holds only the no-report token, in any case."""
+    return line.strip().casefold() == SILENT_SCHEDULE_NO_REPLY_TOKEN.casefold()
+
+
 def is_silent_schedule_no_report_response(response_text: str) -> bool:
-    """Return whether one silent-schedule final text explicitly reports nothing."""
-    normalized = response_text.strip()
-    return not normalized or normalized.casefold() == SILENT_SCHEDULE_NO_REPLY_TOKEN.casefold()
+    """Return whether one silent-schedule final text reports nothing: it is blank, or its last non-blank line is the token.
+
+    The token matches in any case, and the line holds nothing else, so a report must not end with it.
+    """
+    lines = response_text.strip().splitlines()
+    return not lines or _is_no_report_line(lines[-1])
+
+
+def without_no_report_lines(text: str) -> str:
+    """Return ``text`` without the lines that hold only the no-report token, which a reply never shows."""
+    return "\n".join(line for line in text.splitlines() if not _is_no_report_line(line)).rstrip()
 
 
 # Canonical mapping from provider name to the environment variable it requires.
@@ -1123,13 +1141,8 @@ _CHROMADB_PY314_PATCHED = False
 
 
 def env_key_for_provider(provider: str) -> str | None:
-    """Get the environment variable name for a provider's API key.
-
-    Handles the gemini→google alias so callers don't need to.
-    """
-    if provider == "gemini":
-        return PROVIDER_ENV_KEYS.get("google")
-    return PROVIDER_ENV_KEYS.get(provider)
+    """Get the environment variable name for a provider's API key, resolving provider aliases such as ``gemini``."""
+    return PROVIDER_ENV_KEYS.get(provider_route(provider))
 
 
 def patch_chromadb_for_python314() -> None:
@@ -1190,12 +1203,13 @@ def safe_replace(tmp_path: Path, target_path: Path) -> None:
 
     ``Path.replace`` performs an atomic rename which fails on some filesystems
     (e.g. Docker bind mounts) with ``OSError: [Errno 16] Device or resource
-    busy``.  When that happens we fall back to a non-atomic copy.
+    busy``.  When that happens we fall back to a non-atomic copy of the content
+    only, which keeps the target's owner and mode and needs no ownership of it.
     """
     try:
         tmp_path.replace(target_path)
     except OSError:
-        shutil.copy2(tmp_path, target_path)
+        shutil.copyfile(tmp_path, target_path)
         target_fd = os.open(target_path, os.O_RDONLY)
         try:
             os.fsync(target_fd)

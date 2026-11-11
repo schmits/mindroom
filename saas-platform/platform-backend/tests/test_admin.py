@@ -1,11 +1,14 @@
 """Comprehensive HTTP API tests for admin endpoints."""
 
-from datetime import UTC, datetime
-from unittest.mock import MagicMock, Mock, patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+
+from main import app
+from tests.fake_supabase import FakeQuery, FakeResult, FakeSupabase
 
 
 class TestAdminEndpoints:
@@ -27,6 +30,13 @@ class TestAdminEndpoints:
             yield sb
 
     @pytest.fixture
+    def fake_db(self):
+        """In-memory Supabase tables behind the admin routes."""
+        db = FakeSupabase()
+        with patch("backend.routes.admin.ensure_supabase", return_value=db):
+            yield db
+
+    @pytest.fixture
     def mock_verify_admin(self):
         """Mock admin verification."""
         from main import app  # noqa: PLC0415
@@ -39,69 +49,8 @@ class TestAdminEndpoints:
         yield
         app.dependency_overrides.clear()
 
-    @pytest.fixture
-    def mock_check_deployment(self):
-        """Mock deployment existence check."""
-        with patch("backend.k8s.check_deployment_exists") as mock:
-            mock.return_value = True
-            yield mock
-
-    @pytest.fixture
-    def mock_kubectl(self):
-        """Mock kubectl commands."""
-        with patch("backend.k8s.run_kubectl") as mock:
-            mock.return_value = (0, "1", "")  # Default success with 1 replica
-            yield mock
-
-    def test_admin_stats_success(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
-        """Test getting admin statistics successfully."""
-        # Setup - create separate mock chains for each table query
-        accounts_mock = MagicMock()
-        accounts_mock.select.return_value = accounts_mock
-        accounts_mock.execute.return_value = Mock(data=[{}, {}, {}, {}, {}, {}, {}, {}, {}, {}])  # 10 accounts
-
-        subscriptions_mock = MagicMock()
-        subscriptions_mock.select.return_value = subscriptions_mock
-        subscriptions_mock.eq.return_value = subscriptions_mock
-        subscriptions_mock.execute.return_value = Mock(data=[{}, {}, {}, {}, {}, {}, {}, {}])  # 8 active
-
-        instances_mock = MagicMock()
-        instances_mock.select.return_value = instances_mock
-        instances_mock.eq.return_value = instances_mock
-        instances_mock.execute.return_value = Mock(data=[{}, {}, {}, {}, {}, {}, {}])  # 7 running
-
-        audit_mock = MagicMock()
-        audit_mock.select.return_value = audit_mock
-        audit_mock.order.return_value = audit_mock
-        audit_mock.limit.return_value = audit_mock
-        audit_mock.execute.return_value = Mock(data=[])  # no recent logs
-
-        # Configure table method to return different mocks
-        def table_side_effect(table_name):
-            if table_name == "accounts":
-                return accounts_mock
-            elif table_name == "subscriptions":
-                return subscriptions_mock
-            elif table_name == "instances":
-                return instances_mock
-            elif table_name == "audit_logs":
-                return audit_mock
-            return MagicMock()
-
-        mock_supabase.table = Mock(side_effect=table_side_effect)
-
-        # Make request
-        response = client.get("/admin/stats")
-
-        # Verify
-        assert response.status_code == 200
-        data = response.json()
-        assert data["accounts"] == 10
-        assert data["active_subscriptions"] == 8
-        assert data["running_instances"] == 7
-
-    def test_admin_stats_unauthorized(self, client: TestClient):
-        """Test accessing admin stats without authorization."""
+    def test_admin_dashboard_metrics_unauthorized(self, client: TestClient):
+        """Test accessing admin dashboard metrics without authorization."""
         from main import app  # noqa: PLC0415
         from backend.deps import verify_admin
         from fastapi import HTTPException
@@ -111,7 +60,7 @@ class TestAdminEndpoints:
 
         app.dependency_overrides[verify_admin] = override_verify_admin
         try:
-            response = client.get("/admin/stats")
+            response = client.get("/admin/metrics/dashboard")
             assert response.status_code == 401
         finally:
             app.dependency_overrides.clear()
@@ -149,7 +98,7 @@ class TestAdminEndpoints:
         assert response.json()["success"] is True
         mock_kubectl.assert_has_awaits(
             [
-                call(["scale", "deployment/synapse-123", "--replicas=1"], namespace="mindroom-instances"),
+                call(["scale", "deployment/tuwunel-123", "--replicas=1"], namespace="mindroom-instances"),
                 call(["scale", "deployment/mindroom-123", "--replicas=1"], namespace="mindroom-instances"),
             ]
         )
@@ -206,13 +155,19 @@ class TestAdminEndpoints:
         """Test admin provisioning an instance."""
         # Setup - Mock instance query
         mock_supabase.table().select().eq().execute.return_value = Mock(
-            data=[{"instance_id": "123", "status": "deprovisioned", "account_id": "acc_123"}]
+            data=[
+                {
+                    "instance_id": "123",
+                    "status": "deprovisioned",
+                    "account_id": "acc_123",
+                    "subscription_id": "sub_123",
+                    "tier": "pro",
+                }
+            ]
         )
 
-        # Mock subscription query for provision_instance
-        mock_supabase.table().select().eq().single().execute.return_value = Mock(
-            data={"id": "sub_123", "account_id": "acc_123", "tier": "byok"}
-        )
+        # The subscription moved to byok since the instance was last deployed as pro.
+        mock_supabase.table().select().eq().limit().execute.return_value = Mock(data=[{"tier": "byok"}])
 
         with patch("backend.services.provisioner_service.provision_instance") as mock_provision:
             mock_provision.return_value = {
@@ -231,15 +186,12 @@ class TestAdminEndpoints:
             assert response.status_code == 200
             data = response.json()
             assert data["success"] is True
+            assert mock_provision.call_args.kwargs["data"]["tier"] == "byok"
 
     def test_admin_sync_instances(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
         """Test admin syncing instances."""
         with patch("backend.services.provisioner_service.sync_instances") as mock_sync:
-
-            async def mock_sync_func(sb):
-                return {"total": 5, "synced": 2, "errors": 0, "updates": []}
-
-            mock_sync.side_effect = mock_sync_func
+            mock_sync.return_value = {"total": 5, "synced": 2, "errors": 0, "updates": []}
 
             # Make request (admin auth is mocked via fixture)
             response = client.post("/admin/sync-instances")
@@ -286,10 +238,7 @@ class TestAdminEndpoints:
         instances_mock.execute.return_value = Mock(data=[instance_data])
 
         # Configure table calls
-        call_count = [0]
-
         def table_side_effect(table_name):
-            call_count[0] += 1
             if table_name == "accounts":
                 return account_mock
             elif table_name == "subscriptions":
@@ -328,37 +277,159 @@ class TestAdminEndpoints:
         assert data["account_id"] == "acc_123"
         assert data["new_status"] == "suspended"
 
-    def test_admin_logout(self, client: TestClient, mock_verify_admin: Mock):
-        """Test admin logout."""
-        # Make request
-        response = client.post("/admin/auth/logout")
+    def test_admin_refuses_to_activate_an_account_awaiting_deletion(
+        self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock
+    ):
+        """Setting active would leave deleted_at set, so the admin is pointed at the owner's cancel-deletion."""
+        mock_supabase.table().select().eq().execute.return_value = Mock(data=[{"deleted_at": "2026-09-01T00:00:00Z"}])
 
-        # Verify
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is True
+        response = client.put("/admin/accounts/acc_123/status", json={"status": "active"})
 
-    def test_admin_list_resources(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
-        """Test admin listing resources."""
-        # Setup mock with query chaining for accounts
-        mock_query = MagicMock()
-        mock_query.select.return_value = mock_query
-        mock_query.range.return_value = mock_query
-        mock_query.execute.return_value = Mock(
-            data=[{"id": "1", "name": "Resource 1"}, {"id": "2", "name": "Resource 2"}], count=2
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "Account is awaiting deletion. Set its status to deleted so the owner can cancel the deletion."
         )
-        mock_supabase.table.return_value = mock_query
+        mock_supabase.table().update.assert_not_called()
 
-        # Make request
+    def test_admin_activates_an_account_not_awaiting_deletion(
+        self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock
+    ):
+        """Reactivating a suspended account still works."""
+        mock_supabase.table().select().eq().execute.return_value = Mock(data=[{"deleted_at": None}])
+        mock_supabase.table().update().eq().execute.return_value = Mock(data=[{"id": "acc_123", "status": "active"}])
+
+        response = client.put("/admin/accounts/acc_123/status", json={"status": "active"})
+
+        assert response.status_code == 200
+        assert response.json()["new_status"] == "active"
+
+    def test_admin_status_change_for_an_unknown_account_is_not_found(
+        self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock
+    ):
+        """A missing account answers 404 instead of being reported as a server error."""
+        mock_supabase.table().update().eq().execute.return_value = Mock(data=[])
+
+        response = client.put("/admin/accounts/acc_missing/status", json={"status": "suspended"})
+
+        assert response.status_code == 404
+
+    @pytest.mark.parametrize(
+        ("method", "path", "body"),
+        [
+            ("PUT", "/admin/accounts/5F0B2C1E-8C3D-4F7A-9B21-6E4D3A2C1B0F/status", {"status": "suspended"}),
+            ("PUT", "/admin/accounts/5F0B2C1E-8C3D-4F7A-9B21-6E4D3A2C1B0F", {"status": "suspended"}),
+            ("DELETE", "/admin/accounts/5F0B2C1E-8C3D-4F7A-9B21-6E4D3A2C1B0F/complete", None),
+        ],
+    )
+    def test_admin_account_changes_drop_cached_auth(
+        self,
+        client: TestClient,
+        mock_supabase: MagicMock,
+        mock_verify_admin: Mock,
+        method: str,
+        path: str,
+        body: dict | None,
+    ):
+        """Admin account changes take effect on the account's next request, whatever spelling the path id uses."""
+        from backend.deps import AuthCacheEntry, _auth_cache  # noqa: PLC0415
+
+        account_id = "5f0b2c1e-8c3d-4f7a-9b21-6e4d3a2c1b0f"
+        mock_supabase.table().update().eq().execute.return_value = Mock(
+            data=[{"id": account_id, "status": "suspended"}]
+        )
+        mock_supabase.table().select().eq().execute.return_value = Mock(data=[{"id": account_id, "email": "u@x.test"}])
+        _auth_cache.clear()
+        expires_at = datetime.now(UTC) + timedelta(minutes=5)
+        for cached_id in (account_id, "acc_other"):
+            _auth_cache[cached_id] = AuthCacheEntry(
+                expires_at=expires_at,
+                account_id=cached_id,
+                user_data={"user_id": cached_id, "account_id": cached_id, "account": {"status": "active"}},
+            )
+
+        with (
+            patch("backend.routes.admin.instances_data.get_instances_for_account", return_value=[]),
+            patch("backend.routes.admin.instance_lifecycle.tear_down_account", new=AsyncMock()),
+            patch("backend.routes.admin.instance_lifecycle.delete_auth_user", new=AsyncMock()),
+        ):
+            response = client.request(method, path, json=body)
+
+        assert response.status_code == 200
+        assert set(_auth_cache) == {"acc_other"}
+        _auth_cache.clear()
+
+    def test_admin_list_holds_every_row_newest_first(
+        self, client: TestClient, fake_db: FakeSupabase, mock_verify_admin: Mock
+    ):
+        """A list without ``limit`` holds every row past PostgREST's row limit, newest first, ties in id order."""
+        accounts = [{"id": f"acc_{day:02d}", "created_at": f"2026-10-{day:02d}T00:00:00Z"} for day in range(1, 13)]
+        accounts.append({"id": "acc_00", "created_at": "2026-10-12T00:00:00Z"})
+        fake_db.tables["accounts"] = accounts[1::2] + accounts[::2]
+        fake_db.max_rows = 5
         response = client.get("/admin/accounts")
 
-        # Verify
         assert response.status_code == 200
-        data = response.json()
-        assert "data" in data
-        assert "total" in data
-        assert len(data["data"]) == 2
-        assert data["total"] == 2
+        newest_first = ["acc_00", *(f"acc_{day:02d}" for day in range(12, 0, -1))]
+        assert [row["id"] for row in response.json()["data"]] == newest_first
+        assert response.json()["total"] == 13
+
+    def test_admin_list_survives_a_row_deleted_while_it_pages(
+        self, client: TestClient, fake_db: FakeSupabase, mock_verify_admin: Mock
+    ):
+        """A row deleted between two pages of a full listing does not fail the listing."""
+        fake_db.tables["accounts"] = [
+            {"id": f"acc_{day}", "created_at": f"2026-10-0{day}T00:00:00Z"} for day in (1, 2, 3)
+        ]
+        fake_db.max_rows = 2
+        serve = FakeQuery.execute
+
+        def serve_then_delete_after_the_last_page_of_rows(query: FakeQuery) -> FakeResult:
+            result = serve(query)
+            if query.row_range and query.row_range[0] == 2:
+                fake_db.tables["accounts"] = fake_db.tables["accounts"][1:]
+            return result
+
+        with patch.object(FakeQuery, "execute", serve_then_delete_after_the_last_page_of_rows):
+            response = client.get("/admin/accounts")
+
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["data"]] == ["acc_3", "acc_2", "acc_1"]
+
+    def test_admin_list_limit_holds_the_newest_rows_and_counts_every_row(
+        self, client: TestClient, fake_db: FakeSupabase, mock_verify_admin: Mock
+    ):
+        """A list with ``limit`` holds that many of the newest rows, and total counts every row."""
+        fake_db.tables["audit_logs"] = [
+            {"id": f"log_{day}", "created_at": f"2026-10-0{day}T00:00:00Z"} for day in (4, 1, 5, 3, 2)
+        ]
+        response = client.get("/admin/audit_logs?limit=2")
+
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["data"]] == ["log_5", "log_4"]
+        assert response.json()["total"] == 5
+
+    def test_admin_subscription_and_instance_lists_show_the_account(
+        self, client: TestClient, fake_db: FakeSupabase, mock_verify_admin: Mock
+    ):
+        """Subscription and instance rows carry their account, which the admin pages show as the customer."""
+        fake_db.tables |= {
+            "accounts": [{"id": "acc_1", "email": "owner@example.com", "full_name": "Owner"}],
+            "subscriptions": [{"id": "sub_1", "account_id": "acc_1", "created_at": "2026-10-01T00:00:00Z"}],
+            "instances": [{"id": "inst_1", "account_id": "acc_1", "created_at": "2026-10-01T00:00:00Z"}],
+        }
+        listed = {resource: client.get(f"/admin/{resource}").json() for resource in ("subscriptions", "instances")}
+
+        assert {resource: body["data"][0]["accounts"]["email"] for resource, body in listed.items()} == {
+            "subscriptions": "owner@example.com",
+            "instances": "owner@example.com",
+        }
+
+    def test_admin_list_failure_is_an_error_not_an_empty_list(self, mock_supabase: MagicMock, mock_verify_admin: Mock):
+        """A failed listing answers 500, not a 200 with no rows."""
+        mock_supabase.table.side_effect = RuntimeError("database unavailable")
+        response = TestClient(app, raise_server_exceptions=False).get("/admin/accounts")
+
+        assert response.status_code == 500
 
     def test_admin_get_single_resource(self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock):
         """Test admin getting a single resource."""
@@ -419,128 +490,47 @@ class TestAdminEndpoints:
         data = response.json()
         assert "data" in data
 
-    def test_admin_dashboard_metrics(
-        self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock, monkeypatch: pytest.MonkeyPatch
+    def test_admin_dashboard_metrics_cover_every_row(
+        self, client: TestClient, fake_db: FakeSupabase, mock_verify_admin: Mock
     ):
-        """Test admin dashboard metrics."""
-        from backend import pricing
-        from backend.routes import admin
+        """Every dashboard figure counts all rows, past PostgREST's per-request row cap."""
+        fake_db.max_rows = 2
+        fake_db.tables = {
+            "accounts": [{"id": f"account-{i}"} for i in range(5)],
+            "subscriptions": [
+                # MRR counts each subscription's recorded Stripe price per month, and nothing before a price is recorded.
+                {"id": "sub-1", "status": "active", "tier": "byok", "billing_cycle": "monthly", "price_cents": 1000},
+                {"id": "sub-2", "status": "active", "tier": "byok", "billing_cycle": "yearly", "price_cents": 9600},
+                {"id": "sub-3", "status": "active", "tier": "hobby", "billing_cycle": "yearly", "price_cents": 19990},
+                {"id": "sub-4", "status": "active", "tier": "pro", "billing_cycle": None, "price_cents": None},
+                {"id": "sub-5", "status": "active", "tier": "free", "billing_cycle": "monthly", "price_cents": 0},
+                {"id": "sub-6", "status": "cancelled", "tier": "pro", "billing_cycle": "monthly", "price_cents": 5000},
+            ],
+            "instances": [
+                {"instance_id": i, "status": status}
+                for i, status in enumerate(["running", "running", "running", "stopped"])
+            ],
+        }
 
-        pricing_config = pricing.load_pricing_config()
-        pricing_config["plans"]["byok"]["price_monthly"] = 3100
-        pricing_config["plans"]["pro"]["price_monthly"] = 9700
-        monkeypatch.setattr(admin, "PRICING_CONFIG_MODEL", pricing.PricingConfig(**pricing_config))
-
-        # Setup mock queries for each specific table call
-        # Mock accounts query
-        accounts_mock = MagicMock()
-        accounts_mock.select = MagicMock(return_value=accounts_mock)
-        accounts_result = Mock()
-        accounts_result.count = 100
-        accounts_mock.execute.return_value = accounts_result
-
-        # Mock active subscriptions query
-        active_subs_mock = MagicMock()
-        active_subs_mock.select = MagicMock(return_value=active_subs_mock)
-        active_subs_mock.eq.return_value = active_subs_mock
-        active_subs_result = Mock()
-        active_subs_result.count = 70
-        active_subs_mock.execute.return_value = active_subs_result
-
-        # Mock running instances query
-        running_instances_mock = MagicMock()
-        running_instances_mock.select = MagicMock(return_value=running_instances_mock)
-        running_instances_mock.eq.return_value = running_instances_mock
-        running_instances_result = Mock()
-        running_instances_result.count = 45
-        running_instances_mock.execute.return_value = running_instances_result
-
-        # Mock subscriptions data for MRR
-        subs_data_mock = MagicMock()
-        subs_data_mock.select.return_value = subs_data_mock
-        subs_data_mock.eq.return_value = subs_data_mock
-        subs_data_mock.execute.return_value = Mock(data=[{"tier": "byok"}, {"tier": "pro"}])
-
-        # Mock usage metrics for messages
-        usage_mock = MagicMock()
-        usage_mock.select.return_value = usage_mock
-        usage_mock.gte.return_value = usage_mock
-        usage_mock.order.return_value = usage_mock
-        usage_mock.execute.return_value = Mock(data=[])
-
-        # Mock all instances for status counts
-        all_instances_mock = MagicMock()
-        all_instances_mock.select.return_value = all_instances_mock
-        all_instances_mock.execute.return_value = Mock(data=[{"status": "running"}, {"status": "stopped"}])
-
-        # Mock audit logs
-        audit_mock = MagicMock()
-        audit_mock.select.return_value = audit_mock
-        audit_mock.order.return_value = audit_mock
-        audit_mock.limit.return_value = audit_mock
-        audit_mock.execute.return_value = Mock(data=[])
-
-        # Set up table method to return the right mock for each table
-        subscription_calls = [0]
-
-        def table_side_effect(table_name):
-            if table_name == "accounts":
-                return accounts_mock
-            elif table_name == "subscriptions":
-                # Track subscription calls to distinguish between different queries
-                subscription_calls[0] += 1
-                if subscription_calls[0] == 1:  # First call is for active subs count
-                    return active_subs_mock
-                else:  # Second call is for tier data
-                    return subs_data_mock
-            elif table_name == "instances":
-                # For instances, we need to return different mocks based on what's being queried
-                # First call has .eq("status", "running"), second doesn't
-                mock = MagicMock()
-                # Create a mock that can handle the chained calls
-                mock.select = MagicMock(return_value=mock)
-                mock.eq = MagicMock(return_value=mock)
-
-                # Determine which result to return based on whether eq() was called
-                def execute_side_effect():
-                    # If eq was called with "status", "running", return running instances
-                    if (
-                        mock.eq.called
-                        and mock.eq.call_args
-                        and len(mock.eq.call_args[0]) > 1
-                        and mock.eq.call_args[0][1] == "running"
-                    ):
-                        result = Mock()
-                        result.count = 45
-                        return result
-                    else:
-                        # Otherwise return all instances
-                        return Mock(data=[{"status": "running"}, {"status": "stopped"}])
-
-                mock.execute = MagicMock(side_effect=execute_side_effect)
-                return mock
-            elif table_name == "usage_metrics":
-                return usage_mock
-            elif table_name == "audit_logs":
-                return audit_mock
-            return MagicMock()
-
-        mock_supabase.table = Mock(side_effect=table_side_effect)
-
-        # Make request
         response = client.get("/admin/metrics/dashboard")
 
-        # Verify
         assert response.status_code == 200
         data = response.json()
-        assert "total_accounts" in data
-        assert "active_subscriptions" in data
-        assert "total_instances" in data
-        assert "subscription_revenue" in data
-        assert data["total_accounts"] == 100
-        assert data["active_subscriptions"] == 70
-        assert data["total_instances"] == 2  # We have 2 instances total in the mock
-        assert data["subscription_revenue"] == 128.0
+        assert data["total_accounts"] == 5
+        assert data["active_subscriptions"] == 4
+        assert data["subscription_revenue"] == 35.0  # 10 + 8 + 16.66 (199.90 / 12), rounded to whole dollars
+        assert data["instances_by_status"] == {"running": 3, "stopped": 1}
+
+    def test_admin_dashboard_metrics_fail_instead_of_reporting_zeros(
+        self, client: TestClient, mock_supabase: MagicMock, mock_verify_admin: Mock
+    ):
+        """A database failure is an error response, not a dashboard of zero figures."""
+        mock_supabase.table.side_effect = RuntimeError("database unavailable")
+
+        response = client.get("/admin/metrics/dashboard")
+
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Failed to fetch dashboard metrics"}
 
     def test_admin_resource_not_in_allowlist(self, client: TestClient, mock_verify_admin: Mock):
         """Test admin accessing resource not in allowlist."""
@@ -555,11 +545,7 @@ class TestAdminEndpoints:
         """Test admin operations on non-existent instance."""
         # Setup - mock the provisioner service start function to raise 404
         with patch("backend.services.provisioner_service.start_instance") as mock_start:
-
-            async def mock_start_func(instance_id):
-                raise HTTPException(status_code=404, detail="Deployment not found")
-
-            mock_start.side_effect = mock_start_func
+            mock_start.side_effect = HTTPException(status_code=404, detail="Deployment not found")
 
             # Make request (admin auth is mocked)
             response = client.post("/admin/instances/999/start")
@@ -573,23 +559,19 @@ class TestAdminEndpoints:
     ):
         """Test admin sync with some errors."""
         with patch("backend.services.provisioner_service.sync_instances") as mock_sync:
-
-            async def mock_sync_func(sb):
-                return {
-                    "total": 10,
-                    "synced": 7,
-                    "errors": 3,
-                    "updates": [
-                        {
-                            "instance_id": "123",
-                            "old_status": "running",
-                            "new_status": "stopped",
-                            "reason": "status_mismatch",
-                        }
-                    ],
-                }
-
-            mock_sync.side_effect = mock_sync_func
+            mock_sync.return_value = {
+                "total": 10,
+                "synced": 7,
+                "errors": 3,
+                "updates": [
+                    {
+                        "instance_id": "123",
+                        "old_status": "running",
+                        "new_status": "stopped",
+                        "reason": "status_mismatch",
+                    }
+                ],
+            }
 
             # Make request (admin auth is mocked via fixture)
             response = client.post("/admin/sync-instances")

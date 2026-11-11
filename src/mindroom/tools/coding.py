@@ -9,6 +9,8 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
+    ToolManagedInitArg,
     ToolStatus,
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
@@ -21,7 +23,10 @@ if TYPE_CHECKING:
     name="coding",
     display_name="Coding Tools",
     description="Find code, search across files, and make precise edits",
+    docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#coding",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.AGENT,
+    managed_init_args=(ToolManagedInitArg.FILE_ACCESS, ToolManagedInitArg.SHARED_DIRECTORY_ROOTS),
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
@@ -38,17 +43,10 @@ if TYPE_CHECKING:
             description="Working directory for file operations. Defaults to current directory.",
             authored_override=False,
         ),
-        ConfigField(
-            name="restrict_to_base_dir",
-            label="Restrict To Base Dir",
-            type="boolean",
-            required=False,
-            default=True,
-            description="Whether file access must stay under base_dir. Relative paths still resolve from base_dir.",
-        ),
     ],
     dependencies=[],
     function_names=("edit_file", "find_files", "grep", "ls", "read_file", "write_file"),
+    workspace_writers=("edit_file", "write_file"),
 )
 def coding_tools() -> type[CodingTools]:
     """Return ergonomic coding tools for LLM agents."""

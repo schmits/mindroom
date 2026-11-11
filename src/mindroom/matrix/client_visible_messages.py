@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeIs
 
 import nio
-from nio.api import RelationshipType
-from typing_extensions import TypeIs
 
 from mindroom.constants import STREAM_STATUS_KEY
 from mindroom.entity_resolution import current_internal_sender_ids
@@ -21,8 +18,8 @@ from mindroom.matrix.message_content import (
     extract_edit_body,
     resolve_event_source_content,
 )
-from mindroom.matrix.sidecar_content import holds_unresolved_sidecar
 from mindroom.matrix.visible_body import bundled_visible_body_preview, visible_body_from_event_source
+from mindroom.tool_system.events import body_without_tool_markers
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
@@ -187,9 +184,8 @@ class ResolvedVisibleMessage:
             **({"thread_id": self.thread_id} if self.thread_id_known else {"thread_id_unknown": True}),
             "latest_event_id": self.latest_event_id,
         }
-        # Position and edit time are separate facts now that an edit no longer moves the message.
-        # Emitting the edit time keeps it available to consumers that used to read it off
-        # "timestamp" before that field became the immutable ordering key.
+        # "timestamp" is the creation time that orders the message; an edit's own time is a
+        # separate fact, reported only when the message was edited.
         if self.edited_timestamp is not None:
             message_data["edited_timestamp"] = self.edited_timestamp
         msgtype = self.content.get("msgtype")
@@ -219,22 +215,6 @@ def _resolved_trusted_sender_ids(
     return trusted_visible_sender_ids(config, runtime_paths)
 
 
-async def extract_visible_message(
-    event: VisibleRoomMessage,
-    client: nio.AsyncClient | None = None,
-    *,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    trusted_sender_ids: Collection[str] | None = None,
-) -> dict[str, Any]:
-    """Extract one visible message using runtime-derived sender trust."""
-    return await extract_and_resolve_message(
-        event,
-        client,
-        trusted_sender_ids=_resolved_trusted_sender_ids(config, runtime_paths, trusted_sender_ids),
-    )
-
-
 async def extract_visible_edit_body(
     event_source: dict[str, Any],
     client: nio.AsyncClient | None = None,
@@ -248,199 +228,6 @@ async def extract_visible_edit_body(
         event_source,
         client,
         trusted_sender_ids=_resolved_trusted_sender_ids(config, runtime_paths, trusted_sender_ids),
-    )
-
-
-def _is_replacement_for_event(
-    event_source: dict[str, Any],
-    *,
-    sender: str,
-    event_id: str,
-) -> bool:
-    """Return whether one replacement belongs to the event being recovered."""
-    event_info = EventInfo.from_event(event_source)
-    return event_source.get("sender") == sender and event_info.is_edit and event_info.original_event_id == event_id
-
-
-async def _latest_relation_or_original_body(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    event_id: str,
-    event: VisibleRoomMessage,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    trusted_sender_ids: Collection[str] | None,
-) -> str | None:
-    """Read the newest valid replacement relation, or the original body."""
-    relations = client.room_get_event_relations(
-        room_id,
-        event_id,
-        RelationshipType.replacement,
-        direction=nio.MessageDirection.back,
-    )
-    async with contextlib.aclosing(relations):
-        async for candidate in relations:
-            if candidate.sender != event.sender:
-                continue
-            replacement = candidate
-            if isinstance(replacement, nio.MegolmEvent):
-                if client.olm is None:
-                    return None
-                try:
-                    replacement = client.decrypt_event(replacement)
-                except nio.EncryptionError:
-                    return None
-            if isinstance(replacement, nio.RedactedEvent):
-                continue
-            if not is_visible_room_message(replacement):
-                return None
-            if not _is_replacement_for_event(
-                replacement.source,
-                sender=event.sender,
-                event_id=event_id,
-            ):
-                continue
-            body, content = await extract_visible_edit_body(
-                replacement.source,
-                client,
-                config=config,
-                runtime_paths=runtime_paths,
-                trusted_sender_ids=trusted_sender_ids,
-            )
-            return None if content is not None and holds_unresolved_sidecar(content) else body
-
-    resolved_source, body = await resolve_visible_event_source(
-        event.source,
-        client,
-        fallback_body=room_message_fallback_body(event),
-        config=config,
-        runtime_paths=runtime_paths,
-        trusted_sender_ids=trusted_sender_ids,
-    )
-    resolved_content = resolved_source.get("content")
-    if not isinstance(resolved_content, Mapping) or holds_unresolved_sidecar(resolved_content):
-        return None
-    return body
-
-
-async def fetch_latest_visible_message(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    event_id: str,
-    trusted_sender_ids: Collection[str] = (),
-) -> ResolvedVisibleMessage | None:
-    """Read one exact original and its complete replacement state, failing closed."""
-    response = await client.room_get_event(room_id, event_id)
-    if not isinstance(response, nio.RoomGetEventResponse):
-        return None
-    original = response.event
-    if isinstance(original, nio.MegolmEvent):
-        original = client.decrypt_event(original)
-    if not is_visible_room_message(original) or original.event_id != event_id:
-        return None
-    info = EventInfo.from_event(original.source)
-    if info.is_edit:
-        return None
-
-    edits = await _fetch_exact_replacements(client, room_id=room_id, original=original)
-    if edits is None:
-        return None
-    data = await extract_and_resolve_message(original, client, trusted_sender_ids=trusted_sender_ids)
-    message = ResolvedVisibleMessage.from_message_data(data, thread_id=info.thread_id, latest_event_id=event_id)
-    winner = edits.winner_for(event_id, sender=original.sender)
-    await apply_latest_edits_to_messages(
-        client,
-        messages_by_event_id={event_id: message},
-        edit_candidates=edits,
-        synthesize_unseen_originals=False,
-        trusted_sender_ids=trusted_sender_ids,
-    )
-    if winner is not None and message.latest_event_id != winner.event_id:
-        return None
-    # Replacements cannot change the original conversation or reply target.
-    original_relation = original.source["content"].get("m.relates_to")
-    message.content = dict(message.content)
-    message.content.pop("m.relates_to", None)
-    if original_relation is not None:
-        message.content["m.relates_to"] = original_relation
-    return None if holds_unresolved_sidecar(message.content) else message
-
-
-async def _fetch_exact_replacements(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    original: nio.RoomMessage,
-) -> ThreadEditCandidates | None:
-    """Collect complete same-sender edits, refusing unreadable replacement state."""
-    edits = ThreadEditCandidates()
-    relations = client.room_get_event_relations(
-        room_id,
-        original.event_id,
-        RelationshipType.replacement,
-        direction=nio.MessageDirection.back,
-    )
-    async with contextlib.aclosing(relations):
-        async for event in relations:
-            if event.sender != original.sender:
-                continue
-            candidate = client.decrypt_event(event) if isinstance(event, nio.MegolmEvent) else event
-            if isinstance(candidate, nio.RedactedEvent):
-                continue
-            if not is_visible_room_message(candidate):
-                return None
-            candidate_info = EventInfo.from_event(candidate.source)
-            if candidate_info.is_edit and candidate_info.original_event_id == original.event_id:
-                edits.record(candidate, event_info=candidate_info)
-    return edits
-
-
-async def fetch_latest_visible_body(
-    client: nio.AsyncClient,
-    *,
-    room_id: str,
-    event_id: str,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    trusted_sender_ids: Collection[str] | None = None,
-) -> str | None:
-    """Fetch an event's authoritative latest visible body, failing closed."""
-    response = await client.room_get_event(room_id, event_id)
-    if not isinstance(response, nio.RoomGetEventResponse):
-        return None
-    event = response.event
-    if not is_visible_room_message(event):
-        return None
-    event_source = event.source if isinstance(event.source, dict) else None
-    if event_source is None:
-        return None
-    replacements = bundled_replacement_candidates(event_source)
-    for replacement in replacements:
-        if not _is_replacement_for_event(
-            replacement,
-            sender=event.sender,
-            event_id=event_id,
-        ):
-            continue
-        body, content = await extract_visible_edit_body(
-            replacement,
-            client,
-            config=config,
-            runtime_paths=runtime_paths,
-            trusted_sender_ids=trusted_sender_ids,
-        )
-        return None if content is not None and holds_unresolved_sidecar(content) else body
-
-    return await _latest_relation_or_original_body(
-        client,
-        room_id=room_id,
-        event_id=event_id,
-        event=event,
-        config=config,
-        runtime_paths=runtime_paths,
-        trusted_sender_ids=trusted_sender_ids,
     )
 
 
@@ -476,19 +263,14 @@ def message_preview(body: object, max_length: int = 120) -> str:
 def bundled_replacement_candidates(event_source: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Return bundled replacement candidates in preference order.
 
-    One order, shared by every reader, because the alternative is what this
-    replaced: a preview and a reconstructed history disagreeing about which
-    edit a message currently shows, for a source carrying both keys.
-
     ``latest_event`` before ``event`` is the order that is correct when they
     differ. ``event`` is whichever replacement the server chose to bundle;
     ``latest_event`` is the statement that this is the most recent one, which
     is the question a reader is asking. The bare aggregation is last because it
     is a stub rather than an event and only sometimes carries enough to parse.
 
-    Whether a candidate may be trusted is not decided here. Consumers differ on that
-    -- a preview validates the sender, a history read parses and type-checks --
-    so this yields candidates and each reader refuses the ones it cannot use.
+    Whether a candidate may be trusted is not decided here: the caller validates
+    each candidate's sender and skips the ones it cannot use.
     """
     candidates: list[dict[str, Any]] = []
     unsigned = event_source.get("unsigned")
@@ -530,11 +312,12 @@ async def bundled_replacement_body(
             trusted_sender_ids=trusted_sender_ids,
         )
         if body is not None:
-            return body
+            new_content = resolved_candidate.get("content", {}).get("m.new_content")
+            return body_without_tool_markers(body, new_content) if isinstance(new_content, dict) else body
     return None
 
 
-def room_message_fallback_body(event: nio.Event) -> str:
+def _room_message_fallback_body(event: nio.Event) -> str:
     """Return one best-effort Matrix body for a room message event."""
     if is_visible_room_message(event):
         return event.body
@@ -569,15 +352,18 @@ async def thread_root_body_preview(
     )
     if replacement_body is not None:
         return message_preview(replacement_body)
-    _resolved_event_source, visible_body = await resolve_visible_event_source(
+    resolved_event_source, visible_body = await resolve_visible_event_source(
         event_source,
         client,
-        fallback_body=room_message_fallback_body(event),
+        fallback_body=_room_message_fallback_body(event),
         config=config,
         runtime_paths=runtime_paths,
         trusted_sender_ids=trusted_sender_ids,
     )
-    return message_preview(visible_body)
+    content = resolved_event_source.get("content")
+    return message_preview(
+        body_without_tool_markers(visible_body, content) if isinstance(content, dict) else visible_body,
+    )
 
 
 def replace_visible_message(
@@ -587,19 +373,12 @@ def replace_visible_message(
     body: str | None = None,
 ) -> ResolvedVisibleMessage:
     """Return one visible-message copy while keeping body/content coherent."""
-    updated_content: dict[str, Any] | None = None
-    if body is not None:
-        content = message.content
-        updated_content = dict(content)
-        updated_content["body"] = body
-
     updates: dict[str, str | dict[str, Any]] = {}
     if sender is not None:
         updates["sender"] = sender
     if body is not None:
         updates["body"] = body
-    if updated_content is not None:
-        updates["content"] = updated_content
+        updates["content"] = {**message.content, "body": body}
     return replace(message, **updates)
 
 
@@ -656,12 +435,12 @@ def _edit_payload_rank(event: VisibleRoomMessage) -> tuple[bool, int, str]:
 
 
 @dataclass(slots=True)
-class ThreadEditCandidates:
-    """Replacement candidates for one reconstruction, kept per original and per sender.
+class EditCandidates:
+    """Replacement candidates among raw message events, kept per original and per sender.
 
-    Matrix replacement events are only legitimate from the sender of the event they replace, but a
-    thread is reconstructed from raw timeline events rather than from the homeserver's bundled
-    relations, so nothing upstream has applied that rule. Candidates are therefore kept per sender
+    Matrix replacement events are only legitimate from the sender of the event they replace, but
+    raw timeline events carry no homeserver-applied bundled relations, so nothing upstream has
+    applied that rule. Candidates are therefore kept per sender
     and the sender check is applied when an edit is matched to its original, which is the first
     point where the original's sender is known. Keeping only a single global newest candidate
     would let one foreign edit hide the newest legitimate one.
@@ -722,27 +501,15 @@ class ThreadEditCandidates:
 
 
 async def apply_latest_edits_to_messages(
-    client: nio.AsyncClient,
+    client: nio.AsyncClient | None,
     *,
     messages_by_event_id: dict[str, ResolvedVisibleMessage],
-    edit_candidates: ThreadEditCandidates,
-    synthesize_unseen_originals: bool = True,
+    edit_candidates: EditCandidates,
     trusted_sender_ids: Collection[str] = (),
 ) -> None:
-    """Apply latest edits to message records, reconstructing unseen originals when allowed.
-
-    ``synthesize_unseen_originals=False`` is for a read scoped to one thread. Such a read has no
-    way to place a message it never saw: the original carries the relation, the replacement
-    inherits it rather than restating it, and applying ``m.new_content`` ignores any relation
-    written inside the replacement. Nothing left could admit the reconstruction except the
-    replacement's own claim to belong here, so the read declines to contain it at all - saying its
-    placement is unknown would not undo it having been published into this thread's answer.
-    """
+    """Apply latest edits to message records, reconstructing originals that were never seen."""
     for original_event_id in edit_candidates.original_event_ids():
         existing_message = messages_by_event_id.get(original_event_id)
-        # Bail out before resolving potentially large edit payloads from sidecar storage.
-        if existing_message is None and not synthesize_unseen_originals:
-            continue
         edit_event = edit_candidates.winner_for(
             original_event_id,
             sender=None if existing_message is None else existing_message.sender,
@@ -798,17 +565,13 @@ async def resolve_latest_visible_messages(
     events: Sequence[VisibleRoomMessage],
     client: nio.AsyncClient,
     *,
-    sender: str | None = None,
     trusted_sender_ids: Collection[str] = (),
 ) -> dict[str, ResolvedVisibleMessage]:
     """Resolve the latest visible message state by original event ID for a set of message events."""
     messages_by_event_id: dict[str, ResolvedVisibleMessage] = {}
-    edit_candidates = ThreadEditCandidates()
+    edit_candidates = EditCandidates()
 
     for event in events:
-        if sender is not None and event.sender != sender:
-            continue
-
         event_info = EventInfo.from_event(event.source)
         if edit_candidates.record(event, event_info=event_info):
             continue
@@ -837,21 +600,17 @@ async def resolve_latest_visible_messages(
 
 
 __all__ = [
+    "EditCandidates",
     "ResolvedVisibleMessage",
-    "ThreadEditCandidates",
     "apply_latest_edits_to_messages",
     "bundled_replacement_body",
     "bundled_replacement_candidates",
     "extract_visible_edit_body",
-    "extract_visible_message",
-    "fetch_latest_visible_body",
-    "fetch_latest_visible_message",
     "is_visible_room_message",
     "message_preview",
     "replace_visible_message",
     "resolve_latest_visible_messages",
     "resolve_visible_event_source",
-    "room_message_fallback_body",
     "thread_root_body_preview",
     "trusted_visible_sender_ids",
 ]

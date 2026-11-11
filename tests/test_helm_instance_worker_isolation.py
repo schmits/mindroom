@@ -2,17 +2,41 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import fcntl
 import hashlib
 import json
+import os
 import shutil
 import subprocess
-from pathlib import Path
-from typing import Any
+import textwrap
+import tomllib
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
 
+from mindroom.agent_modes import set_agent_mode
 from mindroom.config.main import Config
+from mindroom.constants import resolve_runtime_paths
+from mindroom.legacy_state_root_records import migrate_state_root_records
+from mindroom.matrix.invited_rooms_store import invited_rooms_path, pending_room_invites_path
+from mindroom.matrix.personal_room_store import (
+    PersonalRoomRecord,
+    personal_room_digest,
+    personal_room_record_path,
+    write_personal_room,
+)
+from mindroom.private_storage.private_instance_identity_store import ensure_private_instance_identity
+from mindroom.session_storage import agent_storage
+from mindroom.session_storage.agent_storage import create_agent_state_storage
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from mindroom.session_storage.store import ConversationStore
 
 
 def _render_chart(
@@ -45,6 +69,8 @@ def _run_helm_template(
 ) -> subprocess.CompletedProcess[str]:
     helm = shutil.which("helm")
     if helm is None:
+        if os.environ.get("CI"):
+            pytest.fail("helm must be available in CI, where the pytest workflow runs these checks")
         pytest.skip("helm is required for rendered chart checks")
     return subprocess.run(
         [
@@ -63,20 +89,25 @@ def _run_helm_template(
     )
 
 
+def _values_files(tmp_path: Path, *values: str | dict[str, Any]) -> tuple[Path, ...]:
+    """Write each values document, dedented YAML text or a mapping, to its own file in Helm merge order."""
+    paths = tuple(tmp_path / f"values-{index}.yaml" for index in range(len(values)))
+    for path, value in zip(paths, values, strict=True):
+        path.write_text(textwrap.dedent(value) if isinstance(value, str) else yaml.safe_dump(value), encoding="utf-8")
+    return paths
+
+
 def _render_instance_chart() -> list[dict[str, Any]]:
-    return _render_chart(
-        Path("cluster/k8s/instance"),
-        "workerBackend=kubernetes",
-        "storageAccessMode=ReadWriteMany",
-    )
+    return _render_chart(Path("cluster/k8s/instance"))
 
 
-def _render_runtime_chart() -> list[dict[str, Any]]:
+def _render_runtime_chart(*extra_set_args: str) -> list[dict[str, Any]]:
     return _render_chart(
         Path("cluster/k8s/runtime"),
         "workers.backend=kubernetes",
         "workers.sandbox.proxyToken.value=test-token",
         "eventCache.postgres.auth.password=test-password",
+        *extra_set_args,
         release_name="mindroom-runtime",
     )
 
@@ -103,13 +134,14 @@ def test_runtime_chart_exposes_exact_script_resource_profiles_to_primary() -> No
     }
 
 
-def _render_runtime_chart_with_separate_worker_namespace() -> list[dict[str, Any]]:
+def _render_runtime_chart_with_separate_worker_namespace(*extra_set_args: str) -> list[dict[str, Any]]:
     return _render_chart(
         Path("cluster/k8s/runtime"),
         "workers.backend=kubernetes",
         "workers.kubernetes.namespace=mindroom-workers",
         "workers.sandbox.proxyToken.value=test-token",
         "eventCache.postgres.auth.password=test-password",
+        *extra_set_args,
         release_name="mindroom-runtime",
     )
 
@@ -145,6 +177,15 @@ def _env_by_name(container: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {env["name"]: env for env in container["env"]}
 
 
+def _secret_key_refs(container: dict[str, Any]) -> list[dict[str, Any]]:
+    assert "envFrom" not in container
+    return [env["valueFrom"]["secretKeyRef"] for env in container["env"] if "secretKeyRef" in env.get("valueFrom", {})]
+
+
+def _volumes_by_name(deployment: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {volume["name"]: volume for volume in deployment["spec"]["template"]["spec"]["volumes"]}
+
+
 def _instance_secret_hash(**overrides: str) -> str:
     secret_data = {
         "openai_key": "",
@@ -152,11 +193,11 @@ def _instance_secret_hash(**overrides: str) -> str:
         "openrouter_key": "",
         "google_key": "",
         "deepseek_key": "",
-        "supabase_service_key": "",
         "sandbox_proxy_token": "",
         "credentials_encryption_key": "",
         "matrix_oidc_client_secret": "",
         "matrix_registration_shared_secret": "",
+        "platform_sso_secret": "",
     }
     secret_data.update(overrides)
     ordered_values = [
@@ -165,24 +206,189 @@ def _instance_secret_hash(**overrides: str) -> str:
         secret_data["openrouter_key"],
         secret_data["google_key"],
         secret_data["deepseek_key"],
-        secret_data["supabase_service_key"],
         secret_data["sandbox_proxy_token"],
         secret_data["credentials_encryption_key"],
         secret_data["matrix_oidc_client_secret"],
         secret_data["matrix_registration_shared_secret"],
+        secret_data["platform_sso_secret"],
     ]
     return hashlib.sha256("|".join(ordered_values).encode("utf-8")).hexdigest()
 
 
-def test_instance_chart_worker_network_policy_allows_runner_ingress_only_from_control_plane() -> None:
-    """Worker runner ingress should not allow every pod carrying the instance label."""
-    docs = _render_instance_chart()
-    policy = _resource(docs, "NetworkPolicy", "instance-traffic-controls-demo")
-    worker_rule = next(
-        rule for rule in policy["spec"]["ingress"] if any(port.get("port") == 8766 for port in rule.get("ports", []))
+def _tuwunel_config(docs: list[dict[str, Any]], customer: str) -> dict[str, Any]:
+    return tomllib.loads(_resource(docs, "ConfigMap", f"tuwunel-config-{customer}")["data"]["tuwunel.toml"])["global"]
+
+
+@pytest.mark.parametrize("worker_backend", ["kubernetes", "docker"])
+def test_instance_chart_refuses_dedicated_workers_in_the_shared_tenant_namespace(worker_backend: str) -> None:
+    """A tenant's worker manager would control every tenant's Deployments and Services in the shared namespace."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/instance"),
+        f"workerBackend={worker_backend}",
+        "storageAccessMode=ReadWriteMany",
     )
 
-    assert worker_rule["from"] == [{"podSelector": {"matchLabels": {"app": "mindroom", "customer": "demo"}}}]
+    assert completed.returncode != 0
+    assert "workerBackend must be static_runner" in completed.stderr
+
+
+def test_instance_chart_grants_tenant_pods_no_kubernetes_api_access() -> None:
+    """No tenant pod may hold a Kubernetes API credential or a namespace role."""
+    docs = _render_instance_chart()
+    pod_specs = [doc["spec"]["template"]["spec"] for doc in docs if doc["kind"] == "Deployment"]
+
+    assert {doc["kind"] for doc in docs}.isdisjoint({"Role", "RoleBinding", "ServiceAccount"})
+    assert [pod.get("automountServiceAccountToken") for pod in pod_specs] == [False, False]
+    assert all("serviceAccountName" not in pod for pod in pod_specs)
+
+
+_BASELINE_CAPABILITIES = {
+    "AUDIT_WRITE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "MKNOD",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+}
+
+
+def test_instance_chart_pods_satisfy_the_tenant_namespace_pod_security_baseline() -> None:
+    """The tenant namespace enforces the Pod Security baseline profile, so every chart pod must pass it."""
+    docs = _render_chart(Path("cluster/k8s/instance"), "imagePullSecrets[0].name=ghcr-pull")
+    templates = [doc["spec"]["template"] for doc in docs if doc["kind"] == "Deployment"]
+
+    assert len(templates) == 2
+    for template in templates:
+        pod = template["spec"]
+        annotations = template["metadata"].get("annotations", {})
+        assert not any(key.startswith("container.apparmor.security.beta.kubernetes.io/") for key in annotations)
+        for host_field in ("hostNetwork", "hostPID", "hostIPC"):
+            assert not pod.get(host_field)
+        assert all("hostPath" not in volume for volume in pod["volumes"])
+        containers = [*pod.get("initContainers", []), *pod["containers"]]
+        for security_context in [pod.get("securityContext", {}), *(c.get("securityContext", {}) for c in containers)]:
+            assert security_context.get("seccompProfile", {}).get("type") != "Unconfined"
+            assert security_context.get("appArmorProfile", {}).get("type") != "Unconfined"
+            assert "seLinuxOptions" not in security_context
+            assert "windowsOptions" not in security_context
+        assert "sysctls" not in pod.get("securityContext", {})
+        for container in containers:
+            security_context = container.get("securityContext", {})
+            assert not security_context.get("privileged")
+            assert set(security_context.get("capabilities", {}).get("add", [])) <= _BASELINE_CAPABILITIES
+            assert "procMount" not in security_context
+            assert all("hostPort" not in port for port in container.get("ports", []))
+
+
+def test_instance_chart_pods_run_under_the_runtime_default_seccomp_profile() -> None:
+    """Tenant pods share a node and the MindRoom pod runs tenant code, so no instance pod may run without the runtime's syscall filter."""
+    docs = _render_chart(Path("cluster/k8s/instance"), "imagePullSecrets[0].name=ghcr-pull")
+    pods = [doc["spec"]["template"]["spec"] for doc in docs if doc["kind"] == "Deployment"]
+
+    assert len(pods) == 2
+    for pod in pods:
+        assert pod["securityContext"]["seccompProfile"] == {"type": "RuntimeDefault"}
+        for container in [*pod.get("initContainers", []), *pod["containers"]]:
+            assert "seccompProfile" not in container.get("securityContext", {})
+
+
+def _hcl_block(text: str, header: str) -> str:
+    start = text.index(header)
+    depth = 0
+    for index in range(text.index("{", start), len(text)):
+        depth += {"{": 1, "}": -1}.get(text[index], 0)
+        if depth == 0:
+            return text[start : index + 1]
+    msg = f"unterminated block {header!r}"
+    raise AssertionError(msg)
+
+
+def test_tenant_namespace_enforces_the_pod_security_baseline() -> None:
+    """Admission must reject privileged or host-reaching pods in the namespace that runs tenant code."""
+    terraform = Path("cluster/terraform/terraform-k8s/cert-manager.tf").read_text(encoding="utf-8")
+    namespace = _hcl_block(terraform, 'resource "kubernetes_namespace" "mindroom_instances"')
+    kind_install = Path("cluster/k8s/kind/install_platform.sh").read_text(encoding="utf-8")
+
+    assert '"pod-security.kubernetes.io/enforce" = "baseline"' in namespace
+    assert "kubectl label namespace mindroom-instances pod-security.kubernetes.io/enforce=baseline" in kind_install
+
+
+def test_instance_chart_limits_web_egress_to_public_addresses_and_the_ingress_controller() -> None:
+    """Tenant code must not reach metadata services, private networks, or other pods over HTTP(S)."""
+    docs = _render_instance_chart()
+    policy = _resource(docs, "NetworkPolicy", "instance-traffic-controls-demo")
+    web_rules = [
+        rule for rule in policy["spec"]["egress"] if {port.get("port") for port in rule.get("ports", [])} & {80, 443}
+    ]
+
+    assert web_rules == [
+        {
+            "to": [
+                {
+                    "ipBlock": {
+                        "cidr": "0.0.0.0/0",
+                        "except": [
+                            "10.0.0.0/8",
+                            "100.64.0.0/10",
+                            "169.254.0.0/16",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                        ],
+                    },
+                },
+                {"ipBlock": {"cidr": "::/0", "except": ["fc00::/7", "fe80::/10"]}},
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ingress-nginx"}},
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/component": "controller",
+                            "app.kubernetes.io/name": "ingress-nginx",
+                        },
+                    },
+                },
+            ],
+            "ports": [{"port": 80}, {"port": 443}],
+        },
+    ]
+    assert all(
+        "to" in rule for rule in policy["spec"]["egress"] if {port.get("port") for port in rule["ports"]} != {53}
+    )
+
+
+def _ingress_controller_peers(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    rules = [*policy["spec"]["ingress"], *policy["spec"]["egress"]]
+    peers = [peer for rule in rules for peer in [*rule.get("from", []), *rule.get("to", [])]]
+    return [peer for peer in peers if "namespaceSelector" in peer]
+
+
+@pytest.mark.parametrize(("namespace", "expected"), [(None, "ingress-nginx"), ("nginx", "nginx")])
+def test_instance_chart_admits_the_configured_ingress_controller_namespace(
+    namespace: str | None,
+    expected: str,
+) -> None:
+    """Both controller rules follow one chart value, whose default keeps the namespace existing releases admit."""
+    set_args = () if namespace is None else (f"ingressControllerNamespace={namespace}",)
+    policy = _resource(
+        _render_chart(Path("cluster/k8s/instance"), *set_args),
+        "NetworkPolicy",
+        "instance-traffic-controls-demo",
+    )
+
+    assert _ingress_controller_peers(policy) == 2 * [
+        {
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": expected}},
+            "podSelector": {
+                "matchLabels": {"app.kubernetes.io/component": "controller", "app.kubernetes.io/name": "ingress-nginx"},
+            },
+        },
+    ]
 
 
 def test_instance_chart_network_policy_limits_public_ports_to_ingress_and_instance_pods() -> None:
@@ -212,16 +418,6 @@ def test_instance_chart_network_policy_limits_public_ports_to_ingress_and_instan
             "ports": [{"port": 8765}, {"port": 8008}],
         },
     ]
-
-
-def test_instance_chart_disables_service_links_for_dynamic_worker_pods_by_default() -> None:
-    """The control plane should configure generated worker pod specs with service links disabled."""
-    docs = _render_instance_chart()
-    deployment = _resource(docs, "Deployment", "mindroom-demo")
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    env_values = {env["name"]: env.get("value") for env in container["env"]}
-
-    assert env_values["MINDROOM_KUBERNETES_WORKER_ENABLE_SERVICE_LINKS"] == "false"
 
 
 def test_instance_chart_sets_public_url_for_oauth_redirects() -> None:
@@ -257,7 +453,6 @@ def test_instance_chart_configures_owner_room_access_for_oidc_tenants() -> None:
         ),
     )
     mindroom_config = yaml.safe_load(_resource(docs, "ConfigMap", "mindroom-config-42")["data"]["config.yaml"])
-    synapse_config = yaml.safe_load(_resource(docs, "ConfigMap", "synapse-config-42")["data"]["homeserver.yaml"])
 
     assert "access_model" not in mindroom_config
     assert mindroom_config["administrators"] == ["@owner:42.example.test"]
@@ -269,26 +464,240 @@ def test_instance_chart_configures_owner_room_access_for_oidc_tenants() -> None:
         "admins": ["@owner:42.example.test"],
     }
     Config.model_validate(mindroom_config)
-    assert synapse_config["auto_join_rooms"] == [
-        "#lobby:42.example.test",
-        "#dev:42.example.test",
+    assert _tuwunel_config(docs, "42")["auto_join_rooms"] == ["#lobby:42.example.test", "#dev:42.example.test"]
+
+
+@pytest.mark.parametrize(
+    ("auth_args", "expected"),
+    [
+        (
+            ("accountId=account-42", "supabaseUrl=https://supabase.example.test", "supabaseAnonKey=anon-key"),
+            "@owner:42.example.test",
+        ),
+        (("supabaseUrl=https://supabase.example.test", "supabaseAnonKey=anon-key"), None),
+        (("accountId=account-42", "allowUnauthenticatedPrimary=true"), None),
+    ],
+    ids=["platform-login", "no-account-binding", "open-access"],
+)
+def test_instance_chart_maps_platform_logins_to_the_owner_only_behind_supabase(
+    auth_args: tuple[str, ...],
+    expected: str | None,
+) -> None:
+    """Only account-bound platform logins act as the owner; never other project users or credentialless requests."""
+    docs = _render_chart(
+        Path("cluster/k8s/instance"),
+        "customer=42",
+        "baseDomain=example.test",
+        *auth_args,
+        set_string_args=("administrators[0]=@owner:42.example.test",),
+    )
+    container = _resource(docs, "Deployment", "mindroom-42")["spec"]["template"]["spec"]["containers"][0]
+    env_values = {env["name"]: env.get("value") for env in container["env"]}
+
+    assert env_values.get("MINDROOM_OWNER_USER_ID") == expected
+
+
+@pytest.mark.parametrize(
+    "oidc_args",
+    [(), ("matrixOidc.enabled=true", "matrixOidc.issuer=https://api.example.test/matrix-oidc")],
+    ids=["default", "oidc"],
+)
+def test_instance_chart_closes_public_tuwunel_registration(oidc_args: tuple[str, ...]) -> None:
+    """Tenant homeservers are public, so no mode may accept anonymous self-registration or grant server admin."""
+    docs = _render_chart(Path("cluster/k8s/instance"), *oidc_args)
+    tuwunel_config = _tuwunel_config(docs, "demo")
+
+    assert tuwunel_config["allow_registration"] is False
+    assert tuwunel_config["registration_shared_secret_file"] == (
+        "/etc/mindroom-secrets/matrix_registration_shared_secret"  # noqa: S105
+    )
+    assert tuwunel_config["grant_admin_to_first_user"] is False
+    assert tuwunel_config["allow_federation"] is False
+    # Synapse kept the platform's display name and accepted 50 MiB uploads.
+    assert tuwunel_config["new_user_displayname_suffix"] == ""
+    assert tuwunel_config["max_request_size"] == "50 MiB"
+    # Wrong passwords keep Tuwunel's default brute-force limit; only successful sign-ins get a larger burst.
+    assert tuwunel_config["rate_limiting"]["login"] == {"account": {"per_second": 0.05, "burst_count": 10}}
+
+
+def test_instance_chart_signs_owners_in_through_platform_oidc_with_bound_tokens() -> None:
+    """The platform names the owner's localpart, and OpenID tokens stay bound to the server that asked."""
+    docs = _render_chart(
+        Path("cluster/k8s/instance"),
+        "customer=42",
+        "baseDomain=example.test",
+        "matrixOidc.enabled=true",
+        "matrixOidc.issuer=https://api.example.test/matrix-oidc",
+    )
+    tuwunel_config = _tuwunel_config(docs, "42")
+
+    assert tuwunel_config["server_name"] == "42.example.test"
+    assert tuwunel_config["mindroom_openid_audience"] is True
+    assert tuwunel_config["mindroom_compact_edits_enabled"] is True
+    assert tuwunel_config["identity_provider"] == [
+        {
+            "brand": "mindroom",
+            "name": "MindRoom",
+            "client_id": "mindroom-matrix",
+            "client_secret_file": "/etc/mindroom-secrets/matrix_oidc_client_secret",
+            "issuer_url": "https://api.example.test/matrix-oidc",
+            "callback_url": "https://42.matrix.example.test/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+            "scope": ["openid", "profile", "email"],
+            "userid_claims": ["preferred_username"],
+            "unique_id_fallbacks": False,
+        },
     ]
-    assert synapse_config["autocreate_auto_join_rooms"] is False
+    assert "identity_provider" not in _tuwunel_config(_render_instance_chart(), "demo")
+
+
+def _reset_container() -> dict[str, Any]:
+    deployment = _resource(_render_instance_chart(), "Deployment", "mindroom-demo")
+    return next(
+        container
+        for container in deployment["spec"]["template"]["spec"]["initContainers"]
+        if container["name"] == "reset-synapse-matrix-state"
+    )
+
+
+def _run_reset(reset: dict[str, Any], storage: Path) -> None:
+    subprocess.run([*reset["command"], *reset["args"]], env={**os.environ, "STORAGE": str(storage)}, check=True)
+
+
+def test_instance_chart_resets_synapse_matrix_state_once(tmp_path: Path) -> None:
+    """The first start on Tuwunel drops the state bound to the Synapse server; later starts keep the new state."""
+    reset = _reset_container()
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path, process_env={})
+    bound = [
+        personal_room_record_path(paths, "router", "@owner:1.mindroom.chat"),
+        invited_rooms_path(paths, "router"),
+        pending_room_invites_path(paths, "router"),
+        tmp_path / "matrix_state.yaml",
+        tmp_path / "encryption_keys" / "mindroom_router_1.mindroom.chat" / "store.db",
+        tmp_path / "sync_continuity" / "router.json",
+        tmp_path / "tracking" / "event_journal.db",
+        tmp_path / "tracking" / "event_journal.db-wal",
+        tmp_path / "tracking" / "event_journal_binding.json",
+    ]
+    kept = [
+        tmp_path / "credentials" / "openrouter_credentials.json",
+        tmp_path / "tracking" / "memory_auto_flush.json",
+        tmp_path / "tracking" / "agents" / "router" / "agent_modes.json",
+    ]
+
+    for path in [*bound, *kept]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("synapse\n")
+    _run_reset(reset, tmp_path)
+    assert [path for path in bound if path.exists()] == []
+    assert all(path.read_text() == "synapse\n" for path in kept)
+    for path in bound:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("tuwunel\n")
+    _run_reset(reset, tmp_path)
+    assert all(path.read_text() == "tuwunel\n" for path in bound)
+    assert [mount["mountPath"] for mount in reset["volumeMounts"]] == [_env_by_name(reset)["STORAGE"]["value"]]
+
+
+def test_instance_chart_reset_keeps_pre_move_room_records_from_coming_back(tmp_path: Path) -> None:
+    """Room records still in agents/<agent>/ would move below tracking/ at startup, so the reset drops them too."""
+    owner = "@owner:1.mindroom.chat"
+
+    def synapse_era_storage(storage: Path) -> None:
+        legacy = storage / "agents" / "router"
+        legacy.mkdir(parents=True)
+        (legacy / "invited_rooms.json").write_text('["!deleted:1.mindroom.chat"]')
+        (legacy / "pending_room_invites.json").write_text('{"!deleted:1.mindroom.chat": "@owner:1.mindroom.chat"}')
+        write_personal_room(
+            legacy / "personal_rooms" / f"{personal_room_digest(owner)}.json",
+            PersonalRoomRecord(
+                user_id=owner,
+                alias="#personal_owner:1.mindroom.chat",
+                source_room_id="!lobby:1.mindroom.chat",
+                room_id="!deleted:1.mindroom.chat",
+            ),
+        )
+
+    def migrated(storage: Path) -> list[Path]:
+        paths = resolve_runtime_paths(config_path=storage / "config.yaml", storage_path=storage, process_env={})
+        asyncio.run(migrate_state_root_records(paths))
+        return [
+            path
+            for path in (
+                personal_room_record_path(paths, "router", owner),
+                invited_rooms_path(paths, "router"),
+                pending_room_invites_path(paths, "router"),
+            )
+            if path.exists()
+        ]
+
+    control = tmp_path / "control"
+    synapse_era_storage(control)
+    assert len(migrated(control)) == 3
+
+    storage = tmp_path / "storage"
+    synapse_era_storage(storage)
+    # Tool code can write agents/: a link or a deeper file with a record's name must not redirect the deletion.
+    (storage / "credentials").mkdir()
+    (storage / "credentials" / "invited_rooms.json").write_text("kept\n")
+    (storage / "agents" / "linked").symlink_to(storage / "credentials")
+    (storage / "agents" / "router" / "notes").mkdir()
+    (storage / "agents" / "router" / "notes" / "invited_rooms.json").write_text("kept\n")
+    # An entry the reset cannot read is skipped, as the startup migration skips it, so the pod still starts.
+    (storage / "agents" / "unreadable").mkdir(mode=0)
+    try:
+        _run_reset(_reset_container(), storage)
+    finally:
+        (storage / "agents" / "unreadable").chmod(0o700)
+    assert (storage / ".homeserver-tuwunel").exists()
+
+    assert migrated(storage) == []
+    assert (storage / "credentials" / "invited_rooms.json").read_text() == "kept\n"
+    assert (storage / "agents" / "router" / "notes" / "invited_rooms.json").read_text() == "kept\n"
+
+
+def test_instance_chart_runs_one_tuwunel_that_reads_its_rendered_config() -> None:
+    """Tuwunel locks its database, reads TUWUNEL_* variables as config, and must find the files its config names."""
+    docs = _render_chart(
+        Path("cluster/k8s/instance"),
+        "matrixOidc.enabled=true",
+        "matrixOidc.issuer=https://api.test/oidc",
+    )
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
+    pod = tuwunel["spec"]["template"]["spec"]
+    container = _container(tuwunel, "tuwunel")
+    mounts = {mount["name"]: mount for mount in container["volumeMounts"]}
+    config = _tuwunel_config(docs, "demo")
+    secret_dir = mounts["mindroom-secrets"]["mountPath"]
+    secret_files = {
+        f"{secret_dir}/{item['path']}" for item in _volumes_by_name(tuwunel)["mindroom-secrets"]["secret"]["items"]
+    }
+
+    assert tuwunel["spec"]["strategy"] == {"type": "Recreate"}
+    assert pod["enableServiceLinks"] is False
+    assert container["securityContext"] == {"allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+    assert _env_by_name(container)["TUWUNEL_CONFIG"]["value"] == mounts["tuwunel-config"]["mountPath"]
+    assert config["database_path"] == mounts["tuwunel-data"]["mountPath"]
+    assert {
+        config["registration_shared_secret_file"],
+        config["identity_provider"][0]["client_secret_file"],
+    } == secret_files
+    # The config is mounted with subPath, which never refreshes in a running pod, so a change must roll the pod.
+    plain = _resource(_render_instance_chart(), "Deployment", "tuwunel-demo")
+    config_hashes = {
+        deployment["spec"]["template"]["metadata"]["annotations"]["mindroom.ai/tuwunel-config-hash"]
+        for deployment in (tuwunel, plain)
+    }
+    assert len(config_hashes) == 2
 
 
 def test_instance_chart_wires_image_pull_secrets_to_control_plane_pods() -> None:
     """Private registry credentials should be available before pulling instance images."""
-    docs = _render_chart(
-        Path("cluster/k8s/instance"),
-        "workerBackend=kubernetes",
-        "storageAccessMode=ReadWriteMany",
-        "imagePullSecrets[0].name=ghcr-pull",
-    )
-    deployment = _resource(docs, "Deployment", "mindroom-demo")
-    worker_manager_account = _resource(docs, "ServiceAccount", "mindroom-worker-manager-demo")
+    docs = _render_chart(Path("cluster/k8s/instance"), "imagePullSecrets[0].name=ghcr-pull")
 
-    assert deployment["spec"]["template"]["spec"]["imagePullSecrets"] == [{"name": "ghcr-pull"}]
-    assert worker_manager_account["imagePullSecrets"] == [{"name": "ghcr-pull"}]
+    for name in ("mindroom-demo", "tuwunel-demo"):
+        assert _resource(docs, "Deployment", name)["spec"]["template"]["spec"]["imagePullSecrets"] == [
+            {"name": "ghcr-pull"},
+        ]
 
 
 def test_runtime_chart_renders_content_bundle_init_containers_after_user_init_containers(tmp_path: Path) -> None:
@@ -351,13 +760,11 @@ def test_runtime_chart_renders_content_bundle_init_containers_after_user_init_co
     )
     assert team_config["imagePullPolicy"] == "IfNotPresent"
     assert team_config["command"] == ["sh", "-ec"]
-    assert team_config["args"] == [
-        "set -eu\n"
-        'rm -rf "/app/agent_data/content-bundles/team-config"\n'
-        'mkdir -p "/app/agent_data/content-bundles/team-config"\n'
-        'cp -a "/bundle/." "/app/agent_data/content-bundles/team-config/"\n'
-        '"/app/agent_data/content-bundles/team-config/scripts/seed-content.sh"',
-    ]
+    team_config_script, *team_config_args = team_config["args"]
+    assert team_config_args == ["content-bundle-team-config", "/bundle", "/app/agent_data/content-bundles/team-config"]
+    # The seed runs after the sync, which tests/test_runtime_chart_content_bundles.py executes.
+    assert team_config_script.startswith("set -eu\nsrc=$1\ndst=$2\n")
+    assert team_config_script.endswith('\nfi\n"/app/agent_data/content-bundles/team-config/scripts/seed-content.sh"')
     assert team_config["volumeMounts"] == [
         {
             "name": "storage",
@@ -365,9 +772,10 @@ def test_runtime_chart_renders_content_bundle_init_containers_after_user_init_co
         },
     ]
     assert policy_pack["args"] == [
-        "set -eu\n"
-        'mkdir -p "/app/agent_data/content-bundles/policy-pack"\n'
-        'cp -a "/bundle/." "/app/agent_data/content-bundles/policy-pack/"',
+        'set -eu\nmkdir -p "$2"\ncp -a "$1/." "$2/"',
+        "content-bundle-policy-pack",
+        "/bundle",
+        "/app/agent_data/content-bundles/policy-pack",
     ]
 
 
@@ -390,6 +798,282 @@ def test_runtime_chart_rejects_content_bundle_images_without_digest(image: str) 
 
     assert completed.returncode != 0
     assert "contentBundles[0].image must be pinned by full sha256 digest" in completed.stderr
+
+
+def test_runtime_chart_native_bootstrap_runs_in_main_container() -> None:
+    """Bootstrap must use the runtime image, environment, and mounts before serving."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "config.source=file",
+        "config.path=/app/agent_data/active/custom.yaml",
+        "config.bootstrapBundlePath=/app/agent_data/incoming",
+        "workers.backend=kubernetes",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    runtime = deployment["spec"]["template"]["spec"]["containers"][0]
+    command = runtime["command"]
+    assert command[command.index("--bootstrap-config-bundle") + 1] == "/app/agent_data/incoming"
+    assert {entry["name"]: entry.get("value") for entry in runtime["env"]}["MINDROOM_CONFIG_PATH"] == (
+        "/app/agent_data/active/custom.yaml"
+    )
+
+
+def test_runtime_chart_primary_pod_gets_no_service_link_environment() -> None:
+    """A Service named `mindroom` would otherwise inject `MINDROOM_PORT=tcp://<ip>:<port>`, which MindRoom reads as its port."""
+    docs = _render_chart(Path("cluster/k8s/runtime"), "fullnameOverride=mindroom", release_name="mindroom-runtime")
+    assert _resource(docs, "Deployment", "mindroom")["spec"]["template"]["spec"]["enableServiceLinks"] is False
+
+
+def test_runtime_chart_passes_bootstrap_revision_to_main_container() -> None:
+    """The runtime command receives the declared chart revision."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        "config.bootstrapBundlePath=/app/agent_data/incoming",
+        "config.bootstrapBundleRevision=deploy-2",
+        "workers.backend=kubernetes",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    command = deployment["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--bootstrap-config-bundle-revision") + 1] == "deploy-2"
+
+
+def test_runtime_chart_rejects_revision_without_source() -> None:
+    """A chart revision cannot silently run without a candidate path."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        "config.bootstrapBundleRevision=one",
+        "workers.backend=kubernetes",
+    )
+    assert result.returncode != 0
+    assert "config.bootstrapBundleRevision" in result.stderr
+
+
+@pytest.mark.parametrize("revision", [" ", "x" * 129])
+def test_runtime_chart_rejects_malformed_revision(revision: str) -> None:
+    """The chart rejects malformed revisions before creating resources."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        "config.bootstrapBundlePath=/app/agent_data/incoming",
+        f"config.bootstrapBundleRevision={revision}",
+        "workers.backend=kubernetes",
+    )
+    assert result.returncode != 0
+    assert "config.bootstrapBundleRevision" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        ("workers.backend=kubernetes",),
+        ("config.source=file", "config.path=/app/agent_data/config.yaml", "workers.backend=kubernetes"),
+        ("config.source=file", "config.path=/app/agent_data/active/config.yaml", "workers.backend=static_runner"),
+    ],
+)
+def test_runtime_chart_rejects_unsafe_native_bootstrap(settings: tuple[str, ...]) -> None:
+    """A bootstrap must target its own writable subtree, never a ConfigMap or storage root."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        *settings,
+        "config.bootstrapBundlePath=/app/agent_data/incoming",
+    )
+    assert result.returncode != 0
+    assert "config.bootstrapBundlePath" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("source", "allowed"),
+    [
+        ("/app/agent_data/active", False),
+        ("/app/agent_data/active/../active/", False),
+        ("/app/agent_data", False),
+        ("/", False),
+        ("/app/agent_data/active/incoming", False),
+        ("/app/agent_data/active-copy", True),
+        ("/app/agent_data/act", True),
+    ],
+)
+def test_runtime_chart_checks_bootstrap_path_boundaries(source: str, allowed: bool) -> None:
+    """Bootstrap paths cannot overlap after normalization; shared name prefixes remain valid."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        f"config.bootstrapBundlePath={source}",
+    )
+    assert (result.returncode == 0) is allowed, result.stderr
+    if not allowed:
+        assert "overlap" in result.stderr
+
+
+_BOOTSTRAP_BUNDLE_DIGEST = "3" * 64
+_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS = (
+    "workers.backend=kubernetes",
+    "config.source=file",
+    "config.path=/app/agent_data/active/config.yaml",
+    "contentBundles[0].name=policy-pack",
+    "contentBundles[0].image=registry.example.org/team/policy@sha256:" + "2" * 64,
+    "contentBundles[1].name=team-config",
+    f"contentBundles[1].image=registry.example.org/team/config:v1@sha256:{_BOOTSTRAP_BUNDLE_DIGEST}",
+    "contentBundles[1].targetPath=/app/agent_data/config-source",
+    "config.bootstrapContentBundle.name=team-config",
+)
+
+
+def _bootstrap_bundle_mount(mount_path: str) -> tuple[str, ...]:
+    return (
+        "contentBundles[1].volumeMounts[0].name=scratch",
+        f"contentBundles[1].volumeMounts[0].mountPath={mount_path}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("sub_path", "source", "image_dir"),
+    [
+        ("", "/app/agent_data/config-source", "/bundle"),
+        ("environments/prod/", "/app/agent_data/config-source/environments/prod", "/bundle/environments/prod"),
+        ("environments/prod", "/app/agent_data/config-source/environments/prod", "/bundle/environments/prod"),
+    ],
+)
+def test_runtime_chart_derives_bootstrap_from_content_bundle(sub_path: str, source: str, image_dir: str) -> None:
+    """The chart derives the source from the bundle target and the revision from its digest and image directory."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        *_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+        release_name="mindroom-runtime",
+        set_string_args=(f"config.bootstrapContentBundle.subPath={sub_path}",),
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    command = deployment["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--bootstrap-config-bundle") + 1] == source
+    revision = hashlib.sha256(f"{_BOOTSTRAP_BUNDLE_DIGEST}:{image_dir}".encode()).hexdigest()
+    assert command[command.index("--bootstrap-config-bundle-revision") + 1] == revision
+    transport = _init_container(deployment, "content-bundle-team-config")
+    assert transport["args"][2:] == ["/bundle", "/app/agent_data/config-source"]
+
+
+def test_runtime_chart_bootstrap_content_bundle_uses_default_target_path() -> None:
+    """A bundle without targetPath bootstraps from its default copy location."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        *(setting for setting in _BOOTSTRAP_CONTENT_BUNDLE_SETTINGS if "targetPath" not in setting),
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    command = deployment["spec"]["template"]["spec"]["containers"][0]["command"]
+    assert command[command.index("--bootstrap-config-bundle") + 1] == "/app/agent_data/content-bundles/team-config"
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        (
+            ("config.bootstrapContentBundle.name=missing",),
+            'config.bootstrapContentBundle.name "missing" must match a contentBundles entry',
+        ),
+        (
+            ("config.bootstrapBundlePath=/app/agent_data/incoming",),
+            "config.bootstrapContentBundle cannot be combined with config.bootstrapBundlePath",
+        ),
+        (
+            ("config.bootstrapBundleRevision=deploy-2",),
+            "config.bootstrapContentBundle cannot be combined with config.bootstrapBundlePath",
+        ),
+        (
+            ("contentBundles[1].overwrite=false",),
+            'contentBundles entry "team-config" to keep overwrite enabled',
+        ),
+        (
+            ("config.bootstrapContentBundle.subPath=/environments/prod",),
+            "config.bootstrapContentBundle.subPath must be a relative path without .. segments",
+        ),
+        (
+            ("config.bootstrapContentBundle.subPath=environments/../../active",),
+            "config.bootstrapContentBundle.subPath must be a relative path without .. segments",
+        ),
+        (("contentBundles[1].seed.enabled=true", "contentBundles[1].seed.command[0]=/bin/true"), None),
+        (_bootstrap_bundle_mount("/scratch"), None),
+        (_bootstrap_bundle_mount("/bundle-cache"), None),
+        (
+            _bootstrap_bundle_mount("/bundle"),
+            'contentBundles entry "team-config" volumeMounts to stay clear of its sourcePath /bundle; mountPath /bundle',
+        ),
+        (_bootstrap_bundle_mount("/bundle/environments/"), "sourcePath /bundle; mountPath /bundle/environments"),
+        (
+            _bootstrap_bundle_mount("/app/agent_data/config-source"),
+            "targetPath /app/agent_data/config-source; mountPath /app/agent_data/config-source overlaps",
+        ),
+        (
+            _bootstrap_bundle_mount("/app/agent_data/config-source/cache"),
+            "targetPath /app/agent_data/config-source; mountPath /app/agent_data/config-source/cache overlaps",
+        ),
+        (_bootstrap_bundle_mount("/app"), "targetPath /app/agent_data/config-source; mountPath /app overlaps"),
+        (
+            ("contentBundles[1].targetPath=/app/agent_data/active/incoming",),
+            "config.bootstrapContentBundle must not overlap the config.path directory",
+        ),
+        (
+            (
+                "config.path=/app/agent_data/config-source/active/config.yaml",
+                "config.bootstrapContentBundle.subPath=environments/prod",
+            ),
+            "config.bootstrapContentBundle must not overlap the config.path directory",
+        ),
+        (
+            ("workers.backend=static_runner",),
+            "config.bootstrapContentBundle cannot be combined with workers.backend=static_runner",
+        ),
+        (
+            ("config.bootstrapContentBundle.name=", "config.bootstrapContentBundle.subPath=environments/prod"),
+            "config.bootstrapContentBundle.subPath requires config.bootstrapContentBundle.name",
+        ),
+    ],
+)
+def test_runtime_chart_validates_bootstrap_content_bundle(settings: tuple[str, ...], message: str | None) -> None:
+    """A derived bootstrap needs a digest-pinned, fully replaced bundle with unmounted paths and a contained subPath."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        *_BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+        *settings,
+    )
+    assert (result.returncode == 0) is (message is None), result.stderr
+    if message is not None:
+        assert message in result.stderr
+
+
+@pytest.mark.parametrize(("replicas", "allowed"), [(0, True), (1, True), (2, False)])
+@pytest.mark.parametrize(
+    "bootstrap",
+    [
+        ("config.bootstrapBundlePath=/app/agent_data/incoming",),
+        _BOOTSTRAP_CONTENT_BUNDLE_SETTINGS,
+    ],
+)
+def test_runtime_chart_rejects_bootstrap_with_multiple_replicas(
+    bootstrap: tuple[str, ...],
+    replicas: int,
+    allowed: bool,
+) -> None:
+    """Concurrent pods would install into the same config directory at once."""
+    result = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "config.source=file",
+        "config.path=/app/agent_data/active/config.yaml",
+        *bootstrap,
+        f"replicaCount={replicas}",
+    )
+    assert (result.returncode == 0) is allowed, result.stderr
+    if not allowed:
+        assert "requires replicaCount 0 or 1" in result.stderr
 
 
 def test_runtime_chart_rejects_duplicate_content_bundle_names() -> None:
@@ -466,36 +1150,6 @@ def test_runtime_chart_rejects_content_bundle_target_path_equal_root_storage() -
     assert "contentBundles[0].targetPath cannot be equal to storage.mountPath /" in completed.stderr
 
 
-def test_instance_chart_worker_manager_can_only_patch_own_worker_auth_secret() -> None:
-    """Shared-namespace instances must not get cross-tenant Secret permissions."""
-    docs = _render_instance_chart()
-    role = _resource(docs, "Role", "mindroom-worker-manager-demo")
-
-    secret_rules = [rule for rule in role["rules"] if "secrets" in rule.get("resources", [])]
-    assert secret_rules == [
-        {
-            "apiGroups": [""],
-            "resources": ["secrets"],
-            "resourceNames": ["mindroom-worker-auth-demo"],
-            "verbs": ["get", "patch"],
-        },
-    ]
-
-
-def test_instance_chart_uses_tenant_worker_auth_secret() -> None:
-    """Shared-namespace instances should reference a pre-created tenant token Secret."""
-    docs = _render_instance_chart()
-    deployment = _resource(docs, "Deployment", "mindroom-demo")
-    worker_auth_secret = _resource(docs, "Secret", "mindroom-worker-auth-demo")
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
-    env_values = {env["name"]: env.get("value") for env in container["env"]}
-
-    assert env_values["MINDROOM_KUBERNETES_WORKER_AUTH_SECRET_NAME"] == "mindroom-worker-auth-demo"  # noqa: S105
-    assert worker_auth_secret["metadata"]["namespace"] == "mindroom-instances"
-    assert "stringData" not in worker_auth_secret
-    assert "data" not in worker_auth_secret
-
-
 def test_instance_chart_exposes_public_matrix_url_to_desktop_pairing() -> None:
     """Hosted pairing commands should use the tenant's reachable Matrix ingress."""
     docs = _render_chart(
@@ -506,12 +1160,12 @@ def test_instance_chart_exposes_public_matrix_url_to_desktop_pairing() -> None:
     deployment = _resource(docs, "Deployment", "mindroom-alice")
     env = _env_by_name(_container(deployment, "mindroom"))
 
-    assert env["MATRIX_HOMESERVER"]["value"] == "http://synapse-alice:8008"
+    assert env["MATRIX_HOMESERVER"]["value"] == "http://tuwunel-alice:8008"
     assert env["MINDROOM_DESKTOP_MATRIX_HOMESERVER"]["value"] == "https://alice.matrix.staging.mindroom.chat"
 
 
-def test_instance_chart_static_runner_uses_shared_credentials_encryption_key_secret() -> None:
-    """Static runner mode should give both runtime containers the same Secret-backed credential key."""
+def test_instance_chart_static_runner_withholds_credentials_encryption_key() -> None:
+    """Only the primary may receive the Secret-backed key that decrypts the tenant credential store."""
     credentials_encryption_key = "test-encryption-key"
     docs = _render_chart(
         Path("cluster/k8s/instance"),
@@ -537,19 +1191,11 @@ def test_instance_chart_static_runner_uses_shared_credentials_encryption_key_sec
             },
         },
     }
-    assert _env_by_name(runner_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == {
-        "name": "MINDROOM_CREDENTIALS_ENCRYPTION_KEY",
-        "valueFrom": {
-            "secretKeyRef": {
-                "name": "mindroom-api-keys-demo",
-                "key": "credentials_encryption_key",
-            },
-        },
-    }
+    assert _secret_key_refs(runner_container) == [{"name": "mindroom-api-keys-demo", "key": "sandbox_proxy_token"}]
 
 
 def test_instance_chart_wires_credentials_encryption_env_when_key_is_unset() -> None:
-    """Instance runtime containers should consistently read the key from the shared Secret."""
+    """The primary should read the key from the instance Secret even before a value is set."""
     docs = _render_chart(Path("cluster/k8s/instance"))
     deployment = _resource(docs, "Deployment", "mindroom-demo")
     mindroom_container = _container(deployment, "mindroom")
@@ -566,19 +1212,147 @@ def test_instance_chart_wires_credentials_encryption_env_when_key_is_unset() -> 
         },
     }
     assert _env_by_name(mindroom_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == expected_env
-    assert _env_by_name(runner_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == expected_env
+    assert "MINDROOM_CREDENTIALS_ENCRYPTION_KEY" not in _env_by_name(runner_container)
     assert annotations["mindroom.ai/instance-secret-hash"] == _instance_secret_hash()
 
 
-def test_instance_chart_credentials_encryption_key_rotation_changes_pod_template() -> None:
-    """Changing the Secret-backed credential key should render a new pod template hash."""
+def test_instance_chart_static_runner_mounts_only_agent_state() -> None:
+    """The sidecar keeps agent workspaces persistent without reaching tenant secrets or the live config."""
+    deployment = _resource(_render_chart(Path("cluster/k8s/instance")), "Deployment", "mindroom-demo")
+    mindroom_container = _container(deployment, "mindroom")
+    runner_container = _container(deployment, "sandbox-runner")
+    volumes = _volumes_by_name(deployment)
+
+    assert {"name": "storage", "mountPath": "/mindroom_data"} in mindroom_container["volumeMounts"]
+    assert _env_by_name(mindroom_container)["MINDROOM_CONFIG_PATH"]["value"] == "/mindroom_data/config/config.yaml"
+    # The primary knows the sidecar mounts the agents' storage, so people may type in the agents' terminals.
+    assert _env_by_name(mindroom_container)["MINDROOM_STATIC_RUNNER_AGENT_STORAGE"]["value"] == "true"
+    assert runner_container["volumeMounts"] == [
+        {"name": "storage", "mountPath": "/mindroom_data", "subPath": "sandbox-runner"},
+        {"name": "storage", "mountPath": "/mindroom_data/agents", "subPath": "agents"},
+        {"name": "storage", "mountPath": "/mindroom_data/private_instances", "subPath": "private_instances"},
+        {"name": "storage", "mountPath": "/mindroom_data/shared_directories", "subPath": "shared_directories"},
+        {"name": "sandbox-workspace", "mountPath": "/app/workspace"},
+    ]
+    assert volumes["storage"] == {"name": "storage", "persistentVolumeClaim": {"claimName": "mindroom-storage-demo"}}
+    assert volumes["sandbox-workspace"] == {"name": "sandbox-workspace", "emptyDir": {"sizeLimit": "1Gi"}}
+    assert _env_by_name(runner_container)["MINDROOM_STORAGE_PATH"]["value"] == "/mindroom_data"
+    assert _init_container(deployment, "prepare-sandbox-runner-storage")["command"] == [
+        "mkdir",
+        "-p",
+        "/mindroom_data/sandbox-runner",
+        "/mindroom_data/agents",
+        "/mindroom_data/private_instances",
+        "/mindroom_data/shared_directories",
+    ]
+
+
+def test_static_runner_storage_mounts_hold_no_record_or_lock_the_primary_trusts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Records and locks the primary acts on stay outside every storage subPath sidecar tool code can write."""
+    runtime_chart = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        release_name="mindroom-runtime",
+    )
+    runner_subpaths = {
+        mount["subPath"]
+        for doc in (*_render_instance_chart(), *runtime_chart)
+        if doc.get("kind") == "Deployment"
+        for container in doc["spec"]["template"]["spec"]["containers"]
+        if any(env["name"] == "MINDROOM_SANDBOX_RUNNER_MODE" for env in container.get("env", []))
+        for mount in container["volumeMounts"]
+        if "subPath" in mount
+    }
+    assert runner_subpaths == {"sandbox-runner", "agents", "private_instances", "shared_directories"}
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
+    for state_root in (
+        paths.storage_root / "agents" / "helper",
+        paths.storage_root / "private_instances" / "s" / "helper",
+    ):
+        set_agent_mode(paths, state_root, "helper", "session", "minimal")
+        _open_sessions(state_root)
+    ensure_private_instance_identity(
+        paths.storage_root,
+        worker_key="v1:default:user:~@alice:example.org",
+        requester_id="@alice:example.org",
+    )
+    locks = list(paths.storage_root.rglob("*.lock"))
+    # Session recovery stays beside the sessions it guards, so its lock may sit in a mounted subPath only because
+    # a planted or held one fails storage creation after SQLite's busy timeout instead of stalling it.
+    recovery_locks = [lock for lock in locks if lock.name == ".sessions-recovery.lock"]
+    trusted = [
+        personal_room_record_path(paths, "helper", "@alice:example.org"),
+        invited_rooms_path(paths, "helper"),
+        pending_room_invites_path(paths, "helper"),
+        *paths.storage_root.rglob("agent_modes.json"),
+        *(lock for lock in locks if lock not in recovery_locks),
+    ]
+    assert len(trusted) == 8
+    assert not [path for path in trusted if path.relative_to(paths.storage_root).parts[0] in runner_subpaths]
+    assert len(recovery_locks) == 2
+    monkeypatch.setattr(agent_storage, "BUSY_TIMEOUT_SECONDS", 0.2)
+    for lock in recovery_locks:
+        with lock.open("a") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            # A database this process already prepared opens without the lock.
+            database = _open_sessions(lock.parent).path
+            # Its first open in a process, as after a restart, takes the lock and fails instead of stalling.
+            monkeypatch.delitem(agent_storage._PREPARED, database)
+            with pytest.raises(TimeoutError, match="Session recovery lock"):
+                _open_sessions(lock.parent)
+
+
+def _open_sessions(state_root: Path) -> ConversationStore:
+    return create_agent_state_storage("helper", state_root)
+
+
+def test_instance_chart_static_runner_generates_primary_api_key_without_other_auth() -> None:
+    """Without Supabase auth, the primary API gets a key the sidecar never receives."""
+    deployment_docs = _render_chart(Path("cluster/k8s/instance"))
+    deployment = _resource(deployment_docs, "Deployment", "mindroom-demo")
+    api_key_secret = _resource(deployment_docs, "Secret", "mindroom-primary-api-key-demo")
+
+    assert api_key_secret["metadata"]["namespace"] == "mindroom-instances"
+    assert len(base64.b64decode(api_key_secret["data"]["MINDROOM_API_KEY"])) == 48
+    assert _env_by_name(_container(deployment, "mindroom"))["MINDROOM_API_KEY"] == {
+        "name": "MINDROOM_API_KEY",
+        "valueFrom": {"secretKeyRef": {"name": "mindroom-primary-api-key-demo", "key": "MINDROOM_API_KEY"}},
+    }
+    assert "MINDROOM_API_KEY" not in _env_by_name(_container(deployment, "sandbox-runner"))
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        ("supabaseUrl=https://supabase.example.test", "supabaseAnonKey=anon-key"),
+        ("allowUnauthenticatedPrimary=true",),
+    ],
+)
+def test_instance_chart_skips_generated_api_key_when_not_needed(settings: tuple[str, ...]) -> None:
+    """Provisioned Supabase auth and the opt-out render no generated key."""
+    docs = _render_chart(Path("cluster/k8s/instance"), *settings)
+    mindroom_container = _container(_resource(docs, "Deployment", "mindroom-demo"), "mindroom")
+
+    assert not any(
+        doc["kind"] == "Secret" and doc["metadata"]["name"] == "mindroom-primary-api-key-demo" for doc in docs
+    )
+    assert "MINDROOM_API_KEY" not in _env_by_name(mindroom_container)
+
+
+@pytest.mark.parametrize("secret_value", ["credentials_encryption_key", "platformSsoSecret"])
+def test_instance_chart_secret_key_rotation_changes_pod_template(secret_value: str) -> None:
+    """Changing a Secret-backed key the runtime reads at startup should render a new pod template hash."""
     first_docs = _render_chart(
         Path("cluster/k8s/instance"),
-        "credentials_encryption_key=first-key",
+        f"{secret_value}=first-key",
     )
     second_docs = _render_chart(
         Path("cluster/k8s/instance"),
-        "credentials_encryption_key=second-key",
+        f"{secret_value}=second-key",
     )
     first_deployment = _resource(first_docs, "Deployment", "mindroom-demo")
     second_deployment = _resource(second_docs, "Deployment", "mindroom-demo")
@@ -599,13 +1373,14 @@ def test_instance_chart_can_use_existing_secret_for_sensitive_values() -> None:
         "credentials_encryption_key=must-not-render",
         "matrixOidc.enabled=true",
         "matrixOidc.issuer=https://api.mindroom.chat/matrix-oidc",
-        "matrixOidc.clientId=mindroom-synapse",
+        "matrixOidc.clientId=mindroom-matrix",
         "matrixOidc.clientSecret=must-not-render-oidc",
         "matrixRegistrationSharedSecret=must-not-render-registration",
+        "platformSsoSecret=must-not-render-platform-sso",
     )
     mindroom = _resource(docs, "Deployment", "mindroom-demo")
-    synapse = _resource(docs, "Deployment", "synapse-demo")
-    synapse_config = _resource(docs, "ConfigMap", "synapse-config-demo")["data"]["homeserver.yaml"]
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
+    tuwunel_config = _tuwunel_config(docs, "demo")
     rendered = json.dumps(docs)
     mindroom_container = _container(mindroom, "mindroom")
     mindroom_env = {env["name"]: env.get("value") for env in mindroom_container["env"]}
@@ -614,16 +1389,75 @@ def test_instance_chart_can_use_existing_secret_for_sensitive_values() -> None:
     assert "must-not-render" not in rendered
     assert "must-not-render-oidc" not in rendered
     assert "must-not-render-registration" not in rendered
+    assert "must-not-render-platform-sso" not in rendered
+    platform_sso_secret_env = next(
+        env for env in mindroom_container["env"] if env["name"] == "MINDROOM_PLATFORM_SSO_SECRET"
+    )
+    assert platform_sso_secret_env["valueFrom"]["secretKeyRef"] == {
+        "name": "tenant-runtime-secrets",
+        "key": "platform_sso_secret",
+        "optional": True,
+    }
+    assert mindroom_env["MINDROOM_PLATFORM_SSO_URL"] == "https://api.mindroom.chat/instance-sso/authorize"
     assert mindroom["spec"]["template"]["spec"]["volumes"][2]["secret"]["secretName"] == "tenant-runtime-secrets"
-    assert synapse["spec"]["template"]["spec"]["volumes"][2]["secret"]["secretName"] == "tenant-runtime-secrets"
+    assert _volumes_by_name(tuwunel)["mindroom-secrets"]["secret"]["secretName"] == "tenant-runtime-secrets"
     assert mindroom["spec"]["template"]["metadata"]["annotations"]["mindroom.ai/instance-secret-hash"] == "abc123"
-    assert synapse["spec"]["template"]["metadata"]["annotations"]["mindroom.ai/instance-secret-hash"] == "abc123"
+    assert tuwunel["spec"]["template"]["metadata"]["annotations"]["mindroom.ai/instance-secret-hash"] == "abc123"
     assert mindroom_env["MATRIX_REGISTRATION_SHARED_SECRET_FILE"] == (
         "/etc/secrets/matrix_registration_shared_secret"  # noqa: S105
     )
-    assert "registration_shared_secret_path: /etc/mindroom-secrets/matrix_registration_shared_secret" in synapse_config
-    assert "registration_shared_secret:" not in synapse_config
-    assert yaml.safe_load(synapse_config)["password_config"] == {"enabled": True}
+    assert tuwunel_config["registration_shared_secret_file"] == (
+        "/etc/mindroom-secrets/matrix_registration_shared_secret"  # noqa: S105
+    )
+    assert "registration_shared_secret" not in tuwunel_config
+    assert tuwunel_config["identity_provider"][0]["client_secret_file"] == (
+        "/etc/mindroom-secrets/matrix_oidc_client_secret"  # noqa: S105
+    )
+
+
+def test_instance_chart_never_gives_tenant_the_supabase_service_key() -> None:
+    """Tenant workloads are untrusted and must never hold the platform's RLS-bypassing key."""
+    docs = _render_chart(
+        Path("cluster/k8s/instance"),
+        "supabaseServiceKey=must-not-render-service-key",
+    )
+    secret = _resource(docs, "Secret", "mindroom-api-keys-demo")
+    mindroom_env = _env_by_name(_container(_resource(docs, "Deployment", "mindroom-demo"), "mindroom"))
+
+    assert "must-not-render-service-key" not in json.dumps(docs)
+    assert not any("service_key" in key for key in secret["stringData"])
+    assert not any("SERVICE_KEY" in name for name in mindroom_env)
+    assert "SUPABASE_ANON_KEY" in mindroom_env
+
+
+def test_instance_chart_mounts_the_platform_oidc_client_secret_only_into_tuwunel() -> None:
+    """The Matrix OIDC client secret is platform-wide, so tenant code in the MindRoom container must not read it."""
+    docs = _render_instance_chart()
+    mindroom = _resource(docs, "Deployment", "mindroom-demo")
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
+    mounted_keys = {item["key"] for item in _volumes_by_name(mindroom)["api-keys"]["secret"].get("items", [])}
+    secret_files = {
+        env["value"]
+        for env in _container(mindroom, "mindroom")["env"]
+        if str(env.get("value")).startswith("/etc/secrets/")
+    }
+
+    assert {f"/etc/secrets/{key}" for key in mounted_keys} == secret_files
+    assert "matrix_oidc_client_secret" not in mounted_keys
+    assert {item["key"] for item in _volumes_by_name(tuwunel)["mindroom-secrets"]["secret"]["items"]} == {
+        "matrix_oidc_client_secret",
+        "matrix_registration_shared_secret",
+    }
+
+
+def test_instance_chart_points_platform_login_at_platform_domain() -> None:
+    """Split platform and instance domains keep platform login and SSO on the platform hosts."""
+    docs = _render_chart(Path("cluster/k8s/instance"), "baseDomain=tenants.example.test", "platformDomain=example.test")
+    mindroom_env = _env_by_name(_container(_resource(docs, "Deployment", "mindroom-demo"), "mindroom"))
+
+    assert mindroom_env["MINDROOM_PUBLIC_URL"]["value"] == "https://demo.tenants.example.test"
+    assert mindroom_env["MINDROOM_PLATFORM_LOGIN_URL"]["value"] == "https://app.example.test/auth/login"
+    assert mindroom_env["MINDROOM_PLATFORM_SSO_URL"]["value"] == "https://api.example.test/instance-sso/authorize"
 
 
 def test_instance_chart_numeric_customer_uses_valid_instance_secret_name() -> None:
@@ -637,37 +1471,35 @@ def test_instance_chart_numeric_customer_uses_valid_instance_secret_name() -> No
 
     assert secret["metadata"]["name"] == "mindroom-api-keys-1"
     assert secret["stringData"]["matrix_registration_shared_secret"]
+    assert secret["stringData"]["platform_sso_secret"] == ""
     assert deployment["spec"]["template"]["spec"]["volumes"][2]["secret"]["secretName"] == "mindroom-api-keys-1"
 
 
-def test_instance_chart_rejects_email_template_without_email_header() -> None:
-    """Email-to-Matrix derivation requires the trusted email header name."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/instance"),
-        "trustedUpstreamAuth.enabled=true",
-        "trustedUpstreamAuth.userIdHeader=X-Trusted-User",
-        set_string_args=("trustedUpstreamAuth.emailToMatrixUserIdTemplate=@{localpart}:example.org",),
-    )
-
-    assert completed.returncode != 0
-    assert (
-        "trustedUpstreamAuth.emailHeader is required when trustedUpstreamAuth.emailToMatrixUserIdTemplate is set"
-        in completed.stderr
-    )
+_TRUSTED_UPSTREAM_JWT_VALUES = {
+    "jwtHeader": "X-Trusted-Jwt",
+    "jwksUrl": "https://issuer.example/jwks",
+    "jwtAudience": "mindroom-dashboard",
+    "jwtIssuer": "https://issuer.example",
+}
 
 
-@pytest.mark.parametrize("chart", ["instance", "platform"])
+def _trusted_upstream_jwt_args(prefix: str, *, omit: str | None = None) -> tuple[str, ...]:
+    return tuple(f"{prefix}.{name}={value}" for name, value in _TRUSTED_UPSTREAM_JWT_VALUES.items() if name != omit)
+
+
+@pytest.mark.parametrize("chart", ["instance", "platform", "runtime"])
 @pytest.mark.parametrize("email_domain", ["", "example.com"])
 def test_chart_email_mapping_requires_explicit_domain(chart: str, email_domain: str) -> None:
-    """Both deployment paths must carry the email namespace into runtime configuration."""
+    """Every deployment path must carry the email namespace into runtime configuration."""
     prefix = "provisioner.trustedUpstreamAuth" if chart == "platform" else "trustedUpstreamAuth"
     completed = _run_helm_template(
         Path("cluster/k8s") / chart,
         f"{prefix}.enabled=true",
-        f"{prefix}.userIdHeader=X-Trusted-User",
-        f"{prefix}.emailHeader=X-Trusted-Email",
         f"{prefix}.emailDomain={email_domain}",
-        set_string_args=(f"{prefix}.emailToMatrixUserIdTemplate=@{{localpart}}:example.org",),
+        set_string_args=(
+            f"{prefix}.emailToMatrixUserIdTemplate=@{{localpart}}:example.org",
+            *_trusted_upstream_jwt_args(prefix),
+        ),
     )
     if not email_domain:
         assert completed.returncode != 0
@@ -683,27 +1515,39 @@ def test_chart_email_mapping_requires_explicit_domain(chart: str, email_domain: 
         assert email_domain in completed.stdout
 
 
-def test_instance_chart_renders_strict_trusted_upstream_jwt_env() -> None:
-    """Strict trusted upstream settings should render to MindRoom runtime env vars."""
+@pytest.mark.parametrize("chart", ["instance", "platform", "runtime"])
+@pytest.mark.parametrize("missing", list(_TRUSTED_UPSTREAM_JWT_VALUES))
+def test_chart_rejects_trusted_upstream_without_jwt_setting(chart: str, missing: str) -> None:
+    """Every chart fails before deploying a runtime whose trusted upstream auth cannot verify the signed assertion."""
+    prefix = "provisioner.trustedUpstreamAuth" if chart == "platform" else "trustedUpstreamAuth"
+    completed = _run_helm_template(
+        Path("cluster/k8s") / chart,
+        f"{prefix}.enabled=true",
+        set_string_args=_trusted_upstream_jwt_args(prefix, omit=missing),
+    )
+
+    assert completed.returncode != 0
+    assert f"{prefix}.{missing} is required when {prefix}.enabled=true" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("chart", "deployment_name"),
+    [("instance", "mindroom-demo"), ("runtime", "mindroom-demo-mindroom-runtime")],
+)
+def test_chart_renders_trusted_upstream_jwt_env(chart: str, deployment_name: str) -> None:
+    """Trusted upstream settings should render to MindRoom runtime env vars."""
     docs = _render_chart(
-        Path("cluster/k8s/instance"),
+        Path("cluster/k8s") / chart,
         "trustedUpstreamAuth.enabled=true",
-        "trustedUpstreamAuth.userIdHeader=X-Trusted-User",
-        "trustedUpstreamAuth.emailHeader=X-Trusted-Email",
-        "trustedUpstreamAuth.requireJwt=true",
-        "trustedUpstreamAuth.jwtHeader=X-Trusted-Jwt",
-        "trustedUpstreamAuth.jwtAudience=mindroom-dashboard",
-        "trustedUpstreamAuth.jwtIssuer=https://issuer.example",
         "trustedUpstreamAuth.jwtEmailClaim=email",
         "trustedUpstreamAuth.jwtUserIdClaim=sub",
         "trustedUpstreamAuth.jwtMatrixUserIdClaim=matrix_user_id",
-        set_string_args=("trustedUpstreamAuth.jwksUrl=https://issuer.example/jwks",),
+        set_string_args=_trusted_upstream_jwt_args("trustedUpstreamAuth"),
     )
-    deployment = _resource(docs, "Deployment", "mindroom-demo")
-    container = deployment["spec"]["template"]["spec"]["containers"][0]
+    container = _container(_resource(docs, "Deployment", deployment_name), "mindroom")
     env_values = {env["name"]: env.get("value") for env in container["env"]}
 
-    assert env_values["MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT"] == "true"
+    assert env_values["MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED"] == "true"
     assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER"] == "X-Trusted-Jwt"
     assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWKS_URL"] == "https://issuer.example/jwks"
     assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE"] == "mindroom-dashboard"
@@ -713,35 +1557,52 @@ def test_instance_chart_renders_strict_trusted_upstream_jwt_env() -> None:
     assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM"] == "matrix_user_id"
 
 
-def test_platform_chart_rejects_email_template_without_email_header() -> None:
-    """The platform chart should fail before provisioning invalid instance auth config."""
+def test_runtime_chart_renders_no_trusted_upstream_env_by_default() -> None:
+    """Trusted upstream auth stays off unless the runtime chart's block enables it."""
+    docs = _render_chart(Path("cluster/k8s/runtime"))
+    for container in _resource(docs, "Deployment", "mindroom-demo-mindroom-runtime")["spec"]["template"]["spec"][
+        "containers"
+    ]:
+        assert not [env["name"] for env in container["env"] if env["name"].startswith("MINDROOM_TRUSTED_UPSTREAM_")]
+
+
+@pytest.mark.parametrize(
+    "env_extra_args",
+    [
+        ("env.extra[0].name=MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE", "env.extra[0].value=duplicate"),
+        ("env.extra.MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE=duplicate",),
+    ],
+)
+def test_runtime_chart_rejects_trusted_upstream_env_also_in_env_extra(env_extra_args: tuple[str, ...]) -> None:
+    """A trusted upstream variable has one source, so env.extra cannot silently override the block."""
     completed = _run_helm_template(
-        Path("cluster/k8s/platform"),
-        "provisioner.trustedUpstreamAuth.enabled=true",
-        "provisioner.trustedUpstreamAuth.userIdHeader=X-Trusted-User",
-        release_name="mindroom-platform",
-        set_string_args=("provisioner.trustedUpstreamAuth.emailToMatrixUserIdTemplate=@{localpart}:example.org",),
+        Path("cluster/k8s/runtime"),
+        "trustedUpstreamAuth.enabled=true",
+        *env_extra_args,
+        set_string_args=_trusted_upstream_jwt_args("trustedUpstreamAuth"),
     )
 
     assert completed.returncode != 0
     assert (
-        "provisioner.trustedUpstreamAuth.emailHeader is required when "
-        "provisioner.trustedUpstreamAuth.emailToMatrixUserIdTemplate is set"
-    ) in completed.stderr
-
-
-def test_platform_chart_rejects_trusted_upstream_without_user_id_header() -> None:
-    """The platform chart should fail before provisioning instances that cannot authenticate users."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/platform"),
-        "provisioner.trustedUpstreamAuth.enabled=true",
-        release_name="mindroom-platform",
+        "trustedUpstreamAuth and env.extra both set MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE; remove one of them"
+        in completed.stderr
     )
 
-    assert completed.returncode != 0
-    assert (
-        "provisioner.trustedUpstreamAuth.userIdHeader is required when provisioner.trustedUpstreamAuth.enabled=true"
-    ) in completed.stderr
+
+@pytest.mark.parametrize("webhook_secret", ["", " ", "whsec_test"])
+def test_platform_chart_requires_stripe_webhook_secret_with_stripe_key(webhook_secret: str) -> None:
+    """Stripe webhooks are forgeable without a signing secret, so Stripe billing must not deploy without one."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/platform"),
+        "stripe.secretKey=sk_test",
+        f"stripe.webhookSecret={webhook_secret}",
+        release_name="mindroom-platform",
+    )
+    if not webhook_secret.strip():
+        assert completed.returncode != 0
+        assert "stripe.webhookSecret is required when stripe.secretKey is set" in completed.stderr
+    else:
+        completed.check_returncode()
 
 
 def test_platform_chart_wires_instance_credentials_encryption_secret() -> None:
@@ -792,6 +1653,61 @@ def test_platform_chart_exposes_instance_image_pull_secret_names() -> None:
     assert config["data"]["INSTANCE_IMAGE_PULL_SECRET_NAMES"] == "ghcr-pull,backup-pull"  # noqa: S105
 
 
+def test_platform_backend_cannot_create_service_accounts_in_the_tenant_namespace() -> None:
+    """The instance chart renders no ServiceAccount, so the provisioner needs no way to mint tenant identities."""
+    role = _resource(
+        _render_chart(Path("cluster/k8s/platform"), release_name="mindroom-platform"),
+        "Role",
+        "platform-backend",
+    )
+
+    assert role["metadata"]["namespace"] == "mindroom-instances"
+    assert all("serviceaccounts" not in rule["resources"] for rule in role["rules"])
+
+
+def test_platform_chart_exposes_the_instance_ingress_controller_namespace() -> None:
+    """Fresh clusters may run the controller outside the instance chart's default namespace."""
+    default_config = _resource(
+        _render_chart(Path("cluster/k8s/platform"), release_name="mindroom-platform"),
+        "ConfigMap",
+        "platform-config",
+    )
+    config = _resource(
+        _render_chart(
+            Path("cluster/k8s/platform"),
+            "provisioner.instanceIngressControllerNamespace=nginx",
+            release_name="mindroom-platform",
+        ),
+        "ConfigMap",
+        "platform-config",
+    )
+
+    assert default_config["data"]["INSTANCE_INGRESS_CONTROLLER_NAMESPACE"] == ""
+    assert config["data"]["INSTANCE_INGRESS_CONTROLLER_NAMESPACE"] == "nginx"
+
+
+def test_platform_chart_trusts_forwarded_client_addresses_only_from_private_networks() -> None:
+    """The backend keys rate limits on X-Real-IP only from the in-cluster ingress, never from public callers."""
+    config = _resource(
+        _render_chart(Path("cluster/k8s/platform"), release_name="mindroom-platform"),
+        "ConfigMap",
+        "platform-config",
+    )
+
+    assert config["data"]["TRUSTED_PROXY_CIDRS"] == "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+
+def test_reference_ingress_sets_x_real_ip_from_the_client_connection() -> None:
+    """Clients reach the node directly, so the trusted controller must not take their address from their headers."""
+    terraform = Path("cluster/terraform/terraform-k8s/kube.tf").read_text(encoding="utf-8")
+    module = _hcl_block(terraform, 'module "kube-hetzner"')
+    values = yaml.safe_load(textwrap.dedent(module.split("nginx_values = <<-EOT\n", 1)[1].split("\n  EOT", 1)[0]))
+
+    assert values["controller"]["config"]["use-forwarded-headers"] == "false"
+    assert values["controller"]["config"]["use-proxy-protocol"] == "false"
+    assert values["controller"]["service"]["externalTrafficPolicy"] == "Local"
+
+
 def test_platform_chart_can_pin_frontend_and_backend_images_separately() -> None:
     """Platform services should be deployable without forcing identical image tags."""
     docs = _render_chart(
@@ -807,29 +1723,76 @@ def test_platform_chart_can_pin_frontend_and_backend_images_separately() -> None
     assert _container(backend, "app")["image"] == "ghcr.io/mindroom-ai/platform-backend:backend-tag"
 
 
+def test_instance_chart_requests_fit_measured_tenant_use() -> None:
+    """Default requests decide how many tenants fit on a node, so they stay near measured idle use."""
+    docs = _render_instance_chart()
+    mindroom = _resource(docs, "Deployment", "mindroom-demo")
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
+
+    requests = {
+        "mindroom": _container(mindroom, "mindroom")["resources"]["requests"],
+        "sandbox-runner": _container(mindroom, "sandbox-runner")["resources"]["requests"],
+        "tuwunel": _container(tuwunel, "tuwunel")["resources"]["requests"],
+    }
+    assert requests == {
+        "mindroom": {"cpu": "100m", "memory": "320Mi", "ephemeral-storage": "64Mi"},
+        "sandbox-runner": {"cpu": "25m", "memory": "128Mi", "ephemeral-storage": "64Mi"},
+        "tuwunel": {"cpu": "50m", "memory": "192Mi", "ephemeral-storage": "64Mi"},
+    }
+    # Tuwunel would otherwise size its database pool to the node's cores and idle well above its request.
+    assert _tuwunel_config(docs, "demo")["db_pool_max_workers"] == 16
+    assert _tuwunel_config(docs, "demo")["db_cache_capacity_mb"] == 256
+
+
 def test_instance_chart_renders_configurable_control_plane_resources() -> None:
-    """Tenant MindRoom and Synapse resources should be configurable per release."""
+    """Tenant MindRoom and Tuwunel resources should be configurable per release."""
     docs = _render_chart(
         Path("cluster/k8s/instance"),
         "mindroomResources.requests.cpu=300m",
         "mindroomResources.requests.memory=768Mi",
         "mindroomResources.limits.cpu=1500m",
         "mindroomResources.limits.memory=3Gi",
-        "synapseResources.requests.cpu=350m",
-        "synapseResources.requests.memory=1Gi",
-        "synapseResources.limits.memory=4Gi",
-        set_string_args=("synapseResources.limits.cpu=2",),
+        "tuwunelResources.requests.cpu=350m",
+        "tuwunelResources.requests.memory=1Gi",
+        "tuwunelResources.limits.memory=4Gi",
+        set_string_args=("tuwunelResources.limits.cpu=2",),
     )
     mindroom = _resource(docs, "Deployment", "mindroom-demo")
-    synapse = _resource(docs, "Deployment", "synapse-demo")
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
 
     assert _container(mindroom, "mindroom")["resources"] == {
-        "requests": {"cpu": "300m", "memory": "768Mi"},
-        "limits": {"cpu": "1500m", "memory": "3Gi"},
+        "requests": {"cpu": "300m", "memory": "768Mi", "ephemeral-storage": "64Mi"},
+        "limits": {"cpu": "1500m", "memory": "3Gi", "ephemeral-storage": "16Gi"},
     }
-    assert _container(synapse, "synapse")["resources"] == {
-        "requests": {"cpu": "350m", "memory": "1Gi"},
-        "limits": {"cpu": "2", "memory": "4Gi"},
+    assert _container(tuwunel, "tuwunel")["resources"] == {
+        "requests": {"cpu": "350m", "memory": "1Gi", "ephemeral-storage": "64Mi"},
+        "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "2Gi"},
+    }
+
+
+@pytest.mark.parametrize("workspace_size_limit", [None, "2Gi"])
+def test_instance_chart_bounds_ephemeral_storage_of_every_tenant_container(workspace_size_limit: str | None) -> None:
+    """Tenant tool code shares a node with other tenants, so no instance container may fill its disk.
+
+    Requests stay small because every tenant's requests count against the node's allocatable ephemeral storage,
+    and large ones would leave new tenant pods unschedulable; the limits provide the protection.
+    """
+    set_args = () if workspace_size_limit is None else (f"sandboxRunnerWorkspaceSizeLimit={workspace_size_limit}",)
+    docs = _render_chart(Path("cluster/k8s/instance"), *set_args)
+    mindroom = _resource(docs, "Deployment", "mindroom-demo")
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
+    containers = [
+        _container(mindroom, "mindroom"),
+        _container(mindroom, "sandbox-runner"),
+        _container(tuwunel, "tuwunel"),
+    ]
+
+    for container in containers:
+        assert container["resources"]["requests"]["ephemeral-storage"] == "64Mi", container["name"]
+        assert "ephemeral-storage" in container["resources"]["limits"], container["name"]
+    assert _volumes_by_name(mindroom)["sandbox-workspace"] == {
+        "name": "sandbox-workspace",
+        "emptyDir": {"sizeLimit": workspace_size_limit or "1Gi"},
     }
 
 
@@ -843,11 +1806,12 @@ def test_instance_chart_renders_with_pre_resource_release_values(tmp_path: Path)
 
     docs = _render_chart(Path("cluster/k8s/instance"), values_files=(values_path,))
     mindroom = _resource(docs, "Deployment", "mindroom-demo")
-    synapse = _resource(docs, "Deployment", "synapse-demo")
+    tuwunel = _resource(docs, "Deployment", "tuwunel-demo")
 
     assert _container(mindroom, "mindroom")["resources"] == {}
     assert _container(mindroom, "sandbox-runner")["resources"] == {}
-    assert _container(synapse, "synapse")["resources"] == {}
+    # Those releases ran Synapse, so Tuwunel gets the chart defaults.
+    assert _container(tuwunel, "tuwunel")["resources"]["requests"]["memory"] == "192Mi"
 
 
 def test_platform_chart_renders_default_resources_for_stateless_services() -> None:
@@ -933,8 +1897,8 @@ def test_runtime_chart_worker_network_policy_selects_dynamic_worker_labels() -> 
     }
 
 
-def test_runtime_chart_default_configmap_source_wires_runtime_and_worker_configmap() -> None:
-    """Default config mode should preserve the chart-managed ConfigMap mount and worker projection."""
+def test_runtime_chart_default_configmap_source_mounts_config_only_into_the_primary() -> None:
+    """Default config mode mounts the chart-managed ConfigMap into the primary and hands workers no config."""
     docs = _render_runtime_chart()
     config_map = _resource(docs, "ConfigMap", "mindroom-runtime-config")
     deployment = _resource(docs, "Deployment", "mindroom-runtime")
@@ -951,9 +1915,7 @@ def test_runtime_chart_default_configmap_source_wires_runtime_and_worker_configm
         "readOnly": True,
     } in mindroom_container["volumeMounts"]
     assert mindroom_env["MINDROOM_CONFIG_PATH"]["value"] == "/app/config.yaml"
-    assert mindroom_env["MINDROOM_KUBERNETES_WORKER_CONFIG_MAP_NAME"]["value"] == "mindroom-runtime-config"
-    assert mindroom_env["MINDROOM_KUBERNETES_WORKER_CONFIG_KEY"]["value"] == "config.yaml"
-    assert mindroom_env["MINDROOM_KUBERNETES_WORKER_CONFIG_PATH"]["value"] == "/app/config.yaml"
+    assert not any(name.startswith("MINDROOM_KUBERNETES_WORKER_CONFIG_") for name in mindroom_env)
 
 
 def test_runtime_chart_mounts_appservice_token_for_passwordless_managed_accounts() -> None:
@@ -1028,7 +1990,7 @@ def test_tuwunel_chart_mounts_secret_appservice_registration() -> None:
 
 
 def test_runtime_chart_file_config_source_uses_bundle_path_without_configmap() -> None:
-    """File config mode should point runtime and workers at the bundle file without rendering a ConfigMap."""
+    """File config mode should point the runtime at the bundle file without rendering a ConfigMap."""
     config_path = "/app/agent_data/content-bundles/team-config/content/environments/prod/agent-config.yaml"
     docs = _render_chart(
         Path("cluster/k8s/runtime"),
@@ -1054,9 +2016,7 @@ def test_runtime_chart_file_config_source_uses_bundle_path_without_configmap() -
     assert not any(volume["name"] == "config" for volume in pod_spec["volumes"])
     assert not any(mount["name"] == "config" for mount in mindroom_container["volumeMounts"])
     assert mindroom_env["MINDROOM_CONFIG_PATH"]["value"] == config_path
-    assert "MINDROOM_KUBERNETES_WORKER_CONFIG_MAP_NAME" not in mindroom_env
-    assert "MINDROOM_KUBERNETES_WORKER_CONFIG_KEY" not in mindroom_env
-    assert mindroom_env["MINDROOM_KUBERNETES_WORKER_CONFIG_PATH"]["value"] == config_path
+    assert not any(name.startswith("MINDROOM_KUBERNETES_WORKER_CONFIG_") for name in mindroom_env)
     assert mindroom_env["MINDROOM_KUBERNETES_WORKER_STORAGE_MOUNT_PATH"]["value"] == "/app/agent_data"
     assert mindroom_env["MINDROOM_KUBERNETES_WORKER_STORAGE_PVC_NAME"]["value"] == "mindroom-runtime-storage"
 
@@ -1430,121 +2390,6 @@ def test_runtime_chart_approved_egress_can_opt_out_of_runtime_config_overlay(tmp
     assert "MINDROOM_APPROVED_EGRESS_TOKEN" in runtime_env
 
 
-@pytest.mark.parametrize("bypass_domains", [[], ["downloads.example.test", ".objects.example.test"]])
-def test_runtime_chart_approved_egress_can_chain_agent_vault_parent(
-    tmp_path: Path,
-    bypass_domains: list[str],
-) -> None:
-    """Tokened Agent Vault traffic should chain through Squid while grants keep worker IPs."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "approvedEgress": {
-                    "enabled": True,
-                    "image": {"tag": "v0.1.0"},
-                    "parentProxy": {
-                        "enabled": True,
-                        "host": "agent-vault",
-                        "port": 14322,
-                        "bypassDomains": bypass_domains,
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "server": {"enabled": True},
-                        },
-                    },
-                },
-            },
-        ),
-        encoding="utf-8",
-    )
-    docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-    proxy_name = "mindroom-runtime-egress-proxy"
-    proxy_deployment = _resource(docs, "Deployment", proxy_name)
-    proxy_container = _container(proxy_deployment, "approved-egress-proxy")
-    proxy_pod_template = proxy_deployment["spec"]["template"]
-    runtime_container = _container(_resource(docs, "Deployment", "mindroom-runtime"), "mindroom")
-    worker_policy = _resource(docs, "NetworkPolicy", "mindroom-runtime-workers")
-    proxy_env = _env_by_name(proxy_container)
-    runtime_env = _env_by_name(runtime_container)
-    squid_config = _resource(docs, "ConfigMap", f"{proxy_name}-squid-config")
-
-    assert runtime_env["MINDROOM_KUBERNETES_AGENT_VAULT_API_URL"]["value"] == "http://agent-vault:14321"
-    assert runtime_env["MINDROOM_KUBERNETES_AGENT_VAULT_PROXY_URL"]["value"] == (
-        "http://mindroom-runtime-egress-proxy.default.svc.cluster.local:3128"
-    )
-    assert "checksum/squid-config" in proxy_pod_template["metadata"]["annotations"]
-    assert proxy_env["MINDROOM_EGRESS_SQUID_CONFIG_PATH"]["value"] == "/etc/squid/mindroom-egress-chain.conf"
-    assert {
-        "name": "squid-config",
-        "mountPath": "/etc/squid/mindroom-egress-chain.conf",
-        "subPath": "squid.conf",
-        "readOnly": True,
-    } in proxy_container["volumeMounts"]
-    assert {
-        "name": "squid-config",
-        "configMap": {"name": f"{proxy_name}-squid-config"},
-    } in proxy_deployment["spec"]["template"]["spec"]["volumes"]
-    assert worker_policy["spec"]["egress"][2] == {
-        "to": [
-            {
-                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "default"}},
-                "podSelector": {
-                    "matchLabels": {
-                        "app.kubernetes.io/name": "agent-vault",
-                        "app.kubernetes.io/instance": "mindroom-runtime",
-                        "app.kubernetes.io/component": "agent-vault",
-                    },
-                },
-            },
-        ],
-        "ports": [{"protocol": "TCP", "port": 14321}],
-    }
-    assert not any(
-        any(port.get("port") == 14322 for port in rule.get("ports", []))
-        and any(
-            to.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/name") == "agent-vault"
-            for to in rule.get("to", [])
-        )
-        for rule in worker_policy["spec"]["egress"]
-    )
-
-    conf = squid_config["data"]["squid.conf"]
-    assert "include /etc/squid/squid.conf" in conf
-    assert "acl egress_has_token req_header Proxy-Authorization ." in conf
-    assert "dns_defnames on" in conf
-    assert "cache_peer agent-vault parent 14322 0 no-query no-digest login=PASSTHRU" in conf
-    assert "cache_peer_access agent-vault allow egress_has_token" in conf
-    assert "cache_peer_access agent-vault deny all" in conf
-    assert "nonhierarchical_direct off" in conf
-    assert "always_direct allow !egress_has_token" in conf
-    assert "never_direct allow egress_has_token" in conf
-    assert "name=agentvault" not in conf
-    if bypass_domains:
-        assert "acl egress_bypass_parent dstdomain -n downloads.example.test .objects.example.test" in conf
-        assert conf.index("cache_peer_access agent-vault deny egress_bypass_parent") < conf.index(
-            "cache_peer_access agent-vault allow egress_has_token",
-        )
-        assert conf.index("always_direct allow egress_bypass_parent") < conf.index(
-            "always_direct allow !egress_has_token",
-        )
-    else:
-        assert "egress_bypass_parent" not in conf
-
-
 def test_runtime_chart_parent_bypass_domains_change_proxy_rollout_checksum(tmp_path: Path) -> None:
     """Changing bypass routing updates the mounted config and forces the proxy to restart."""
     checksums = set()
@@ -1558,7 +2403,7 @@ def test_runtime_chart_parent_bypass_domains_change_proxy_rollout_checksum(tmp_p
             "workers.sandbox.proxyToken.value=test-token",
             "approvedEgress.enabled=true",
             "approvedEgress.image.tag=v0.1.0",
-            "approvedEgress.parentProxy.enabled=true",
+            "egressBroker.enabled=true",
             values_files=(values_path,),
         )
         deployment = _resource(docs, "Deployment", "mindroom-demo-mindroom-runtime-egress-proxy")
@@ -1613,7 +2458,7 @@ def test_runtime_chart_rejects_invalid_parent_bypass_domains(tmp_path: Path, byp
         "workers.sandbox.proxyToken.value=test-token",
         "approvedEgress.enabled=true",
         "approvedEgress.image.tag=v0.1.0",
-        "approvedEgress.parentProxy.enabled=true",
+        "egressBroker.enabled=true",
         values_files=(values_path,),
     )
     assert completed.returncode != 0
@@ -1637,7 +2482,7 @@ def test_runtime_chart_accepts_valid_parent_bypass_domain_boundaries(domain: str
         "workers.sandbox.proxyToken.value=test-token",
         "approvedEgress.enabled=true",
         "approvedEgress.image.tag=v0.1.0",
-        "approvedEgress.parentProxy.enabled=true",
+        "egressBroker.enabled=true",
         set_string_args=(f"approvedEgress.parentProxy.bypassDomains[0]={domain}",),
     )
     config = _resource(docs, "ConfigMap", "mindroom-demo-mindroom-runtime-egress-proxy-squid-config")
@@ -1645,7 +2490,7 @@ def test_runtime_chart_accepts_valid_parent_bypass_domain_boundaries(domain: str
 
 
 def test_runtime_chart_parent_bypass_domains_are_inactive_without_parent(tmp_path: Path) -> None:
-    """Preconfigured bypass domains cannot enable a parent or change egress authorization."""
+    """Preconfigured bypass domains without the egress broker render no parent and leave egress authorization alone."""
     values_path = tmp_path / "values.yaml"
     values_path.write_text(
         yaml.safe_dump({"approvedEgress": {"parentProxy": {"bypassDomains": ["downloads.example.test"]}}}),
@@ -1663,10 +2508,19 @@ def test_runtime_chart_parent_bypass_domains_are_inactive_without_parent(tmp_pat
     assert not any(doc["kind"] == "ConfigMap" and doc["metadata"]["name"].endswith("-squid-config") for doc in docs)
 
 
+_PROGRESS_DEADLINE_CHARTS = pytest.mark.parametrize(
+    ("chart", "required_args"),
+    [("runtime", ()), ("tuwunel", ("tuwunel.serverName=example.com",))],
+)
+
+
+@_PROGRESS_DEADLINE_CHARTS
 @pytest.mark.parametrize("deadline", [None, 1, 1800, 2147483647])
 @pytest.mark.parametrize("from_values_file", [False, True])
-def test_runtime_chart_progress_deadline_is_optional(
+def test_chart_progress_deadline_is_optional(
     tmp_path: Path,
+    chart: str,
+    required_args: tuple[str, ...],
     deadline: int | None,
     from_values_file: bool,
 ) -> None:
@@ -1674,12 +2528,13 @@ def test_runtime_chart_progress_deadline_is_optional(
     values_path = tmp_path / "values.yaml"
     values_path.write_text(yaml.safe_dump({"progressDeadlineSeconds": deadline}))
     docs = _render_chart(
-        Path("cluster/k8s/runtime"),
+        Path(f"cluster/k8s/{chart}"),
+        *required_args,
         *((f"progressDeadlineSeconds={deadline}",) if deadline is not None and not from_values_file else ()),
         values_files=(values_path,) if from_values_file else (),
-        release_name="mindroom-runtime",
+        release_name=f"mindroom-{chart}",
     )
-    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    deployment = _resource(docs, "Deployment", f"mindroom-{chart}")
 
     if deadline is None:
         assert "progressDeadlineSeconds" not in deployment["spec"]
@@ -1688,10 +2543,16 @@ def test_runtime_chart_progress_deadline_is_optional(
         assert deployment["spec"]["progressDeadlineSeconds"] == deadline
 
 
-@pytest.mark.parametrize("deadline", [0, -1, 1.5, "abc", True, "", 2147483648, 999999999999999999999999])
+@_PROGRESS_DEADLINE_CHARTS
+@pytest.mark.parametrize(
+    "deadline",
+    [0, -1, 1.5, "abc", True, "", 2147483648, 99999999999999999999, 999999999999999999999999],
+)
 @pytest.mark.parametrize("from_values_file", [False, True])
-def test_runtime_chart_rejects_invalid_progress_deadline(
+def test_chart_rejects_invalid_progress_deadline(
     tmp_path: Path,
+    chart: str,
+    required_args: tuple[str, ...],
     deadline: str | float,
     from_values_file: bool,
 ) -> None:
@@ -1699,7 +2560,8 @@ def test_runtime_chart_rejects_invalid_progress_deadline(
     values_path = tmp_path / "values.yaml"
     values_path.write_text(yaml.safe_dump({"progressDeadlineSeconds": deadline}))
     completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
+        Path(f"cluster/k8s/{chart}"),
+        *required_args,
         set_string_args=() if from_values_file else (f"progressDeadlineSeconds={deadline}",),
         values_files=(values_path,) if from_values_file else (),
     )
@@ -1708,630 +2570,44 @@ def test_runtime_chart_rejects_invalid_progress_deadline(
     assert "progressDeadlineSeconds must be a positive integer no greater than 2147483647" in completed.stderr
 
 
-@pytest.mark.parametrize("smtp_enabled", [False, True])
 @pytest.mark.parametrize(
-    "env_name",
+    ("values", "expected"),
     [
-        "AGENT_VAULT_MASTER_PASSWORD",
-        "AGENT_VAULT_SMTP_HOST",
-        "AGENT_VAULT_SMTP_PORT",
-        "AGENT_VAULT_SMTP_TLS_MODE",
-        "AGENT_VAULT_SMTP_FROM_NAME",
-        "AGENT_VAULT_SMTP_USERNAME",
-        "AGENT_VAULT_SMTP_PASSWORD",
-        "AGENT_VAULT_SMTP_FROM",
+        ({}, 1800),
+        ({"terminationGracePeriodSeconds": None}, None),
+        ({"terminationGracePeriodSeconds": 0}, 0),
+        ({"terminationGracePeriodSeconds": 600}, 600),
     ],
 )
-def test_runtime_chart_agent_vault_server_rejects_managed_environment(env_name: str, smtp_enabled: bool) -> None:
-    """Extensions cannot replace chart-managed credentials; disabled SMTP stays configurable."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        "workers.kubernetes.agentVault.server.enabled=true",
-        "workers.kubernetes.agentVault.server.image=example.test/agent-vault:test",
-        f"workers.kubernetes.agentVault.server.smtp.enabled={str(smtp_enabled).lower()}",
-        "workers.kubernetes.agentVault.server.smtp.host=smtp.example.test",
-        "workers.kubernetes.agentVault.server.smtp.existingSecret=vault-smtp",
-        f"workers.kubernetes.agentVault.server.extraEnv[0].name={env_name}",
-        "workers.kubernetes.agentVault.server.extraEnv[0].value=custom-value",
-    )
-
-    if env_name == "AGENT_VAULT_MASTER_PASSWORD" or smtp_enabled:
-        assert completed.returncode != 0
-        assert f"server.extraEnv[0] cannot override chart-managed {env_name}" in completed.stderr
-    else:
-        completed.check_returncode()
-        docs = [doc for doc in yaml.safe_load_all(completed.stdout) if isinstance(doc, dict)]
-        vault = _container(_resource(docs, "Deployment", "agent-vault"), "agent-vault")
-        assert _env_by_name(vault)[env_name]["value"] == "custom-value"
-
-
-@pytest.mark.parametrize("smtp_enabled", [False, True])
-@pytest.mark.parametrize("custom_env", [False, True])
-def test_runtime_chart_agent_vault_server_environment(
+def test_tuwunel_chart_termination_grace_period_outlasts_a_migration_step(
     tmp_path: Path,
-    smtp_enabled: bool,
-    custom_env: bool,
+    values: dict[str, int | None],
+    expected: int | None,
 ) -> None:
-    """Vault-only environment extensions preserve built-in password and SMTP wiring."""
-    extra_env = [
-        {"name": "AGENT_VAULT_ADDR", "value": "https://vault.example.test"},
-        {
-            "name": "AGENT_VAULT_OAUTH_GITHUB_CLIENT_SECRET",
-            "valueFrom": {"secretKeyRef": {"name": "vault-oauth", "key": "client-secret"}},
-        },
-    ]
-    env_from = [
-        {"secretRef": {"name": "vault-extra-env"}},
-        {"configMapRef": {"name": "vault-settings"}, "prefix": "VAULT_"},
-    ]
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "kubernetes": {
-                        "agentVault": {
-                            "server": {
-                                "enabled": True,
-                                "image": "example.test/agent-vault:test",
-                                "extraEnv": extra_env if custom_env else [],
-                                "envFrom": env_from if custom_env else [],
-                                "smtp": {
-                                    "enabled": smtp_enabled,
-                                    "host": "smtp.example.test",
-                                    "existingSecret": "vault-smtp",
-                                },
-                            },
-                        },
-                    },
-                },
-            },
-        ),
-    )
-    docs = _render_chart(Path("cluster/k8s/runtime"), values_files=(values_path,), release_name="mindroom-runtime")
-    vault = _container(_resource(docs, "Deployment", "agent-vault"), "agent-vault")
-    env = _env_by_name(vault)
-
-    assert env["AGENT_VAULT_MASTER_PASSWORD"] == {
-        "name": "AGENT_VAULT_MASTER_PASSWORD",
-        "valueFrom": {"secretKeyRef": {"name": "agent-vault-bootstrap", "key": "AGENT_VAULT_MASTER_PASSWORD"}},
-    }
-    if smtp_enabled:
-        assert env["AGENT_VAULT_SMTP_HOST"]["value"] == "smtp.example.test"
-        assert env["AGENT_VAULT_SMTP_PASSWORD"] == {
-            "name": "AGENT_VAULT_SMTP_PASSWORD",
-            "valueFrom": {"secretKeyRef": {"name": "vault-smtp", "key": "AGENT_VAULT_SMTP_PASSWORD"}},
-        }
-    else:
-        assert "AGENT_VAULT_SMTP_HOST" not in env
-    if custom_env:
-        assert vault["env"][-2:] == extra_env
-        assert vault["envFrom"] == env_from
-    else:
-        assert "AGENT_VAULT_ADDR" not in env
-        assert "envFrom" not in vault
-
-    runtime = _container(_resource(docs, "Deployment", "mindroom-runtime"), "mindroom")
-    assert "AGENT_VAULT_ADDR" not in _env_by_name(runtime)
-    assert "AGENT_VAULT_OAUTH_GITHUB_CLIENT_SECRET" not in _env_by_name(runtime)
-    assert "envFrom" not in runtime
-
-
-def test_runtime_chart_agent_vault_access_tool_sets_owner_email() -> None:
-    """The self-service access tool must know the owner used by worker token minting."""
+    """Killing Tuwunel before a migration step finishes leaves the database half migrated, so the default waits."""
     docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        "workers.backend=kubernetes",
-        "workers.sandbox.proxyToken.value=test-token",
-        "workers.kubernetes.agentVault.enabled=true",
-        "workers.kubernetes.agentVault.cliImage=infisical/agent-vault:test",
-        "workers.kubernetes.agentVault.ownerEmail=owner@example.test",
-        "workers.kubernetes.agentVault.accessTool.enabled=true",
-        "workers.kubernetes.agentVault.accessTool.uiBaseUrl=https://example.test/agent-vault",
-        "workers.kubernetes.agentVault.accessTool.emailDomain=example.test",
-        "eventCache.postgres.auth.password=test-password",
-        release_name="mindroom-runtime",
+        Path("cluster/k8s/tuwunel"),
+        "tuwunel.serverName=example.com",
+        values_files=_values_files(tmp_path, values),
+        release_name="mindroom-tuwunel",
     )
+    pod_spec = _resource(docs, "Deployment", "mindroom-tuwunel")["spec"]["template"]["spec"]
 
-    runtime_container = _container(_resource(docs, "Deployment", "mindroom-runtime"), "mindroom")
-    runtime_env = _env_by_name(runtime_container)
-
-    assert runtime_env["MINDROOM_AGENT_VAULT_ACCESS_OWNER_EMAIL"]["value"] == "owner@example.test"
-    assert runtime_env["MINDROOM_AGENT_VAULT_ACCESS_VAULT_NAME_PREFIX"]["value"] == "agent-vault"
-    assert runtime_env["MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE"]["value"] == "/etc/agent-vault-access/token"
+    assert pod_spec.get("terminationGracePeriodSeconds") == expected
+    assert expected is None or isinstance(pod_spec["terminationGracePeriodSeconds"], int)
 
 
-def test_runtime_chart_rejects_agent_vault_default_proxy_url_with_approved_egress() -> None:
-    """Agent Vault must not stay vault-first when approved egress owns dynamic grants."""
+@pytest.mark.parametrize("grace", [-1, 1.5, "abc", True, ""])
+def test_tuwunel_chart_rejects_invalid_termination_grace_period(tmp_path: Path, grace: str | float) -> None:
+    """Reject grace periods Kubernetes would refuse during rendering rather than installation."""
     completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        "workers.backend=kubernetes",
-        "workers.sandbox.proxyToken.value=test-token",
-        "workers.kubernetes.agentVault.enabled=true",
-        "workers.kubernetes.agentVault.cliImage=infisical/agent-vault:test",
-        "workers.kubernetes.agentVault.ownerEmail=owner@example.test",
-        "eventCache.postgres.auth.password=test-password",
-        "approvedEgress.enabled=true",
-        "approvedEgress.image.tag=v0.1.0",
-        release_name="mindroom-runtime",
+        Path("cluster/k8s/tuwunel"),
+        "tuwunel.serverName=example.com",
+        values_files=_values_files(tmp_path, {"terminationGracePeriodSeconds": grace}),
     )
 
     assert completed.returncode != 0
-    assert "approvedEgress with Agent Vault must be squid-first" in completed.stderr
-
-
-def test_runtime_chart_agent_vault_access_grants_are_noop_by_default() -> None:
-    """Access grants should not add grant resources unless explicitly enabled with grants."""
-    docs = _render_runtime_chart()
-
-    assert not any(
-        doc.get("kind") in {"ConfigMap", "Job"}
-        and isinstance(doc.get("metadata"), dict)
-        and doc["metadata"].get("name") == "agent-vault-access-grants"
-        for doc in docs
-    )
-
-
-def test_runtime_chart_agent_vault_access_grants_renders_shared_grant_job(tmp_path: Path) -> None:
-    """Shared worker vault admins can be declared without inline scripts."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "accessGrants": {
-                                "enabled": True,
-                                "tenantId": "tenant-42",
-                                "grants": [
-                                    {
-                                        "email": "maintainer@example.test",
-                                        "workerScope": "shared",
-                                        "agent": "example-agent",
-                                        "role": "admin",
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-    config_map = _resource(docs, "ConfigMap", "agent-vault-access-grants")
-    job = _resource(docs, "Job", "agent-vault-access-grants")
-    container = _container(job, "access-grants")
-    config = yaml.safe_load(config_map["data"]["access-grants.yaml"])
-
-    assert config == {
-        "apiUrl": "http://agent-vault:14321",
-        "vaultNamePrefix": "agent-vault",
-        "tenantId": "tenant-42",
-        "grants": [
-            {
-                "email": "maintainer@example.test",
-                "workerScope": "shared",
-                "agent": "example-agent",
-                "role": "admin",
-            },
-        ],
-    }
-    assert job["metadata"]["annotations"]["helm.sh/hook"] == "post-install,post-upgrade"
-    assert job["metadata"]["annotations"]["helm.sh/hook-delete-policy"] == "before-hook-creation,hook-succeeded"
-    assert container["image"] == "ghcr.io/mindroom-ai/mindroom:latest"
-    assert container["command"] == [
-        "python",
-        "-m",
-        "mindroom.agent_vault_access_grants",
-        "apply",
-        "--config",
-        "/etc/mindroom-agent-vault-access-grants/access-grants.yaml",
-        "--admin-token-file",
-        "/etc/agent-vault-access-grants/token",
-        "--wait-ready-seconds",
-        "180",
-    ]
-    assert {
-        "name": "access-grants-config",
-        "mountPath": "/etc/mindroom-agent-vault-access-grants",
-        "readOnly": True,
-    } in container["volumeMounts"]
-    assert {
-        "name": "access-grants-admin-token",
-        "mountPath": "/etc/agent-vault-access-grants",
-        "readOnly": True,
-    } in container["volumeMounts"]
-
-
-def test_runtime_chart_agent_vault_access_grants_renders_user_agent_grant(tmp_path: Path) -> None:
-    """The chart passes requester-scoped grant inputs through to the helper config."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "accessGrants": {
-                                "enabled": True,
-                                "grants": [
-                                    {
-                                        "email": "user@example.test",
-                                        "workerScope": "user_agent",
-                                        "requester": "@user:example.test",
-                                        "agent": "example-agent",
-                                        "role": "admin",
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-    config = yaml.safe_load(_resource(docs, "ConfigMap", "agent-vault-access-grants")["data"]["access-grants.yaml"])
-
-    assert config["grants"] == [
-        {
-            "email": "user@example.test",
-            "workerScope": "user_agent",
-            "requester": "@user:example.test",
-            "agent": "example-agent",
-            "role": "admin",
-        },
-    ]
-
-
-def test_runtime_chart_agent_vault_access_grants_renders_user_grant(tmp_path: Path) -> None:
-    """The chart passes user-scoped grant inputs through without an agent."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "accessGrants": {
-                                "enabled": True,
-                                "grants": [
-                                    {
-                                        "email": "user@example.test",
-                                        "workerScope": "user",
-                                        "requester": "@user:example.test",
-                                        "role": "admin",
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-    config = yaml.safe_load(_resource(docs, "ConfigMap", "agent-vault-access-grants")["data"]["access-grants.yaml"])
-
-    assert config["grants"] == [
-        {
-            "email": "user@example.test",
-            "workerScope": "user",
-            "requester": "@user:example.test",
-            "role": "admin",
-        },
-    ]
-
-
-def test_runtime_chart_agent_vault_bootstrap_publishes_access_grants_admin_token(tmp_path: Path) -> None:
-    """The bootstrap Job should publish an owner-role token for access-grant jobs."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "workerCaConfigMapName": "agent-vault-ca",
-                            "bootstrap": {
-                                "enabled": True,
-                                "kubectlImage": "bitnami/kubectl:latest",
-                            },
-                            "accessGrants": {
-                                "enabled": True,
-                                "adminTokenSecret": {
-                                    "name": "agent-vault-grants-admin",
-                                    "key": "token",
-                                },
-                                "grants": [
-                                    {
-                                        "email": "maintainer@example.test",
-                                        "workerScope": "shared",
-                                        "agent": "example-agent",
-                                        "role": "admin",
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    docs = _render_chart(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-    bootstrap_job = _resource(docs, "Job", "agent-vault-bootstrap")
-    bootstrap_init = _init_container(bootstrap_job, "bootstrap-owner")
-    publish_container = _container(bootstrap_job, "publish-ca")
-    bootstrap_role = _resource(docs, "Role", "agent-vault-bootstrap")
-
-    assert 'agent-vault agent create "access-admin"' in bootstrap_init["args"][0]
-    assert 'agent-vault agent set-role "access-admin" --role owner' in bootstrap_init["args"][0]
-    assert "create secret generic agent-vault-grants-admin" in publish_container["args"][0]
-    secret_rule = next(
-        rule for rule in bootstrap_role["rules"] if "secrets" in rule.get("resources", []) and "resourceNames" in rule
-    )
-    assert "agent-vault-grants-admin" in secret_rule["resourceNames"]
-
-
-def test_runtime_chart_rejects_agent_vault_access_token_same_secret_different_keys(tmp_path: Path) -> None:
-    """Bootstrap must not apply the same Secret twice with different admin-token keys."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "workerCaConfigMapName": "agent-vault-ca",
-                            "bootstrap": {
-                                "enabled": True,
-                                "kubectlImage": "bitnami/kubectl:latest",
-                            },
-                            "accessTool": {
-                                "enabled": True,
-                                "uiBaseUrl": "https://example.test/agent-vault",
-                                "emailDomain": "example.test",
-                                "adminTokenSecret": {
-                                    "name": "agent-vault-access-admin",
-                                    "key": "tool-token",
-                                },
-                            },
-                            "accessGrants": {
-                                "enabled": True,
-                                "adminTokenSecret": {
-                                    "name": "agent-vault-access-admin",
-                                    "key": "grants-token",
-                                },
-                                "grants": [
-                                    {
-                                        "email": "maintainer@example.test",
-                                        "workerScope": "shared",
-                                        "agent": "example-agent",
-                                        "role": "admin",
-                                    },
-                                ],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-
-    assert completed.returncode != 0
-    assert (
-        "workers.kubernetes.agentVault.accessTool.adminTokenSecret.key must match "
-        "workers.kubernetes.agentVault.accessGrants.adminTokenSecret.key when both use the same Secret name"
-    ) in completed.stderr
-
-
-@pytest.mark.parametrize(
-    ("grant", "message"),
-    [
-        (
-            {
-                "email": "maintainer@example.test",
-                "workerScope": "shared",
-                "requester": "@user:example.test",
-                "agent": "example-agent",
-                "role": "admin",
-            },
-            "workers.kubernetes.agentVault.accessGrants.grants[0].requester must be empty for workerScope=shared",
-        ),
-        (
-            {
-                "email": "user@example.test",
-                "workerScope": "user_agent",
-                "agent": "example-agent",
-                "role": "admin",
-            },
-            "workers.kubernetes.agentVault.accessGrants.grants[0].requester is required for workerScope=user_agent",
-        ),
-        (
-            {
-                "email": "user@example.test",
-                "workerScope": "user",
-                "requester": "@user:example.test",
-                "role": "viewer",
-            },
-            "workers.kubernetes.agentVault.accessGrants.grants[0].role must be admin",
-        ),
-        (
-            {
-                "email": "user@example.test",
-                "workerScope": "invalid",
-                "requester": "@user:example.test",
-                "role": "admin",
-            },
-            "workers.kubernetes.agentVault.accessGrants.grants[0].workerScope must be one of: shared, user, user_agent",
-        ),
-        (
-            {
-                "email": "user@example.test",
-                "workerScope": "user",
-                "requester": "@user:example.test",
-                "agent": "example-agent",
-                "role": "admin",
-            },
-            "workers.kubernetes.agentVault.accessGrants.grants[0].agent must be empty for workerScope=user",
-        ),
-    ],
-)
-def test_runtime_chart_rejects_invalid_agent_vault_access_grants(
-    tmp_path: Path,
-    grant: dict[str, str],
-    message: str,
-) -> None:
-    """Grant validation should fail during Helm rendering before the Job runs."""
-    values_path = tmp_path / "values.yaml"
-    values_path.write_text(
-        yaml.safe_dump(
-            {
-                "workers": {
-                    "backend": "kubernetes",
-                    "sandbox": {"proxyToken": {"value": "test-token"}},
-                    "kubernetes": {
-                        "agentVault": {
-                            "enabled": True,
-                            "cliImage": "infisical/agent-vault:test",
-                            "ownerEmail": "owner@example.test",
-                            "accessGrants": {
-                                "enabled": True,
-                                "grants": [grant],
-                            },
-                        },
-                    },
-                },
-                "eventCache": {"postgres": {"auth": {"password": "test-password"}}},
-            },
-        ),
-        encoding="utf-8",
-    )
-
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        values_files=(values_path,),
-        release_name="mindroom-runtime",
-    )
-
-    assert completed.returncode != 0
-    assert message in completed.stderr
-
-
-def test_runtime_chart_rejects_invalid_approved_egress_parent_proxy_port() -> None:
-    """Parent proxy ports must be valid TCP ports before rendering Squid config."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        "workers.backend=kubernetes",
-        "workers.sandbox.proxyToken.value=test-token",
-        "workers.kubernetes.agentVault.enabled=true",
-        "workers.kubernetes.agentVault.cliImage=infisical/agent-vault:test",
-        "workers.kubernetes.agentVault.ownerEmail=owner@example.test",
-        "workers.kubernetes.agentVault.server.enabled=true",
-        "eventCache.postgres.auth.password=test-password",
-        "approvedEgress.enabled=true",
-        "approvedEgress.image.tag=v0.1.0",
-        "approvedEgress.parentProxy.enabled=true",
-        "approvedEgress.parentProxy.port=70000",
-        release_name="mindroom-runtime",
-    )
-
-    assert completed.returncode != 0
-    assert "approvedEgress.parentProxy.port must be between 1 and 65535" in completed.stderr
-
-
-@pytest.mark.parametrize(
-    "proxy_url",
-    [
-        " http://agent-vault:14322 ",
-        "http://agent-vault:14322/",
-        "HTTP://agent-vault:14322/",
-        "http://agent-vault.default:14322",
-        "http://agent-vault.default.svc:14322",
-        "http://agent-vault.default.svc.cluster.local:14322",
-    ],
-)
-def test_runtime_chart_rejects_agent_vault_service_proxy_url_aliases_with_approved_egress(proxy_url: str) -> None:
-    """Agent Vault service aliases must not avoid the Squid-first validation."""
-    completed = _run_helm_template(
-        Path("cluster/k8s/runtime"),
-        "workers.backend=kubernetes",
-        "workers.sandbox.proxyToken.value=test-token",
-        "workers.kubernetes.agentVault.enabled=true",
-        "workers.kubernetes.agentVault.cliImage=infisical/agent-vault:test",
-        "workers.kubernetes.agentVault.ownerEmail=owner@example.test",
-        f"workers.kubernetes.agentVault.proxyUrl={proxy_url}",
-        "eventCache.postgres.auth.password=test-password",
-        "approvedEgress.enabled=true",
-        "approvedEgress.image.tag=v0.1.0",
-        release_name="mindroom-runtime",
-    )
-
-    assert completed.returncode != 0
-    assert "approvedEgress with Agent Vault must be squid-first" in completed.stderr
+    assert "terminationGracePeriodSeconds must be a non-negative integer" in completed.stderr
 
 
 def test_runtime_chart_approved_egress_uses_worker_namespace_for_pod_lookup_and_rbac() -> None:
@@ -2654,6 +2930,59 @@ def test_runtime_chart_disables_service_links_for_dynamic_worker_pods_by_default
     env_values = {env["name"]: env.get("value") for env in container["env"]}
 
     assert env_values["MINDROOM_KUBERNETES_WORKER_ENABLE_SERVICE_LINKS"] == "false"
+    assert "MINDROOM_KUBERNETES_WORKER_SECCOMP_PROFILE_JSON" not in env_values
+    assert "MINDROOM_KUBERNETES_WORKER_RUNTIME_CLASS_NAME" not in env_values
+
+
+def test_runtime_chart_passes_localhost_seccomp_profile_to_worker_manager() -> None:
+    """The runtime chart serializes the optional main worker container profile exactly."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "workers.kubernetes.seccompProfile.type=Localhost",
+        "workers.kubernetes.seccompProfile.localhostProfile=profiles/worker-computer.json",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    env = _env_by_name(_container(deployment, "mindroom"))
+
+    assert json.loads(env["MINDROOM_KUBERNETES_WORKER_SECCOMP_PROFILE_JSON"]["value"]) == {
+        "type": "Localhost",
+        "localhostProfile": "profiles/worker-computer.json",
+    }
+
+
+def test_runtime_chart_passes_worker_runtime_class_to_worker_manager() -> None:
+    """The runtime chart can opt the whole generated worker pool into one RuntimeClass."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "workers.kubernetes.runtimeClassName=sandboxed",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    env = _env_by_name(_container(deployment, "mindroom"))
+
+    assert env["MINDROOM_KUBERNETES_WORKER_RUNTIME_CLASS_NAME"]["value"] == "sandboxed"
+
+
+def test_runtime_chart_rejects_unsupported_worker_seccomp_profile() -> None:
+    """The runtime chart refuses a profile that would turn syscall filtering off."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "workers.kubernetes.seccompProfile.type=Unconfined",
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert "workers.kubernetes.seccompProfile" in completed.stderr
 
 
 def test_runtime_chart_worker_manager_can_only_patch_default_worker_auth_secret() -> None:
@@ -2686,19 +3015,30 @@ def test_runtime_chart_uses_default_worker_auth_secret() -> None:
     assert "data" not in worker_auth_secret
 
 
-def test_runtime_chart_static_runner_uses_credentials_encryption_key_secret() -> None:
-    """Static runner mode should wire the optional credential key Secret into both containers."""
+@pytest.mark.parametrize(
+    ("proxy_tools_args", "proxy_tools"),
+    [((), "shell,file,python,coding"), (("workers.sandbox.proxyTools=*",), "*")],
+)
+def test_runtime_chart_static_runner_withholds_key_and_mounts_only_agent_state(
+    proxy_tools_args: tuple[str, ...],
+    proxy_tools: str,
+) -> None:
+    """Only the primary receives the credential key, and the sidecar sees agent state but no other runtime storage."""
     docs = _render_chart(
         Path("cluster/k8s/runtime"),
         "workers.sandbox.proxyToken.value=test-token",
         "workers.sandbox.credentialsEncryptionKey.existingSecret=runtime-credentials",
         "eventCache.postgres.auth.password=test-password",
+        *proxy_tools_args,
         release_name="mindroom-runtime",
     )
     deployment = _resource(docs, "Deployment", "mindroom-runtime")
     mindroom_container = _container(deployment, "mindroom")
     runner_container = _container(deployment, "sandbox-runner")
-    expected_env = {
+    volumes = _volumes_by_name(deployment)
+
+    assert _env_by_name(mindroom_container)["MINDROOM_SANDBOX_PROXY_TOOLS"]["value"] == proxy_tools
+    assert _env_by_name(mindroom_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == {
         "name": "MINDROOM_CREDENTIALS_ENCRYPTION_KEY",
         "valueFrom": {
             "secretKeyRef": {
@@ -2707,9 +3047,261 @@ def test_runtime_chart_static_runner_uses_credentials_encryption_key_secret() ->
             },
         },
     }
+    assert [ref["key"] for ref in _secret_key_refs(runner_container)] == ["MINDROOM_SANDBOX_PROXY_TOKEN"]
+    assert {"name": "storage", "mountPath": "/app/agent_data"} in mindroom_container["volumeMounts"]
+    # The primary knows the sidecar mounts the agents' storage, so people may type in the agents' terminals.
+    assert _env_by_name(mindroom_container)["MINDROOM_STATIC_RUNNER_AGENT_STORAGE"]["value"] == "true"
+    assert runner_container["volumeMounts"] == [
+        {"name": "storage", "mountPath": "/app/agent_data", "subPath": "sandbox-runner"},
+        {"name": "storage", "mountPath": "/app/agent_data/agents", "subPath": "agents"},
+        {"name": "storage", "mountPath": "/app/agent_data/private_instances", "subPath": "private_instances"},
+        {"name": "storage", "mountPath": "/app/agent_data/shared_directories", "subPath": "shared_directories"},
+        {"name": "sandbox-workspace", "mountPath": "/app/workspace"},
+    ]
+    assert volumes["storage"] == {
+        "name": "storage",
+        "persistentVolumeClaim": {"claimName": "mindroom-runtime-storage"},
+    }
+    assert volumes["sandbox-workspace"] == {"name": "sandbox-workspace", "emptyDir": {}}
+    assert _env_by_name(runner_container)["MINDROOM_STORAGE_PATH"]["value"] == "/app/agent_data"
+    assert _init_container(deployment, "prepare-sandbox-runner-storage")["command"] == [
+        "mkdir",
+        "-p",
+        "/app/agent_data/sandbox-runner",
+        "/app/agent_data/agents",
+        "/app/agent_data/private_instances",
+        "/app/agent_data/shared_directories",
+    ]
 
-    assert _env_by_name(mindroom_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == expected_env
-    assert _env_by_name(runner_container)["MINDROOM_CREDENTIALS_ENCRYPTION_KEY"] == expected_env
+
+_RUNTIME_CHART_BASE_ARGS = (
+    "workers.sandbox.proxyToken.value=test-token",
+    "eventCache.postgres.auth.password=test-password",
+)
+_BUNDLED_CONFIG_PATH = "/app/agent_data/content-bundles/team/prod/agent-config.yaml"
+
+
+@pytest.mark.parametrize(
+    ("chart", "set_args", "storage_root", "primary_config_path"),
+    [
+        ("runtime", (), "/app/agent_data", "/app/config.yaml"),
+        (
+            "runtime",
+            ("config.source=file", f"config.path={_BUNDLED_CONFIG_PATH}"),
+            "/app/agent_data",
+            _BUNDLED_CONFIG_PATH,
+        ),
+        (
+            "runtime",
+            ("config.source=file", "config.path=/app/agent_data/config.yaml"),
+            "/app/agent_data",
+            "/app/agent_data/config.yaml",
+        ),
+        ("runtime", ("workers.backend=kubernetes",), "/app/agent_data", "/app/config.yaml"),
+        (
+            "runtime",
+            ("workers.backend=kubernetes", "config.source=file", f"config.path={_BUNDLED_CONFIG_PATH}"),
+            "/app/agent_data",
+            _BUNDLED_CONFIG_PATH,
+        ),
+        ("instance", (), "/mindroom_data", "/mindroom_data/config/config.yaml"),
+    ],
+)
+def test_charts_never_hand_the_primary_config_to_runners_or_workers(
+    chart: str,
+    set_args: tuple[str, ...],
+    storage_root: str,
+    primary_config_path: str,
+) -> None:
+    """Runner sidecars and Kubernetes workers get no config file, config directory, or config ConfigMap.
+
+    They keep the primary's config path so config-relative snapshot paths resolve alike, and take
+    every agent setting from the allowlisted snapshot each request carries.
+    """
+    release_name = "mindroom-runtime" if chart == "runtime" else "mindroom-demo"
+    base_args = _RUNTIME_CHART_BASE_ARGS if chart == "runtime" else ()
+    docs = _render_chart(Path("cluster/k8s") / chart, *base_args, *set_args, release_name=release_name)
+    deployment = _resource(docs, "Deployment", release_name)
+    volumes = _volumes_by_name(deployment)
+    primary_env = _env_by_name(_container(deployment, "mindroom"))
+    config_relative = (
+        PurePosixPath(primary_config_path).relative_to(storage_root).as_posix()
+        if primary_config_path.startswith(f"{storage_root}/")
+        else None
+    )
+
+    assert primary_env["MINDROOM_CONFIG_PATH"]["value"] == primary_config_path
+    # The Kubernetes worker manager has no setting that would mount a config into workers.
+    assert not any(name.startswith("MINDROOM_KUBERNETES_WORKER_CONFIG_") for name in primary_env)
+    for container in deployment["spec"]["template"]["spec"]["containers"]:
+        if container["name"] == "mindroom":
+            continue
+        assert _env_by_name(container)["MINDROOM_CONFIG_PATH"]["value"] == primary_config_path
+        for mount in container.get("volumeMounts", []):
+            volume = volumes[mount["name"]]
+            assert "configMap" not in volume, mount
+            if "persistentVolumeClaim" in volume and config_relative is not None:
+                sub_path = str(mount.get("subPath", ""))
+                assert sub_path, mount
+                assert config_relative != sub_path, mount
+                assert not config_relative.startswith(f"{sub_path}/"), mount
+
+
+@pytest.mark.parametrize("directory", ["agents", "private_instances", "sandbox-runner", "shared_directories"])
+def test_runtime_chart_static_runner_rejects_file_config_in_sidecar_writable_storage(directory: str) -> None:
+    """The sidecar must not be able to rewrite the config the primary loads."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "eventCache.postgres.auth.password=test-password",
+        "config.source=file",
+        f"config.path=/app/agent_data/{directory}/config.yaml",
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert "the sandbox-runner sidecar can write those directories" in completed.stderr
+
+
+def test_runtime_chart_static_runner_generates_primary_api_key() -> None:
+    """The sidecar shares the pod network, so an unauthenticated primary API gets a chart-generated key."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "env.envFrom[0].secretRef.name=operator-env",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    api_key_secret = _resource(docs, "Secret", "mindroom-runtime-api-key")
+    runner_container = _container(deployment, "sandbox-runner")
+
+    assert list(api_key_secret["data"]) == ["MINDROOM_API_KEY"]
+    assert len(base64.b64decode(api_key_secret["data"]["MINDROOM_API_KEY"])) == 48
+    # The generated key comes first so an operator-supplied MINDROOM_API_KEY wins.
+    assert _container(deployment, "mindroom")["envFrom"] == [
+        {"secretRef": {"name": "mindroom-runtime-api-key"}},
+        {"secretRef": {"name": "operator-env"}},
+    ]
+    assert "envFrom" not in runner_container
+    assert "MINDROOM_API_KEY" not in _env_by_name(runner_container)
+
+
+def test_runtime_chart_dedicated_workers_generate_primary_api_key() -> None:
+    """Dedicated worker pods can reach the primary Service, so an unauthenticated primary API gets a key too."""
+    docs = _render_runtime_chart()
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    api_key_secret = _resource(docs, "Secret", "mindroom-runtime-api-key")
+
+    assert list(api_key_secret["data"]) == ["MINDROOM_API_KEY"]
+    assert len(base64.b64decode(api_key_secret["data"]["MINDROOM_API_KEY"])) == 48
+    assert _container(deployment, "mindroom")["envFrom"] == [{"secretRef": {"name": "mindroom-runtime-api-key"}}]
+
+
+@pytest.mark.parametrize("backend", ["static_runner", "kubernetes"])
+def test_runtime_chart_opt_out_skips_generated_api_key(backend: str) -> None:
+    """The explicit opt-out renders no generated key for either worker backend."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        f"workers.backend={backend}",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "apiAuth.allowUnauthenticatedPrimary=true",
+        release_name="mindroom-runtime",
+    )
+    mindroom_container = _container(_resource(docs, "Deployment", "mindroom-runtime"), "mindroom")
+
+    assert not any(doc["kind"] == "Secret" and doc["metadata"]["name"] == "mindroom-runtime-api-key" for doc in docs)
+    assert "envFrom" not in mindroom_container
+
+
+@pytest.mark.parametrize("backend", ["static_runner", "kubernetes"])
+def test_runtime_chart_existing_api_key_secret_replaces_generated_key(backend: str) -> None:
+    """An existing Secret gives the primary a key that offline renders cannot rotate, and only the primary reads it."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        f"workers.backend={backend}",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "apiAuth.existingSecret=operator-api",
+        "apiAuth.key=primary-key",
+        release_name="mindroom-runtime",
+    )
+    deployment = _resource(docs, "Deployment", "mindroom-runtime")
+    mindroom_container = _container(deployment, "mindroom")
+
+    assert not any(doc["kind"] == "Secret" and doc["metadata"]["name"] == "mindroom-runtime-api-key" for doc in docs)
+    assert "envFrom" not in mindroom_container
+    assert _env_by_name(mindroom_container)["MINDROOM_API_KEY"] == {
+        "name": "MINDROOM_API_KEY",
+        "valueFrom": {"secretKeyRef": {"name": "operator-api", "key": "primary-key"}},
+    }
+    for container in deployment["spec"]["template"]["spec"]["containers"]:
+        if container["name"] != "mindroom":
+            assert "MINDROOM_API_KEY" not in _env_by_name(container)
+
+
+@pytest.mark.parametrize(
+    ("set_args", "error"),
+    [
+        (
+            ("apiAuth.allowUnauthenticatedPrimary=true",),
+            "apiAuth.existingSecret cannot be set when apiAuth.allowUnauthenticatedPrimary=true",
+        ),
+        (("apiAuth.key=",), "apiAuth.key is required when apiAuth.existingSecret is set"),
+        (
+            ("apiAuth.existingSecret=mindroom-runtime-api-key",),
+            "apiAuth.existingSecret must name a Secret the chart does not manage, not mindroom-runtime-api-key",
+        ),
+        (
+            ("env.extra[0].name=MINDROOM_API_KEY", "env.extra[0].value=duplicate"),
+            "apiAuth.existingSecret and env.extra both set MINDROOM_API_KEY; remove one of them",
+        ),
+    ],
+)
+def test_runtime_chart_rejects_conflicting_existing_api_key_secret(set_args: tuple[str, ...], error: str) -> None:
+    """An existing API key Secret must be the primary's only key source."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "apiAuth.existingSecret=operator-api",
+        *set_args,
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert error in completed.stderr
+
+
+def test_runtime_chart_dedicated_workers_skip_static_runner_storage() -> None:
+    """Dedicated workers need neither the sidecar nor its storage preparation."""
+    pod_spec = _resource(_render_runtime_chart(), "Deployment", "mindroom-runtime")["spec"]["template"]["spec"]
+
+    assert [container["name"] for container in pod_spec["containers"]] == ["mindroom"]
+    assert "initContainers" not in pod_spec
+
+
+def test_runtime_chart_runs_runtime_image_containers_as_non_root() -> None:
+    """Every runtime-image container enforces non-root, while the state-storage chown step stays explicitly root."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "eventCache.postgres.auth.password=test-password",
+        "stateStorage.enabled=true",
+        "stateStorage.create=true",
+        release_name="mindroom-runtime",
+    )
+    pod_spec = _resource(docs, "Deployment", "mindroom-runtime")["spec"]["template"]["spec"]
+    containers = {container["name"]: container for container in [*pod_spec["initContainers"], *pod_spec["containers"]]}
+    runtime_security = {"runAsNonRoot": True, "allowPrivilegeEscalation": False, "capabilities": {"drop": ["ALL"]}}
+
+    assert pod_spec["securityContext"] == {"fsGroup": 1000, "fsGroupChangePolicy": "OnRootMismatch"}
+    for name in ("prepare-sandbox-runner-storage", "mindroom", "sandbox-runner"):
+        assert containers[name]["securityContext"] == runtime_security
+    assert containers["prepare-state-storage"]["securityContext"] == {
+        "runAsUser": 0,
+        "runAsNonRoot": False,
+        "allowPrivilegeEscalation": False,
+    }
 
 
 def test_runtime_chart_state_storage_renders_existing_pvc_mounts_and_init_permissions(tmp_path: Path) -> None:
@@ -2899,12 +3491,9 @@ def test_runtime_chart_does_not_copy_shared_proxy_token_to_worker_namespace() ->
     assert worker_namespace_secrets == []
 
 
-@pytest.mark.parametrize("chart", ["runtime", "instance"])
-def test_worker_manager_can_verify_absence_without_controller_write_access(chart: str) -> None:
+def test_worker_manager_can_verify_absence_without_controller_write_access() -> None:
     """Migration can list lingering Pods and ReplicaSets without granting ReplicaSet mutation."""
-    docs = _render_runtime_chart() if chart == "runtime" else _render_instance_chart()
-    name = "mindroom-runtime-worker-manager" if chart == "runtime" else "mindroom-worker-manager-demo"
-    role = _resource(docs, "Role", name)
+    role = _resource(_render_runtime_chart(), "Role", "mindroom-runtime-worker-manager")
     for group, resource in (("", "pods"), ("apps", "deployments"), ("apps", "replicasets")):
         rules = [rule for rule in role["rules"] if group in rule["apiGroups"] and resource in rule["resources"]]
         verbs = {verb for rule in rules for verb in rule["verbs"]}
@@ -2912,3 +3501,453 @@ def test_worker_manager_can_verify_absence_without_controller_write_access(chart
         if resource == "replicasets":
             assert verbs <= {"get", "list", "watch"}
         assert all("resourceNames" not in rule for rule in rules)
+
+
+@pytest.mark.parametrize("port", [5432, 6432])
+def test_runtime_event_journal_postgres_port_contract(port: int) -> None:
+    """The headless database endpoint must match its listener and health checks."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        f"eventCache.postgres.service.port={port}",
+        "eventCache.postgres.auth.password=test-password",
+        release_name="mindroom-runtime",
+    )
+    database_name = "mindroom-runtime-event-cache-postgres"
+    database = _resource(docs, "StatefulSet", database_name)
+    postgres = _container(database, "postgres")
+    service = _resource(docs, "Service", database_name)
+    policy = _resource(docs, "NetworkPolicy", database_name)
+    runtime = _resource(docs, "Deployment", "mindroom-runtime")
+    runtime_env = _env_by_name(_container(runtime, "mindroom"))
+    secret_ref = runtime_env["MINDROOM_EVENT_CACHE_DATABASE_URL"]["valueFrom"]["secretKeyRef"]
+    secret = _resource(docs, "Secret", secret_ref["name"])
+
+    assert service["spec"]["clusterIP"] == "None"
+    assert service["spec"]["ports"] == [{"name": "postgres", "port": port, "targetPort": "postgres", "protocol": "TCP"}]
+    assert postgres["ports"] == [{"name": "postgres", "containerPort": port, "protocol": "TCP"}]
+    assert policy["spec"]["ingress"][0]["ports"] == [{"protocol": "TCP", "port": port}]
+    assert secret["stringData"][secret_ref["key"]] == (
+        f"postgresql://mindroom_cache:test-password@{database_name}:{port}/mindroom_cache"
+    )
+    assert postgres.get("args") == ["-p", str(port)]
+    for probe in ("readinessProbe", "livenessProbe"):
+        command = postgres[probe]["exec"]["command"]
+        assert command[0] == "pg_isready"
+        assert "-p" in command, f"{probe} must check the configured database port"
+        assert command[command.index("-p") + 1] == str(port)
+
+
+def test_instance_chart_static_runner_proxies_every_default_worker_execution_tool() -> None:
+    """The hosted seed agent uses coding, so selective sandbox routing must send it to the runner sidecar."""
+    docs = _render_chart(Path("cluster/k8s/instance"), "customer=tenant42", "baseDomain=example.test")
+    env = _env_by_name(_container(_resource(docs, "Deployment", "mindroom-tenant42"), "mindroom"))
+
+    assert env["MINDROOM_SANDBOX_EXECUTION_MODE"]["value"] == "selective"
+    assert set(env["MINDROOM_SANDBOX_PROXY_TOOLS"]["value"].split(",")) >= {"shell", "file", "python", "coding"}
+
+
+_EGRESS_BROKER_NAME = "mindroom-runtime-egress-broker"
+_EGRESS_BROKER_HOST = f"{_EGRESS_BROKER_NAME}.default.svc.cluster.local"
+_EGRESS_BROKER_PRIMARY_SELECTOR = {
+    "app.kubernetes.io/name": "mindroom-runtime",
+    "app.kubernetes.io/instance": "mindroom-runtime",
+    "app.kubernetes.io/component": "runtime",
+}
+_EGRESS_BROKER_WORKER_SELECTOR = {
+    "mindroom.ai/component": "worker",
+    "app.kubernetes.io/managed-by": "mindroom",
+    "app.kubernetes.io/name": "mindroom-worker",
+}
+_EGRESS_PROXY_VALUES = (
+    "egressProxy.enabled=true",
+    "egressProxy.networkPolicy.proxyPodSelector.matchLabels.app=egress-proxy",
+)
+
+
+def _egress_broker_resource_names(docs: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    return sorted(
+        (doc["kind"], doc["metadata"]["name"])
+        for doc in docs
+        if "egress-broker" in doc["metadata"]["name"] and doc["kind"] != "Deployment"
+    )
+
+
+def _broker_primary_env(docs: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, str]]:
+    container = _container(_resource(docs, "Deployment", "mindroom-runtime"), "mindroom")
+    return container, {name: entry.get("value", "") for name, entry in _env_by_name(container).items()}
+
+
+def test_runtime_chart_egress_broker_disabled_by_default() -> None:
+    """Without opting in, the chart renders no broker Service, policies, listener, or env."""
+    docs = _render_runtime_chart("networkPolicy.create=true", *_EGRESS_PROXY_VALUES)
+    container, env = _broker_primary_env(docs)
+
+    assert _egress_broker_resource_names(docs) == []
+    assert [port["name"] for port in container["ports"]] == ["api"]
+    assert not [name for name in env if name.startswith("MINDROOM_EGRESS_BROKER_")]
+
+
+def test_runtime_chart_egress_broker_direct_mode_without_worker_egress_policy() -> None:
+    """Workers without an egress policy need no worker rule, and the primary admits only worker pods."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.kubernetes.namespace=mindroom-workers",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "networkPolicy.create=true",
+        "egressBroker.enabled=true",
+        release_name="mindroom-runtime",
+        namespace="mindroom",
+    )
+    container, env = _broker_primary_env(docs)
+
+    assert _egress_broker_resource_names(docs) == [
+        ("NetworkPolicy", _EGRESS_BROKER_NAME),
+        ("Service", _EGRESS_BROKER_NAME),
+    ]
+    service = _resource(docs, "Service", _EGRESS_BROKER_NAME)
+    assert service["spec"]["type"] == "ClusterIP"
+    assert service["spec"]["selector"] == _EGRESS_BROKER_PRIMARY_SELECTOR
+    assert service["spec"]["ports"] == [
+        {"port": 8768, "targetPort": "egress-broker", "protocol": "TCP", "name": "egress-broker"},
+    ]
+    assert {"name": "egress-broker", "containerPort": 8768, "protocol": "TCP"} in container["ports"]
+
+    policy = _resource(docs, "NetworkPolicy", _EGRESS_BROKER_NAME)
+    assert policy["spec"]["podSelector"] == {"matchLabels": _EGRESS_BROKER_PRIMARY_SELECTOR}
+    assert policy["spec"]["policyTypes"] == ["Ingress"]
+    assert policy["spec"]["ingress"] == [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "mindroom-workers"}},
+                    "podSelector": {"matchLabels": _EGRESS_BROKER_WORKER_SELECTOR},
+                },
+            ],
+            "ports": [{"protocol": "TCP", "port": 8768}],
+        },
+    ]
+
+    assert env["MINDROOM_EGRESS_BROKER_PORT"] == "8768"
+    assert env["MINDROOM_EGRESS_BROKER_HOST"] == "0.0.0.0"  # noqa: S104
+    assert env["MINDROOM_EGRESS_BROKER_URL"] == f"http://{_EGRESS_BROKER_NAME}.mindroom.svc.cluster.local:8768"
+
+
+def test_runtime_chart_egress_broker_skips_ingress_policy_unless_network_policy_is_created() -> None:
+    """The primary ingress policy follows networkPolicy.create so an open control plane stays open."""
+    docs = _render_runtime_chart("egressBroker.enabled=true", "egressBroker.port=9100")
+
+    assert _egress_broker_resource_names(docs) == [("Service", _EGRESS_BROKER_NAME)]
+    service = _resource(docs, "Service", _EGRESS_BROKER_NAME)
+    assert service["spec"]["ports"][0]["port"] == 9100
+    _, env = _broker_primary_env(docs)
+    assert env["MINDROOM_EGRESS_BROKER_PORT"] == "9100"
+    assert env["MINDROOM_EGRESS_BROKER_URL"] == f"http://{_EGRESS_BROKER_HOST}:9100"
+
+
+@pytest.mark.parametrize(
+    ("render", "worker_namespace"),
+    [
+        (_render_runtime_chart, "default"),
+        (_render_runtime_chart_with_separate_worker_namespace, "mindroom-workers"),
+    ],
+)
+def test_runtime_chart_egress_broker_adds_worker_egress_rule_with_egress_proxy(
+    render: Callable[..., list[dict[str, Any]]],
+    worker_namespace: str,
+) -> None:
+    """A fenced worker may additionally open the primary's broker port and nothing else new."""
+    docs = render("egressBroker.enabled=true", *_EGRESS_PROXY_VALUES)
+
+    policy = _resource(docs, "NetworkPolicy", f"{_EGRESS_BROKER_NAME}-workers")
+    assert policy["metadata"]["namespace"] == worker_namespace
+    assert policy["spec"]["podSelector"] == {"matchLabels": _EGRESS_BROKER_WORKER_SELECTOR}
+    assert policy["spec"]["policyTypes"] == ["Egress"]
+    assert policy["spec"]["egress"] == [
+        {
+            "to": [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "default"}},
+                    "podSelector": {"matchLabels": _EGRESS_BROKER_PRIMARY_SELECTOR},
+                },
+            ],
+            "ports": [{"protocol": "TCP", "port": 8768}],
+        },
+    ]
+    assert _resource(docs, "Service", _EGRESS_BROKER_NAME)["spec"]["ports"][0]["port"] == 8768
+
+
+def test_runtime_chart_egress_broker_names_stay_distinct_for_the_longest_fullname() -> None:
+    """Truncation keeps every broker resource name within 63 characters and apart from the runtime Service."""
+    fullname = "x" * 63
+    docs = _render_runtime_chart(
+        "networkPolicy.create=true",
+        "egressBroker.enabled=true",
+        *_EGRESS_PROXY_VALUES,
+        f"fullnameOverride={fullname}",
+    )
+
+    names = _egress_broker_resource_names(docs)
+    assert names == [
+        ("NetworkPolicy", f"{'x' * 40}-egress-broker-workers"),
+        ("NetworkPolicy", f"{'x' * 48}-egress-broker"),
+        ("Service", f"{'x' * 48}-egress-broker"),
+    ]
+    assert max(len(name) for _, name in names) <= 63
+    assert fullname in [doc["metadata"]["name"] for doc in docs if doc["kind"] == "Service"]
+
+
+@pytest.mark.parametrize(
+    ("ttl_args", "expected"),
+    [
+        ((), None),
+        (("egressBroker.tokenTtlSeconds=3600",), "3600"),
+    ],
+)
+def test_runtime_chart_egress_broker_ttl_env_only_when_set(ttl_args: tuple[str, ...], expected: str | None) -> None:
+    """The token lifetime env var is omitted unless the operator sets it."""
+    _, env = _broker_primary_env(_render_runtime_chart("egressBroker.enabled=true", *ttl_args))
+
+    assert env.get("MINDROOM_EGRESS_BROKER_TOKEN_TTL_SECONDS") == expected
+
+
+@pytest.mark.parametrize(
+    ("set_args", "message"),
+    [
+        (
+            ("workers.backend=static_runner", "egressBroker.enabled=true"),
+            "egressBroker.enabled requires workers.backend=kubernetes",
+        ),
+        (
+            ("workers.backend=kubernetes", "egressBroker.enabled=true", "egressBroker.port=8765"),
+            "egressBroker.port must differ from runtime.apiPort and scriptGateway.port",
+        ),
+        (
+            (
+                "workers.backend=kubernetes",
+                "egressBroker.enabled=true",
+                "runtime.apiPort=9000",
+                "egressBroker.port=9000",
+            ),
+            "egressBroker.port must differ from runtime.apiPort and scriptGateway.port",
+        ),
+        (
+            ("workers.backend=kubernetes", "egressBroker.enabled=true", "egressBroker.port=8767"),
+            "egressBroker.port must differ from runtime.apiPort and scriptGateway.port",
+        ),
+    ],
+)
+def test_runtime_chart_egress_broker_validation(set_args: tuple[str, ...], message: str) -> None:
+    """Unsupported broker configurations fail at render time with an actionable message."""
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        *set_args,
+        release_name="mindroom-runtime",
+    )
+
+    assert completed.returncode != 0
+    assert message in completed.stderr
+
+
+def test_runtime_chart_egress_broker_skips_worker_egress_rule_when_the_egress_policy_is_off() -> None:
+    """Without the chart's worker egress policy workers are unfenced, so no additive broker rule renders."""
+    docs = _render_runtime_chart(
+        "egressBroker.enabled=true",
+        *_EGRESS_PROXY_VALUES,
+        "egressProxy.networkPolicy.create=false",
+    )
+
+    assert _egress_broker_resource_names(docs) == [("Service", _EGRESS_BROKER_NAME)]
+
+
+_EGRESS_PROXY_NAME = "mindroom-runtime-egress-proxy"
+_EGRESS_PROXY_URL = f"http://{_EGRESS_PROXY_NAME}.default.svc.cluster.local:3128"
+_EGRESS_SQUID_CONFIG_NAME = f"{_EGRESS_PROXY_NAME}-squid-config"
+_APPROVED_EGRESS_VALUES = ("approvedEgress.enabled=true", "approvedEgress.image.tag=v0.1.0")
+_EGRESS_BROKER_CHAIN_VALUES = ("egressBroker.enabled=true", *_APPROVED_EGRESS_VALUES)
+
+
+def _squid_chain_config(docs: list[dict[str, Any]]) -> str:
+    return _resource(docs, "ConfigMap", _EGRESS_SQUID_CONFIG_NAME)["data"]["squid.conf"]
+
+
+def test_runtime_chart_chain_renders_broker_cache_peer() -> None:
+    """Squid forwards token-bearing requests to the broker Service as its parent."""
+    docs = _render_runtime_chart(*_EGRESS_BROKER_CHAIN_VALUES)
+    conf = _squid_chain_config(docs)
+    proxy = _resource(docs, "Deployment", _EGRESS_PROXY_NAME)
+    proxy_container = _container(proxy, "approved-egress-proxy")
+
+    assert conf.lstrip().startswith("include /etc/squid/squid.conf\n")
+    assert "dns_defnames on" in conf
+    assert "nonhierarchical_direct off" in conf
+    assert "egress_bypass_parent" not in conf
+    assert (
+        f"cache_peer {_EGRESS_BROKER_HOST} parent 8768 0 no-query no-digest login=PASSTHRU connect-fail-limit=1000000"
+        in conf
+    )
+    assert f"cache_peer_access {_EGRESS_BROKER_HOST} allow egress_has_token" in conf
+    assert f"cache_peer_access {_EGRESS_BROKER_HOST} deny all" in conf
+    assert "acl egress_has_token req_header Proxy-Authorization ." in conf
+    assert "never_direct allow egress_has_token" in conf
+    assert "always_direct allow !egress_has_token" in conf
+    assert _env_by_name(proxy_container)["MINDROOM_EGRESS_SQUID_CONFIG_PATH"]["value"] == (
+        "/etc/squid/mindroom-egress-chain.conf"
+    )
+    assert {
+        "name": "squid-config",
+        "mountPath": "/etc/squid/mindroom-egress-chain.conf",
+        "subPath": "squid.conf",
+        "readOnly": True,
+    } in proxy_container["volumeMounts"]
+    assert {"name": "squid-config", "configMap": {"name": _EGRESS_SQUID_CONFIG_NAME}} in proxy["spec"]["template"][
+        "spec"
+    ]["volumes"]
+    assert "checksum/squid-config" in proxy["spec"]["template"]["metadata"]["annotations"]
+
+
+def test_runtime_chart_chain_follows_the_broker_port() -> None:
+    """A custom broker port reaches the Squid parent line, with the broker Service naming the same port."""
+    docs = _render_runtime_chart(*_EGRESS_BROKER_CHAIN_VALUES, "egressBroker.port=9100")
+
+    assert f"cache_peer {_EGRESS_BROKER_HOST} parent 9100 0 no-query no-digest login=PASSTHRU" in _squid_chain_config(
+        docs,
+    )
+    assert _resource(docs, "Service", _EGRESS_BROKER_NAME)["spec"]["ports"][0]["port"] == 9100
+
+
+def test_runtime_chart_chain_points_workers_at_squid() -> None:
+    """Workers keep Squid as their first hop, so no worker rule for the broker port renders."""
+    docs = _render_runtime_chart(*_EGRESS_BROKER_CHAIN_VALUES, "networkPolicy.create=true")
+    _, env = _broker_primary_env(docs)
+
+    assert env["MINDROOM_EGRESS_BROKER_URL"] == _EGRESS_PROXY_URL
+    assert env["MINDROOM_EGRESS_BROKER_PORT"] == "8768"
+    assert _egress_broker_resource_names(docs) == [
+        ("NetworkPolicy", _EGRESS_BROKER_NAME),
+        ("Service", _EGRESS_BROKER_NAME),
+    ]
+
+
+def test_runtime_chart_chain_requires_both_features() -> None:
+    """Either feature alone keeps its own worker URL and renders no Squid parent."""
+    approved_only = _render_runtime_chart(*_APPROVED_EGRESS_VALUES)
+    broker_only = _render_runtime_chart("egressBroker.enabled=true")
+
+    assert not any(doc["metadata"]["name"] == _EGRESS_SQUID_CONFIG_NAME for doc in approved_only)
+    assert not [name for name in _broker_primary_env(approved_only)[1] if name.startswith("MINDROOM_EGRESS_BROKER_")]
+    assert "checksum/squid-config" not in _resource(approved_only, "Deployment", _EGRESS_PROXY_NAME)["spec"][
+        "template"
+    ]["metadata"].get("annotations", {})
+    assert _broker_primary_env(broker_only)[1]["MINDROOM_EGRESS_BROKER_URL"] == f"http://{_EGRESS_BROKER_HOST}:8768"
+
+
+def test_runtime_chart_chain_ingress_admits_squid_not_workers() -> None:
+    """Only the approved-egress pods in the release namespace may reach the broker port on the primary."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.kubernetes.namespace=mindroom-workers",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        "networkPolicy.create=true",
+        *_EGRESS_BROKER_CHAIN_VALUES,
+        release_name="mindroom-runtime",
+        namespace="mindroom",
+    )
+
+    policy = _resource(docs, "NetworkPolicy", _EGRESS_BROKER_NAME)
+    assert policy["spec"]["podSelector"] == {"matchLabels": _EGRESS_BROKER_PRIMARY_SELECTOR}
+    assert policy["spec"]["ingress"] == [
+        {
+            "from": [
+                {
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "mindroom"}},
+                    "podSelector": {
+                        "matchLabels": {
+                            "app.kubernetes.io/name": _EGRESS_PROXY_NAME,
+                            "app.kubernetes.io/instance": "mindroom-runtime",
+                            "app.kubernetes.io/component": "approved-egress-proxy",
+                        },
+                    },
+                },
+            ],
+            "ports": [{"protocol": "TCP", "port": 8768}],
+        },
+    ]
+
+
+def test_runtime_chart_chain_keeps_bypass_domains(tmp_path: Path) -> None:
+    """Bypass domains skip the broker in its chain and are listed before the token routing rules."""
+    values = {"approvedEgress": {"parentProxy": {"bypassDomains": ["downloads.example.test", ".objects.example.test"]}}}
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "workers.backend=kubernetes",
+        "workers.sandbox.proxyToken.value=test-token",
+        "eventCache.postgres.auth.password=test-password",
+        *_EGRESS_BROKER_CHAIN_VALUES,
+        values_files=_values_files(tmp_path, values),
+        release_name="mindroom-runtime",
+    )
+    conf = _squid_chain_config(docs)
+
+    assert "acl egress_bypass_parent dstdomain -n downloads.example.test .objects.example.test" in conf
+    assert conf.index(f"cache_peer_access {_EGRESS_BROKER_HOST} deny egress_bypass_parent") < conf.index(
+        f"cache_peer_access {_EGRESS_BROKER_HOST} allow egress_has_token",
+    )
+    assert conf.index("always_direct allow egress_bypass_parent") < conf.index("always_direct allow !egress_has_token")
+
+
+def test_runtime_chart_chain_restarts_squid_on_parent_change() -> None:
+    """The parent host and port live in the mounted Squid config, so changing them must roll the proxy pod."""
+    checksums = []
+    for port in ("8768", "9100"):
+        docs = _render_runtime_chart(*_EGRESS_BROKER_CHAIN_VALUES, f"egressBroker.port={port}")
+        proxy = _resource(docs, "Deployment", _EGRESS_PROXY_NAME)
+        checksums.append(proxy["spec"]["template"]["metadata"]["annotations"]["checksum/squid-config"])
+        assert f"parent {port} 0" in _squid_chain_config(docs)
+
+    assert checksums[0] != checksums[1]
+
+
+_INSTANCE_EGRESS_BROKER_ENV = {
+    "MINDROOM_EGRESS_BROKER_PORT": "8768",
+    "MINDROOM_EGRESS_BROKER_HOST": "127.0.0.1",
+    "MINDROOM_EGRESS_BROKER_URL": "http://127.0.0.1:8768",
+}
+
+
+def _instance_resource_identities(docs: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    return sorted((doc["kind"], doc["metadata"]["name"]) for doc in docs)
+
+
+def test_instance_chart_egress_broker_env_on_primary_only() -> None:
+    """The broker binds loopback in the primary, which the same-pod sidecar reaches without a Service or policy."""
+    baseline = _render_chart(Path("cluster/k8s/instance"))
+    docs = _render_chart(Path("cluster/k8s/instance"), "egressBroker.enabled=true")
+    deployment = _resource(docs, "Deployment", "mindroom-demo")
+    primary_env = _env_by_name(_container(deployment, "mindroom"))
+    runner_env = _env_by_name(_container(deployment, "sandbox-runner"))
+
+    for name, value in _INSTANCE_EGRESS_BROKER_ENV.items():
+        assert primary_env[name] == {"name": name, "value": value}
+    assert not [name for name in runner_env if name.startswith("MINDROOM_EGRESS_BROKER_")]
+    assert not [
+        name
+        for name in primary_env
+        if name.startswith("MINDROOM_EGRESS_BROKER_") and name not in _INSTANCE_EGRESS_BROKER_ENV
+    ]
+    assert _instance_resource_identities(docs) == _instance_resource_identities(baseline)
+    assert [port["name"] for port in _container(deployment, "mindroom")["ports"]] == ["api"]
+
+
+def test_instance_chart_egress_broker_disabled_by_default() -> None:
+    """Hosted tenants get no broker env unless the release opts in."""
+    deployment = _resource(_render_instance_chart(), "Deployment", "mindroom-demo")
+
+    for container in ("mindroom", "sandbox-runner"):
+        env = _env_by_name(_container(deployment, container))
+        assert not [name for name in env if name.startswith("MINDROOM_EGRESS_BROKER_")]

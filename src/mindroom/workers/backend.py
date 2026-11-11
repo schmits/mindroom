@@ -7,11 +7,20 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from mindroom.workers.models import WorkerMaintenanceResult
 
 if TYPE_CHECKING:
-    from mindroom.workers.models import ProgressSink, WorkerHandle, WorkerSpec, WorkerStatus
+    from mindroom.workers.models import ProgressSink, WorkerHandle, WorkerLaunchConfig, WorkerSpec, WorkerStatus
 
 
 class WorkerBackendError(RuntimeError):
     """Raised when a worker backend cannot satisfy a request."""
+
+
+class WorkerStartTimeoutError(WorkerBackendError):
+    """Raised when a starting worker does not become ready within its backend's ready timeout."""
+
+
+def mirrored_credential_services(spec: WorkerSpec, launch: WorkerLaunchConfig) -> frozenset[str]:
+    """Return the shared credential services mirrored into the spec's dedicated worker launched from ``launch``."""
+    return launch.grantable_credentials if spec.mirror_grantable_credentials else frozenset()
 
 
 def effective_idle_status(
@@ -62,8 +71,15 @@ class WorkerBackend(Protocol):
     def cleanup_idle_workers(self, *, now: float | None = None) -> list[WorkerHandle]:
         """Apply idle cleanup to known workers."""
 
-    def record_failure(self, worker_key: str, failure_reason: str, *, now: float | None = None) -> WorkerHandle:
-        """Persist a worker failure for observability."""
+    def record_failure(
+        self,
+        worker_key: str,
+        failure_reason: str,
+        *,
+        now: float | None = None,
+        startup_count: int | None = None,
+    ) -> WorkerHandle:
+        """Persist a worker failure; one from a start the backend has since replaced may be ignored."""
 
 
 @runtime_checkable

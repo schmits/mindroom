@@ -7,10 +7,9 @@ acknowledgement belong to matrix/durable_ingestion.py.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypeIs, cast
 
 import nio
-from typing_extensions import TypeIs
 
 from mindroom.constants import SILENT_SCHEDULE_EVENT_TYPE
 from mindroom.event_journal import (
@@ -27,7 +26,7 @@ from mindroom.matrix.media import (
     is_encrypted_media_event_source,
     parse_matrix_media_event_source,
 )
-from mindroom.matrix.transport_progress import is_transport_progress_revision
+from mindroom.matrix.transport_progress import is_transport_progress_revision, is_unfinished_reply
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -37,6 +36,7 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _TOOL_APPROVAL_RESPONSE_EVENT_TYPE = "io.mindroom.tool_approval_response"
+_BACKGROUND_JOB_CANCEL_EVENT_TYPE = "io.mindroom.background_job_cancel"
 _SECURITY_METADATA_KEY = "io.mindroom.dispatch_recovery_security"
 _RTC_EVENT_TYPES = frozenset({CALL_MEMBER_EVENT_TYPE, RTC_NOTIFICATION_EVENT_TYPE})
 # Kinds whose events carry conversation content, and so update the projection.
@@ -68,6 +68,11 @@ class _RoomIdEvent(Protocol):
 def _is_tool_approval_response(event: nio.Event) -> TypeIs[nio.UnknownEvent]:
     """Return whether one event is a tool-approval response."""
     return isinstance(event, nio.UnknownEvent) and event.type == _TOOL_APPROVAL_RESPONSE_EVENT_TYPE
+
+
+def _is_background_job_cancel(event: nio.Event) -> TypeIs[nio.UnknownEvent]:
+    """Return whether one event asks to cancel background jobs."""
+    return isinstance(event, nio.UnknownEvent) and event.type == _BACKGROUND_JOB_CANCEL_EVENT_TYPE
 
 
 def _is_silent_schedule_trigger(event: nio.Event) -> TypeIs[nio.UnknownEvent]:
@@ -105,6 +110,7 @@ _KIND_RULES: tuple[tuple[Callable[[nio.Event], bool], EventKind], ...] = (
     (_is_silent_schedule_trigger, EventKind.SCHEDULE_TRIGGER),
     (_is_rtc_event, EventKind.RTC),
     (_is_tool_approval_response, EventKind.APPROVAL),
+    (_is_background_job_cancel, EventKind.JOB_CANCEL),
     (lambda event: isinstance(event, nio.MegolmEvent), EventKind.OPAQUE_HISTORY),
 )
 
@@ -150,15 +156,23 @@ def _event_class_for(provenance: nio.TimelineEventProvenance, event: nio.Event) 
     That subsumes the narrower rule this used to carry for this bot's own
     stream frames: those are notices, so they are covered by being notices.
 
-    A msgtype nio could not type is the other exception, for a plainer reason:
+    A msgtype nio could not type is another exception, for a plainer reason:
     `RoomMessageUnknown` carries no `body`, so there is no utterance for a turn
     to answer. Demoting the class nio uses for "I do not know this msgtype" is
     not the same mistake as enumerating msgtypes -- the set stays correct as
     Matrix grows -- and it still projects, so the conversation keeps the event.
+
+    A text message whose status says it will be revised again is the last one:
+    an agent's `pending` placeholder is `m.text`, and the turn engine never
+    answers an unfinished reply, only its terminal edit. Every agent in a room
+    receives every agent's placeholder, so admitting them as work queued each
+    one in every agent's ordered room lane, ahead of the prompts behind it.
     """
     if not _happened_while_member(provenance):
         return EventClass.CONTEXT_ONLY
     if isinstance(event, nio.RoomMessageNotice | nio.RoomMessageUnknown):
+        return EventClass.CONTEXT_ONLY
+    if isinstance(event, TEXTUAL_MESSAGE_EVENT_TYPE) and is_unfinished_reply(event.source.get("content") or {}):
         return EventClass.CONTEXT_ONLY
     return EventClass.ACTIONABLE
 
@@ -247,6 +261,22 @@ def _projected_event(
     return projected
 
 
+def _ingested_kind(parsed: nio.Event, schedule_trigger_sender_is_managed: Callable[[str], bool]) -> EventKind | None:
+    """Return the kind one parsed timeline event is admitted as, or None to settle it without work."""
+    if parsed.decrypted and (isinstance(parsed, nio.RedactionEvent) or "state_key" in parsed.source):
+        # Redactions and state are never encrypted, so a decrypted one is a sender's claim the homeserver never checked.
+        return None
+    if isinstance(parsed, nio.RedactionEvent) and not parsed.redacts:
+        # Nio's schema accepts an empty target, which deletes nothing and which batch validation would reject.
+        return None
+    kind = _event_kind(parsed)
+    if kind is EventKind.SCHEDULE_TRIGGER and not schedule_trigger_sender_is_managed(parsed.sender):
+        return None
+    if kind is None and isinstance(parsed, nio.RoomMemberEvent):
+        return EventKind.ROOM_LIFECYCLE
+    return kind
+
+
 def ingestion_timeline_views(
     *,
     room_id: str,
@@ -276,11 +306,7 @@ def ingestion_timeline_views(
         # Nio owns ciphertext recovery. Only historical identities need an
         # application tombstone so later decryption cannot revive old work.
         return None
-    kind = _event_kind(parsed)
-    if kind is EventKind.SCHEDULE_TRIGGER and not schedule_trigger_sender_is_managed(parsed.sender):
-        return None
-    if kind is None and isinstance(parsed, nio.RoomMemberEvent):
-        kind = EventKind.ROOM_LIFECYCLE
+    kind = _ingested_kind(parsed, schedule_trigger_sender_is_managed)
     if kind is None:
         return None
     event_class = _event_class_for(provenance, parsed)
@@ -302,23 +328,6 @@ def parse_journal_event(stored: JournalEvent) -> nio.Event:
         event.room_id = stored.room_id
     _restore_security_metadata(event, security_metadata, room_id=stored.room_id, event_id=stored.event_id)
     return event
-
-
-def replayable_redaction_target(stored: JournalEvent) -> str | None:
-    """Return the exact target only when retained cleanup can replay as admitted."""
-    if stored.kind is not EventKind.REDACTION:
-        return None
-    try:
-        event = parse_journal_event(stored)
-    except JournalCorruptionError:
-        return None
-    if (
-        not isinstance(event, nio.RedactionEvent)
-        or event.sender != stored.sender
-        or stored.source.get("room_id", stored.room_id) != stored.room_id
-    ):
-        return None
-    return event.redacts
 
 
 def _restore_security_metadata(

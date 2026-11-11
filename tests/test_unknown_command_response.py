@@ -10,6 +10,7 @@ import pytest
 
 from mindroom.config.main import Config
 from mindroom.config.models import RouterConfig
+from mindroom.matrix.client_delivery import MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.matrix.users import AgentMatrixUser
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
@@ -43,13 +44,12 @@ async def test_unknown_command_in_main_room(tmp_path: Path) -> None:
         password=TEST_PASSWORD,
     )
 
+    config.defaults.enable_streaming = False
     # Create router bot
     bot = make_test_agent_bot(
         agent_user=agent_user,
         config=config,
-        storage_path=tmp_path,
         runtime_paths=runtime_paths_for(config),
-        enable_streaming=False,
         rooms=["!test:localhost"],  # Make sure bot knows it's in this room
     )
 
@@ -102,10 +102,6 @@ async def test_unknown_command_in_main_room(tmp_path: Path) -> None:
         )
         return delivered_matrix_event("$response_event", content)
 
-    # Add orchestrator mock
-    bot.orchestrator = MagicMock()
-    bot.orchestrator.thread_specific_agents = {}
-
     with patch("mindroom.delivery_gateway.send_message_outcome", mock_send_message):
         await bot._on_message(room, event)
         await drain_coalescing(bot)
@@ -139,13 +135,12 @@ async def test_unknown_command_in_thread(tmp_path: Path) -> None:
         password=TEST_PASSWORD,
     )
 
+    config.defaults.enable_streaming = False
     # Create router bot
     bot = make_test_agent_bot(
         agent_user=agent_user,
         config=config,
-        storage_path=tmp_path,
         runtime_paths=runtime_paths_for(config),
-        enable_streaming=False,
         rooms=["!test:localhost"],  # Make sure bot knows it's in this room
     )
 
@@ -201,10 +196,12 @@ async def test_unknown_command_in_thread(tmp_path: Path) -> None:
 
         # Check if this is trying to create a thread from a thread message incorrectly
         if thread_id == "$test_event":  # Using the event itself as thread root
-            # This would trigger the Matrix error
+            # The homeserver would reject this send.
             error_messages.append("Cannot start threads from an event with a relation")
-            msg = "M_UNKNOWN Cannot start threads from an event with a relation"
-            raise nio.SendRetryError(msg)
+            return MatrixDeliveryFailure(
+                MatrixDeliveryFailureKind.UNEXPECTED_RESPONSE,
+                "M_UNKNOWN Cannot start threads from an event with a relation",
+            )
 
         sent_messages.append(
             {
@@ -214,10 +211,6 @@ async def test_unknown_command_in_thread(tmp_path: Path) -> None:
             },
         )
         return delivered_matrix_event("$response_event", content)
-
-    # Add orchestrator mock
-    bot.orchestrator = MagicMock()
-    bot.orchestrator.thread_specific_agents = {}
 
     with (
         patch("mindroom.delivery_gateway.send_message_outcome", mock_send_message),
@@ -252,13 +245,12 @@ async def test_unknown_command_with_reply_starts_prompt_thread(tmp_path: Path) -
         password=TEST_PASSWORD,
     )
 
+    config.defaults.enable_streaming = False
     # Create router bot
     bot = make_test_agent_bot(
         agent_user=agent_user,
         config=config,
-        storage_path=tmp_path,
         runtime_paths=runtime_paths_for(config),
-        enable_streaming=False,
         rooms=["!test:localhost"],  # Make sure bot knows it's in this room
     )
 
@@ -313,10 +305,6 @@ async def test_unknown_command_with_reply_starts_prompt_thread(tmp_path: Path) -
             },
         )
         return delivered_matrix_event("$response_event", content)
-
-    # Add orchestrator mock
-    bot.orchestrator = MagicMock()
-    bot.orchestrator.thread_specific_agents = {}
 
     with patch("mindroom.delivery_gateway.send_message_outcome", mock_send_message):
         await bot._on_message(room, event)

@@ -100,7 +100,10 @@ class TestCheckoutEndpoint:
             return {"account_id": "acc_test_123", "email": "test@example.com"}
 
         app.dependency_overrides[verify_user] = override_verify_user
-        with patch("backend.routes.stripe_routes.ensure_supabase") as mock:
+        with (
+            patch("backend.routes.stripe_routes.ensure_supabase") as mock,
+            patch("backend.services.provisioner_service.account_pending_deletion", return_value=False),
+        ):
             sb = Mock()
             sb.table().select().eq().single().execute.return_value = Mock(data={"stripe_customer_id": "cus_test_123"})
             mock.return_value = sb
@@ -126,7 +129,7 @@ class TestCheckoutEndpoint:
             mock_stripe.checkout.Session.create.return_value = mock_session
             # Mock other required methods
             mock_stripe.Customer.create.return_value = Mock(id="cus_test_123")
-            mock_stripe.Subscription.list.return_value = Mock(data=[])
+            mock_stripe.Subscription.list.return_value.auto_paging_iter.return_value = []
 
             response = client.post("/stripe/checkout", json={"tier": "byok", "billing_cycle": "monthly"})
 
@@ -168,7 +171,7 @@ class TestCheckoutEndpoint:
             mock_session.url = "https://checkout.stripe.com/test_session"
             mock_stripe.checkout.Session.create.return_value = mock_session
             mock_stripe.Customer.create.return_value = Mock(id="cus_test_123")
-            mock_stripe.Subscription.list.return_value = Mock(data=[])
+            mock_stripe.Subscription.list.return_value.auto_paging_iter.return_value = []
 
             response = client.post("/stripe/checkout", json={"tier": "pro", "billing_cycle": "yearly"})
 
@@ -205,25 +208,3 @@ class TestPricingEndpoints:
         # Check that Stripe IDs are included
         assert data["plans"]["byok"]["stripe_price_id_monthly"] is not None
         assert data["plans"]["pro"]["stripe_price_id_yearly"] is not None
-
-    def test_stripe_price_endpoint(self, client: TestClient) -> None:
-        """Test the Stripe price retrieval endpoint."""
-        response = client.get("/pricing/stripe-price/byok/monthly")
-
-        assert response.status_code == 200
-        data = response.json()
-
-        assert "price_id" in data
-        assert data["price_id"] == get_stripe_price_id("byok", "monthly")
-        assert data["plan"] == "byok"
-        assert data["billing_cycle"] == "monthly"
-
-    def test_stripe_price_endpoint_invalid(self, client: TestClient) -> None:
-        """Test Stripe price endpoint with invalid parameters."""
-        # Invalid plan
-        response = client.get("/pricing/stripe-price/invalid/monthly")
-        assert response.status_code == 404
-
-        # Invalid billing cycle
-        response = client.get("/pricing/stripe-price/byok/weekly")
-        assert response.status_code == 400

@@ -1,0 +1,484 @@
+"""Qualified tools bound to one live agent turn, independent of presentation.
+
+The catalog lock serializes materialization and execution. A caller's outer
+Bash-window lock must be distinct: Bash waits for calls using this lock.
+Authorization and durable continuation remain responsibilities of the turn owner.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
+from functools import wraps
+from typing import TYPE_CHECKING, Literal
+
+from mindroom.agent_cli.shell_contract import SHELL_FUNCTION
+from mindroom.agent_loop.spec import UnstoredSession
+from mindroom.background_tasks import wait_for_future_until_complete
+from mindroom.llm.events import ReportedCall
+from mindroom.llm.runs import RunRequirement
+from mindroom.tool_jobs.control import job_owns_execution
+from mindroom.tool_system.dedicated_threads import JOB_CALL_EXECUTOR
+from mindroom.tool_system.invocation import execute_tool_call
+from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.tool_access import ToolKey, UnknownToolError, validate_tool_arguments
+from mindroom.tool_system.tool_function import (
+    POLICY_CONFIRMATION_APPROVAL_TYPE,
+    ToolGate,
+    close_toolkits,
+    connect_toolkits,
+)
+from mindroom.tool_system.tool_hooks import owned_sync_tool_completion
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+
+    from mindroom.agent_loop.spec import RunContext
+    from mindroom.llm.runs import RunRecord
+    from mindroom.session_storage.store import ConversationStore
+    from mindroom.session_storage.types import ConversationSession
+    from mindroom.tool_system.invocation import ToolMiddleware
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_function import AdaptedToolkit, ToolFunction, ToolkitClose, ToolValue
+
+_INNER: ContextVar[bool] = ContextVar("cli_inner_dispatch", default=False)
+
+
+def cli_dispatch_active() -> bool:
+    """Return whether a CLI-dispatched tool call is executing in this context."""
+    return _INNER.get()
+
+
+@contextmanager
+def cli_dispatch_scope() -> Iterator[None]:
+    """Mark this context as executing a CLI-dispatched tool call, which ``cli_dispatch_active`` reports."""
+    token = _INNER.set(True)
+    try:
+        yield
+    finally:
+        _INNER.reset(token)
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredAgentToolkit:
+    """Metadata and the owning turn's normal factory; listing never calls it.
+
+    Factory includes normal configuration, filtering, approval policy, and adaptation to the tools the loop runs.
+    """
+
+    name: str
+    description: str
+    materialize: Callable[[], Awaitable[AdaptedToolkit]]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAgentToolBinding:
+    """A prepared function, the catalog owning its exact live agent turn, and its toolkit's instructions."""
+
+    key: ToolKey
+    function: ToolFunction
+    catalog: PreparedAgentToolCatalog = field(repr=False)
+    instructions: tuple[str, ...]
+
+    @property
+    def approval_toolkit(self) -> str:
+        """Return the toolkit an approval of this function's calls names: its authored toolkit, ``agent`` if generated.
+
+        It differs from the toolkit this binding is reached under for an implied or preset tool. A resumed approval
+        rebuilds the agent with that toolkit attached and finds the function's binding by it (``approved_binding``).
+        """
+        return self.function.toolkit or "agent"
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolCallStep:
+    """A CLI call started or ended, with the call as reported then; an ended call carries its result and error flag.
+
+    ``continuation_required`` ends a call after which the run stops, so the next attempt runs with what it did.
+    """
+
+    kind: Literal["started", "continuation_required", "completed"]
+    key: ToolKey
+    call: ReportedCall
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolCallWaiting:
+    """A CLI call that waits for ``requirement``: a person's confirmation or its execution elsewhere."""
+
+    requirement: RunRequirement
+
+
+@dataclass(frozen=True, slots=True)
+class AgentToolCallMedia:
+    """The media a successful CLI call returned beside its text."""
+
+    media: ToolValue
+
+
+type AgentToolCallEvent = AgentToolCallStep | AgentToolCallWaiting | AgentToolCallMedia
+
+
+@dataclass
+class PreparedAgentToolCatalog:
+    """One turn's catalog of the agent's tools, each under the registered tool it comes from.
+
+    ``runtime_context`` is the agent's own, under which the functions generated for its build run.
+    ``run`` is the turn's run identity, whose session holds the state its calls share and receives the catalog's
+    checkpoints and delegations; ``store`` is the store they write, and ``record`` is the run itself once known: the live run after its first
+    tool batch is planned, or the stored run a recovery continues. ``middleware`` is the build's tool-call policy,
+    which every call runs through, and ``max_tool_calls_per_turn`` bounds the calls of one turn. The toolkits it
+    connects, the ones a run reaches only through it and every deferred toolkit it materializes, stay connected until
+    it closes.
+    """
+
+    run: RunContext
+    runtime_context: ToolRuntimeContext
+    store: ConversationStore | None
+    middleware: Sequence[ToolMiddleware]
+    max_tool_calls_per_turn: int | None
+    record: RunRecord | None = None
+    _bindings: dict[ToolKey, PreparedAgentToolBinding] = field(default_factory=dict, init=False)
+    _deferred: dict[str, DeferredAgentToolkit] = field(default_factory=dict, init=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+    _call_count: int = field(default=0, init=False)
+    _closed: bool = field(default=False, init=False)
+    _closes: list[ToolkitClose] = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        """Refuse a run outside a stored session, since the catalog's checkpoints and delegations write its session."""
+        if isinstance(self.run.session, UnstoredSession):
+            msg = "A tool catalog needs a run that belongs to a session"
+            raise TypeError(msg)
+
+    @property
+    def session(self) -> ConversationSession:
+        """Return the session the turn's run belongs to, which the catalog's checkpoints and delegations write."""
+        session = self.run.session
+        assert not isinstance(session, UnstoredSession)
+        return session
+
+    def owns(self, binding: PreparedAgentToolBinding) -> bool:
+        """Check the exact prepared binding, including its live catalog lifetime."""
+        return not self._closed and self._bindings.get(binding.key) is binding
+
+    @asynccontextmanager
+    async def dispatch(
+        self,
+        binding: PreparedAgentToolBinding,
+        authorize: Callable[[], Awaitable[None]] | None,
+    ) -> AsyncIterator[None]:
+        """Serialize ordinary or external execution under the same authority gate."""
+        async with self._lock:
+            self._check_open()
+            if not self.owns(binding):
+                msg = "Stale Agent tool binding"
+                raise ValueError(msg)
+            if authorize is not None:
+                await authorize()
+            yield
+
+    def add_deferred(self, toolkit: DeferredAgentToolkit) -> None:
+        """Register metadata before dispatch; reject reserved or duplicate owners."""
+        self._check_open()
+        if toolkit.name == "agent":
+            msg = "The agent toolkit namespace is reserved for generated functions"
+            raise ValueError(msg)
+        if toolkit.name in self._deferred or any(key.toolkit == toolkit.name for key in self._bindings):
+            msg = f"Duplicate toolkit: {toolkit.name}"
+            raise ValueError(msg)
+        self._deferred[toolkit.name] = toolkit
+
+    def _check_open(self) -> None:
+        if self._closed:
+            msg = "Agent tool catalog is closed"
+            raise RuntimeError(msg)
+
+    async def prepare(
+        self,
+        toolkits: Sequence[AdaptedToolkit],
+        *,
+        include: Callable[[ToolFunction], bool] | None = None,
+    ) -> None:
+        """Bind the run's functions under the registered tool each comes from; skip functions ``include`` rejects.
+
+        ``toolkits`` are a run's, which offer each function name once. A function that names no toolkit was
+        generated for the agent, such as the knowledge search and the skill readers, and is reached as ``agent``.
+        """
+        async with self._lock:
+            self._check_open()
+            for toolkit in toolkits:
+                self._prepare(
+                    toolkit,
+                    [function for function in toolkit.functions if include is None or include(function)],
+                )
+
+    async def connect(self, toolkits: Sequence[AdaptedToolkit]) -> None:
+        """Connect the toolkits among ``toolkits`` that hold a connection for one run, until the catalog closes.
+
+        A run that offers only Bash reaches its agent's toolkits through this catalog, so the catalog connects them.
+        """
+        async with self._lock:
+            self._check_open()
+            await connect_toolkits(toolkits, self._closes)
+
+    def _prepare(
+        self,
+        toolkit: AdaptedToolkit,
+        functions: Sequence[ToolFunction],
+        namespace: str | None = None,
+    ) -> None:
+        """Bind ``functions`` of ``toolkit`` under ``namespace``, or each under its registered tool, ``agent`` for none."""
+        bindings: dict[ToolKey, PreparedAgentToolBinding] = {}
+        instructions = (toolkit.guidance,) if toolkit.guidance else ()
+        for function in functions:
+            if namespace is None and function.registered_toolkit == "agent":
+                msg = "The agent toolkit namespace is reserved for generated functions"
+                raise ValueError(msg)
+            key = ToolKey(namespace or function.registered_toolkit or "agent", function.name)
+            if key in bindings or key in self._bindings:
+                msg = f"Duplicate qualified tool: {key.toolkit}.{key.function}"
+                raise ValueError(msg)
+            bindings[key] = PreparedAgentToolBinding(key, function, self, instructions)
+        # Nothing is recorded until every function is bound, so a refused toolkit leaves the catalog unchanged.
+        self._bindings.update(bindings)
+
+    def bindings(self) -> tuple[PreparedAgentToolBinding, ...]:
+        """Return the bindings prepared so far, for a check over the whole prepared surface."""
+        self._check_open()
+        return tuple(self._bindings.values())
+
+    def metadata(self) -> list[dict[str, object]]:
+        """Return discovery records without preparing deferred schemas."""
+        self._check_open()
+        return [
+            {"toolkit": key.toolkit, "function": key.function, "description": binding.function.description or ""}
+            for key, binding in self._bindings.items()
+        ] + [
+            {"toolkit": item.name, "description": item.description, "deferred": True}
+            for item in self._deferred.values()
+        ]
+
+    async def bind(
+        self,
+        key: ToolKey,
+        *,
+        check_current: Callable[[], None] | None = None,
+    ) -> PreparedAgentToolBinding:
+        """Materialize one deferred toolkit once, under the owning turn's context."""
+        async with self._lock:
+            self._check_open()
+            if check_current is not None:
+                check_current()
+            deferred = self._deferred.get(key.toolkit)
+            if deferred is not None:
+                with tool_runtime_context(self.runtime_context):
+                    toolkit = await deferred.materialize()
+                await connect_toolkits((toolkit,), self._closes)
+                # A deferred toolkit's functions are reached under the name it was listed under, which an agent's
+                # build gives as the registered tool they come from.
+                self._prepare(toolkit, toolkit.functions, deferred.name)
+                del self._deferred[key.toolkit]
+            binding = self._bindings.get(key)
+            if binding is None:
+                functions = sorted(known.function for known in self._bindings if known.toolkit == key.toolkit)
+                if functions:
+                    msg = f"Toolkit {key.toolkit!r} has no function {key.function!r}; its functions: {', '.join(functions)}"
+                else:
+                    msg = f"No toolkit {key.toolkit!r}"
+                raise UnknownToolError(msg)
+            return binding
+
+    def approved_binding(self, toolkit: str, function: str) -> PreparedAgentToolBinding:
+        """Return the binding of ``function`` whose calls an approval naming ``toolkit`` approves.
+
+        A resumed approval names the toolkit it approved (``approval_toolkit``), which its rebuilt agent attaches,
+        so the function is bound here already, under the registered tool it comes from.
+        """
+        self._check_open()
+        binding = next(
+            (
+                binding
+                for binding in self._bindings.values()
+                if binding.key.function == function and binding.approval_toolkit == toolkit
+            ),
+            None,
+        )
+        if binding is None:
+            msg = f"No function {function!r} approved under toolkit {toolkit!r}"
+            raise UnknownToolError(msg)
+        return binding
+
+    async def close(self) -> None:
+        """Refuse new work, wait for the operation that currently holds the catalog, then close what it connected."""
+        self._closed = True
+        async with self._lock:
+            await close_toolkits(self._closes)
+
+
+def _failure(
+    binding: PreparedAgentToolBinding,
+    call_id: str,
+    arguments: dict[str, object],
+    message: str,
+) -> AgentToolCallStep:
+    call = ReportedCall(call_id, binding.key.function, arguments, result=message, is_error=True)
+    return AgentToolCallStep("completed", binding.key, call)
+
+
+def _check_resolves(
+    requirement: RunRequirement,
+    binding: PreparedAgentToolBinding,
+    call_id: str,
+    arguments: dict[str, object],
+) -> None:
+    """Refuse a decision unless it is a confirmation of exactly this call to this function.
+
+    The function as offered now must still run in the loop, and confirm, if at all, as the call paused for.
+    """
+    execution = requirement.tool_execution
+    paused_for = ToolGate.POLICY if execution.approval_type == POLICY_CONFIRMATION_APPROVAL_TYPE else ToolGate.CONFIRM
+    if (
+        execution.tool_call_id != call_id
+        or execution.tool_name != binding.key.function
+        or json.dumps(execution.tool_args, sort_keys=True, allow_nan=False)
+        != json.dumps(arguments, sort_keys=True, allow_nan=False)
+        or execution.requires_confirmation is not True
+        or not requirement.is_resolved()
+        or requirement.confirmation is None
+        or binding.function.gate not in (None, ToolGate.JOB, paused_for)
+    ):
+        msg = "Approval does not resolve this exact prepared call"
+        raise ValueError(msg)
+
+
+def execute_agent_tool_call(
+    binding: PreparedAgentToolBinding,
+    call_id: str,
+    arguments: dict[str, object],
+    *,
+    authorize: Callable[[], Awaitable[None]] | None = None,
+    requirement: RunRequirement | None = None,
+) -> AsyncIterator[AgentToolCallEvent]:
+    """Execute a prepared call without a provider request or transcript insertion.
+
+    Caller must authorize immediately before dispatch. Waiting and continuation
+    events require the response owner's control adapter; never bypass pause checks.
+    Closing/cancelling waits for the synchronous leaves a call started before releasing the catalog.
+    """
+    return _execute_agent_tool_call(binding, call_id, arguments, authorize=authorize, requirement=requirement)
+
+
+def execute_agent_shell_call(
+    binding: PreparedAgentToolBinding,
+    call_id: str,
+    arguments: dict[str, object],
+    *,
+    shell_leaf: Callable[[dict[str, object]], Awaitable[object]],
+    authorize: Callable[[], Awaitable[None]] | None = None,
+    requirement: RunRequirement | None = None,
+) -> AsyncIterator[AgentToolCallEvent]:
+    """Keep canonical hooks and pauses; release mutation only around the shell's own IO.
+
+    Only the response owner supplies this leaf, which runs the binding's own shell
+    function, so CLI calls from inside the command can use the catalog meanwhile.
+    """
+    if binding.key.function != SHELL_FUNCTION:
+        msg = "Shell leaf replacement requires the canonical shell function"
+        raise ValueError(msg)
+    return _execute_agent_tool_call(
+        binding,
+        call_id,
+        arguments,
+        shell_leaf=shell_leaf,
+        authorize=authorize,
+        requirement=requirement,
+    )
+
+
+async def _execute_agent_tool_call(
+    binding: PreparedAgentToolBinding,
+    call_id: str,
+    arguments: dict[str, object],
+    *,
+    shell_leaf: Callable[[dict[str, object]], Awaitable[object]] | None = None,
+    authorize: Callable[[], Awaitable[None]] | None = None,
+    requirement: RunRequirement | None = None,
+) -> AsyncIterator[AgentToolCallEvent]:
+    catalog = binding.catalog
+    # The call runs with the arguments it was admitted with, whatever the caller does with its dict later.
+    arguments = deepcopy(arguments)
+    async with catalog.dispatch(binding, authorize):
+        if requirement is not None:
+            _check_resolves(requirement, binding, call_id, arguments)
+            if not requirement.confirmation:
+                yield _failure(binding, call_id, arguments, requirement.denial_note)
+                return
+        try:
+            validate_tool_arguments(dict(binding.function.parameters), arguments)
+        except ValueError:
+            yield _failure(binding, call_id, arguments, "Invalid tool arguments")
+            return
+        limit = catalog.max_tool_calls_per_turn
+        if limit is not None and catalog._call_count >= limit:
+            yield _failure(binding, call_id, arguments, "Tool call limit reached")
+            return
+        # A call that resumes from its decision runs now, so only a fresh call plans its execution.
+        execution = binding.function.planned_execution(call_id, arguments) if requirement is None else None
+        if execution is not None and execution.is_paused:
+            if execution.external_execution_required:
+                catalog._call_count += 1
+            yield AgentToolCallWaiting(RunRequirement(execution))
+            return
+        catalog._call_count += 1
+        call = ReportedCall(call_id, binding.key.function, deepcopy(arguments))
+        # The start reports a copy, so a consumer that edits its arguments changes neither the call nor its completion.
+        yield AgentToolCallStep("started", binding.key, deepcopy(call))
+        function = binding.function
+        if shell_leaf is not None:
+
+            @wraps(function.entrypoint)
+            async def pinned_leaf(**kwargs: object) -> object:
+                catalog._lock.release()
+                try:
+                    return await shell_leaf(kwargs)
+                finally:
+                    # Hook unwinding must regain exclusive catalog ownership even
+                    # under repeated cancellation of the response task.
+                    await wait_for_future_until_complete(asyncio.create_task(catalog._lock.acquire()))
+
+            function = replace(function, entrypoint=pinned_leaf)
+        # A job's call has no time limit, so what it offloads must not hold a shared pool's thread. The synchronous
+        # bodies the call started keep the catalog until they finish, so their threads never outlive the catalog.
+        with tool_runtime_context(catalog.runtime_context):
+            async with owned_sync_tool_completion(JOB_CALL_EXECUTOR if job_owns_execution() else None):
+                with cli_dispatch_scope():
+                    outcome = await execute_tool_call(
+                        function,
+                        arguments,
+                        catalog.run.call_context(call_id),
+                        middleware=catalog.middleware,
+                    )
+        if outcome.images or outcome.audios or outcome.videos or outcome.files:
+            yield AgentToolCallMedia(outcome)
+        kind = "continuation_required" if outcome.stop_after_call else "completed"
+        yield AgentToolCallStep(kind, binding.key, replace(call, result=outcome.content, is_error=outcome.is_error))
+
+
+__all__ = [
+    "AgentToolCallEvent",
+    "AgentToolCallMedia",
+    "AgentToolCallStep",
+    "AgentToolCallWaiting",
+    "DeferredAgentToolkit",
+    "PreparedAgentToolBinding",
+    "PreparedAgentToolCatalog",
+    "cli_dispatch_active",
+    "cli_dispatch_scope",
+    "execute_agent_shell_call",
+    "execute_agent_tool_call",
+]

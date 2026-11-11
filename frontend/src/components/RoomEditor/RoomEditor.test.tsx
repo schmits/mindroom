@@ -2,10 +2,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { RoomEditor } from "./RoomEditor";
 import { useConfigStore } from "@/store/configStore";
+import { useConfigSchema } from "@/hooks/useConfigSchema";
 import { Room, Agent, Config } from "@/types/config";
 
 // Mock the store
 vi.mock("@/store/configStore");
+vi.mock("@/hooks/useConfigSchema", () => ({
+  useConfigSchema: vi.fn(() => ({ schema: null, error: null, retry: vi.fn() })),
+}));
 
 describe("RoomEditor", () => {
   const mockRoom: Room = {
@@ -48,8 +52,7 @@ describe("RoomEditor", () => {
   const mockDeleteRoom = vi.fn();
   const mockSaveConfig = vi.fn();
 
-  beforeEach(() => {
-    vi.clearAllMocks();
+  function mockStore(overrides: Record<string, unknown> = {}) {
     (useConfigStore as any).mockReturnValue({
       rooms: [mockRoom],
       agents: mockAgents,
@@ -59,7 +62,13 @@ describe("RoomEditor", () => {
       deleteRoom: mockDeleteRoom,
       saveConfig: mockSaveConfig,
       isDirty: false,
+      ...overrides,
     });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockStore();
   });
 
   it("renders room editor with room details", () => {
@@ -75,36 +84,58 @@ describe("RoomEditor", () => {
   });
 
   it("shows placeholder when no room is selected", () => {
-    (useConfigStore as any).mockReturnValue({
-      rooms: [],
-      agents: mockAgents,
-      config: mockConfig,
-      selectedRoomId: null,
-      updateRoom: mockUpdateRoom,
-      deleteRoom: mockDeleteRoom,
-      saveConfig: mockSaveConfig,
-      isDirty: false,
-    });
+    mockStore({ rooms: [], selectedRoomId: null });
 
     render(<RoomEditor />);
 
     expect(screen.getByText("Select a room to edit")).toBeInTheDocument();
   });
 
-  it("updates room display name", async () => {
+  it("updates room display name", () => {
     render(<RoomEditor />);
 
     const nameInput = screen.getByLabelText("Display Name");
     fireEvent.change(nameInput, { target: { value: "Updated Room Name" } });
 
-    await waitFor(() => {
-      expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
-        display_name: "Updated Room Name",
-      });
+    expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
+      display_name: "Updated Room Name",
     });
   });
 
-  it("updates room description", async () => {
+  it("keeps the spaces typed into a room name", async () => {
+    const actual = await vi.importActual<typeof import("@/store/configStore")>(
+      "@/store/configStore",
+    );
+    const config = {
+      agents: {},
+      rooms: { lobby: { display_name: "My" } },
+      models: { default: { provider: "ollama", id: "llama2" } },
+      router: { model: "default" },
+    } as unknown as Config;
+    actual.useConfigStore.setState({
+      config,
+      loadedConfig: config,
+      agents: [],
+      teams: [],
+      rooms: [{ id: "lobby", display_name: "My", description: "", agents: [] }],
+      selectedRoomId: "lobby",
+    });
+    (useConfigStore as any).mockImplementation(() => actual.useConfigStore());
+    render(<RoomEditor />);
+
+    const nameInput = screen.getByLabelText("Display Name") as HTMLInputElement;
+    fireEvent.change(nameInput, { target: { value: "My " } });
+    fireEvent.change(nameInput, {
+      target: { value: `${nameInput.value}Room` },
+    });
+
+    expect(nameInput).toHaveValue("My Room");
+    expect(actual.useConfigStore.getState().config?.rooms?.lobby).toEqual({
+      display_name: "My Room",
+    });
+  });
+
+  it("updates room description", () => {
     render(<RoomEditor />);
 
     const descriptionInput = screen.getByLabelText("Description");
@@ -112,10 +143,8 @@ describe("RoomEditor", () => {
       target: { value: "Updated description" },
     });
 
-    await waitFor(() => {
-      expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
-        description: "Updated description",
-      });
+    expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
+      description: "Updated description",
     });
   });
 
@@ -136,29 +165,25 @@ describe("RoomEditor", () => {
     expect(agent2Checkbox).not.toBeChecked();
   });
 
-  it("adds agent to room when checkbox is checked", async () => {
+  it("adds agent to room when checkbox is checked", () => {
     render(<RoomEditor />);
 
     const agent2Checkbox = screen.getByRole("checkbox", { name: /Agent 2/ });
     fireEvent.click(agent2Checkbox);
 
-    await waitFor(() => {
-      expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
-        agents: ["agent1", "agent2"],
-      });
+    expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
+      agents: ["agent1", "agent2"],
     });
   });
 
-  it("removes agent from room when checkbox is unchecked", async () => {
+  it("removes agent from room when checkbox is unchecked", () => {
     render(<RoomEditor />);
 
     const agent1Checkbox = screen.getByRole("checkbox", { name: /Agent 1/ });
     fireEvent.click(agent1Checkbox);
 
-    await waitFor(() => {
-      expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
-        agents: [],
-      });
+    expect(mockUpdateRoom).toHaveBeenCalledWith("lobby", {
+      agents: [],
     });
   });
 
@@ -214,17 +239,7 @@ describe("RoomEditor", () => {
   });
 
   it("calls saveConfig when save button is clicked", async () => {
-    // Re-mock with isDirty: true so the button is enabled
-    (useConfigStore as any).mockReturnValue({
-      rooms: [mockRoom],
-      agents: mockAgents,
-      config: mockConfig,
-      selectedRoomId: "lobby",
-      updateRoom: mockUpdateRoom,
-      deleteRoom: mockDeleteRoom,
-      saveConfig: mockSaveConfig,
-      isDirty: true,
-    });
+    mockStore({ isDirty: true });
 
     render(<RoomEditor />);
 
@@ -244,35 +259,8 @@ describe("RoomEditor", () => {
     expect(saveButton).toBeDisabled();
   });
 
-  it("enables save button when dirty", () => {
-    (useConfigStore as any).mockReturnValue({
-      rooms: [mockRoom],
-      agents: mockAgents,
-      config: mockConfig,
-      selectedRoomId: "lobby",
-      updateRoom: mockUpdateRoom,
-      deleteRoom: mockDeleteRoom,
-      saveConfig: mockSaveConfig,
-      isDirty: true,
-    });
-
-    render(<RoomEditor />);
-
-    const saveButton = screen.getByRole("button", { name: /Save/i });
-    expect(saveButton).not.toBeDisabled();
-  });
-
   it("shows empty state when no agents available", () => {
-    (useConfigStore as any).mockReturnValue({
-      rooms: [mockRoom],
-      agents: [],
-      config: mockConfig,
-      selectedRoomId: "lobby",
-      updateRoom: mockUpdateRoom,
-      deleteRoom: mockDeleteRoom,
-      saveConfig: mockSaveConfig,
-      isDirty: false,
-    });
+    mockStore({ agents: [] });
 
     render(<RoomEditor />);
 
@@ -285,5 +273,69 @@ describe("RoomEditor", () => {
     expect(
       screen.getByText(/Select agents that should have access to this room/),
     ).toBeInTheDocument();
+  });
+
+  const roomSchema = {
+    type: "object",
+    properties: {},
+    $defs: {
+      RoomConfig: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          encrypted: {
+            anyOf: [{ type: "boolean" }, { type: "null" }],
+            default: null,
+          },
+        },
+      },
+    },
+  };
+
+  const renderRoomWithSchema = (
+    rooms: Record<string, Record<string, unknown>>,
+  ) => {
+    const mockUpdateConfigValue = vi.fn();
+    mockStore({
+      config: { ...mockConfig, rooms },
+      diagnostics: [],
+      updateConfigValue: mockUpdateConfigValue,
+    });
+    vi.mocked(useConfigSchema).mockReturnValue({
+      schema: roomSchema,
+      error: null,
+      retry: vi.fn(),
+    });
+    render(<RoomEditor />);
+    fireEvent.click(screen.getByRole("button", { name: /More settings/ }));
+    return mockUpdateConfigValue;
+  };
+
+  it("edits per-room Matrix settings through More settings", () => {
+    const updateConfigValue = renderRoomWithSchema({
+      lobby: { description: "Main discussion room" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Encrypted" }), {
+      target: { value: "true" },
+    });
+
+    expect(updateConfigValue).toHaveBeenCalledWith(
+      ["rooms", "lobby", "encrypted"],
+      true,
+    );
+  });
+
+  it("resets a per-room override to its default", () => {
+    const updateConfigValue = renderRoomWithSchema({
+      lobby: { encrypted: true },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Encrypted" }), {
+      target: { value: "__default__" },
+    });
+
+    expect(updateConfigValue).toHaveBeenCalledWith(
+      ["rooms", "lobby", "encrypted"],
+      undefined,
+    );
   });
 });

@@ -1,4 +1,4 @@
-"""One-time retirement of application work admitted before Nio owned ingestion."""
+"""Migrations for legacy journal layouts and approval records."""
 
 from __future__ import annotations
 
@@ -6,11 +6,15 @@ from typing import TYPE_CHECKING
 
 from mindroom.logging_config import get_logger
 
+from .schema import OUTBOX_TABLE, SQLITE_DIALECT
+
 if TYPE_CHECKING:
     from .backend import Transaction
+    from .upgrades import SchemaInspector
 
 logger = get_logger(__name__)
 
+# LEGACY_COMPAT: Application-owned journal ingestion before durable Matrix consumers.
 # Legacy format: Application-owned journal ingestion without matrix_sync_consumers.
 # Last legacy release: v2026.9.28; replacement: v2026.9.29 transferred ingestion ownership.
 # Handling: Retire unfinished transport work while preserving history, terminal turns, and journal generation.
@@ -38,7 +42,7 @@ _RETIRED_TABLES = (
 )
 
 
-def upgrade_legacy_journal(transaction: Transaction, existing_tables: frozenset[str]) -> None:
+def upgrade_legacy_journal(transaction: Transaction, inspector: SchemaInspector) -> None:
     """Retire old work inside the transaction that installs the current schema.
 
     Keep event identities, projected history, completed-turn tracking, and the
@@ -46,6 +50,7 @@ def upgrade_legacy_journal(transaction: Transaction, existing_tables: frozenset[
     consumer table in this same transaction makes the upgrade crash-atomic and
     prevents another open from retiring work admitted after the cutover.
     """
+    existing_tables = inspector.tables()
     if "journal_events" not in existing_tables or "matrix_sync_consumers" in existing_tables:
         return
     logger.warning(
@@ -65,3 +70,74 @@ def upgrade_legacy_journal(transaction: Transaction, existing_tables: frozenset[
     # while empty membership/hydration tables require a fresh source baseline.
     transaction.execute("UPDATE journal_events SET membership_epoch = 0 WHERE membership_epoch != 0")
     transaction.execute("UPDATE visible_messages SET membership_epoch = 0 WHERE membership_epoch != 0")
+
+
+# LEGACY_COMPAT: Hydration markers written before walks had versions.
+# Legacy format: conversation_hydration without a walk_version column. Its thread markers came from a walk that trusted
+# a recursive relations walk to return every edit, which Tuwunel's paging does not, so a streamed reply whose ending it
+# missed sat at its placeholder under a marker that said the thread was whole.
+# Last legacy release: v2026.10.564, the newest release before walk versions; replacement: the next release writes
+# walk_version 1, whose thread walk looks up the edits of every message it left mid-stream.
+# Handling: adds walk_version as 0 to every existing marker, then sets room markers to 1 because the room walk did not
+# change. Each thread an older walk marked is walked again on its next read, and the new walk replaces its coverage.
+# Coverage: tests/test_journal_upgrade_boundary.py::test_thread_markers_from_before_walk_versions_are_walked_again,
+# tests/test_conversation_hydration.py::TestMarkersFromAnOlderWalk.
+def upgrade_hydration_walk_version(transaction: Transaction, inspector: SchemaInspector) -> None:
+    """Version the hydration markers of a journal created before walk versions, inside the schema transaction."""
+    hydration_columns = inspector.columns("conversation_hydration")
+    if not hydration_columns or "walk_version" in hydration_columns:
+        return
+    transaction.execute("ALTER TABLE conversation_hydration ADD COLUMN walk_version BIGINT NOT NULL DEFAULT 0")
+    transaction.execute("UPDATE conversation_hydration SET walk_version = 1 WHERE thread_id = ''")
+
+
+_PRE_REPLY_OUTBOX_COLUMNS = (
+    "principal_id, delivery_id, stage, event_type, room_id, membership_epoch, thread_id, transaction_id, "
+    "payload_json, result_json, edits_event_id, edit_target_pending, attempted, retired, "
+    "permanent_failure_reason, sending_device_id, acknowledged_event_id, created_at_ns"
+)
+
+
+# LEGACY_COMPAT: Outbox rows without reply identity and with only initial and final stages.
+# Legacy format: matrix_delivery_outbox without reply_id, span_id, reply_sequence, and reply_row_json columns, whose
+# stage CHECK constraint admits only 'initial' and 'final'.
+# Last legacy release: v2026.10.227; replacement: the durable reply messages of v2026.10.228 add the four nullable
+# columns and the 'edit' stage for non-terminal reply writes.
+# Handling: SQLite rebuilds the table under the new definition and copies every row unchanged, before the schema's
+# indexes are created; PostgreSQL adds the columns and replaces the stage constraint. Existing rows keep null reply
+# identity, which every reader treats as a delivery that is not a reply row.
+# Coverage: tests/test_journal_upgrade_boundary.py::test_outbox_upgrade_keeps_rows_and_admits_edit_stage.
+def upgrade_outbox_reply_rows(transaction: Transaction, inspector: SchemaInspector) -> None:
+    """Admit reply rows in an outbox created before them, inside the schema transaction."""
+    outbox_columns = inspector.columns("matrix_delivery_outbox")
+    if not outbox_columns or "reply_id" in outbox_columns:
+        return
+    if inspector.dialect is SQLITE_DIALECT:
+        transaction.execute("ALTER TABLE matrix_delivery_outbox RENAME TO matrix_delivery_outbox_pre_reply")
+        transaction.execute(OUTBOX_TABLE)
+        transaction.execute(
+            f"INSERT INTO matrix_delivery_outbox ({_PRE_REPLY_OUTBOX_COLUMNS}) "  # noqa: S608 - fixed columns
+            f"SELECT {_PRE_REPLY_OUTBOX_COLUMNS} FROM matrix_delivery_outbox_pre_reply",
+        )
+        # Dropping the renamed table drops the indexes that followed it; the
+        # schema statements that run next create them on the new table.
+        transaction.execute("DROP TABLE matrix_delivery_outbox_pre_reply")
+        return
+    transaction.execute("ALTER TABLE matrix_delivery_outbox ADD COLUMN IF NOT EXISTS reply_id TEXT")
+    transaction.execute("ALTER TABLE matrix_delivery_outbox ADD COLUMN IF NOT EXISTS span_id TEXT")
+    transaction.execute("ALTER TABLE matrix_delivery_outbox ADD COLUMN IF NOT EXISTS reply_sequence BIGINT")
+    transaction.execute("ALTER TABLE matrix_delivery_outbox ADD COLUMN IF NOT EXISTS reply_row_json TEXT")
+    # The released constraint is unnamed in its DDL; find it in the catalog
+    # rather than trusting the name PostgreSQL generated for it.
+    for row in transaction.fetchall(
+        """
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = 'matrix_delivery_outbox'::regclass AND contype = 'c'
+          AND strpos(pg_get_constraintdef(oid), 'stage') > 0
+        """,
+    ):
+        transaction.execute(f'ALTER TABLE matrix_delivery_outbox DROP CONSTRAINT "{row["conname"]}"')
+    transaction.execute(
+        "ALTER TABLE matrix_delivery_outbox ADD CONSTRAINT matrix_delivery_outbox_stage_check "
+        "CHECK (stage IN ('initial', 'final', 'edit'))",
+    )

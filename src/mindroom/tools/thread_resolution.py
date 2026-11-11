@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="thread_resolution",
+    file_access=ToolFileAccess.NONE,
     display_name="Thread Resolution",
     description="Mark conversation threads as resolved or reopen them",
     category=ToolCategory.COMMUNICATION,
@@ -20,8 +21,7 @@ if TYPE_CHECKING:
     setup_type=SetupType.NONE,
     icon="CircleCheckBig",
     icon_color="text-emerald-500",
-    dependencies=["agno"],
-    docs_url="https://github.com/mindroom-ai/mindroom",
+    docs_url="https://docs.mindroom.chat/tools/matrix-and-attachments/#thread_resolution",
     function_names=("reopen_thread", "resolve_thread"),
     requires_room_context=True,
 )

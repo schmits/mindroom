@@ -20,7 +20,8 @@ from mindroom.entity_resolution import configured_routable_entity_ids_for_room, 
 from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.state import MatrixState
 from tests.conftest import bind_runtime_paths, orchestrator_runtime_paths, runtime_paths_for
-from tests.identity_helpers import entity_names_for_ids, persist_entity_accounts
+from tests.identity_helpers import entity_names_for_ids
+from tests.matrix_state_helpers import save_matrix_state
 
 
 class TestResponderCandidateSelection:
@@ -34,12 +35,10 @@ class TestResponderCandidateSelection:
     @staticmethod
     def _bind_runtime(config: Config) -> Config:
         runtime_root = Path(tempfile.mkdtemp())
-        bound = bind_runtime_paths(
+        return bind_runtime_paths(
             config,
             orchestrator_runtime_paths(runtime_root, config_path=runtime_root / "config.yaml"),
         )
-        persist_entity_accounts(bound, runtime_paths_for(bound))
-        return bound
 
     def setup_method(self) -> None:
         """Set up test config."""
@@ -49,20 +48,20 @@ class TestResponderCandidateSelection:
                 agents={
                     "calculator": AgentConfig(
                         display_name="Calculator",
-                        rooms=["#math:localhost", "#general:localhost"],
+                        rooms=["math", "general"],
                     ),
                     "research": AgentConfig(
                         display_name="Research Assistant",
-                        rooms=["#research:localhost", "#general:localhost"],
+                        rooms=["research", "general"],
                     ),
                     "writer": AgentConfig(
                         display_name="Writer",
-                        rooms=["#writing:localhost"],  # NOT in general room
+                        rooms=["writing"],  # NOT in general room
                     ),
                 },
                 teams={},
                 room_models={},
-                models={"default": ModelConfig(provider="test", id="test-model")},
+                models={"default": ModelConfig(provider="openai", id="test-model")},
             ),
         )
 
@@ -197,7 +196,7 @@ class TestResponderCandidateSelection:
         runtime_paths = runtime_paths_for(self.config)
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_account("agent_calculator", "mindroom_calculator_oldns", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
         room = MagicMock()
         room.room_id = "#math:localhost"
         room.members_synced = True
@@ -227,7 +226,7 @@ class TestResponderCandidateSelection:
         runtime_paths = runtime_paths_for(self.config)
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_account("agent_calculator", "actual_calculator", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
         room = MagicMock()
         room.room_id = "#math:localhost"
         room.members_synced = True
@@ -259,18 +258,18 @@ class TestResponderCandidateSelection:
             Config(
                 agents={
                     "calculator": AgentConfig(display_name="Calculator"),
-                    "writer": AgentConfig(display_name="Writer", rooms=["#writing:localhost"]),
+                    "writer": AgentConfig(display_name="Writer", rooms=["writing"]),
                 },
                 teams={
                     "ops": TeamConfig(
                         display_name="Ops Team",
                         role="Operations team",
                         agents=["calculator"],
-                        rooms=["#ops:localhost"],
+                        rooms=["ops"],
                     ),
                 },
                 room_models={},
-                models={"default": ModelConfig(provider="test", id="test-model")},
+                models={"default": ModelConfig(provider="openai", id="test-model")},
             ),
         )
         runtime_paths = runtime_paths_for(config)
@@ -335,7 +334,7 @@ class TestResponderCandidateSelection:
         runtime_paths = runtime_paths_for(self.config)
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_account("agent_writer", "actual_writer", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
         room = MagicMock()
         room.room_id = "!adhoc:localhost"
         room.members_synced = True
@@ -403,14 +402,14 @@ class TestResponderCandidateSelection:
                         access=ResponderAccessConfig(members_of_rooms=["project"]),
                     ),
                 },
-                models={"default": ModelConfig(provider="test", id="test-model")},
+                models={"default": ModelConfig(provider="openai", id="test-model")},
             ),
         )
         runtime_paths = runtime_paths_for(config)
         grant_room_id = "!project:localhost"
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_room("project", grant_room_id, "#project:localhost", "Project")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
         client = AsyncMock(spec=nio.AsyncClient)
         client.joined_rooms.return_value = nio.JoinedRoomsResponse(rooms=[grant_room_id])
         client.joined_members.return_value = nio.JoinedMembersResponse(
@@ -445,12 +444,12 @@ class TestResponderCandidateSelection:
                 agents={
                     "calculator": AgentConfig(
                         display_name="Calculator",
-                        rooms=["#general:localhost"],
+                        rooms=["general"],
                     ),
                 },
                 teams={},
                 room_models={},
-                models={"default": ModelConfig(provider="test", id="test-model")},
+                models={"default": ModelConfig(provider="openai", id="test-model")},
             ),
         )
 

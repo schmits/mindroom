@@ -9,6 +9,7 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
@@ -20,17 +21,19 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="usage_stats",
+    file_access=ToolFileAccess.NONE,
     display_name="Usage Statistics",
     description="Inspect retained token usage without modifying session storage",
+    docs_url="https://docs.mindroom.chat/usage/#usage_stats",
     category=ToolCategory.INFORMATION,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     requires_room_context=True,
     default_execution_target=ToolExecutionTarget.PRIMARY,
+    requires_primary_runtime=True,
     icon="FaChartBar",
     icon_color="text-cyan-500",
-    dependencies=["agno"],
-    function_names=("get_my_usage", "get_all_usage"),
+    function_names=("get_my_usage", "get_my_private_usage", "get_all_usage"),
     managed_init_args=(ToolManagedInitArg.AGENT_NAME,),
     agent_override_fields=[
         ConfigField(

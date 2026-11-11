@@ -42,15 +42,11 @@ export interface ListPanelProps<T extends ListItem> {
    */
   selectedId?: string;
   /**
-   * Function to handle item selection
-   */
-  onItemSelect?: (id: string) => void;
-  /**
    * Function to handle item creation
    */
   onCreateItem?: (data?: string) => void | boolean | Promise<void | boolean>;
   /**
-   * Function to render each item
+   * Function to render each item, including accessible selection controls
    */
   renderItem: (item: T, isSelected: boolean) => ReactNode;
   /**
@@ -97,10 +93,6 @@ export interface ListPanelProps<T extends ListItem> {
    * Whether to show create button
    */
   showCreateButton?: boolean;
-  /**
-   * Creation form border color variant
-   */
-  creationBorderVariant?: "blue" | "orange";
 }
 
 /**
@@ -127,7 +119,6 @@ export function ListPanel<T extends ListItem>({
   icon: Icon,
   items,
   selectedId,
-  onItemSelect: _onItemSelect,
   onCreateItem,
   renderItem,
   showSearch = false,
@@ -141,7 +132,6 @@ export function ListPanel<T extends ListItem>({
   emptySubtitle,
   className = "",
   showCreateButton = true,
-  creationBorderVariant = "blue",
 }: ListPanelProps<T>) {
   const [searchTerm, setSearchTerm] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -205,11 +195,6 @@ export function ListPanel<T extends ListItem>({
   const headerClass = sharedStyles.panel.header;
   const contentClass = sharedStyles.panel.content;
 
-  const creationBorderClass =
-    creationBorderVariant === "orange"
-      ? "border-2 border-orange-500"
-      : "border-2 border-blue-500";
-
   const headerContent = (
     <>
       <div className={sharedStyles.header.titleContainer}>
@@ -259,7 +244,7 @@ export function ListPanel<T extends ListItem>({
     <div className={contentClass}>
       {/* Inline creation form */}
       {isCreating && creationMode === "inline-form" && (
-        <Card className={creationBorderClass}>
+        <Card className={sharedStyles.creation.container}>
           <CardContent className={sharedStyles.creation.content}>
             <div className={sharedStyles.creation.inputContainer}>
               <Input

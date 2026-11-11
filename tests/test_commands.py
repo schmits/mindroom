@@ -23,9 +23,10 @@ from mindroom.commands.parsing import (
     get_compact_command_entries,
 )
 from mindroom.config.agent import AgentConfig, TeamConfig
-from mindroom.config.main import Config
-from mindroom.constants import RuntimePaths
+from mindroom.config.main import Config, load_config
+from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.matrix.identity import MatrixID
+from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.message_target import MessageTarget
 from tests.authorization_helpers import (
     isolated_membership_index,
@@ -33,6 +34,7 @@ from tests.authorization_helpers import (
 )
 from tests.conftest import make_conversation_reader_mock
 from tests.identity_helpers import persist_entity_accounts
+from tests.test_plugins import _write_broken_tool_plugin
 
 WELCOME_QUICK_COMMAND_LINES = [
     "\u2022 `!hi` - Show this welcome message again",
@@ -47,6 +49,7 @@ def _test_runtime_paths(tmp_path: Path) -> RuntimePaths:
         config_dir=tmp_path,
         env_path=tmp_path / ".env",
         storage_root=tmp_path / "mindroom_data",
+        process_env={"MATRIX_HOMESERVER": "http://localhost:8008"},
     )
 
 
@@ -199,6 +202,21 @@ def test_all_commands_have_documentation() -> None:
     for cmd_type, (syntax, description) in _COMMAND_DOCS.items():
         assert syntax.startswith("!"), f"{cmd_type} syntax should start with '!'"
         assert len(description) > 0, f"{cmd_type} should have a description"
+
+
+def test_background_job_commands() -> None:
+    """`!jobs` lists the conversation's background jobs; `!cancel_job` cancels one or all of them."""
+    command = command_parser.parse("!jobs")
+    assert command is not None
+    assert command.type == CommandType.JOBS
+    command = command_parser.parse("!cancel_job abc123")
+    assert command is not None
+    assert command.type == CommandType.CANCEL_JOB
+    assert command.args == {"job_id": "abc123"}
+    command = command_parser.parse("!cancel-job all")
+    assert command is not None
+    assert command.type == CommandType.CANCEL_JOB
+    assert command.args == {"job_id": None}
 
 
 def test_cancel_schedule_command() -> None:
@@ -393,7 +411,8 @@ async def test_welcome_message_lists_configured_teams(tmp_path: Path) -> None:
     )
 
     assert "\U0001f9e0 **Available agents and teams in this room:**" in welcome_message
-    assert "\u2022 **@ops**: Operations escalation team (Team of 1 agent)" in welcome_message
+    assert "\u2022 **Ops Team** (alias `ops`): Operations escalation team (Team of 1 agent)" in welcome_message
+    assert format_message_with_mentions(config, runtime_paths, welcome_message)["body"] == welcome_message
 
 
 @pytest.mark.asyncio
@@ -445,9 +464,9 @@ async def test_senderless_welcome_lists_configured_room_responders(tmp_path: Pat
     )
 
     assert "\U0001f9e0 **Available agents and teams in this room:**" in welcome_message
-    assert "\u2022 **@code**: Writes code" in welcome_message
-    assert "\u2022 **@ops**: Operations escalation team (Team of 1 agent)" in welcome_message
-    assert "@research" not in welcome_message
+    assert "\u2022 **Code** (alias `code`): Writes code" in welcome_message
+    assert "\u2022 **Ops Team** (alias `ops`): Operations escalation team (Team of 1 agent)" in welcome_message
+    assert "\u2022 **Research**" not in welcome_message
 
 
 @pytest.mark.asyncio
@@ -500,7 +519,7 @@ async def test_hi_command_lists_ad_hoc_present_responder(tmp_path: Path) -> None
 
     response_text = send_response.await_args.args[0]
     assert "\U0001f9e0 **Available agents and teams in this room:**" in response_text
-    assert "\u2022 **@code**: Writes code" in response_text
+    assert "\u2022 **Code** (alias `code`): Writes code" in response_text
     context.client.joined_members.assert_not_awaited()
 
 
@@ -560,8 +579,8 @@ async def test_hi_command_uses_live_responder_candidates_when_available(tmp_path
 
     candidate_resolver.assert_awaited_once_with(room, "@alice:localhost")
     response_text = send_response.await_args.args[0]
-    assert "\u2022 **@code**: Writes code" in response_text
-    assert "@research" not in response_text
+    assert "\u2022 **Code** (alias `code`): Writes code" in response_text
+    assert "\u2022 **Research**" not in response_text
 
 
 @pytest.mark.asyncio
@@ -627,16 +646,31 @@ async def test_schedule_command_reuses_failed_boundary_membership_snapshot(tmp_p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("extra_member", [None, "@bob:localhost"])
+@pytest.mark.parametrize(
+    ("room_shape", "sync_mode", "expected_reply"),
+    [
+        ("private", "classic", None),
+        ("extra_member", "classic", "private room"),
+        ("failed_refresh", "classic", "try again"),
+        ("unseen_invite", "classic", "private room"),
+        # Sliding sync loads members lazily, so a refresh without the server's counts proves nothing about invites.
+        ("private", "sliding", "private room"),
+        ("counted", "sliding", None),
+    ],
+)
 async def test_desktop_command_resolves_exact_agent_from_router_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    extra_member: str | None,
+    room_shape: str,
+    sync_mode: str,
+    expected_reply: str | None,
 ) -> None:
-    """Router-owned commands require the sole eligible agent and no unrelated room member."""
+    """Router-owned commands require the sole eligible agent and a complete membership with no other party."""
     runtime_paths = _test_runtime_paths(tmp_path)
     config = Config.validate_with_runtime(
         {
+            "models": {"default": {"provider": "openai", "id": "test-model"}},
+            "matrix_sync": {"mode": sync_mode},
             "defaults": {"tools": []},
             "agents": {
                 "code": {
@@ -654,17 +688,34 @@ async def test_desktop_command_resolves_exact_agent_from_router_candidates(
         usernames={"router": "mindroom_router", "code": "mindroom_code"},
     )
     room = nio.MatrixRoom(room_id="!room:localhost", own_user_id="@mindroom_router:localhost")
-    for user_id in ("@mindroom_router:localhost", "@mindroom_code:localhost", "@alice:localhost"):
+    joined_user_ids = ["@mindroom_router:localhost", "@mindroom_code:localhost", "@alice:localhost"]
+    if room_shape == "extra_member":
+        joined_user_ids.append("@bob:localhost")
+    for user_id in joined_user_ids:
         room.add_member(user_id, None, None)
-    if extra_member is not None:
-        room.add_member(extra_member, None, None)
+    if room_shape == "unseen_invite":
+        # The server still counts an invite the projection never saw.
+        room.update_summary(nio.RoomSummary(invited_member_count=1, joined_member_count=3))
+    if room_shape == "counted":
+        room.update_summary(nio.RoomSummary(invited_member_count=0, joined_member_count=3))
+    client = AsyncMock()
+    if room_shape == "failed_refresh":
+        client.joined_members.side_effect = TimeoutError("membership lookup timed out")
+    else:
+        client.joined_members.return_value = nio.JoinedMembersResponse(
+            members=[nio.RoomMember(user_id, None, None) for user_id in joined_user_ids],
+            room_id=room.room_id,
+        )
+    assert await ensure_room_membership_synced(client, room, sender_id="@alice:localhost") is (
+        room_shape != "failed_refresh"
+    )
     send_response = AsyncMock(return_value="$desktop")
     candidate_resolver = AsyncMock(return_value=[MatrixID.parse("@mindroom_code:localhost")])
     controller_identity = MagicMock()
     desktop_handler = MagicMock(return_value="desktop status")
     monkeypatch.setattr("mindroom.commands.handler.handle_desktop_command", desktop_handler)
     context = make_test_command_handler_context(
-        client=AsyncMock(),
+        client=client,
         config=config,
         runtime_paths=runtime_paths,
         logger=MagicMock(),
@@ -694,23 +745,65 @@ async def test_desktop_command_resolves_exact_agent_from_router_candidates(
         requester_user_id="@alice:localhost",
     )
 
-    if extra_member is None:
+    if expected_reply is None:
         assert desktop_handler.call_args.kwargs["scope"].agent_name == "code"
         assert desktop_handler.call_args.kwargs["scope"].requester_id == "@alice:localhost"
         assert desktop_handler.call_args.kwargs["scope"].controller_identity is controller_identity
     else:
         desktop_handler.assert_not_called()
-        assert "private room" in send_response.await_args.args[0]
+        assert expected_reply in send_response.await_args.args[0]
 
 
-def test_docs_index_chat_commands_summary_lists_all_supported_commands() -> None:
-    """The docs index summary should stay in sync with the supported command set."""
-    docs_index = Path(__file__).resolve().parents[1] / "docs" / "index.md"
-    contents = docs_index.read_text(encoding="utf-8")
-    table_row = next(line for line in contents.splitlines() if line.startswith("| **Chat Commands** |"))
-    doc_link = next(line for line in contents.splitlines() if line.startswith("- [Chat Commands]("))
+def test_chat_commands_page_lists_all_supported_commands() -> None:
+    """The chat commands docs page should document every supported command syntax."""
+    chat_commands = Path(__file__).resolve().parents[1] / "docs" / "chat-commands.md"
+    # Table cells escape literal pipes in command syntax as "\|".
+    contents = chat_commands.read_text(encoding="utf-8").replace("\\|", "|")
 
     for syntax, _description in _COMMAND_DOCS.values():
-        # Table cells escape literal pipes in command syntax as "\|".
-        assert syntax in table_row.replace("\\|", "|")
-        assert syntax in doc_link
+        assert syntax in contents
+
+
+@pytest.mark.asyncio
+async def test_welcome_lists_only_the_tools_an_agent_can_use_here(tmp_path: Path) -> None:
+    """A tool whose plugin failed to load is not advertised, while the agent's other tools are."""
+    _write_broken_tool_plugin(tmp_path / "plugins" / "broken")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "models:\n"
+        "  default:\n"
+        "    provider: openai\n"
+        "    id: gpt-6-astra\n"
+        "agents:\n"
+        "  code:\n"
+        "    display_name: Code\n"
+        "    role: Writes code\n"
+        "    rooms: ['!room:localhost']\n"
+        "    include_default_tools: false\n"
+        "    tools:\n"
+        "      - broken_plugin_tool\n"
+        "      - calculator\n"
+        "plugins:\n"
+        "  - ./plugins/broken\n",
+        encoding="utf-8",
+    )
+    runtime_paths = resolve_runtime_paths(
+        config_path=config_path,
+        storage_path=tmp_path / "mindroom_data",
+        process_env={"MATRIX_HOMESERVER": "http://localhost:8008", "MINDROOM_NAMESPACE": ""},
+    )
+    room = nio.MatrixRoom(room_id="!room:localhost", own_user_id="@mindroom_router:localhost")
+
+    config = load_config(runtime_paths, tolerate_plugin_load_errors=True)
+    persist_entity_accounts(config, runtime_paths, usernames={"router": "mindroom_router", "code": "mindroom_code"})
+    welcome_message = await generate_welcome_message_for_room(
+        _synced_client(),
+        room,
+        None,
+        config,
+        runtime_paths,
+        isolated_membership_index(),
+    )
+
+    assert "• **Code** (alias `code`): Writes code (\U0001f527 `calculator`)" in welcome_message
+    assert "broken_plugin_tool" not in welcome_message

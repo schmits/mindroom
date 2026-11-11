@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -15,14 +14,16 @@ from nio import crypto
 from nio.api import Api
 from nio.exceptions import OlmTrustError
 
+from mindroom.llm.media import named_mime_type
 from mindroom.logging_config import get_logger
+from mindroom.matrix.guarded_rooms import send_refused
 from mindroom.matrix.large_messages import MatrixEventTooLargeError, prepare_large_message
-from mindroom.matrix.media import upload_content_uri, upload_media_bytes
-from mindroom.matrix.message_builder import build_matrix_edit_content
+from mindroom.matrix.media import durable_session_closed, prepare_media_upload, upload_content_uri, upload_media_bytes
+from mindroom.matrix.message_builder import build_matrix_edit_content, build_thread_relation
 from mindroom.timing import emit_timing_event
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Callable, Sequence
 
     from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
 
@@ -30,10 +31,6 @@ logger = get_logger(__name__)
 
 _MATRIX_TRUST_DELIVERY_ERROR_MESSAGE = "Matrix encrypted delivery rejected by local device trust policy."
 _MATRIX_GENERIC_DELIVERY_ERROR_MESSAGE = "Matrix delivery raised an unexpected local exception."
-# Allow one default nio recovery pump, while keeping terminal delivery bounded.
-_SYNC_RECOVERY_RETRY_TIMEOUT_SECONDS = 30.0
-_SYNC_RECOVERY_RETRY_INITIAL_DELAY_SECONDS = 0.05
-_SYNC_RECOVERY_RETRY_MAX_DELAY_SECONDS = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +78,7 @@ def _sanitized_delivery_error_message(error: Exception) -> str:
 
 
 def _log_matrix_delivery_exception(
+    client: nio.AsyncClient,
     error: Exception,
     *,
     room_id: str,
@@ -88,7 +86,8 @@ def _log_matrix_delivery_exception(
     cache_bypass: bool,
 ) -> None:
     """Log one local Matrix send/edit exception without exposing device details."""
-    logger.error(
+    log = logger.warning if durable_session_closed(client) else logger.error
+    log(
         "matrix_message_delivery_exception",
         room_id=room_id,
         operation=operation,
@@ -98,55 +97,7 @@ def _log_matrix_delivery_exception(
     )
 
 
-async def _retry_prepared_room_message_after_sync_recovery(
-    send_once: Callable[[], Awaitable[object | None]],
-    *,
-    original_error: nio.SendRetryError,
-    room_id: str,
-    operation: str,
-    cache_bypass: bool,
-) -> object | None:
-    """Retry one frozen payload within a bounded sync-recovery window."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _SYNC_RECOVERY_RETRY_TIMEOUT_SECONDS
-    delay = _SYNC_RECOVERY_RETRY_INITIAL_DELAY_SECONDS
-    first_retry = True
-    while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            raise original_error
-        retry_delay = min(delay, remaining)
-        log = logger.warning if first_retry else logger.debug
-        log(
-            "Waiting to retry Matrix delivery after sync recovery",
-            room_id=room_id,
-            operation=operation,
-            retry_in_seconds=retry_delay,
-        )
-        await asyncio.sleep(retry_delay)
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            raise original_error
-        try:
-            return await asyncio.wait_for(send_once(), remaining)
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            raise original_error from None
-        except nio.SendRetryError:
-            first_retry = False
-            delay = min(delay * 2, _SYNC_RECOVERY_RETRY_MAX_DELAY_SECONDS)
-        except Exception as error:
-            _log_matrix_delivery_exception(
-                error,
-                room_id=room_id,
-                operation=operation,
-                cache_bypass=cache_bypass,
-            )
-            return None
-
-
-async def _send_prepared_room_message(
+async def _send_prepared_room_message(  # noqa: PLR0911
     client: nio.AsyncClient,
     room_id: str,
     content_sent: dict[str, Any],
@@ -154,16 +105,25 @@ async def _send_prepared_room_message(
     message_type: str,
     cache_bypass: bool,
     operation: str,
-    retry_sync_recovery: bool,
     transaction_id: str | None = None,
+    write_allowed: Callable[[], bool] | None = None,
 ) -> object | None:
-    """Send one prepared Matrix room message and normalize local delivery exceptions."""
+    """Send one prepared Matrix room message and normalize local delivery exceptions.
 
-    async def send_once() -> object | None:
+    Every message, edit, reaction, and file sent to a room passes here, so a send into the room this context guards
+    is refused here as a failed one.
+    """
+    if send_refused(room_id):
+        logger.warning("matrix_send_refused_in_guarded_room", room_id=room_id, operation=operation)
+        return None
+    try:
+        if write_allowed is not None and not write_allowed():
+            return None
         if cache_bypass:
             access_token = client.access_token
             if not access_token:
                 _log_matrix_delivery_exception(
+                    client,
                     nio.LocalProtocolError("Matrix client access token is required to send a message."),
                     room_id=room_id,
                     operation=operation,
@@ -204,26 +164,9 @@ async def _send_prepared_room_message(
             tx_id=transaction_id,
             ignore_unverified_devices=True,
         )
-
-    try:
-        return await send_once()
-    except asyncio.CancelledError:
-        raise
     except Exception as error:
-        if isinstance(error, nio.SendRetryError):
-            try:
-                return await _retry_prepared_room_message_after_sync_recovery(
-                    send_once,
-                    original_error=error,
-                    room_id=room_id,
-                    operation=operation,
-                    cache_bypass=cache_bypass,
-                )
-            except nio.SendRetryError as retry_error:
-                if retry_sync_recovery:
-                    raise
-                error = retry_error
         _log_matrix_delivery_exception(
+            client,
             error,
             room_id=room_id,
             operation=operation,
@@ -255,8 +198,8 @@ def _has_encrypted_delivery_support(
     return False
 
 
-def _can_send_to_encrypted_room(client: nio.AsyncClient, room_id: str, *, operation: str) -> bool:
-    """Return whether one outbound room operation can proceed with current nio E2EE support."""
+def can_send_to_encrypted_room(client: nio.AsyncClient, room_id: str, *, operation: str) -> bool:
+    """Return whether nio can protect a send to one cached room, passing rooms it has not synced."""
     room = cached_room(client, room_id)
     return (
         room is None
@@ -309,22 +252,6 @@ async def resolve_room_encryption_outcome(
     return room_encrypted
 
 
-async def resolve_room_encryption_for_delivery(
-    client: nio.AsyncClient,
-    room_id: str,
-    *,
-    operation: str,
-) -> bool | None:
-    """Return authoritative room encryption state for safe outbound preparation."""
-    outcome = await resolve_room_encryption_outcome(client, room_id, operation=operation)
-    return outcome if isinstance(outcome, bool) else None
-
-
-def can_send_to_encrypted_room(client: nio.AsyncClient, room_id: str, *, operation: str) -> bool:
-    """Return whether one outbound Matrix operation can safely proceed."""
-    return _can_send_to_encrypted_room(client, room_id, operation=operation)
-
-
 async def send_room_event_result(
     client: nio.AsyncClient,
     room_id: str,
@@ -334,8 +261,8 @@ async def send_room_event_result(
     transaction_id: str | None = None,
     operation: str = "send_room_event",
 ) -> nio.RoomSendResponse | nio.RoomSendError | None:
-    """Send one already-built room event through bounded sync recovery."""
-    if not _can_send_to_encrypted_room(client, room_id, operation=operation):
+    """Send one already-built room event behind the encryption guard, returning None on a local failure."""
+    if not can_send_to_encrypted_room(client, room_id, operation=operation):
         return None
     response = await _send_prepared_room_message(
         client,
@@ -344,7 +271,6 @@ async def send_room_event_result(
         message_type=message_type,
         cache_bypass=False,
         operation=operation,
-        retry_sync_recovery=False,
         transaction_id=transaction_id,
     )
     return cast("nio.RoomSendResponse | nio.RoomSendError | None", response)
@@ -355,21 +281,14 @@ async def _prepare_matrix_message(
     room_id: str,
     content: dict[str, Any],
     *,
+    room_encrypted: bool,
     operation: str,
     content_is_prepared: bool,
+    sidecar_required: bool = False,
 ) -> _PreparedMatrixMessage | MatrixDeliveryFailure:
     """Prepare one message, rebuilding once if encryption turns on while yielding."""
     rooms = client.rooms
-    room = rooms.get(room_id)
-    encryption_outcome = await resolve_room_encryption_outcome(
-        client,
-        room_id,
-        operation=operation,
-    )
-    if isinstance(encryption_outcome, MatrixDeliveryFailure):
-        return encryption_outcome
-    room_encrypted = encryption_outcome
-    cache_bypass = room is None and not room_encrypted
+    cache_bypass = rooms.get(room_id) is None and not room_encrypted
 
     content_sent = content
     if not content_is_prepared:
@@ -379,6 +298,7 @@ async def _prepare_matrix_message(
                 room_id,
                 content,
                 room_encrypted=room_encrypted,
+                sidecar_required=sidecar_required,
             )
         except MatrixEventTooLargeError as error:
             return MatrixDeliveryFailure(MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, str(error))
@@ -406,6 +326,7 @@ async def _prepare_matrix_message(
                         room_id,
                         content,
                         room_encrypted=True,
+                        sidecar_required=sidecar_required,
                     )
                 except MatrixEventTooLargeError as error:
                     return MatrixDeliveryFailure(MatrixDeliveryFailureKind.PAYLOAD_TOO_LARGE, str(error))
@@ -445,22 +366,49 @@ async def send_message_outcome(
     *,
     message_type: str = "m.room.message",
     operation: str = "send_message",
-    retry_sync_recovery: bool = False,
     transaction_id: str | None = None,
     content_is_prepared: bool = False,
+    write_allowed: Callable[[], bool] | None = None,
+    sidecar_required: bool = False,
 ) -> MatrixSendOutcome:
     """Send a message to a Matrix room and return the delivered payload or a typed failure.
 
     ``content_is_prepared`` is reserved for payloads already frozen in
     durable storage. Those bytes must reach Matrix verbatim so the durable record
-    remains an exact description of the wire event.
+    remains an exact description of the wire event. With ``sidecar_required`` a
+    message too large for one event is not sent when its sidecar cannot be uploaded.
     """
-    if not _can_send_to_encrypted_room(client, room_id, operation=operation):
-        return MatrixDeliveryFailure(
-            MatrixDeliveryFailureKind.ENCRYPTION_GUARD,
-            "encrypted delivery rejected by local trust policy",
-        )
+    room_encrypted = await resolve_room_encryption_outcome(client, room_id, operation=operation)
+    if isinstance(room_encrypted, MatrixDeliveryFailure):
+        return room_encrypted
+    return await _send_resolved_message(
+        client,
+        room_id,
+        content,
+        room_encrypted=room_encrypted,
+        message_type=message_type,
+        operation=operation,
+        transaction_id=transaction_id,
+        content_is_prepared=content_is_prepared,
+        write_allowed=write_allowed,
+        sidecar_required=sidecar_required,
+    )
 
+
+async def _send_resolved_message(
+    client: nio.AsyncClient,
+    room_id: str,
+    content: dict[str, Any],
+    *,
+    room_encrypted: bool,
+    message_type: str,
+    operation: str,
+    transaction_id: str | None = None,
+    content_is_prepared: bool = False,
+    write_allowed: Callable[[], bool] | None = None,
+    sidecar_required: bool = False,
+) -> MatrixSendOutcome:
+    """Prepare and send one message with the room encryption its caller resolved after any upload it references."""
     emit_timing_event(
         "Matrix send timing",
         phase="prepare_start",
@@ -471,8 +419,10 @@ async def send_message_outcome(
         client,
         room_id,
         content,
+        room_encrypted=room_encrypted,
         operation=operation,
         content_is_prepared=content_is_prepared,
+        sidecar_required=sidecar_required,
     )
     if isinstance(prepared, MatrixDeliveryFailure):
         return prepared
@@ -498,8 +448,8 @@ async def send_message_outcome(
         message_type=message_type,
         cache_bypass=cache_bypass,
         operation=operation,
-        retry_sync_recovery=retry_sync_recovery,
         transaction_id=transaction_id,
+        write_allowed=write_allowed,
     )
     if response is None:
         emit_timing_event(
@@ -562,8 +512,9 @@ async def send_message_result(
     *,
     message_type: str = "m.room.message",
     operation: str = "send_message",
-    retry_sync_recovery: bool = False,
     transaction_id: str | None = None,
+    write_allowed: Callable[[], bool] | None = None,
+    sidecar_required: bool = False,
 ) -> DeliveredMatrixEvent | None:
     """Send a message to a Matrix room and return the exact delivered payload."""
     outcome = await send_message_outcome(
@@ -572,15 +523,11 @@ async def send_message_result(
         content,
         message_type=message_type,
         operation=operation,
-        retry_sync_recovery=retry_sync_recovery,
         transaction_id=transaction_id,
+        write_allowed=write_allowed,
+        sidecar_required=sidecar_required,
     )
     return outcome if isinstance(outcome, DeliveredMatrixEvent) else None
-
-
-def _guess_mimetype(file_path: Path) -> str:
-    guessed_mimetype, _ = mimetypes.guess_type(file_path.name)
-    return guessed_mimetype or "application/octet-stream"
 
 
 async def _upload_file_as_mxc(
@@ -589,6 +536,7 @@ async def _upload_file_as_mxc(
     file_path: Path,
     *,
     mimetype: str,
+    filename: str,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """Upload a local file as MXC, encrypting payloads in encrypted rooms."""
     try:
@@ -597,16 +545,16 @@ async def _upload_file_as_mxc(
         logger.exception("Failed to read file before upload", path=str(file_path))
         return None, None
 
-    return await _upload_media_bytes_as_mxc(
+    return await upload_media_bytes_as_mxc(
         client,
         room_id,
         file_bytes,
-        filename=file_path.name,
+        filename=filename,
         mimetype=mimetype,
     )
 
 
-async def _upload_media_bytes_as_mxc(
+async def upload_media_bytes_as_mxc(
     client: nio.AsyncClient,
     room_id: str,
     media_bytes: bytes,
@@ -614,41 +562,27 @@ async def _upload_media_bytes_as_mxc(
     filename: str,
     mimetype: str,
 ) -> tuple[str | None, dict[str, Any] | None]:
-    """Upload an in-memory Matrix media payload as MXC, encrypting for encrypted rooms."""
-    info: dict[str, Any] = {"size": len(media_bytes), "mimetype": mimetype}
-    room_encrypted = await resolve_room_encryption_for_delivery(client, room_id, operation="upload_media_bytes")
-    if room_encrypted is None:
-        return None, None
-    upload_bytes = media_bytes
-    encrypted_file_payload: dict[str, Any] | None = None
-    upload_mimetype = mimetype
-    upload_name = filename
+    """Upload an in-memory Matrix media payload as MXC, encrypting for encrypted rooms.
 
-    if room_encrypted:
-        try:
-            encrypted_bytes, encryption_keys = crypto.attachments.encrypt_attachment(media_bytes)
-        except Exception:
-            logger.exception("Failed to encrypt Matrix media upload", filename=filename)
-            return None, None
-        upload_bytes = encrypted_bytes
-        upload_mimetype = "application/octet-stream"
-        upload_name = f"{filename}.enc"
-        encrypted_file_payload = {
-            "url": "",
-            "key": encryption_keys["key"],
-            "iv": encryption_keys["iv"],
-            "hashes": encryption_keys["hashes"],
-            "v": "v2",
-            "mimetype": mimetype,
-            "size": len(media_bytes),
-        }
+    The payload carries an encrypted ``file`` exactly when the room is encrypted once the upload finished.
+    """
+    room_encrypted = await resolve_room_encryption_outcome(client, room_id, operation="upload_media_bytes")
+    if isinstance(room_encrypted, MatrixDeliveryFailure):
+        return None, None
+    try:
+        prepared = prepare_media_upload(media_bytes, filename=filename, mimetype=mimetype, encrypt=room_encrypted)
+        info = prepared.info()
+    except Exception:
+        logger.exception("Failed to encrypt Matrix media upload", filename=filename)
+        return None, None
+    encrypted_file_payload = prepared.encrypted_file_content(url="")
 
     try:
         upload_response = await upload_media_bytes(
             client,
-            upload_bytes,
-            content_type=upload_mimetype,
-            filename=upload_name,
+            prepared.data,
+            content_type=prepared.content_type,
+            filename=prepared.filename,
         )
     except Exception:
         logger.exception("Failed uploading Matrix media", filename=filename)
@@ -657,6 +591,14 @@ async def _upload_media_bytes_as_mxc(
     mxc_uri = upload_content_uri(upload_response)
     if mxc_uri is None:
         logger.error("Failed Matrix media upload response", filename=filename, response=str(upload_response))
+        return None, None
+    # Encryption can turn on while a plaintext upload is in flight, and an event
+    # must never point an encrypted room at plaintext bytes. Matrix room
+    # encryption cannot later be disabled, so an encrypted upload stays valid.
+    if not room_encrypted and (
+        await resolve_room_encryption_outcome(client, room_id, operation="upload_media_bytes") is not False
+    ):
+        logger.error("matrix_room_encrypted_during_plaintext_upload", room_id=room_id, filename=filename)
         return None, None
 
     upload_payload: dict[str, Any] = {"info": info}
@@ -678,36 +620,73 @@ def _msgtype_for_mimetype(mimetype: str) -> str:
     return "m.file"
 
 
-def _normalized_voice_waveform(waveform: Sequence[int] | None) -> list[int]:
-    """Return a Matrix-compatible waveform payload."""
-    if waveform is None:
-        return [0] * 30
-    return [min(1024, max(0, int(level))) for level in waveform]
-
-
 def _voice_audio_details(duration_ms: int | None, waveform: Sequence[int] | None) -> dict[str, Any] | None:
     """Build Matrix voice-message audio details when duration is available."""
     if duration_ms is None:
         return None
-    return {
-        "duration": duration_ms,
-        "waveform": _normalized_voice_waveform(waveform),
-    }
+    audio_details: dict[str, Any] = {"duration": duration_ms}
+    if waveform is not None:
+        audio_details["waveform"] = [min(1024, max(0, int(level))) for level in waveform]
+    return audio_details
 
 
-def _thread_relation_content(thread_id: str | None, latest_thread_event_id: str | None) -> dict[str, Any] | None:
-    """Build Matrix thread relation content for media sends."""
-    if thread_id is None:
-        return None
-    if latest_thread_event_id is None:
-        msg = "latest_thread_event_id is required for thread fallback"
-        raise ValueError(msg)
-    return {
-        "rel_type": "m.thread",
-        "event_id": thread_id,
-        "is_falling_back": True,
-        "m.in_reply_to": {"event_id": latest_thread_event_id},
-    }
+def _media_message_content(
+    msgtype: str,
+    body: str,
+    info: dict[str, Any],
+    media_source: dict[str, Any],
+    *,
+    filename: str | None,
+    extra_content: dict[str, Any] | None,
+    thread_id: str | None,
+    latest_thread_event_id: str | None,
+) -> dict[str, Any]:
+    """Build one media event; extra content never replaces the media source or the thread relation."""
+    content: dict[str, Any] = {"msgtype": msgtype, "body": body, "info": info}
+    if filename is not None:
+        content["filename"] = filename
+    if extra_content:
+        content.update(extra_content)
+    content.update(media_source)
+    if thread_id is not None:
+        content["m.relates_to"] = build_thread_relation(thread_id, latest_thread_event_id=latest_thread_event_id)
+    return content
+
+
+async def _send_uploaded_media(
+    client: nio.AsyncClient,
+    room_id: str,
+    mxc_uri: str,
+    upload_payload: dict[str, Any],
+    *,
+    msgtype: str,
+    body: str,
+    filename: str | None,
+    extra_content: dict[str, Any] | None,
+    thread_id: str | None,
+    latest_thread_event_id: str | None,
+) -> str | None:
+    """Send one media event from an upload that already matches the room's encryption."""
+    encrypted_file = upload_payload.get("file")
+    content = _media_message_content(
+        msgtype,
+        body,
+        upload_payload["info"],
+        {"file": encrypted_file} if encrypted_file is not None else {"url": mxc_uri},
+        filename=filename,
+        extra_content=extra_content,
+        thread_id=thread_id,
+        latest_thread_event_id=latest_thread_event_id,
+    )
+    outcome = await _send_resolved_message(
+        client,
+        room_id,
+        content,
+        room_encrypted=encrypted_file is not None,
+        message_type="m.room.message",
+        operation="send_message",
+    )
+    return outcome.event_id if isinstance(outcome, DeliveredMatrixEvent) else None
 
 
 async def send_file_message(
@@ -716,46 +695,46 @@ async def send_file_message(
     file_path: str | Path,
     *,
     thread_id: str | None = None,
-    caption: str | None = None,
     latest_thread_event_id: str | None = None,
+    filename: str | None = None,
+    mimetype: str | None = None,
+    extra_content: dict[str, Any] | None = None,
 ) -> str | None:
-    """Upload a file and send it with the appropriate Matrix message type."""
+    """Upload a file and send it with the appropriate Matrix message type.
+
+    ``filename`` names the upload for recipients and defaults to the file's own name.
+    ``mimetype`` defaults to a guess from the file's own name.
+    """
     resolved_path = Path(file_path).expanduser().resolve()
     if not resolved_path.is_file():
         logger.error("Cannot send non-file attachment", path=str(resolved_path))
         return None
-    if not _can_send_to_encrypted_room(client, room_id, operation="send_file_message"):
-        return None
 
-    mimetype = _guess_mimetype(resolved_path)
-    mxc_uri, upload_payload = await _upload_file_as_mxc(client, room_id, resolved_path, mimetype=mimetype)
+    display_name = filename or resolved_path.name
+    mimetype = mimetype or named_mime_type(resolved_path.name) or "application/octet-stream"
+    mxc_uri, upload_payload = await _upload_file_as_mxc(
+        client,
+        room_id,
+        resolved_path,
+        mimetype=mimetype,
+        filename=display_name,
+    )
     if mxc_uri is None or upload_payload is None:
         return None
 
-    info = upload_payload.get("info")
-    if not isinstance(info, dict):
-        info = {"size": resolved_path.stat().st_size, "mimetype": mimetype}
-
     msgtype = _msgtype_for_mimetype(mimetype)
-    content: dict[str, Any] = {
-        "msgtype": msgtype,
-        "body": caption or resolved_path.name,
-        "info": info,
-    }
-    if msgtype == "m.file":
-        content["filename"] = resolved_path.name
-    encrypted_file_payload = upload_payload.get("file")
-    if isinstance(encrypted_file_payload, dict):
-        content["file"] = encrypted_file_payload
-    else:
-        content["url"] = mxc_uri
-
-    thread_relation = _thread_relation_content(thread_id, latest_thread_event_id)
-    if thread_relation is not None:
-        content["m.relates_to"] = thread_relation
-
-    delivered = await send_message_result(client, room_id, content)
-    return delivered.event_id if delivered is not None else None
+    return await _send_uploaded_media(
+        client,
+        room_id,
+        mxc_uri,
+        upload_payload,
+        msgtype=msgtype,
+        body=display_name,
+        filename=display_name if msgtype == "m.file" else None,
+        extra_content=extra_content,
+        thread_id=thread_id,
+        latest_thread_event_id=latest_thread_event_id,
+    )
 
 
 async def send_runtime_encrypted_media_message(
@@ -766,21 +745,20 @@ async def send_runtime_encrypted_media_message(
     thread_id: str | None = None,
     caption: str | None = None,
     latest_thread_event_id: str | None = None,
+    extra_content: dict[str, Any] | None = None,
 ) -> str | None:
     """Send an existing encrypted MXC object without writing or uploading plaintext bytes."""
     msgtype = _msgtype_for_mimetype(attachment.mime_type)
-    content: dict[str, Any] = {
-        "msgtype": msgtype,
-        "body": caption or attachment.filename,
-        "info": {"size": attachment.size, "mimetype": attachment.mime_type},
-        "file": attachment.encrypted_file_content(),
-    }
-    if msgtype == "m.file":
-        content["filename"] = attachment.filename
-    thread_relation = _thread_relation_content(thread_id, latest_thread_event_id)
-    if thread_relation is not None:
-        content["m.relates_to"] = thread_relation
-
+    content = _media_message_content(
+        msgtype,
+        caption or attachment.filename,
+        {"size": attachment.size, "mimetype": attachment.mime_type},
+        {"file": attachment.encrypted_file_content()},
+        filename=attachment.filename if msgtype == "m.file" else None,
+        extra_content=extra_content,
+        thread_id=thread_id,
+        latest_thread_event_id=latest_thread_event_id,
+    )
     delivered = await send_message_result(
         client,
         room_id,
@@ -804,10 +782,7 @@ async def send_audio_message(
     latest_thread_event_id: str | None = None,
 ) -> str | None:
     """Upload an in-memory audio payload and send it as a Matrix voice message."""
-    if not _can_send_to_encrypted_room(client, room_id, operation="send_audio_message"):
-        return None
-
-    mxc_uri, upload_payload = await _upload_media_bytes_as_mxc(
+    mxc_uri, upload_payload = await upload_media_bytes_as_mxc(
         client,
         room_id,
         audio_bytes,
@@ -817,35 +792,23 @@ async def send_audio_message(
     if mxc_uri is None or upload_payload is None:
         return None
 
-    info = upload_payload.get("info")
-    if not isinstance(info, dict):
-        info = {"size": len(audio_bytes), "mimetype": mimetype}
     audio_details = _voice_audio_details(duration_ms, waveform)
+    voice_content: dict[str, Any] | None = None
     if audio_details is not None:
-        info["duration"] = audio_details["duration"]
-
-    content: dict[str, Any] = {
-        "msgtype": "m.audio",
-        "body": caption or filename,
-        "info": info,
-    }
-    if audio_details is not None:
-        content["org.matrix.msc3245.voice"] = {}
-        content["org.matrix.msc1767.audio"] = audio_details
-    if caption:
-        content["filename"] = filename
-    encrypted_file_payload = upload_payload.get("file")
-    if isinstance(encrypted_file_payload, dict):
-        content["file"] = encrypted_file_payload
-    else:
-        content["url"] = mxc_uri
-
-    thread_relation = _thread_relation_content(thread_id, latest_thread_event_id)
-    if thread_relation is not None:
-        content["m.relates_to"] = thread_relation
-
-    delivered = await send_message_result(client, room_id, content)
-    return delivered.event_id if delivered is not None else None
+        upload_payload["info"]["duration"] = audio_details["duration"]
+        voice_content = {"org.matrix.msc3245.voice": {}, "org.matrix.msc1767.audio": audio_details}
+    return await _send_uploaded_media(
+        client,
+        room_id,
+        mxc_uri,
+        upload_payload,
+        msgtype="m.audio",
+        body=caption or filename,
+        filename=filename if caption else None,
+        extra_content=voice_content,
+        thread_id=thread_id,
+        latest_thread_event_id=latest_thread_event_id,
+    )
 
 
 def build_edit_event_content(
@@ -884,7 +847,6 @@ async def edit_message_outcome(
     new_text: str,
     *,
     extra_content: dict[str, Any] | None = None,
-    retry_sync_recovery: bool = False,
     transaction_id: str | None = None,
 ) -> MatrixSendOutcome:
     """Edit an existing Matrix message and return the delivered payload or a typed failure."""
@@ -900,7 +862,6 @@ async def edit_message_outcome(
         room_id,
         edit_content,
         operation="edit_message",
-        retry_sync_recovery=retry_sync_recovery,
         transaction_id=transaction_id,
     )
 
@@ -913,7 +874,6 @@ async def edit_message_result(
     new_text: str,
     *,
     extra_content: dict[str, Any] | None = None,
-    retry_sync_recovery: bool = False,
     transaction_id: str | None = None,
 ) -> DeliveredMatrixEvent | None:
     """Edit an existing Matrix message and return the exact delivered payload."""
@@ -924,7 +884,6 @@ async def edit_message_result(
         new_content,
         new_text,
         extra_content=extra_content,
-        retry_sync_recovery=retry_sync_recovery,
         transaction_id=transaction_id,
     )
     return outcome if isinstance(outcome, DeliveredMatrixEvent) else None
@@ -941,7 +900,6 @@ __all__ = [
     "edit_message_outcome",
     "edit_message_result",
     "prepare_message_content",
-    "resolve_room_encryption_for_delivery",
     "resolve_room_encryption_outcome",
     "send_audio_message",
     "send_file_message",
@@ -949,4 +907,5 @@ __all__ = [
     "send_message_result",
     "send_room_event_result",
     "send_runtime_encrypted_media_message",
+    "upload_media_bytes_as_mxc",
 ]

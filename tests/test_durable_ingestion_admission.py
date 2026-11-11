@@ -5,14 +5,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import nio
 import pytest
+from nio import AuthenticatedToDeviceEvent
 from nio.crypto import DeviceStore, OlmDevice
 from nio.durable import RecordKind, SyncBatch, SyncRecord
+from nio.durable.codec import restore_event
 from nio.durable.model import CryptoEvidence, OwnMembership
 
 from mindroom.constants import STREAM_STATUS_KEY
@@ -30,14 +32,14 @@ from mindroom.event_journal import (
     IngestionRecordDisposition,
     PrincipalStore,
     RoomMembershipPosition,
+    journal,
 )
-from mindroom.event_journal import store as journal_store
 from mindroom.matrix import durable_ingestion
-from mindroom.matrix.client_session import authenticate_to_device_event
 from mindroom.matrix.durable_ingestion import consume_one_ingestion_batch, validate_ingestion_batch
 from mindroom.matrix.journal_ingress import parse_journal_event
-from mindroom.matrix.to_device import AuthenticatedToDeviceEvent
+from mindroom.matrix.olm_to_device import authenticated_sender_is_current
 from mindroom.pending_event_worker import PendingEventWorker
+from tests.journal_helpers import membership_position
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -85,7 +87,7 @@ class Session:
         self.batch = None
 
     async def dispatch(self, record: SyncRecord, *, event: object = None) -> None:
-        self.dispatched_events.append(event)
+        self.dispatched_events.append(restore_event(record) if event is None else event)
         self.dispatched.append(record)
 
 
@@ -178,7 +180,7 @@ async def test_batch_projection_failure_rolls_back_all_records_and_receipt(
     store = EventJournalStore.open_sqlite(tmp_path / "journal.db")
     batch = SyncBatch(uuid4(), 1, (message("$first"), message("$second")))
     principal = await principal_for(store, batch.stream_id)
-    original = journal_store._snapshot_interactive_source
+    original = journal._snapshot_interactive_source
 
     def block_second(transaction: Transaction, principal_id: str, event: InboundEvent) -> None:
         if event.event_id == "$second":
@@ -186,17 +188,38 @@ async def test_batch_projection_failure_rolls_back_all_records_and_receipt(
             raise DeliveryProjectionPendingError(message)
         original(transaction, principal_id, event)
 
-    monkeypatch.setattr(journal_store, "_snapshot_interactive_source", block_second)
+    monkeypatch.setattr(journal, "_snapshot_interactive_source", block_second)
     session = Session(batch)
     with pytest.raises(DeliveryProjectionPendingError):
         await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT)
     assert not await principal.pending()
     assert session.acked == []
-    monkeypatch.setattr(journal_store, "_snapshot_interactive_source", original)
+    monkeypatch.setattr(journal, "_snapshot_interactive_source", original)
     facts = await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT)
     assert facts.receipt_new
     assert [event.event_id for event in await principal.pending()] == ["$first", "$second"]
     assert session.acked == [batch]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_freezes_each_admitted_source_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Batch admission snapshots every admitted actionable record as an interactive source exactly once."""
+    store = EventJournalStore.open_sqlite(tmp_path / "journal.db")
+    batch = SyncBatch(uuid4(), 1, (message("$first"), message("$second")))
+    principal = await principal_for(store, batch.stream_id)
+    original = journal._snapshot_interactive_source
+    snapshotted: list[str] = []
+
+    def counting(transaction: Transaction, principal_id: str, event: InboundEvent) -> None:
+        snapshotted.append(event.event_id)
+        original(transaction, principal_id, event)
+
+    monkeypatch.setattr(journal, "_snapshot_interactive_source", counting)
+
+    await consume_one_ingestion_batch(Session(batch), principal, account_id=ACCOUNT)
+
+    assert snapshotted == ["$first", "$second"]
     await store.close()
 
 
@@ -232,6 +255,72 @@ async def test_redelivery_after_post_hook_failure_retries_hook_without_semantics
     assert session.dispatched == []
     assert len(await principal.pending()) == 2
     await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("msgtype", [[], {}, 5], ids=["list", "dict", "number"])
+@pytest.mark.parametrize("encrypted", [False, True])
+async def test_msgtype_that_is_not_text_settles_and_later_input_is_delivered(
+    journal_database: Callable[[], EventJournalStore],
+    msgtype: object,
+    encrypted: bool,
+) -> None:
+    """Any room member writes the msgtype, so a malformed one must not stall the whole sync."""
+    malformed = message("$malformed")
+    malformed.source["content"]["msgtype"] = msgtype
+    if encrypted:
+        malformed = replace(
+            malformed,
+            source={"type": "m.room.encrypted"},
+            clear=malformed.source,
+            crypto=CryptoEvidence(True, "curve", "session"),
+        )
+    batch = SyncBatch(uuid4(), 1, (malformed, message("$valid")))
+    principal = await principal_for(journal_database(), batch.stream_id)
+    session = Session(batch)
+
+    converted = validate_ingestion_batch(batch, account_id=ACCOUNT)
+    facts = await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT)
+
+    assert [record.disposition for record in converted.records] == [
+        IngestionRecordDisposition.COMPATIBILITY_ONLY,
+        IngestionRecordDisposition.SEMANTIC_EVENT,
+    ]
+    assert facts is not None
+    assert facts.receipt_new
+    assert session.acked == [batch]
+    assert session.dispatched == [malformed]
+    assert isinstance(session.dispatched_events[0], nio.BadEvent)
+    assert [event.event_id for event in await principal.pending()] == ["$valid"]
+
+
+@pytest.mark.asyncio
+async def test_redaction_naming_no_event_settles_and_later_input_is_delivered(
+    journal_database: Callable[[], EventJournalStore],
+) -> None:
+    """A room member's redaction with an empty target must not stall the whole sync."""
+    redaction = replace(
+        message("$redaction"),
+        source={
+            "type": "m.room.redaction",
+            "sender": "@alice:example.org",
+            "event_id": "$redaction",
+            "origin_server_ts": 10,
+            "redacts": "",
+            "content": {},
+        },
+    )
+    batch = SyncBatch(uuid4(), 1, (redaction, message("$valid")))
+    principal = await principal_for(journal_database(), batch.stream_id)
+    session = Session(batch)
+
+    facts = await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT)
+
+    assert facts is not None
+    assert facts.receipt_new
+    assert session.acked == [batch]
+    assert session.dispatched == [redaction]
+    assert [event.event_id for event in await principal.pending()] == ["$valid"]
 
 
 @pytest.mark.asyncio
@@ -416,7 +505,7 @@ async def test_batch_acceptance_rolls_back_with_admission(
     await principal.admit_ingestion_batch(first)
 
     def fail_after_admission(transaction: Transaction) -> None:
-        journal_store._admit_ingestion_batch(transaction, ACCOUNT, second)
+        journal.admit_ingestion_batch(transaction, ACCOUNT, second)
         message = "abort admission transaction"
         raise RuntimeError(message)
 
@@ -496,7 +585,7 @@ async def test_membership_tenure_fences_departed_work_and_retains_rejoin_epoch(
     assert facts[1].semantic_event_new
     assert not facts[3].semantic_event_new
     assert facts[5].semantic_event_new
-    position = await principal.membership_position(ROOM)
+    position = await membership_position(principal, ROOM)
     assert position.membership == "join"
     assert position.membership_epoch == 1
     assert [event.event_id for event in await principal.pending()] == ["$after"]
@@ -584,7 +673,7 @@ async def test_encrypted_semantic_source_keeps_crypto_evidence(
 
 
 @pytest.mark.asyncio
-async def test_auxiliary_replay_reauthenticates_removed_device(
+async def test_auxiliary_replay_preserves_evidence_but_current_authority_can_be_revoked(
     journal_database: Callable[[], EventJournalStore],
 ) -> None:
     store = journal_database()
@@ -599,27 +688,40 @@ async def test_auxiliary_replay_reauthenticates_removed_device(
             "sender": device.user_id,
             "content": {"algorithm": "m.olm.v1.curve25519-aes-sha2", "sender_key": "curve"},
         },
-        clear={"type": "org.example.call", "sender": device.user_id, "content": {"key": "value"}},
+        clear={
+            "type": "org.example.call",
+            "sender": device.user_id,
+            "sender_device": device.device_id,
+            "keys": {"ed25519": device.ed25519},
+            "content": {"key": "value"},
+        },
         route="to_device",
+        crypto=CryptoEvidence(
+            None,
+            "curve",
+            authenticated_sender=nio.AuthenticatedDevice(device.user_id, "ALICE", "curve", "signing"),
+        ),
     )
     batch = SyncBatch(uuid4(), 1, (record,))
     principal = await principal_for(store, batch.stream_id)
     session = Session(batch)
-    authenticate = partial(authenticate_to_device_event, device_store=devices)
-    await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT, authenticate_to_device=authenticate)
+    client = SimpleNamespace(olm=SimpleNamespace(device_store=devices))
+    await consume_one_ingestion_batch(session, principal, account_id=ACCOUNT)
     assert isinstance(session.dispatched_events[0], AuthenticatedToDeviceEvent)
+    assert authenticated_sender_is_current(client, session.dispatched_events[0])
     device.deleted = True
     replay = Session(batch)
     facts = await consume_one_ingestion_batch(
         replay,
         principal,
         account_id=ACCOUNT,
-        authenticate_to_device=authenticate,
     )
     assert facts is not None
     assert not facts.receipt_new
     assert len(replay.dispatched_events) == 1
-    assert not isinstance(replay.dispatched_events[0], AuthenticatedToDeviceEvent)
+    assert isinstance(replay.dispatched_events[0], AuthenticatedToDeviceEvent)
+    assert replay.dispatched_events[0].authenticated_sender == session.dispatched_events[0].authenticated_sender
+    assert not authenticated_sender_is_current(client, replay.dispatched_events[0])
 
 
 @pytest.mark.asyncio
@@ -633,11 +735,11 @@ async def test_initial_nonjoined_producer_position_stays_fenced(
     principal = await principal_for(store, stream)
     record = SyncRecord(RecordKind.ROOM_LIFECYCLE, ROOM, {}, membership=OwnMembership(None, membership, 0, 0))
     await consume_one_ingestion_batch(Session(SyncBatch(stream, 1, (record,))), principal, account_id=ACCOUNT)
-    position = await principal.membership_position(ROOM)
+    position = await membership_position(principal, ROOM)
     assert (position.membership, position.membership_epoch) == ("leave", 0)
     record = SyncRecord(RecordKind.ROOM_LIFECYCLE, ROOM, {}, membership=OwnMembership(membership, "join", 0, 0))
     await consume_one_ingestion_batch(Session(SyncBatch(stream, 2, (record,))), principal, account_id=ACCOUNT)
-    position = await principal.membership_position(ROOM)
+    position = await membership_position(principal, ROOM)
     assert (position.membership, position.membership_epoch) == ("join", 0)
 
 
@@ -652,20 +754,20 @@ async def test_producer_membership_position_rolls_back_with_failed_admission(
     principal = await principal_for(store, stream)
     record = SyncRecord(RecordKind.ROOM_LIFECYCLE, ROOM, {}, membership=OwnMembership(None, "join", 0, 0))
     batch = SyncBatch(stream, 1, (record, message("$blocked")))
-    snapshot = journal_store._snapshot_interactive_source
+    snapshot = journal._snapshot_interactive_source
 
     def blocked(_transaction: Transaction, _principal_id: str, _event: InboundEvent) -> None:
         message = "pending projection"
         raise DeliveryProjectionPendingError(message)
 
-    monkeypatch.setattr(journal_store, "_snapshot_interactive_source", blocked)
+    monkeypatch.setattr(journal, "_snapshot_interactive_source", blocked)
     with pytest.raises(DeliveryProjectionPendingError):
         await consume_one_ingestion_batch(Session(batch), principal, account_id=ACCOUNT)
-    assert await principal.membership_position(ROOM) == RoomMembershipPosition("leave", 0)
+    assert await membership_position(principal, ROOM) == RoomMembershipPosition("leave", 0)
     assert await principal.ingestion_membership_position(ROOM) is None
-    monkeypatch.setattr(journal_store, "_snapshot_interactive_source", snapshot)
+    monkeypatch.setattr(journal, "_snapshot_interactive_source", snapshot)
     await consume_one_ingestion_batch(Session(batch), principal, account_id=ACCOUNT)
-    assert await principal.membership_position(ROOM) == RoomMembershipPosition("join", 0)
+    assert await membership_position(principal, ROOM) == RoomMembershipPosition("join", 0)
     assert await principal.ingestion_membership_position(ROOM) == RoomMembershipPosition("join", 0)
     assert [event.event_id for event in await principal.pending()] == ["$blocked"]
 
@@ -683,5 +785,5 @@ async def test_membership_rejects_a_skipped_producer_epoch(
     invalid = SyncRecord(RecordKind.ROOM_LIFECYCLE, ROOM, {}, membership=OwnMembership("join", "leave", 1, 2))
     with pytest.raises(IngestionBatchIntegrityError):
         await consume_one_ingestion_batch(Session(SyncBatch(stream, 2, (invalid,))), principal, account_id=ACCOUNT)
-    assert await principal.membership_position(ROOM) == RoomMembershipPosition("join", 0)
+    assert await membership_position(principal, ROOM) == RoomMembershipPosition("join", 0)
     assert await principal.ingestion_membership_position(ROOM) == RoomMembershipPosition("join", 0)

@@ -1,0 +1,136 @@
+"""Explicit usage ownership for paid runs without their own session storage."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from mindroom.constants import resolve_session_state_root
+from mindroom.history.storage import new_scope_session
+from mindroom.llm.usage import HelperUsage
+from mindroom.logging_config import get_logger
+from mindroom.session_storage.agent_storage import create_state_storage
+from mindroom.session_storage.lanes import run_session_storage_operation
+from mindroom.usage.storage import SYSTEM_USAGE_OWNER, SYSTEM_USAGE_STORAGE_NAME, request_usage
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from mindroom.constants import RuntimePaths
+    from mindroom.history.session_context import ScopeSessionContext
+    from mindroom.llm.runs import RunRecord
+    from mindroom.session_storage.store import ConversationStore
+    from mindroom.session_storage.types import ConversationSession
+    from mindroom.usage.storage import IndependentUsageKind
+
+
+@dataclass(frozen=True)
+class HelperUsageOwner:
+    """Storage and grouping identity for independently recorded usage."""
+
+    storage_factory: Callable[[], ConversationStore]
+    session_id: str
+    initial_session: ConversationSession | None = None
+
+
+_HELPER_USAGE_OWNER: ContextVar[HelperUsageOwner | None] = ContextVar("helper_usage_owner", default=None)
+logger = get_logger(__name__)
+
+
+def get_helper_usage_owner() -> HelperUsageOwner | None:
+    """Return only the owner bound by the current conversation response boundary."""
+    return _HELPER_USAGE_OWNER.get()
+
+
+@contextmanager
+def helper_usage_context(scope_context: ScopeSessionContext | None) -> Iterator[None]:
+    """Bind exact agent or team ownership for one async call, stream pull, or close."""
+    owner = None
+    if scope_context is not None:
+        owner = HelperUsageOwner(
+            storage_factory=scope_context.storage_factory,
+            session_id=scope_context.session_id,
+            initial_session=scope_context.first_session() if not scope_context.session_exists else None,
+        )
+    with helper_usage_owner_context(owner):
+        yield
+
+
+@contextmanager
+def helper_usage_owner_context(owner: HelperUsageOwner | None) -> Iterator[None]:
+    """Bind one explicit usage owner for an async call, stream pull, or close."""
+    token = _HELPER_USAGE_OWNER.set(owner)
+    try:
+        yield
+    finally:
+        _HELPER_USAGE_OWNER.reset(token)
+
+
+async def record_helper_usage(
+    usage: HelperUsage,
+    *,
+    owner: HelperUsageOwner,
+    kind: IndependentUsageKind,
+    requester_id: str | None,
+) -> None:
+    """Record ``usage`` in ``owner``'s conversation for ``requester_id``, as ``kind`` under ``<kind>:<run id>``."""
+    await run_session_storage_operation(
+        owner.storage_factory,
+        lambda storage: storage.save_independent_usage(
+            session_id=owner.session_id,
+            usage_id=f"{kind}:{usage.run_id}",
+            kind=kind,
+            requester_id=requester_id,
+            usage=usage,
+            initial_session=owner.initial_session,
+        ),
+    )
+
+
+async def record_run_usage(
+    run: RunRecord,
+    *,
+    owner: HelperUsageOwner,
+    kind: IndependentUsageKind,
+    requester_id: str | None,
+) -> None:
+    """Keep the usage of a helper that ran as a whole agent run: a workflow participant's turn or a skill review."""
+    await record_helper_usage(_run_usage(run), owner=owner, kind=kind, requester_id=requester_id)
+
+
+def _run_usage(run: RunRecord) -> HelperUsage:
+    """Return the usage of ``run``: its model, time, and metrics, with each request its messages answered."""
+    assert run.metrics is not None
+    return HelperUsage(
+        run_id=run.run_id,
+        model=run.model,
+        provider=run.model_provider,
+        metrics=run.metrics,
+        requests=tuple(request for message in run.messages if (request := request_usage(message)) is not None),
+        created_at=run.created_at,
+    )
+
+
+async def record_system_usage(
+    usage: HelperUsage,
+    *,
+    runtime_paths: RuntimePaths,
+    kind: IndependentUsageKind,
+) -> None:
+    """Persist one internal provider result under an admin-only, content-free source that names no requester."""
+    try:
+        session_root = resolve_session_state_root(runtime_paths.storage_root, runtime_paths)
+        owner = HelperUsageOwner(
+            storage_factory=lambda: create_state_storage(
+                SYSTEM_USAGE_STORAGE_NAME,
+                session_root / SYSTEM_USAGE_STORAGE_NAME,
+                SYSTEM_USAGE_OWNER,
+            ),
+            session_id=kind,
+            initial_session=new_scope_session(session_id=kind, scope=SYSTEM_USAGE_OWNER),
+        )
+        await record_helper_usage(usage, owner=owner, kind=kind, requester_id=None)
+    except Exception as exc:
+        logger.warning("system_usage_recording_failed", kind=kind, error_type=type(exc).__name__)

@@ -15,7 +15,7 @@ import typer
 
 from mindroom.matrix.health import matrix_versions_url, response_has_matrix_versions
 
-from .config import activate_cli_runtime, console
+from .config import activate_cli_runtime, console, print_literal
 from .env_file import env_path_for_config, upsert_env_values
 
 if TYPE_CHECKING:
@@ -29,18 +29,18 @@ _CINNY_DEFAULT_IMAGE = "ghcr.io/mindroom-ai/mindroom-chat:latest"
 _CINNY_DEFAULT_CONTAINER = "mindroom-cinny-local"
 
 
-def _httpx_get(url: str, *, timeout: float, verify: bool) -> httpx.Response:
+def _httpx_get(url: str) -> httpx.Response:
     """Call httpx.get without importing httpx during CLI help rendering."""
     import httpx  # noqa: PLC0415
 
-    return httpx.get(url, timeout=timeout, verify=verify)
+    return httpx.get(url, timeout=3, verify=False)  # noqa: S501 - probes the local stack's own services
 
 
 def local_stack_setup(
     synapse_dir: Path = typer.Option(  # noqa: B008
         Path("local/matrix"),
         "--synapse-dir",
-        help="Directory containing Synapse docker-compose.yml (from mindroom-stack settings).",
+        help="Directory containing Synapse docker-compose.yml (core MindRoom repo: local/matrix).",
     ),
     homeserver_url: str = typer.Option(
         "http://localhost:8008",
@@ -83,21 +83,23 @@ def local_stack_setup(
     """Start local Synapse + MindRoom Chat using Docker only."""
     runtime_paths = activate_cli_runtime()
     _require_supported_platform()
-    _require_binary("docker", "Docker is required but was not found in PATH.")
+    if shutil.which("docker") is None:
+        console.print("[red]Error:[/red] Docker is required but was not found in PATH.")
+        raise typer.Exit(1)
 
     inferred_server_name = server_name or _infer_server_name(homeserver_url)
     synapse_dir = synapse_dir.expanduser().resolve()
     if not skip_synapse:
         _start_synapse_stack(synapse_dir)
 
-    _wait_for_matrix_homeserver(homeserver_url)
+    _wait_for_service(matrix_versions_url(homeserver_url), "Synapse", response_has_matrix_versions)
 
     cinny_config_path = _write_local_cinny_config(
         homeserver_url,
         inferred_server_name,
         runtime_paths,
     )
-    console.print(f"MindRoom Chat config written: [dim]{cinny_config_path}[/dim]")
+    print_literal("MindRoom Chat config written: ", cinny_config_path)
 
     cinny_url = f"http://localhost:{cinny_port}"
     _start_cinny_container(
@@ -124,7 +126,7 @@ def _infer_server_name(homeserver_url: str) -> str:
     """Infer Matrix server_name from a homeserver URL."""
     parsed = urlparse(homeserver_url)
     if not parsed.scheme or not parsed.hostname:
-        console.print(f"[red]Error:[/red] Invalid homeserver URL: {homeserver_url}")
+        print_literal("[red]Error:[/red] Invalid homeserver URL: ", homeserver_url)
         raise typer.Exit(1)
     return parsed.hostname
 
@@ -155,21 +157,16 @@ def _write_local_cinny_config(
     return target
 
 
-def _persist_local_matrix_env(
-    homeserver_url: str,
-    server_name: str,
-    *,
-    config_path: Path,
-) -> Path:
-    """Write local Matrix settings to .env next to the active config file."""
-    return upsert_env_values(
-        env_path_for_config(config_path),
-        {
-            "MATRIX_HOMESERVER": homeserver_url,
-            "MATRIX_SSL_VERIFY": "false",
-            "MATRIX_SERVER_NAME": server_name,
-        },
-    )
+def _local_matrix_env_values(homeserver_url: str, server_name: str) -> dict[str, str]:
+    """Return the Matrix settings that point MindRoom at the local stack.
+
+    An https:// homeserver gets MATRIX_SSL_VERIFY=false for its self-signed certificate.
+    Plain HTTP needs no certificate override, and a persisted one would stop verifying a hosted homeserver set later.
+    """
+    values = {"MATRIX_HOMESERVER": homeserver_url, "MATRIX_SERVER_NAME": server_name}
+    if urlparse(homeserver_url).scheme == "https":
+        values["MATRIX_SSL_VERIFY"] = "false"
+    return values
 
 
 def _require_supported_platform() -> None:
@@ -180,23 +177,15 @@ def _require_supported_platform() -> None:
     raise typer.Exit(1)
 
 
-def _require_binary(name: str, message: str) -> None:
-    """Ensure a required binary is present in PATH."""
-    if shutil.which(name) is not None:
-        return
-    console.print(f"[red]Error:[/red] {message}")
-    raise typer.Exit(1)
-
-
 def _start_synapse_stack(synapse_dir: Path) -> None:
     """Start Synapse via docker compose in the provided directory."""
     compose_file = synapse_dir / "docker-compose.yml"
     if not compose_file.exists():
-        console.print(f"[red]Error:[/red] Synapse compose file not found: {compose_file}")
+        print_literal("[red]Error:[/red] Synapse compose file not found: ", compose_file)
         raise typer.Exit(1)
 
-    console.print(f"Starting Synapse stack from [bold]{synapse_dir}[/bold]...")
-    result = _run_command(["docker", "compose", "up", "-d"], cwd=synapse_dir, check=False)
+    print_literal("Starting Synapse stack from ", synapse_dir, "...")
+    result = _run_command(["docker", "compose", "up", "-d"], cwd=synapse_dir)
     if result.returncode != 0:
         _print_command_failure(result, "Failed to start Synapse stack")
         raise typer.Exit(1)
@@ -210,7 +199,7 @@ def _start_cinny_container(
     cinny_image: str,
 ) -> None:
     """Start (or replace) the local MindRoom Chat container."""
-    _run_command(["docker", "rm", "-f", cinny_container_name], check=False)
+    _run_command(["docker", "rm", "-f", cinny_container_name])
 
     run_cmd = [
         "docker",
@@ -226,33 +215,31 @@ def _start_cinny_container(
         f"{cinny_config_path}:/app/config.json:ro",
         cinny_image,
     ]
-    result = _run_command(run_cmd, check=False)
+    result = _run_command(run_cmd)
     if result.returncode != 0:
         _print_command_failure(result, "Failed to start MindRoom Chat container")
         raise typer.Exit(1)
 
 
-def _wait_for_service(url: str, service_name: str) -> None:
-    """Wait for a service URL to become healthy."""
-    console.print(f"Waiting for {service_name}: [dim]{url}[/dim]")
-    if _wait_for_http_success(url, timeout_seconds=60, verify=False):
-        return
-    console.print(f"[red]Error:[/red] {service_name} did not become healthy at {url}")
-    raise typer.Exit(1)
+def _wait_for_service(
+    url: str,
+    service_name: str,
+    response_matches: Callable[[httpx.Response], bool] | None = None,
+) -> None:
+    """Wait up to 60 seconds for a service URL to answer with success, or with a response ``response_matches``."""
+    import httpx  # noqa: PLC0415 - httpx loads only when the stack is probed, not during CLI help rendering
 
-
-def _wait_for_matrix_homeserver(homeserver_url: str) -> None:
-    """Wait for the local Synapse `/versions` endpoint to return Matrix metadata."""
-    url = matrix_versions_url(homeserver_url)
-    console.print(f"Waiting for Synapse: [dim]{url}[/dim]")
-    if _wait_for_http_success(
-        url,
-        timeout_seconds=60,
-        verify=False,
-        response_matches=response_has_matrix_versions,
-    ):
-        return
-    console.print(f"[red]Error:[/red] Synapse did not become healthy at {url}")
+    print_literal(f"Waiting for {service_name}: ", url)
+    deadline = time.monotonic() + 60
+    matcher = response_matches or (lambda response: response.is_success)
+    while time.monotonic() < deadline:
+        try:
+            if matcher(_httpx_get(url)):
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(1)
+    print_literal("[red]Error:[/red] ", f"{service_name} did not become healthy at {url}")
     raise typer.Exit(1)
 
 
@@ -269,67 +256,31 @@ def _print_local_stack_summary(
 ) -> None:
     """Print final setup instructions."""
     console.print("\n[green]Local stack is ready.[/green]")
-    console.print(f"  Synapse: {homeserver_url}")
+    print_literal("  Synapse: ", homeserver_url)
     console.print(f"  MindRoom Chat: {cinny_url}")
-    console.print(f"  Server:  {server_name}")
+    print_literal("  Server:  ", server_name)
+    env_values = _local_matrix_env_values(homeserver_url, server_name)
     if persist_env:
-        env_path = _persist_local_matrix_env(
-            homeserver_url,
-            server_name,
-            config_path=config_path,
-        )
-        console.print(f"  Env:     {env_path}")
+        env_path = upsert_env_values(env_path_for_config(config_path), env_values)
+        print_literal("  Env:     ", env_path)
         console.print("\nRun MindRoom backend:")
         console.print("  uv run mindroom run")
     else:
+        assignments = " ".join(f"{name}={value}" for name, value in env_values.items())
         console.print("\nRun MindRoom backend against this stack:")
-        console.print(f"  MATRIX_HOMESERVER={homeserver_url} MATRIX_SSL_VERIFY=false uv run mindroom run")
+        print_literal("  ", f"{assignments} uv run mindroom run")
     console.print("\nStop commands:")
-    console.print(f"  docker rm -f {cinny_container_name}")
+    print_literal("  ", f"docker rm -f {cinny_container_name}")
     if not skip_synapse:
-        console.print(f"  cd {synapse_dir} && docker compose down")
+        print_literal("  ", f"cd {synapse_dir} && docker compose down")
 
 
-def _run_command(
-    cmd: list[str],
-    *,
-    cwd: Path | None = None,
-    check: bool = False,
-) -> subprocess.CompletedProcess[str]:
+def _run_command(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run a subprocess command and return CompletedProcess."""
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        check=check,
-        capture_output=True,
-        text=True,
-    )
+    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=False, capture_output=True, text=True)
 
 
 def _print_command_failure(result: subprocess.CompletedProcess[str], prefix: str) -> None:
     """Print a compact subprocess failure summary."""
     details = result.stderr.strip() or result.stdout.strip() or "no error details"
-    console.print(f"[red]Error:[/red] {prefix}: {details}")
-
-
-def _wait_for_http_success(
-    url: str,
-    *,
-    timeout_seconds: int,
-    verify: bool,
-    response_matches: Callable[[httpx.Response], bool] | None = None,
-) -> bool:
-    """Wait until an HTTP GET request returns success."""
-    import httpx  # noqa: PLC0415
-
-    deadline = time.monotonic() + timeout_seconds
-    matcher = response_matches or (lambda response: response.is_success)
-    while time.monotonic() < deadline:
-        try:
-            response = _httpx_get(url, timeout=3, verify=verify)
-            if matcher(response):
-                return True
-        except httpx.HTTPError:
-            pass
-        time.sleep(1)
-    return False
+    print_literal("[red]Error:[/red] ", f"{prefix}: {details}")

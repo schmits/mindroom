@@ -87,6 +87,20 @@ app.kubernetes.io/component: runtime
 {{- end -}}
 {{- end -}}
 
+{{- /*
+First path component below storage.mountPath that holds a file-sourced config, or "" when there is none.
+The static runner sidecar mounts the agents, private_instances, and shared_directories directories, so the config must stay outside them.
+*/ -}}
+{{- define "mindroom-runtime.fileConfigStorageSubpath" -}}
+{{- if eq (include "mindroom-runtime.configSource" .) "file" -}}
+{{- $prefix := printf "%s/" (trimSuffix "/" (clean .Values.storage.mountPath)) -}}
+{{- $configPath := clean .Values.config.path -}}
+{{- if hasPrefix $prefix $configPath -}}
+{{- first (splitList "/" (trimPrefix $prefix $configPath)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "mindroom-runtime.storageClaimName" -}}
 {{- if .Values.storage.existingClaim -}}
 {{- .Values.storage.existingClaim -}}
@@ -111,6 +125,61 @@ app.kubernetes.io/component: runtime
 {{- default "state-storage" .Values.stateStorage.volumeName -}}
 {{- end -}}
 
+{{- /*
+Quoted state PVC directories, as seen at /state, that the prepare-state-storage init container creates and chowns.
+*/ -}}
+{{- define "mindroom-runtime.stateStorageInitDirs" -}}
+{{- $dirs := list "/state" -}}
+{{- if .Values.stateStorage.encryptionKeys.enabled -}}
+{{- $dirs = append $dirs (printf "/state/%s" .Values.stateStorage.encryptionKeys.subPath) -}}
+{{- end -}}
+{{- if .Values.stateStorage.syncContinuity.enabled -}}
+{{- $dirs = append $dirs (printf "/state/%s" .Values.stateStorage.syncContinuity.subPath) -}}
+{{- end -}}
+{{- range .Values.stateStorage.extraSubPaths -}}
+{{- $dirs = append $dirs (printf "/state/%s" (default .name .subPath)) -}}
+{{- end -}}
+{{- range $index, $dir := $dirs }}{{ if $index }} {{ end }}"{{ $dir }}"{{ end -}}
+{{- end -}}
+
+{{- define "mindroom-runtime.sessionStorageClaimName" -}}
+{{- default (printf "%s-sessions" (include "mindroom-runtime.fullname" .)) .Values.sessionStorage.existingClaim -}}
+{{- end -}}
+
+{{- define "mindroom-runtime.knowledgeStorageClaimName" -}}
+{{- default (printf "%s-knowledge" (include "mindroom-runtime.fullname" .)) .Values.knowledgeStorage.existingClaim -}}
+{{- end -}}
+
+{{- /*
+Knowledge-base indexes, private agents' included, live at <storage.mountPath>/knowledge_db; KnowledgeManager has no override for it.
+*/ -}}
+{{- define "mindroom-runtime.knowledgeStorageMountPath" -}}
+{{- printf "%s/knowledge_db" (trimSuffix "/" (clean .Values.storage.mountPath)) -}}
+{{- end -}}
+
+{{- /*
+Chart-managed PersistentVolumeClaim; takes (list $ claimName valuesBlock) where valuesBlock has accessModes, storageClassName, and size.
+*/ -}}
+{{- define "mindroom-runtime.persistentVolumeClaim" -}}
+{{- $root := index . 0 -}}
+{{- $values := index . 2 -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ index . 1 }}
+  labels:
+    {{- include "mindroom-runtime.labels" $root | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml $values.accessModes | nindent 4 }}
+  {{- if $values.storageClassName }}
+  storageClassName: {{ $values.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $values.size | quote }}
+{{- end -}}
+
 {{- define "mindroom-runtime.contentBundleSourcePath" -}}
 {{- $bundle := index . 1 -}}
 {{- $sourcePath := default "/bundle" $bundle.sourcePath | clean -}}
@@ -122,6 +191,189 @@ app.kubernetes.io/component: runtime
 {{- $bundle := index . 1 -}}
 {{- $targetPath := default (printf "%s/content-bundles/%s" ($root.Values.storage.mountPath | trimSuffix "/") $bundle.name) $bundle.targetPath | clean -}}
 {{- if eq $targetPath "/" -}}/{{- else -}}{{ $targetPath | trimSuffix "/" }}{{- end -}}
+{{- end -}}
+
+{{/*
+Native bootstrap source as JSON: the explicit config.bootstrapBundlePath and revision,
+or the selected content bundle's target path plus subPath, with a revision hashed from its
+image digest and the selected image directory. root is the directory the transport replaces.
+*/}}
+{{- define "mindroom-runtime.bootstrapBundle" -}}
+{{- $bootstrap := dict "path" (default "" .Values.config.bootstrapBundlePath) "root" (default "" .Values.config.bootstrapBundlePath) "revision" (default "" .Values.config.bootstrapBundleRevision) -}}
+{{- $selected := .Values.config.bootstrapContentBundle.name -}}
+{{- if $selected -}}
+{{- $bootstrap = dict "path" "" "root" "" "revision" "" -}}
+{{- range $bundle := $.Values.contentBundles -}}
+{{- if eq (toString $bundle.name) (toString $selected) -}}
+{{- $subPath := default "" $.Values.config.bootstrapContentBundle.subPath -}}
+{{- $targetPath := include "mindroom-runtime.contentBundleTargetPath" (list $ $bundle) -}}
+{{- $imagePath := clean (printf "%s/%s" (include "mindroom-runtime.contentBundleSourcePath" (list $ $bundle)) $subPath) -}}
+{{- $digest := trimPrefix "@sha256:" (regexFind "@sha256:[a-f0-9]{64}$" (toString $bundle.image)) -}}
+{{- $_ := set $bootstrap "root" $targetPath -}}
+{{- $_ := set $bootstrap "path" (clean (printf "%s/%s" $targetPath $subPath)) -}}
+{{- $_ := set $bootstrap "revision" (sha256sum (printf "%s:%s" $digest $imagePath)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $bootstrap -}}
+{{- end -}}
+
+{{- /*
+Content-bundle init script; takes the bundle's overwrite flag and receives the source and target paths as $1 and $2.
+With overwrite, the target ends up with the same entries, types, contents, modes, symlink targets, and (as root, where
+cp -a can preserve them) owners as after rm -rf and cp -a, but only entries that differ are rewritten, so a restart on
+network storage copies only what changed. Unlike a full copy, unchanged files keep their timestamps, directory
+timestamps and symlink owners are not synced, and hard-link relationships between files are not guaranteed to be preserved.
+Other users copy without cp -a, whose BusyBox build reports every file it cannot give its source owner, so their
+copies get the time of the copy instead of the source timestamps.
+Every start compares both trees in full, but with one stat and one md5sum batch per tree instead of processes per
+file, so the number of processes grows with the changes and symlinks, not with the files.
+An image missing a tool the sync uses, or a name with a newline in either tree (listings are line-based),
+falls back to the full copy. Directory modes and owners are applied last, deepest first, so copying into a
+directory that ends up read-only still works. It needs only POSIX sh and BusyBox-compatible tools.
+*/ -}}
+{{- define "mindroom-runtime.contentBundleCopyScript" -}}
+set -eu
+{{- if . }}
+src=$1
+dst=$2
+nl='
+'
+kind() {
+  if [ -L "$1" ]; then k=l
+  elif [ -d "$1" ]; then k=d
+  elif [ -f "$1" ]; then k=f
+  elif [ -e "$1" ]; then k=o
+  else k=-
+  fi
+}
+# BusyBox test -w is always true for root, which root-squashed NFS does not honour, so root always tries u+w.
+# Best effort: a parent we may not chmod can still be writable, and the copy or removal reports a real denial.
+writable() { if [ "$uid" = 0 ] || [ ! -w "$1" ]; then chmod u+w "$1" 2>/dev/null || :; fi; }
+# Only root may give a copy its source owner, and BusyBox cp -a run by anyone else reports every file it could not
+# chown. Others copy without -p, under umask 0 so group and other permission bits stay as with cp -a.
+# An image without id gets cp -a.
+uid=$(id -u 2>/dev/null) || uid=0
+if [ "$uid" = 0 ]; then copy() { cp -a "$@"; }; else copy() { (umask 0 && exec cp -RP "$@"); }; fi
+if [ -L "$dst" ] || [ ! -d "$dst" ]; then rm -f "$dst"; fi
+mkdir -p "$dst"
+reason=
+for tool in find stat md5sum awk readlink chmod chown id; do
+  command -v "$tool" >/dev/null || reason="the image has no $tool"
+done
+[ -n "$reason" ] || find "$dst" -prune -exec stat {} + >/dev/null 2>&1 || reason="its find has no -exec {} +"
+[ -n "$reason" ] || [ -z "$(find "$src" "$dst" -name "*$nl*")" ] || reason="a name contains a newline"
+if [ -n "$reason" ]; then
+  echo "$0: $reason, so $dst is replaced by a full copy" >&2
+  chmod -R u+w "$dst" 2>/dev/null || :
+  rm -rf "$dst"
+  # Copying onto the missing path gives it the source directory's mode too.
+  copy "$src/." "$dst"
+else
+  # cp -a keeps ownership only where chown works, so compare it only then (root without NFS root squashing).
+  own=
+  if [ "$uid" = 0 ] && chown "$(stat -c %u:%g "$src")" "$dst" 2>/dev/null; then own=' %u %g'; fi
+  # Listings of "<hex type and mode> <uid> <gid> <size> ./path" and "<md5>  ./path"; an unreadable file has no
+  # checksum, so it counts as changed and a copy from an unreadable source fails below.
+  sums() { cd "$1" && find . -type f -exec md5sum {} + 2>/dev/null || :; }
+  stats() { cd "$1" && shift && find . "$@" -exec stat -c '%f %u %g %s %n' {} +; }
+  source_stats=$(stats "$src")
+  source_sums=$(sums "$src")
+  target_stats=$(stats "$dst")
+  target_sums=$(sums "$dst")
+  # Reads source stats, source sums, target stats, and target sums, separated by "/" lines, and prints what a pass
+  # visits: target entries that may have to go (remove), source entries that may have to be copied (copy), or source
+  # directories, deepest first, whose mode or owner differs (dirs). Symlinks are always visited, since only
+  # readlink compares their targets. GNU md5sum escapes a name with a backslash and marks the line with one.
+  plan() {
+    printf '%s\n' "$2" / "$3" / "$4" / "$5" | awk -v want="$1" -v own="$own" '
+      function name(line, fields) {
+        while (fields--) line = substr(line, index(line, " ") + 1)
+        return line
+      }
+      function unescape(s, out, c, i) {
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == "\\") { c = substr(s, ++i, 1); c = (c == "n") ? "\n" : ((c == "r") ? "\r" : c) }
+          out = out c
+        }
+        return out
+      }
+      $0 == "/" { part++; next }
+      $0 == "" { next }
+      part % 2 == 0 {
+        side = part ? "d" : "s"; p = name($0, 4)
+        if (part) target[++m] = p; else source[++n] = p
+        type[side p] = substr($1, 1, length($1) - 3); mode[side p] = substr($1, length($1) - 2)
+        owner[side p] = $2 " " $3; size[side p] = $4
+        next
+      }
+      {
+        side = part == 1 ? "s" : "d"; sum = $1; p = name($0, 2)
+        if (sum ~ /^\\/) { sum = substr(sum, 2); p = unescape(p) }
+        # The prefix keeps checksums such as 0e1... and 0e2... from comparing equal as numbers.
+        sums[side p] = "x" sum
+      }
+      END {
+        if (want == "remove") for (i = 1; i <= m; i++) {
+          p = target[i]
+          if (p != "." && (!(("s" p) in type) || type["s" p] != type["d" p] || type["d" p] !~ /^[84]$/)) print p
+        }
+        if (want == "copy") for (i = 1; i <= n; i++) {
+          p = source[i]; t = type["s" p]
+          if (p == "." || t == "4" && type["d" p] == "4") continue
+          if (t != "8" || type["d" p] != "8" || mode["s" p] != mode["d" p] || size["s" p] != size["d" p] ||
+            own != "" && owner["s" p] != owner["d" p] || !(("s" p) in sums) || sums["s" p] != sums["d" p]) print p
+        }
+        if (want == "dirs") for (i = n; i > 0; i--) {
+          p = source[i]
+          if (type["s" p] == "4" && (mode["s" p] != mode["d" p] || own != "" && owner["s" p] != owner["d" p])) print p
+        }
+      }'
+  }
+  # Plans are assigned on their own, so a failing planner stops the init; a while loop's status would hide it.
+  removals=$(plan remove "$source_stats" "$source_sums" "$target_stats" "$target_sums")
+  copies=$(plan copy "$source_stats" "$source_sums" "$target_stats" "$target_sums")
+  # Remove target entries that are missing from the source, of another type, special, or a different symlink.
+  gone=
+  [ -z "$removals" ] || printf '%s\n' "$removals" | while IFS= read -r p; do
+    case $p in "$gone"/*) continue ;; esac
+    kind "$src/$p"; sk=$k
+    kind "$dst/$p"
+    case $sk$k in
+      dd|ff) continue ;;
+      ll) [ "$(readlink "$src/$p"; echo .)" != "$(readlink "$dst/$p"; echo .)" ] || continue ;;
+    esac
+    writable "$dst/${p%/*}"
+    [ "$k" != d ] || chmod -R u+w "$dst/$p" 2>/dev/null || :
+    rm -rf "$dst/$p"
+    gone=$p
+  done
+  # Copy missing entries whole, and recopy files whose size, mode, owner, or content differ.
+  new=
+  [ -z "$copies" ] || printf '%s\n' "$copies" | while IFS= read -r p; do
+    case $p in "$new"/*) continue ;; esac
+    kind "$dst/$p"
+    case $k in -|f) writable "$dst/${p%/*}" ;; *) continue ;; esac
+    [ "$k" = - ] || rm -f "$dst/$p"
+    copy "$src/$p" "$dst/$p"
+    [ "$k" != - ] || new=$p
+  done
+  # Fix directory modes and owners deepest first, including parents that writable changed.
+  target_dirs=$(stats "$dst" -type d)
+  dirs=$(plan dirs "$source_stats" "" "$target_dirs" "")
+  [ -z "$dirs" ] || printf '%s\n' "$dirs" | while IFS= read -r p; do
+    m=$(stat -c "%a$own" "$src/$p")
+    set -- $m
+    [ -z "$own" ] || chown "$2:$3" "$dst/$p"
+    # The leading zeros make GNU chmod clear a directory's setgid bit too.
+    chmod "00$1" "$dst/$p"
+  done
+fi
+{{- else }}
+mkdir -p "$2"
+cp -a "$1/." "$2/"
+{{- end }}
 {{- end -}}
 
 {{- define "mindroom-runtime.contentBundleSeedCommand" -}}
@@ -155,26 +407,9 @@ app.kubernetes.io/component: runtime
 {{- end -}}
 {{- end -}}
 
-{{- define "mindroom-runtime.workerConfigMapName" -}}
-{{- if eq (include "mindroom-runtime.configSource" .) "file" -}}
-{{- else -}}
-{{- default (include "mindroom-runtime.configMapName" .) .Values.workers.kubernetes.configMapName -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.workerConfigKey" -}}
-{{- if eq (include "mindroom-runtime.configSource" .) "file" -}}
-{{- else -}}
-{{- default .Values.config.key .Values.workers.kubernetes.configKey -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.workerConfigPath" -}}
-{{- if eq (include "mindroom-runtime.configSource" .) "file" -}}
-{{- include "mindroom-runtime.configPath" . -}}
-{{- else -}}
-{{- default .Values.config.mountPath .Values.workers.kubernetes.configPath -}}
-{{- end -}}
+{{- /* Whether the chart generates the primary's MINDROOM_API_KEY in the <fullname>-api-key Secret. */ -}}
+{{- define "mindroom-runtime.generatesApiKey" -}}
+{{- if not (or .Values.apiAuth.allowUnauthenticatedPrimary .Values.apiAuth.existingSecret) -}}true{{- end -}}
 {{- end -}}
 
 {{- define "mindroom-runtime.workerNamespace" -}}
@@ -224,6 +459,8 @@ app.kubernetes.io/component: runtime
 {{- end -}}
 
 {{- define "mindroom-runtime.approvedEgressSquidConfig" -}}
+{{- $parentHost := include "mindroom-runtime.egressBrokerHost" . -}}
+{{- $parentPort := .Values.egressBroker.port -}}
 include /etc/squid/squid.conf
 
 acl egress_has_token req_header Proxy-Authorization .
@@ -231,12 +468,15 @@ acl egress_has_token req_header Proxy-Authorization .
 acl egress_bypass_parent dstdomain -n {{ join " " . }}
 {{- end }}
 dns_defnames on
-cache_peer {{ .Values.approvedEgress.parentProxy.host }} parent {{ .Values.approvedEgress.parentProxy.port }} 0 no-query no-digest login=PASSTHRU
+{{- /* The egress broker is Squid's only route for credentialed requests (never_direct), so
+marking it dead only refuses them: connect failures while it restarts, or runs of 5xx CONNECT replies, would make the
+first requests after it recovers fail until Squid re-probed it. */}}
+cache_peer {{ $parentHost }} parent {{ $parentPort }} 0 no-query no-digest login=PASSTHRU connect-fail-limit=1000000
 {{- if .Values.approvedEgress.parentProxy.bypassDomains }}
-cache_peer_access {{ .Values.approvedEgress.parentProxy.host }} deny egress_bypass_parent
+cache_peer_access {{ $parentHost }} deny egress_bypass_parent
 {{- end }}
-cache_peer_access {{ .Values.approvedEgress.parentProxy.host }} allow egress_has_token
-cache_peer_access {{ .Values.approvedEgress.parentProxy.host }} deny all
+cache_peer_access {{ $parentHost }} allow egress_has_token
+cache_peer_access {{ $parentHost }} deny all
 nonhierarchical_direct off
 {{- if .Values.approvedEgress.parentProxy.bypassDomains }}
 always_direct allow egress_bypass_parent
@@ -314,6 +554,11 @@ matchLabels:
 {{- if or .Values.egressProxy.enabled .Values.approvedEgress.enabled -}}true{{- end -}}
 {{- end -}}
 
+{{- /* Whether the worker NetworkPolicy fences worker egress. */ -}}
+{{- define "mindroom-runtime.workerEgressPolicyEnabled" -}}
+{{- if and (include "mindroom-runtime.egressProxyEnabled" .) .Values.egressProxy.networkPolicy.create -}}true{{- end -}}
+{{- end -}}
+
 {{- define "mindroom-runtime.egressProxyNamespace" -}}
 {{- if .Values.approvedEgress.enabled -}}
 {{- .Release.Namespace -}}
@@ -346,6 +591,26 @@ matchLabels:
 {{- end -}}
 {{- end -}}
 
+{{- /* NetworkPolicy peers for the egressProxy.networkPolicy.dns destination of the worker policy. */ -}}
+{{- define "mindroom-runtime.egressProxyDnsPeers" -}}
+{{- $dns := .Values.egressProxy.networkPolicy.dns -}}
+{{- $peers := list -}}
+{{- $selectorPeer := dict -}}
+{{- if kindIs "map" $dns.namespaceSelector -}}
+{{- $_ := set $selectorPeer "namespaceSelector" $dns.namespaceSelector -}}
+{{- end -}}
+{{- if kindIs "map" $dns.podSelector -}}
+{{- $_ := set $selectorPeer "podSelector" $dns.podSelector -}}
+{{- end -}}
+{{- if $selectorPeer -}}
+{{- $peers = append $peers $selectorPeer -}}
+{{- end -}}
+{{- range $dns.ipBlocks -}}
+{{- $peers = append $peers (dict "ipBlock" .) -}}
+{{- end -}}
+{{- toYaml $peers -}}
+{{- end -}}
+
 {{- define "mindroom-runtime.egressProxyUrl" -}}
 {{- $namespace := include "mindroom-runtime.egressProxyNamespace" . -}}
 {{- $serviceName := include "mindroom-runtime.egressProxyServiceName" . -}}
@@ -357,12 +622,133 @@ matchLabels:
 {{- printf "%s://%s.%s.svc.cluster.local:%v" $scheme $serviceName $namespace $servicePort -}}
 {{- end -}}
 
-{{- define "mindroom-runtime.agentVaultProxyUrl" -}}
-{{- if and .Values.approvedEgress.enabled .Values.approvedEgress.parentProxy.enabled -}}
+{{- define "mindroom-runtime.scriptGatewayName" -}}
+{{- printf "%s-script-gateway" (include "mindroom-runtime.fullname" . | trunc 48 | trimSuffix "-") -}}
+{{- end -}}
+
+{{- define "mindroom-runtime.egressBrokerName" -}}
+{{- printf "%s-egress-broker" (include "mindroom-runtime.fullname" . | trunc 48 | trimSuffix "-") -}}
+{{- end -}}
+
+{{- define "mindroom-runtime.egressBrokerHost" -}}
+{{- printf "%s.%s.svc.cluster.local" (include "mindroom-runtime.egressBrokerName" .) .Release.Namespace -}}
+{{- end -}}
+
+{{- /* Whether Squid fronts the broker, so workers keep Squid as their first hop instead of reaching the broker directly. */ -}}
+{{- define "mindroom-runtime.egressBrokerChainMode" -}}
+{{- if and .Values.egressBroker.enabled .Values.approvedEgress.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{- /* The worker-facing first hop: Squid in the approved-egress chain, else the broker Service itself. */ -}}
+{{- define "mindroom-runtime.egressBrokerWorkerUrl" -}}
+{{- if include "mindroom-runtime.egressBrokerChainMode" . -}}
 {{- include "mindroom-runtime.egressProxyUrl" . -}}
 {{- else -}}
-{{- .Values.workers.kubernetes.agentVault.proxyUrl -}}
+{{- printf "http://%s:%v" (include "mindroom-runtime.egressBrokerHost" .) .Values.egressBroker.port -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "mindroom-runtime.workerPodLabels" -}}
+mindroom.ai/component: worker
+app.kubernetes.io/managed-by: mindroom
+app.kubernetes.io/name: mindroom-worker
+{{- with .Values.workers.kubernetes.extraLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end -}}
+
+{{- define "mindroom-runtime.scriptGatewayHost" -}}
+{{- printf "%s.%s.svc.cluster.local" (include "mindroom-runtime.scriptGatewayName" .) .Release.Namespace -}}
+{{- end -}}
+
+{{/*
+Normalize a list value that may also be written as a map keyed by entry.
+Helm replaces lists wholesale across values files but merges maps key by key, so the map form lets a later file override or remove one entry.
+Map entries render in key order, take nameKey (when set) from their key unless they set it, and drop null entries and null fields.
+String map values become {nameKey: key, scalarKey: value} when scalarKey is set.
+Arguments: dict "value" <list or map> "path" <values path> "nameKey" <field or ""> "scalarKey" <field or "">.
+Returns a JSON array for fromJsonArray.
+*/}}
+{{- define "mindroom-runtime.keyedList" -}}
+{{- $items := list -}}
+{{- if kindIs "map" .value -}}
+{{- range $key := keys .value | sortAlpha -}}
+{{- $item := index $.value $key -}}
+{{- if kindIs "map" $item -}}
+{{- $entry := dict -}}
+{{- with $.nameKey -}}
+{{- $_ := set $entry . $key -}}
+{{- end -}}
+{{- range $field, $fieldValue := $item -}}
+{{- if not (kindIs "invalid" $fieldValue) -}}
+{{- $_ := set $entry $field $fieldValue -}}
+{{- end -}}
+{{- end -}}
+{{- $items = append $items $entry -}}
+{{- else if and $.scalarKey (kindIs "string" $item) -}}
+{{- $items = append $items (dict $.nameKey $key $.scalarKey $item) -}}
+{{- else if kindIs "invalid" $item -}}
+{{- /* A null entry removes an entry set by an earlier values file. */ -}}
+{{- else if $.scalarKey -}}
+{{- fail (printf "%s.%s must be a string, a map, or null; quote numbers and booleans (or use --set-string)" $.path $key) -}}
+{{- else -}}
+{{- fail (printf "%s.%s must be a map or null" $.path $key) -}}
+{{- end -}}
+{{- end -}}
+{{- else if kindIs "slice" .value -}}
+{{- $items = .value -}}
+{{- else if not (kindIs "invalid" .value) -}}
+{{- fail (printf "%s must be a list or a map" .path) -}}
+{{- end -}}
+{{- toJson $items -}}
+{{- end -}}
+
+{{/*
+EnvVar entries from a list or a name-keyed map (see keyedList).
+A map value may be a plain string shorthand for {value: ...}.
+String values are rendered with tpl, so they can reference values such as {{ .Release.Namespace }}.
+Arguments: list <root context> <list or map> <values path>.
+*/}}
+{{- define "mindroom-runtime.envList" -}}
+{{- $root := index . 0 -}}
+{{- $env := list -}}
+{{- range $entry := include "mindroom-runtime.keyedList" (dict "value" (index . 1) "path" (index . 2) "nameKey" "name" "scalarKey" "value") | fromJsonArray -}}
+{{- if kindIs "string" $entry.value -}}
+{{- $_ := set $entry "value" (tpl $entry.value $root) -}}
+{{- end -}}
+{{- $env = append $env $entry -}}
+{{- end -}}
+{{- toJson $env -}}
+{{- end -}}
+
+{{/*
+MINDROOM_TRUSTED_UPSTREAM_* EnvVar entries from trustedUpstreamAuth, mirroring the instance chart; empty unless enabled.
+validate.yaml checks the required settings and rejects env.extra entries with the same names.
+*/}}
+{{- define "mindroom-runtime.trustedUpstreamAuthEnv" -}}
+{{- $auth := .Values.trustedUpstreamAuth -}}
+{{- $env := list -}}
+{{- if has (lower (toString $auth.enabled)) (list "1" "true" "yes" "on") -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED" "value" "true") -}}
+{{- with $auth.emailDomain -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_EMAIL_DOMAIN" "value" (toString .)) -}}
+{{- end -}}
+{{- with $auth.emailToMatrixUserIdTemplate -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_EMAIL_TO_MATRIX_USER_ID_TEMPLATE" "value" (toString .)) -}}
+{{- end -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER" "value" (toString $auth.jwtHeader)) -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL" "value" (toString $auth.jwksUrl)) -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE" "value" (toString $auth.jwtAudience)) -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER" "value" (toString $auth.jwtIssuer)) -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_EMAIL_CLAIM" "value" (toString ($auth.jwtEmailClaim | default "email"))) -}}
+{{- with $auth.jwtUserIdClaim -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_USER_ID_CLAIM" "value" (toString .)) -}}
+{{- end -}}
+{{- with $auth.jwtMatrixUserIdClaim -}}
+{{- $env = append $env (dict "name" "MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM" "value" (toString .)) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $env -}}
 {{- end -}}
 
 {{- define "mindroom-runtime.workerExtraEnvJson" -}}
@@ -375,13 +761,26 @@ matchLabels:
 {{- $_ := set $extraEnv "http_proxy" $proxyUrl -}}
 {{- $_ := set $extraEnv "https_proxy" $proxyUrl -}}
 {{- $_ := set $extraEnv "all_proxy" $proxyUrl -}}
-{{- with .Values.egressProxy.noProxy -}}
-{{- $noProxy := join "," . -}}
-{{- $_ := set $extraEnv "NO_PROXY" $noProxy -}}
-{{- $_ := set $extraEnv "no_proxy" $noProxy -}}
+{{- $noProxy := list -}}
+{{- range $entry := include "mindroom-runtime.keyedList" (dict "value" .Values.egressProxy.noProxy "path" "egressProxy.noProxy" "nameKey" "name" "scalarKey" "host") | fromJsonArray -}}
+{{- $host := $entry -}}
+{{- if kindIs "map" $entry -}}
+{{- $host = required (printf "egressProxy.noProxy.%s must be a host string or null" $entry.name) $entry.host -}}
+{{- end -}}
+{{- $noProxy = append $noProxy (tpl (toString $host) $) -}}
+{{- end -}}
+{{- if .Values.scriptGateway.enabled -}}
+{{- $noProxy = append $noProxy (include "mindroom-runtime.scriptGatewayHost" .) -}}
+{{- end -}}
+{{- with $noProxy -}}
+{{- $_ := set $extraEnv "NO_PROXY" (join "," .) -}}
+{{- $_ := set $extraEnv "no_proxy" (join "," .) -}}
 {{- end -}}
 {{- end -}}
 {{- range $key, $value := .Values.workers.kubernetes.extraEnv -}}
+{{- if kindIs "string" $value -}}
+{{- $value = tpl $value $ -}}
+{{- end -}}
 {{- $_ := set $extraEnv $key $value -}}
 {{- end -}}
 {{- if $extraEnv -}}
@@ -453,75 +852,6 @@ event_journal:
 {{- if eq .Values.eventCache.backend "postgres" }}
   database_url_env: {{ .Values.eventCache.databaseUrlEnv | quote }}
 {{- end }}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultServerName" -}}
-{{- default "agent-vault" .Values.workers.kubernetes.agentVault.server.name -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultSelectorLabels" -}}
-app.kubernetes.io/name: {{ include "mindroom-runtime.agentVaultServerName" . | quote }}
-app.kubernetes.io/instance: {{ .Release.Name | quote }}
-app.kubernetes.io/component: agent-vault
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultLabels" -}}
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | quote }}
-{{ include "mindroom-runtime.agentVaultSelectorLabels" . }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultServerClaimName" -}}
-{{- if .Values.workers.kubernetes.agentVault.server.persistence.existingClaim -}}
-{{- .Values.workers.kubernetes.agentVault.server.persistence.existingClaim -}}
-{{- else -}}
-{{- printf "%s-data" (include "mindroom-runtime.agentVaultServerName" .) -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultBootstrapName" -}}
-{{- printf "%s-bootstrap" (include "mindroom-runtime.agentVaultServerName" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultAccessGrantsName" -}}
-{{- printf "%s-access-grants" (include "mindroom-runtime.agentVaultServerName" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultAccessGrantsConfigPath" -}}
-/etc/mindroom-agent-vault-access-grants/access-grants.yaml
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultAccessGrantsTokenPath" -}}
-{{- printf "/etc/agent-vault-access-grants/%s" .Values.workers.kubernetes.agentVault.accessGrants.adminTokenSecret.key -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultBootstrapLabels" -}}
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | quote }}
-app.kubernetes.io/name: {{ include "mindroom-runtime.agentVaultBootstrapName" . | quote }}
-app.kubernetes.io/instance: {{ .Release.Name | quote }}
-app.kubernetes.io/component: agent-vault-bootstrap
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultAccessGrantsLabels" -}}
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | quote }}
-app.kubernetes.io/name: {{ include "mindroom-runtime.agentVaultAccessGrantsName" . | quote }}
-app.kubernetes.io/instance: {{ .Release.Name | quote }}
-app.kubernetes.io/component: agent-vault-access-grants
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service | quote }}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultServerImage" -}}
-{{- $av := .Values.workers.kubernetes.agentVault -}}
-{{- required "workers.kubernetes.agentVault.server.image or cliImage is required when the Agent Vault server is enabled" (default $av.cliImage $av.server.image) -}}
-{{- end -}}
-
-{{- define "mindroom-runtime.agentVaultBootstrapImage" -}}
-{{- $av := .Values.workers.kubernetes.agentVault -}}
-{{- required "workers.kubernetes.agentVault.bootstrap.image or cliImage is required when bootstrap is enabled" (default $av.cliImage $av.bootstrap.image) -}}
 {{- end -}}
 
 {{/*

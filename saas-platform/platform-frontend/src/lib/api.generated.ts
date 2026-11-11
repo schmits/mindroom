@@ -13,7 +13,7 @@ export interface paths {
         };
         /**
          * Openid Configuration
-         * @description Return OIDC discovery metadata for Synapse.
+         * @description Return OIDC discovery metadata for tenant homeservers.
          */
         get: operations["openid_configuration__well_known_openid_configuration_matrix_oidc_get"];
         put?: never;
@@ -84,20 +84,20 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/admin/auth/logout": {
+    "/admin/instance-lifecycle": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get?: never;
-        put?: never;
         /**
-         * Admin Logout
-         * @description Admin logout placeholder.
+         * Get Instance Lifecycle
+         * @description Show the last nightly cleanup run, instances pending teardown, and stuck lifecycle states.
          */
-        post: operations["admin_logout_admin_auth_logout_post"];
+        get: operations["get_instance_lifecycle_admin_instance_lifecycle_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -224,26 +224,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/admin/stats": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Admin Stats
-         * @description Get platform statistics for admin dashboard.
-         */
-        get: operations["get_admin_stats_admin_stats_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/admin/sync-instances": {
         parameters: {
             query?: never;
@@ -273,7 +253,9 @@ export interface paths {
         };
         /**
          * Admin Get List
-         * @description Generic list endpoint for React Admin.
+         * @description List a resource's rows, newest first.
+         *
+         *     Without ``limit``, every row; with it, the ``limit`` newest rows. ``total`` counts every row.
          */
         get: operations["admin_get_list_admin__resource__get"];
         put?: never;
@@ -336,6 +318,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/instance-sso/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Authorize Instance Sso
+         * @description Send one owned instance a short-lived login ticket signed with that instance's own key.
+         *
+         *     The platform cookie never leaves the API host, and the ticket is not a platform credential.
+         */
+        get: operations["authorize_instance_sso_instance_sso_authorize_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/matrix-oidc/.well-known/openid-configuration": {
         parameters: {
             query?: never;
@@ -345,7 +349,7 @@ export interface paths {
         };
         /**
          * Openid Configuration
-         * @description Return OIDC discovery metadata for Synapse.
+         * @description Return OIDC discovery metadata for tenant homeservers.
          */
         get: operations["openid_configuration_matrix_oidc__well_known_openid_configuration_get"];
         put?: never;
@@ -365,7 +369,7 @@ export interface paths {
         };
         /**
          * Authorize
-         * @description Issue an authorization code to Synapse after platform-cookie authentication.
+         * @description Issue an authorization code to a tenant homeserver after platform-cookie authentication.
          */
         get: operations["authorize_matrix_oidc_authorize_get"];
         put?: never;
@@ -407,7 +411,7 @@ export interface paths {
         put?: never;
         /**
          * Token
-         * @description Exchange a Synapse authorization code for OIDC tokens.
+         * @description Exchange a tenant homeserver authorization code for OIDC tokens.
          */
         post: operations["token_matrix_oidc_token_post"];
         delete?: never;
@@ -425,7 +429,7 @@ export interface paths {
         };
         /**
          * Userinfo
-         * @description Return user claims for Synapse's OIDC userinfo fetch.
+         * @description Return user claims for a tenant homeserver's OIDC userinfo fetch.
          */
         get: operations["userinfo_matrix_oidc_userinfo_get"];
         put?: never;
@@ -487,7 +491,7 @@ export interface paths {
         put?: never;
         /**
          * Setup Account
-         * @description Setup free tier account for new user.
+         * @description Set up an account without a plan for a new user.
          */
         post: operations["setup_account_my_account_setup_post"];
         delete?: never;
@@ -690,7 +694,7 @@ export interface paths {
         put?: never;
         /**
          * Set Sso Cookie
-         * @description Set an SSO cookie with the current Supabase access token.
+         * @description Set a host-only platform API cookie with the current Supabase access token.
          */
         post: operations["set_sso_cookie_my_sso_cookie_post"];
         /**
@@ -743,46 +747,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/my/subscription/reactivate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reactivate Subscription
-         * @description Reactivate a cancelled subscription (if still in billing period).
-         */
-        post: operations["reactivate_subscription_my_subscription_reactivate_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/my/usage": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get User Usage
-         * @description Get usage metrics for current user.
-         */
-        get: operations["get_user_usage_my_usage_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/pricing/config": {
         parameters: {
             query?: never;
@@ -794,37 +758,10 @@ export interface paths {
          * Get Pricing Config
          * @description Get the current pricing configuration.
          *
-         *     This returns the pricing plans, features, and limits.
+         *     This returns the pricing plans and their features.
          *     Stripe price IDs are only included if they are configured.
          */
         get: operations["get_pricing_config_pricing_config_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/pricing/stripe-price/{plan}/{billing_cycle}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Stripe Price
-         * @description Get the Stripe price ID for a specific plan and billing cycle.
-         *
-         *     Args:
-         *         plan: Plan key (e.g., 'byok', 'hobby', 'pro')
-         *         billing_cycle: Either 'monthly' or 'yearly'
-         *
-         *     Returns:
-         *         Dict with price_id or error
-         */
-        get: operations["get_stripe_price_pricing_stripe_price__plan___billing_cycle__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1119,20 +1056,10 @@ export interface components {
             recent_instances: {
                 [key: string]: unknown;
             }[];
-            /** Recent Signups */
-            recent_signups: {
-                [key: string]: unknown;
-            }[];
             /** Subscription Revenue */
             subscription_revenue: number;
-            /** Subscriptions By Tier */
-            subscriptions_by_tier: {
-                [key: string]: number;
-            };
             /** Total Accounts */
             total_accounts: number;
-            /** Total Instances */
-            total_instances: number;
         };
         /**
          * AdminDeleteResponse
@@ -1155,6 +1082,21 @@ export interface components {
             };
         };
         /**
+         * AdminInstanceLifecycleResponse
+         * @description Nightly cleanup health, instances pending teardown, and stuck lifecycle states.
+         */
+        AdminInstanceLifecycleResponse: {
+            /** Cleanup Scheduler Enabled */
+            cleanup_scheduler_enabled: boolean;
+            last_run: components["schemas"]["CleanupRunOut"] | null;
+            /** Pending Teardown */
+            pending_teardown: components["schemas"]["LifecycleInstanceOut"][];
+            /** Stuck */
+            stuck: components["schemas"]["LifecycleInstanceOut"][];
+            /** Teardown Grace Days */
+            teardown_grace_days: number;
+        };
+        /**
          * AdminListResponse
          * @description Admin list response for generic resources.
          */
@@ -1165,26 +1107,6 @@ export interface components {
             }[];
             /** Total */
             total: number;
-        };
-        /**
-         * AdminLogoutResponse
-         * @description Admin logout response model.
-         */
-        AdminLogoutResponse: {
-            /** Success */
-            success: boolean;
-        };
-        /**
-         * AdminStatsOut
-         * @description Admin statistics output model.
-         */
-        AdminStatsOut: {
-            /** Accounts */
-            accounts: number;
-            /** Active Subscriptions */
-            active_subscriptions: number;
-            /** Running Instances */
-            running_instances: number;
         };
         /**
          * AdminStatusOut
@@ -1227,6 +1149,22 @@ export interface components {
             billing_cycle: string;
             /** Tier */
             tier: string;
+        };
+        /**
+         * CleanupRunOut
+         * @description One recorded run of the nightly cleanup job.
+         */
+        CleanupRunOut: {
+            /** Finished At */
+            finished_at: string;
+            /** Ok */
+            ok: boolean;
+            /** Started At */
+            started_at: string;
+            /** Summary */
+            summary: {
+                [key: string]: unknown;
+            };
         };
         /**
          * ConsentUpdate
@@ -1360,10 +1298,6 @@ export interface components {
             }[];
             /** Third Party Processors */
             third_party_processors: components["schemas"]["GdprThirdPartyProcessor"][];
-            /** Usage Metrics */
-            usage_metrics: {
-                [key: string]: unknown;
-            }[];
         };
         /**
          * GdprPersonalData
@@ -1429,6 +1363,8 @@ export interface components {
             instance_id: number | string;
             /** Kubernetes Synced At */
             kubernetes_synced_at?: string | null;
+            /** Lifecycle Stopped At */
+            lifecycle_stopped_at?: string | null;
             /** Matrix Server Url */
             matrix_server_url?: string | null;
             /**
@@ -1442,6 +1378,8 @@ export interface components {
             subdomain?: string | null;
             /** Subscription Id */
             subscription_id: string;
+            /** Teardown After */
+            teardown_after?: string | null;
             /** Tier */
             tier?: string | null;
             /** Updated At */
@@ -1456,36 +1394,30 @@ export interface components {
             instances: components["schemas"]["InstanceOut"][];
         };
         /**
-         * PlanLimits
-         * @description Plan limits and capabilities.
+         * LifecycleInstanceOut
+         * @description An instance as seen by the subscription lifecycle.
          */
-        PlanLimits: {
-            /** Analytics */
-            analytics: string;
-            /** Custom Development */
-            custom_development: boolean;
-            /** Dedicated Infrastructure */
-            dedicated_infrastructure: boolean;
-            /** Integrations */
-            integrations: string;
-            /** Max Agents */
-            max_agents: number | "unlimited";
-            /** Max Messages Per Day */
-            max_messages_per_day: number | "unlimited";
-            /** On Premise */
-            on_premise: boolean;
-            /** Sla */
-            sla: boolean;
-            /** Sso */
-            sso: boolean;
-            /** Storage Gb */
-            storage_gb: number | "unlimited";
-            /** Support */
-            support: string;
-            /** Training */
-            training: boolean;
-            /** Workflows */
-            workflows: boolean;
+        LifecycleInstanceOut: {
+            /** Account Email */
+            account_email?: string | null;
+            /** Account Id */
+            account_id?: string | null;
+            /** Instance Id */
+            instance_id: number | string;
+            /** Lifecycle Error */
+            lifecycle_error?: string | null;
+            /** Lifecycle Error At */
+            lifecycle_error_at?: string | null;
+            /** Lifecycle Stopped At */
+            lifecycle_stopped_at?: string | null;
+            /** Problem */
+            problem?: string | null;
+            /** Status */
+            status: string;
+            /** Subscription Status */
+            subscription_status?: string | null;
+            /** Teardown After */
+            teardown_after?: string | null;
         };
         /**
          * PricingConfigResponse
@@ -1550,7 +1482,6 @@ export interface components {
             features: string[];
             /** Included Ai Budget Usd */
             included_ai_budget_usd: number;
-            limits: components["schemas"]["PlanLimits"];
             /** Name */
             name: string;
             /** Price Monthly */
@@ -1580,18 +1511,6 @@ export interface components {
             status: string;
         };
         /**
-         * StripePriceResponse
-         * @description Stripe price ID response model.
-         */
-        StripePriceResponse: {
-            /** Billing Cycle */
-            billing_cycle: string;
-            /** Plan */
-            plan: string;
-            /** Price Id */
-            price_id: string;
-        };
-        /**
          * SubscriptionCancelResponse
          * @description Subscription cancellation response model.
          */
@@ -1614,6 +1533,8 @@ export interface components {
         SubscriptionOut: {
             /** Account Id */
             account_id: string;
+            /** Billing Cycle */
+            billing_cycle?: ("monthly" | "yearly") | null;
             /** Can Run Instances */
             can_run_instances: boolean;
             /** Cancelled At */
@@ -1626,19 +1547,17 @@ export interface components {
             current_period_start?: string | null;
             /** Id */
             id: string;
-            /** Max Agents */
-            max_agents: number;
-            /** Max Messages Per Day */
-            max_messages_per_day: number;
-            /** Max Storage Gb */
-            max_storage_gb: number;
+            /** Price Cents */
+            price_cents?: number | null;
             /**
              * Status
              * @enum {string}
              */
-            status: "active" | "cancelled" | "past_due" | "trialing" | "paused" | "incomplete";
+            status: "active" | "cancelled" | "past_due" | "trialing" | "paused" | "incomplete" | "incomplete_expired" | "unpaid";
             /** Stripe Customer Id */
             stripe_customer_id?: string | null;
+            /** Stripe Subscription Ended */
+            stripe_subscription_ended: boolean;
             /** Stripe Subscription Id */
             stripe_subscription_id?: string | null;
             /**
@@ -1652,18 +1571,6 @@ export interface components {
             trial_ends_at?: string | null;
             /** Updated At */
             updated_at?: string | null;
-        };
-        /**
-         * SubscriptionReactivateResponse
-         * @description Subscription reactivation response model.
-         */
-        SubscriptionReactivateResponse: {
-            /** Message */
-            message: string;
-            /** Subscription Id */
-            subscription_id?: string | null;
-            /** Success */
-            success: boolean;
         };
         /**
          * SyncResult
@@ -1734,47 +1641,6 @@ export interface components {
         UrlResponse: {
             /** Url */
             url: string;
-        };
-        /**
-         * UsageAggregateOut
-         * @description Aggregated usage statistics model.
-         */
-        UsageAggregateOut: {
-            /** Totalagents */
-            totalAgents: number;
-            /** Totalmessages */
-            totalMessages: number;
-            /** Totalstorage */
-            totalStorage: number;
-        };
-        /**
-         * UsageMetricOut
-         * @description Usage metric output model.
-         */
-        UsageMetricOut: {
-            /** Agents Used */
-            agents_used: number;
-            /** Created At */
-            created_at?: string | null;
-            /** Id */
-            id?: string | null;
-            /** Messages Sent */
-            messages_sent: number;
-            /** Metric Date */
-            metric_date: string;
-            /** Storage Used Gb */
-            storage_used_gb: number;
-            /** Subscription Id */
-            subscription_id: string;
-        };
-        /**
-         * UsageResponse
-         * @description Response model for usage metrics.
-         */
-        UsageResponse: {
-            aggregated: components["schemas"]["UsageAggregateOut"];
-            /** Usage */
-            usage: components["schemas"]["UsageMetricOut"][];
         };
         /** ValidationError */
         ValidationError: {
@@ -1929,10 +1795,12 @@ export interface operations {
             };
         };
     };
-    admin_logout_admin_auth_logout_post: {
+    get_instance_lifecycle_admin_instance_lifecycle_get: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                authorization?: string;
+            };
             path?: never;
             cookie?: never;
         };
@@ -1944,7 +1812,16 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["AdminLogoutResponse"];
+                    "application/json": components["schemas"]["AdminInstanceLifecycleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -2145,37 +2022,6 @@ export interface operations {
             };
         };
     };
-    get_admin_stats_admin_stats_get: {
-        parameters: {
-            query?: never;
-            header?: {
-                authorization?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AdminStatsOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     admin_sync_instances_admin_sync_instances_post: {
         parameters: {
             query?: never;
@@ -2210,11 +2056,7 @@ export interface operations {
     admin_get_list_admin__resource__get: {
         parameters: {
             query?: {
-                _sort?: string | null;
-                _order?: string | null;
-                _start?: number;
-                _end?: number;
-                q?: string | null;
+                limit?: number | null;
             };
             header?: {
                 authorization?: string;
@@ -2409,6 +2251,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthResponse"];
+                };
+            };
+        };
+    };
+    authorize_instance_sso_instance_sso_authorize_get: {
+        parameters: {
+            query: {
+                redirect_to: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -3069,70 +2942,6 @@ export interface operations {
             };
         };
     };
-    reactivate_subscription_my_subscription_reactivate_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                authorization?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SubscriptionReactivateResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_user_usage_my_usage_get: {
-        parameters: {
-            query?: {
-                days?: number;
-            };
-            header?: {
-                authorization?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UsageResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_pricing_config_pricing_config_get: {
         parameters: {
             query?: never;
@@ -3149,38 +2958,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PricingConfigResponse"];
-                };
-            };
-        };
-    };
-    get_stripe_price_pricing_stripe_price__plan___billing_cycle__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                plan: string;
-                billing_cycle: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StripePriceResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };

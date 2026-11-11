@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="duckduckgo",
+    file_access=ToolFileAccess.NONE,
     display_name="DuckDuckGo",
     description="Search engine for web search and news",
     category=ToolCategory.RESEARCH,
@@ -93,7 +94,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["ddgs"],
-    docs_url="https://docs.agno.com/tools/toolkits/search/duckduckgo",
+    docs_url="https://docs.mindroom.chat/tools/web-search/#duckduckgo",
     function_names=("web_search", "search_news"),
 )
 def duckduckgo_tools() -> type[DuckDuckGoTools]:

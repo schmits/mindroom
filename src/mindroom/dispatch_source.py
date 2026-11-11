@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
 from mindroom.constants import (
+    HOOK_SOURCE_KEY,
     PER_FIRE_THREAD_ROOT_EVENT_ID_KEY,
     PER_FIRE_THREAD_ROOT_KEY,
     SCHEDULED_HISTORY_LIMIT_KEY,
@@ -27,9 +28,6 @@ ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND = "active_thread_follow_up"
 INTERACTIVE_SELECTION_SOURCE_KIND = "interactive_selection"
 TRUSTED_INTERNAL_RELAY_SOURCE_KIND = "trusted_internal_relay"
 SILENT_SCHEDULE_SOURCE_KIND = "silent_scheduled"
-AUTO_RESUME_MESSAGE = (
-    "[System: Previous response was interrupted by service restart. Please continue where you left off.]"
-)
 _KNOWN_SOURCE_KINDS: frozenset[str] = frozenset(
     {
         MESSAGE_SOURCE_KIND,
@@ -77,18 +75,13 @@ _SELF_AUTHORED_INGRESS_SOURCE_KINDS: frozenset[str] = frozenset(
         EXTERNAL_TRIGGER_SOURCE_KIND,
     },
 )
-_INTERNAL_RELAY_DETECTION_SOURCE_KINDS: frozenset[str] = frozenset(
-    {
-        "",
-        MESSAGE_SOURCE_KIND,
-        TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
-    },
-)
 _PER_FIRE_THREAD_ROOT_SOURCE_KINDS: frozenset[str] = frozenset(
     {
         SCHEDULED_SOURCE_KIND,
         EXTERNAL_TRIGGER_SOURCE_KIND,
         TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
+        # Automations start each prompt in a thread of its own, even for an agent in room mode.
+        HOOK_DISPATCH_SOURCE_KIND,
     },
 )
 
@@ -117,11 +110,6 @@ class _HasSourceKind(Protocol):
 
 
 @runtime_checkable
-class _HasSourceKindOverride(Protocol):
-    source_kind_override: str | None
-
-
-@runtime_checkable
 class _HasSender(Protocol):
     sender: str
 
@@ -146,11 +134,6 @@ def source_kind_allows_self_authored_ingress(source_kind: str | None) -> bool:
     return source_kind in _SELF_AUTHORED_INGRESS_SOURCE_KINDS
 
 
-def source_kind_allows_internal_relay_detection(source_kind: str | None) -> bool:
-    """Return whether content metadata may promote this event to a trusted internal relay."""
-    return source_kind in _INTERNAL_RELAY_DETECTION_SOURCE_KINDS
-
-
 def _source_kind_from_value(value: object) -> str | None:
     """Return a canonical source kind from arbitrary metadata."""
     return value if isinstance(value, str) and value in _KNOWN_SOURCE_KINDS else None
@@ -160,6 +143,17 @@ def source_kind_from_content(content: Mapping[str, Any]) -> str | None:
     """Return canonical source-kind metadata from Matrix content."""
     source_kind = content.get(SOURCE_KIND_KEY)
     return _source_kind_from_value(source_kind)
+
+
+def hook_source_from_content(content: Mapping[str, Any]) -> str | None:
+    """Return the hook that posted Matrix content, or None when no hook posted it.
+
+    Hooks post through MindRoom's own accounts, so callers must only ask about content from a trusted sender.
+    """
+    if source_kind_from_content(content) not in {HOOK_SOURCE_KIND, HOOK_DISPATCH_SOURCE_KIND}:
+        return None
+    hook_source = content.get(HOOK_SOURCE_KEY)
+    return hook_source if isinstance(hook_source, str) and hook_source else "unknown"
 
 
 def per_fire_thread_root_event_id_from_content(content: Mapping[str, Any]) -> str | None:
@@ -194,11 +188,6 @@ def is_visible_router_voice_echo_content(content: object) -> bool:
     return cast("Mapping[str, object]", content).get(VISIBLE_ROUTER_VOICE_ECHO_KEY) is True
 
 
-def is_auto_resume_relay_body(body: object) -> bool:
-    """Return whether one message body is the restart auto-resume relay."""
-    return isinstance(body, str) and AUTO_RESUME_MESSAGE in body
-
-
 def _trusted_source_kind_from_event_content(
     event_or_envelope: object,
     *,
@@ -227,8 +216,6 @@ def is_voice_event(
     source_kind = (
         event_or_envelope.source_kind
         if isinstance(event_or_envelope, _HasSourceKind)
-        else event_or_envelope.source_kind_override
-        if isinstance(event_or_envelope, _HasSourceKindOverride)
         else _trusted_source_kind_from_event_content(
             event_or_envelope,
             sender_is_trusted=sender_is_trusted,

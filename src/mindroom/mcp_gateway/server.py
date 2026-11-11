@@ -4,23 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from fastapi import HTTPException
 from jsonschema import Draft202012Validator
 from mcp import types
-from mcp.server.lowlevel import Server
+from mcp.server import Server, ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
-from mcp.shared.version import SUPPORTED_PROTOCOL_VERSIONS
+from mcp.types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from mindroom.logging_config import get_logger
+from mindroom.bounded_bytes import ByteLimitExceededError, collect_bounded_bytes
+from mindroom.logging_config import bound_log_context, get_logger
 from mindroom.mcp_gateway.execution import ExecutionLease, execution_scope
 from mindroom.mcp_gateway.types import (
     GATEWAY_AGENT_NAME_LIMIT,
@@ -28,9 +31,10 @@ from mindroom.mcp_gateway.types import (
     GatewayErrorResponse,
     GatewayPrincipal,
 )
+from mindroom.timing import elapsed_ms_since
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 
     from starlette.types import Message, Receive, Scope, Send
 
@@ -40,60 +44,129 @@ _MAX_REQUEST_ID_BYTES = 128
 _MAX_PROTOCOL_VERSION_BYTES = 64
 _RESPONSE_ENVELOPE_BYTES = 256
 _PRINCIPAL_SCOPE_KEY = "mcp_gateway_principal"
+_VERSION_PROBE_SCOPE_KEY = "mcp_gateway_version_probe"
+_OPERATION_NAMES = frozenset({"search_tools", "get_tool", "invoke_tool"})
+_PROTOCOL_VERSIONS = frozenset((*HANDSHAKE_PROTOCOL_VERSIONS, *MODERN_PROTOCOL_VERSIONS))
 _PRIVATE_HEADERS = {"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"}
 logger = get_logger(__name__)
 
 
+def _instructions(public_url: str, personal_agent_name: str | None) -> str:
+    personal_agent = (
+        f"This instance's configured personal agent is {json.dumps(personal_agent_name)}. "
+        "For users with access, it represents their personal assistant and service connections. "
+        "It may be unavailable to you; use it only if it appears in your gateway discovery results. "
+        if personal_agent_name
+        else "A personal agent represents the signed-in user's personal assistant and service connections. "
+    )
+    return (
+        "MindRoom is a multi-agent, multi-user chat platform built on Matrix. People and AI agents communicate "
+        "in rooms and threaded conversations. Each agent has a configured role and set of tools for working "
+        "with services and performing tasks; agents can be personal assistants or shared specialists. "
+        "This MCP gateway exposes a compatible subset of those tools to external AI clients, limited to "
+        "the signed-in user's authorized and selected agents and tools. "
+        + personal_agent
+        + "An agent selector chooses a tool and credential context; it does not send a message to that agent "
+        "or load its system prompt, memories, or conversation history. Shared agents may use shared connections. "
+        "Use MindRoom chat to converse with an agent.\n\n"
+        "Discovery workflow:\n"
+        "1. Call search_tools with {} to discover available agent/toolkit pairs, or supply a query. "
+        "Omit agent and toolkit initially. The limit is 1 to 10; narrow the query if needed.\n"
+        "2. Call search_tools with an exact returned agent and toolkit to discover functions.\n"
+        "3. Call get_tool with the returned agent, toolkit, and function to read its input schema.\n"
+        "4. Call invoke_tool with those same selectors and put the function inputs inside arguments.\n\n"
+        "Copy identifiers exactly from gateway discovery. Display names or names from an agent directory "
+        "(such as list_agents) do not establish gateway availability. MCP has no current Matrix room. "
+        f"The user can manage agent/tool selections and service connections at {public_url.rstrip('/')}/connections. "
+        "Availability requires both access permission and selection, including for the personal agent.\n\n"
+        "For invalid_arguments, check the tool's schema and use only its supported fields. "
+        "For tool_not_found, repeat discovery instead of guessing identifiers. If a requested shared-agent tool "
+        "is missing, ask the user to check that the agent and tool are selected in Connections, then repeat "
+        "search_tools without agent or toolkit selectors. Do not call an unselected agent. For empty discovery, "
+        "ask the user to check their selections. For connection_required, ask the user to open the returned "
+        "connection_url and connect that service. Never automatically retry a failed or timed-out invoke_tool "
+        "action: it may already have taken effect."
+    )
+
+
 def _meta_tools() -> list[types.Tool]:
     handle = {"type": "string", "minLength": 1, "maxLength": 128}
-    agent_handle = {"type": "string", "minLength": 1, "maxLength": GATEWAY_AGENT_NAME_LIMIT}
+    agent_handle = {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": GATEWAY_AGENT_NAME_LIMIT,
+        "description": "Exact agent identifier from search_tools. Selects tools and connections, not a chat recipient.",
+    }
+    toolkit_handle = {**handle, "description": "Exact toolkit identifier returned by search_tools for this agent."}
+    function_handle = {**handle, "description": "Exact function identifier returned by search_tools for this toolkit."}
     return [
         types.Tool(
             name="search_tools",
-            description="Search integrations from your selected agents. Select an agent and toolkit to search its functions. Results omit schemas; use get_tool for one definition.",
-            inputSchema={
+            description=(
+                "Discover tools from your selected MindRoom agents, whether personal or shared. "
+                "Start with {} or a query, omitting agent and toolkit, to find available agent/toolkit pairs. "
+                "Then pass an exact returned agent and toolkit to search functions. "
+                "Results omit schemas; use get_tool next. This does not start a conversation with an agent."
+            ),
+            input_schema={
                 "type": "object",
                 "properties": {
                     "agent": agent_handle,
-                    "query": {"type": "string", "maxLength": 256, "default": ""},
-                    "toolkit": handle,
+                    "query": {
+                        "type": "string",
+                        "maxLength": 256,
+                        "default": "",
+                        "description": "Search text; omit or leave empty to browse. Narrow it if results reach the limit.",
+                    },
+                    "toolkit": toolkit_handle,
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
                 },
                 "dependentRequired": {"toolkit": ["agent"]},
                 "additionalProperties": False,
             },
-            annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+            annotations=types.ToolAnnotations(read_only_hint=True, open_world_hint=True),
         ),
         types.Tool(
             name="get_tool",
-            description="Get the input schema for one discovered function. If a connection is required, open its connection_url and connect only that service.",
-            inputSchema={
+            description=(
+                "Get the input schema for one function discovered by search_tools. Copy its agent, toolkit, "
+                "and function exactly; do not infer identifiers from display names or an agent directory. "
+                "If a connection is required, ask the user to open its connection_url and connect that service."
+            ),
+            input_schema={
                 "type": "object",
-                "properties": {"agent": agent_handle, "toolkit": handle, "function": handle},
+                "properties": {"agent": agent_handle, "toolkit": toolkit_handle, "function": function_handle},
                 "required": ["agent", "toolkit", "function"],
                 "additionalProperties": False,
             },
-            annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=True),
+            annotations=types.ToolAnnotations(read_only_hint=True, open_world_hint=True),
         ),
         types.Tool(
             name="invoke_tool",
-            description="Invoke one discovered function using the selected agent's connections. Fetch its schema first. A failed or timed-out action must not be retried automatically.",
-            inputSchema={
+            description=(
+                "Run a discovered function using the selected agent's connections, without invoking the agent's model. "
+                "Fetch its schema with get_tool first, reuse the exact selectors, and place function inputs inside "
+                "arguments. A failed or timed-out action may already have taken effect and must not be retried automatically."
+            ),
+            input_schema={
                 "type": "object",
                 "properties": {
                     "agent": agent_handle,
-                    "toolkit": handle,
-                    "function": handle,
-                    "arguments": {"type": "object"},
+                    "toolkit": toolkit_handle,
+                    "function": function_handle,
+                    "arguments": {
+                        "type": "object",
+                        "description": "Function inputs matching the schema returned by get_tool; use {} for no inputs.",
+                    },
                 },
                 "required": ["agent", "toolkit", "function", "arguments"],
                 "additionalProperties": False,
             },
             annotations=types.ToolAnnotations(
-                readOnlyHint=False,
-                destructiveHint=True,
-                idempotentHint=False,
-                openWorldHint=True,
+                read_only_hint=False,
+                destructive_hint=True,
+                idempotent_hint=False,
+                open_world_hint=True,
             ),
         ),
     ]
@@ -103,19 +176,34 @@ def _error(code: GatewayErrorCode, message: str) -> GatewayErrorResponse:
     return {"error": {"code": code, "message": message}}
 
 
-def _result(payload: Mapping[str, object]) -> types.CallToolResult:
+def _result(payload: Mapping[str, object], *, modern: bool = False) -> types.CallToolResult:
     structured_content = dict(payload)
     text = json.dumps(structured_content, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     result = types.CallToolResult(
         content=[types.TextContent(type="text", text=text)],
-        structuredContent=structured_content,
-        isError="error" in structured_content,
+        structured_content=structured_content,
+        is_error="error" in structured_content,
     )
-    if len(result.model_dump_json().encode()) > _MAX_RESPONSE_BYTES - _RESPONSE_ENVELOPE_BYTES:
+    # Measure the encoding each revision is sent in: 2026-07-28 responses escape non-ASCII characters.
+    wire = (
+        json.dumps(result.model_dump(mode="json", by_alias=True, exclude_none=True), separators=(",", ":"))
+        if modern
+        else result.model_dump_json(by_alias=True)
+    )
+    if len(wire.encode()) > _MAX_RESPONSE_BYTES - _RESPONSE_ENVELOPE_BYTES:
         return _result(
             _error(GatewayErrorCode.RESULT_TOO_LARGE, "The tool response exceeds the gateway response limit."),
         )
     return result
+
+
+def _logged_error_code(result: types.CallToolResult) -> str | None:
+    """Return an allowlisted error code without copying provider-controlled values."""
+    if not result.is_error:
+        return None
+    error = (result.structured_content or {}).get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code in GatewayErrorCode else "unknown"
 
 
 def _request_payload(body: bytes) -> object:
@@ -134,10 +222,10 @@ def _request_payload(body: bytes) -> object:
     return payload
 
 
-def _validate_message(payload: object) -> Response | None:
+def _validate_message(payload: object, *, modern: bool) -> Response | None:
     """Keep SDK validation diagnostics from reflecting untrusted envelope content."""
     try:
-        envelope = types.JSONRPCMessage.model_validate(payload).root
+        envelope = types.jsonrpc_message_adapter.validate_python(payload)
     except (ValidationError, RecursionError, PydanticSerializationError) as exc:
         raise HTTPException(400, "Invalid MCP envelope") from exc
     if isinstance(envelope, types.JSONRPCResponse | types.JSONRPCError):
@@ -147,9 +235,9 @@ def _validate_message(payload: object) -> Response | None:
     try:
         normalized = envelope.model_dump(by_alias=True, mode="json", exclude_none=True)
         if isinstance(envelope, types.JSONRPCRequest):
-            types.ClientRequest.model_validate(normalized)
+            types.client_request_adapter.validate_python(normalized)
         else:
-            types.ClientNotification.model_validate(normalized)
+            types.client_notification_adapter.validate_python(normalized)
     except (ValidationError, RecursionError, PydanticSerializationError):
         if isinstance(envelope, types.JSONRPCNotification):
             return Response(status_code=202)
@@ -158,7 +246,11 @@ def _validate_message(payload: object) -> Response | None:
             id=envelope.id,
             error=types.ErrorData(code=-32602, message="Invalid request parameters"),
         )
-        return JSONResponse(error.model_dump(by_alias=True, mode="json", exclude_none=True))
+        # The 2026-07-28 revision answers invalid parameters with HTTP 400; earlier revisions answer them with 200.
+        return JSONResponse(
+            error.model_dump(by_alias=True, mode="json", exclude_none=True),
+            status_code=400 if modern else 200,
+        )
     return None
 
 
@@ -167,7 +259,20 @@ def _validate_protocol_header(request: Request) -> None:
         raise HTTPException(400, "MCP protocol version exceeds the size limit")
 
 
-def _validate_early_response_headers(request: Request, payload: object) -> None:
+def _is_modern(request: Request) -> bool:
+    return request.headers.get("mcp-protocol-version") in MODERN_PROTOCOL_VERSIONS
+
+
+def _mark_version_probe(request: Request) -> bool:
+    """Flag a revision served in neither era; newer clients may probe with their own revision first."""
+    version = request.headers.get("mcp-protocol-version")
+    if version is None or version in _PROTOCOL_VERSIONS:
+        return False
+    request.scope[_VERSION_PROBE_SCOPE_KEY] = True
+    return True
+
+
+def _validate_early_response_headers(request: Request) -> None:
     """Preserve SDK negotiation for replies that the privacy gate now owns."""
     accepted = request.headers.get("accept", "").split(",")
     if not any(value.strip().startswith("application/json") for value in accepted):
@@ -175,24 +280,52 @@ def _validate_early_response_headers(request: Request, payload: object) -> None:
     content_types = request.headers.get("content-type", "").split(";")[0].split(",")
     if not any(value.strip() == "application/json" for value in content_types):
         raise HTTPException(415, "MCP requires application/json requests")
-    if isinstance(payload, dict) and cast("dict[str, object]", payload).get("method") == "initialize":
-        return
-    version = request.headers.get("mcp-protocol-version")
-    if version is not None and version not in SUPPORTED_PROTOCOL_VERSIONS:
+    if _mark_version_probe(request):
         raise HTTPException(400, "Unsupported MCP protocol version")
+
+
+def _input_schema(name: str) -> dict[str, Any] | None:
+    return next((tool.input_schema for tool in _meta_tools() if tool.name == name), None)
+
+
+def _request_identity(ctx: ServerRequestContext) -> tuple[Request, tuple[GatewayPrincipal, type, int | str]] | None:
+    request = ctx.request
+    if not isinstance(request, Request):
+        return None
+    principal = request.scope.get(_PRINCIPAL_SCOPE_KEY)
+    if not isinstance(principal, GatewayPrincipal) or type(ctx.request_id) not in {str, int}:
+        return None
+    return request, (principal, type(ctx.request_id), cast("int | str", ctx.request_id))
+
+
+async def _cancel_after_disconnect(request: Request, lease: ExecutionLease) -> None:
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+    lease.cancel()
+
+
+@contextmanager
+def _disconnect_cancellation(ctx: ServerRequestContext, request: Request, lease: ExecutionLease) -> Iterator[None]:
+    """Cancel a 2026-07-28 call when its client closes the response stream, that revision's cancellation signal."""
+    if ctx.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+        yield
+        return
+    watcher = asyncio.create_task(_cancel_after_disconnect(request, lease))
+    # Retrieve a failed receive so it is not reported as an unretrieved task exception.
+    watcher.add_done_callback(lambda task: task.cancelled() or task.exception())
+    try:
+        yield
+    finally:
+        watcher.cancel()
 
 
 async def read_gateway_body(request: Request) -> bytes:
     """Read bounded client input before handing it to SDK protocol handlers."""
-    chunks: list[bytes] = []
-    size = 0
-    async with asyncio.timeout(10):
-        async for chunk in request.stream():
-            size += len(chunk)
-            if size > _MAX_REQUEST_BYTES:
-                raise HTTPException(413, "Gateway request exceeds the size limit")
-            chunks.append(chunk)
-    return b"".join(chunks)
+    try:
+        async with asyncio.timeout(10):
+            return await collect_bounded_bytes(request.stream(), max_bytes=_MAX_REQUEST_BYTES)
+    except ByteLimitExceededError as exc:
+        raise HTTPException(413, "Gateway request exceeds the size limit") from exc
 
 
 def replay_gateway_body(body: bytes, receive: Receive) -> Receive:
@@ -218,10 +351,11 @@ class GatewayServer:
         authenticate: Callable[[Request], Awaitable[GatewayPrincipal]],
         dispatch: Callable[[Request, str, dict[str, Any]], Awaitable[Mapping[str, object]]],
         public_url: str,
+        personal_agent_name: str | None = None,
         allowed_origins: tuple[str, ...] | None = None,
         timeout_seconds: float = 60,
         max_active_calls: int = 128,
-        max_user_calls: int = 32,
+        max_user_calls: int = 16,
         max_grant_calls: int = 16,
         record_activity: Callable[[Request], Awaitable[None]] | None = None,
     ) -> None:
@@ -237,12 +371,22 @@ class GatewayServer:
         self._timeout = timeout_seconds
         self._closing = False
         self._active: dict[tuple[GatewayPrincipal, type, int | str], ExecutionLease] = {}
-        self._server: Server[None, Request] = Server("MindRoom gateway")
-        self._server.list_tools()(self._list_tools)
-        self._server.request_handlers[types.CallToolRequest] = self._handle_call_request
+        self._server: Server[dict[str, Any]] = Server(
+            "MindRoom gateway",
+            instructions=_instructions(public_url, personal_agent_name),
+            get_tool_input_schema=_input_schema,
+            on_list_tools=self._list_tools,
+            on_call_tool=self._handle_call_request,
+        )
+        # The default tracing middleware parses client `_meta` trace fields and logs malformed ones verbatim.
+        self._server.middleware.clear()
         origin = urlsplit(public_url)
+        allowed_hosts = [origin.netloc]
+        if origin.port is None:
+            default_port = 443 if origin.scheme == "https" else 80
+            allowed_hosts.append(f"{origin.netloc}:{default_port}")
         security = TransportSecuritySettings(
-            allowed_hosts=[origin.netloc],
+            allowed_hosts=allowed_hosts,
             allowed_origins=list(allowed_origins)
             if allowed_origins is not None
             else [f"{origin.scheme}://{origin.netloc}"],
@@ -272,36 +416,50 @@ class GatewayServer:
         if self._active.get(key) is lease:
             del self._active[key]
 
-    async def _list_tools(self) -> list[types.Tool]:
-        identity = self._request_identity()
+    async def _list_tools(
+        self,
+        ctx: ServerRequestContext,
+        _params: types.PaginatedRequestParams | None,
+    ) -> types.ListToolsResult:
+        identity = _request_identity(ctx)
         if self._record_activity is not None and identity is not None:
             await self._record_activity(identity[0])
-        return _meta_tools()
+        return types.ListToolsResult(tools=_meta_tools())
 
-    def _request_identity(self) -> tuple[Request, tuple[GatewayPrincipal, type, int | str]] | None:
-        context = self._server.request_context
-        request = context.request
-        if not isinstance(request, Request):
-            return None
-        principal = request.scope.get(_PRINCIPAL_SCOPE_KEY)
-        if not isinstance(principal, GatewayPrincipal) or type(context.request_id) not in {str, int}:
-            return None
-        return request, (principal, type(context.request_id), context.request_id)
+    async def _handle_call_request(
+        self,
+        ctx: ServerRequestContext,
+        params: types.CallToolRequestParams,
+    ) -> types.CallToolResult:
+        started = time.monotonic()
+        name = params.name
+        # Client-controlled names, arguments, IDs, and error messages are not log fields.
+        with bound_log_context(operation=name if name in _OPERATION_NAMES else "unknown"):
+            result = await self._call_tool(ctx, name, params.arguments or {})
+            log = logger.warning if result.is_error else logger.info
+            log(
+                "mcp_gateway_call_completed",
+                outcome="error" if result.is_error else "success",
+                error_code=_logged_error_code(result),
+                duration_ms=elapsed_ms_since(started),
+            )
+            identity = _request_identity(ctx)
+            if not result.is_error and self._record_activity is not None and identity is not None:
+                await self._record_activity(identity[0])
+            return result
 
-    async def _handle_call_request(self, request: types.CallToolRequest) -> types.ServerResult:
-        result = await self._call_tool(request.params.name, request.params.arguments or {})
-        identity = self._request_identity()
-        if not result.isError and self._record_activity is not None and identity is not None:
-            await self._record_activity(identity[0])
-        return types.ServerResult(result)
-
-    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> types.CallToolResult:  # noqa: PLR0911
-        if name not in {"search_tools", "get_tool", "invoke_tool"}:
+    async def _call_tool(  # noqa: PLR0911
+        self,
+        ctx: ServerRequestContext,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> types.CallToolResult:
+        if name not in _OPERATION_NAMES:
             return _result(_error(GatewayErrorCode.TOOL_NOT_FOUND, "Unknown gateway operation."))
-        schema = next(tool.inputSchema for tool in _meta_tools() if tool.name == name)
+        schema = _input_schema(name)
         if not Draft202012Validator(schema).is_valid(arguments):
             return _result(_error(GatewayErrorCode.INVALID_ARGUMENTS, "Gateway operation arguments are invalid."))
-        identity = self._request_identity()
+        identity = _request_identity(ctx)
         if identity is None:
             return _result(_error(GatewayErrorCode.UNAUTHORIZED, "Gateway request identity is unavailable."))
         request, key = identity
@@ -323,9 +481,12 @@ class GatewayServer:
         lease = ExecutionLease(task, lambda completed: self._release(key, completed))
         self._active[key] = lease
         try:
-            with execution_scope(lease):
+            with _disconnect_cancellation(ctx, request, lease), execution_scope(lease):
                 async with asyncio.timeout(self._timeout):
-                    return _result(await self._dispatch(request, name, arguments))
+                    return _result(
+                        await self._dispatch(request, name, arguments),
+                        modern=ctx.protocol_version in MODERN_PROTOCOL_VERSIONS,
+                    )
         except TimeoutError:
             return _result(
                 _error(
@@ -358,7 +519,7 @@ class GatewayServer:
             notification = types.CancelledNotification.model_validate(notification_payload)
         except ValidationError:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
-        request_id = notification.params.requestId
+        request_id = notification.params.request_id
         if type(request_id) not in {str, int}:
             return JSONResponse({"error": "invalid_request"}, status_code=400)
         lease = self._active.get((principal, type(request_id), cast("int | str", request_id)))
@@ -367,11 +528,14 @@ class GatewayServer:
         return Response(status_code=202)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Validate each request before it enters the SDK's stateless transport."""
-        request = Request(scope, receive)
+        """Correlate transport and dispatch diagnostics without trusting client IDs."""
+        started = time.monotonic()
+        status_code: int | None = None
 
         async def private_send(message: Message) -> None:
+            nonlocal status_code
             if message["type"] == "http.response.start":
+                status_code = message["status"]
                 message["headers"] = [
                     *message.get("headers", []),
                     (b"cache-control", b"private, no-store"),
@@ -379,6 +543,25 @@ class GatewayServer:
                 ]
             await send(message)
 
+        with bound_log_context(request_id=uuid4().hex):
+            try:
+                await self._handle_http_request(scope, receive, private_send)
+            finally:
+                principal = scope.get(_PRINCIPAL_SCOPE_KEY)
+                version_probe = scope.get(_VERSION_PROBE_SCOPE_KEY)
+                failed = status_code is None or status_code >= 400
+                log = logger.warning if failed and not version_probe else logger.info
+                log(
+                    "mcp_gateway_http_completed",
+                    status_code=status_code,
+                    requester_id=principal.requester_id if isinstance(principal, GatewayPrincipal) else None,
+                    duration_ms=elapsed_ms_since(started),
+                    **({"unsupported_protocol_version": True} if version_probe else {}),
+                )
+
+    async def _handle_http_request(self, scope: Scope, receive: Receive, private_send: Send) -> None:
+        """Validate each request before it enters the SDK's stateless transport."""
+        request = Request(scope, receive)
         try:
             principal = await self._authenticate(request)
             scope[_PRINCIPAL_SCOPE_KEY] = principal
@@ -396,11 +579,13 @@ class GatewayServer:
             if cancelled is not None:
                 await cancelled(scope, receive, private_send)
                 return
-            rejected = _validate_message(payload)
+            rejected = _validate_message(payload, modern=_is_modern(request))
             if rejected is not None:
-                _validate_early_response_headers(request, payload)
+                _validate_early_response_headers(request)
                 await rejected(scope, receive, private_send)
                 return
+            # The SDK answers an unserved revision with the revisions it serves, so newer clients can negotiate.
+            _mark_version_probe(request)
         except HTTPException as exc:
             response = JSONResponse(
                 {"error": "invalid_token" if exc.status_code == 401 else "request_rejected"},
@@ -412,4 +597,5 @@ class GatewayServer:
         except TimeoutError:
             await JSONResponse({"error": "request_timeout"}, status_code=408)(scope, receive, private_send)
             return
-        await self._manager.handle_request(scope, replay_gateway_body(body, receive), private_send)
+        with bound_log_context(requester_id=principal.requester_id):
+            await self._manager.handle_request(scope, replay_gateway_body(body, receive), private_send)

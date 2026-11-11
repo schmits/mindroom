@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, Mock
 
@@ -15,14 +16,22 @@ from mindroom.config.auth import AuthorizationConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ToolConfigEntry
 from mindroom.custom_tools.usage_stats import UsageStatsTools
+from mindroom.llm.runs import RunRecord
+from mindroom.llm.usage import RunMetrics, TokenCounts
 from mindroom.message_target import MessageTarget
-from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.session_storage.agent_storage import create_agent_state_storage
+from mindroom.session_storage.types import ConversationSession
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext
 from tests.conftest import (
     bind_runtime_paths,
     make_conversation_reader_mock,
     make_relation_lookup,
+    persist_session,
     runtime_paths_for,
+    seed_session_metrics,
     test_runtime_paths,
 )
 
@@ -38,10 +47,12 @@ class _Report:
         return {"scope": self.scope, "totals": {"total_tokens": 10}}
 
 
-def test_usage_endpoints_have_no_query_parameters() -> None:
-    """The public tool stays limited to the two requested all-time summaries."""
-    assert tuple(inspect.signature(UsageStatsTools.get_my_usage).parameters) == ("self",)
-    assert tuple(inspect.signature(UsageStatsTools.get_all_usage).parameters) == ("self",)
+def test_usage_endpoints_only_accept_optional_daily_breakdown() -> None:
+    """Callers can request daily detail without redirecting the report's scope."""
+    for method in (UsageStatsTools.get_my_usage, UsageStatsTools.get_my_private_usage, UsageStatsTools.get_all_usage):
+        parameters = inspect.signature(method).parameters
+        assert tuple(parameters) == ("self", "include_daily")
+        assert parameters["include_daily"].default is False
 
 
 def _context(
@@ -61,6 +72,7 @@ def _context(
         ),
         test_runtime_paths(tmp_path),
     )
+    runtime_paths = runtime_paths_for(config)
     return ToolRuntimeContext(
         agent_name="usage",
         target=MessageTarget.resolve(
@@ -71,14 +83,84 @@ def _context(
         requester_id=requester_id,
         client=AsyncMock(),
         config=config,
-        runtime_paths=runtime_paths_for(config),
+        runtime_paths=runtime_paths,
+        plugins=config_plugins(config, runtime_paths),
         conversation_reader=make_conversation_reader_mock(),
         relations=make_relation_lookup(),
     )
 
 
 def _function_names(toolkit: UsageStatsTools) -> set[str]:
-    return set(toolkit.functions) | set(toolkit.async_functions)
+    return set(toolkit.functions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admin", [False, True])
+@pytest.mark.parametrize("include_daily", [None, False, True])
+async def test_usage_tool_optionally_returns_daily_tokens_from_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    admin: bool,
+    include_daily: bool | None,
+) -> None:
+    """Both tool entry points expose daily tokens only when explicitly requested."""
+    context = _context(tmp_path, administrators=["@alice:example.test"])
+    monkeypatch.setattr("mindroom.custom_tools.usage_stats.get_tool_runtime_context", lambda: context)
+    storage = create_agent_state_storage("usage", context.runtime_paths.storage_root / "agents" / "usage")
+    persist_session(
+        storage,
+        ConversationSession(
+            kind="agent",
+            session_id="session-1",
+            owner_id="usage",
+            runs=[
+                RunRecord(
+                    run_id="run-1",
+                    user_id="@alice:example.test",
+                    model_provider="test-provider",
+                    model="test-model",
+                    created_at=int(datetime(2026, 9, 15, tzinfo=UTC).timestamp()),
+                    metrics=RunMetrics(
+                        tokens=TokenCounts(
+                            input_tokens=12,
+                            output_tokens=8,
+                            total_tokens=20,
+                            cache_read_tokens=9,
+                            cache_write_tokens=2,
+                        ),
+                    ),
+                ),
+            ],
+        ),
+    )
+    seed_session_metrics(storage, "session-1", {"total_tokens": 100})
+    toolkit = UsageStatsTools(agent_name="usage", admin_scope=admin)
+    method = toolkit.get_all_usage if admin else toolkit.get_my_usage
+
+    payload = json.loads(await method() if include_daily is None else await method(include_daily=include_daily))
+
+    assert payload["status"] == "ok"
+    assert payload["totals"]["total_tokens"] == (100 if admin else 20)
+    if include_daily:
+        assert len(payload["daily_breakdown"]) == 1
+        assert payload["daily_breakdown"][0]["date"] == "2026-09-15"
+        assert payload["daily_breakdown"][0]["totals"]["total_tokens"] == 20
+        assert payload["daily_breakdown"][0]["run_count"] == 1
+        assert payload["daily_breakdown"][0]["model_breakdown"] == payload["model_breakdown"]
+        model = payload["daily_breakdown"][0]["model_breakdown"][0]
+        assert (model["provider"], model["model"]) == ("test-provider", "test-model")
+        assert model["totals"]["input_tokens"] == 12
+        assert model["totals"]["output_tokens"] == 8
+        assert model["totals"]["cache_read_tokens"] == 9
+        assert model["totals"]["cache_write_tokens"] == 2
+        assert payload["daily_coverage"]["unavailable_sources"] == 0
+        if admin:
+            assert payload["user_breakdown"][0]["daily_breakdown"] == payload["daily_breakdown"]
+    else:
+        assert "daily_breakdown" not in payload
+        assert "daily_coverage" not in payload
+        if admin:
+            assert "daily_breakdown" not in payload["user_breakdown"][0]
 
 
 @pytest.mark.asyncio
@@ -109,20 +191,35 @@ async def test_get_my_usage_uses_bound_agent_and_canonical_requester(
     assert collect.call_args.kwargs["execution_identity"].agent_name == "usage"
 
 
+@pytest.mark.asyncio
+async def test_private_usage_requires_a_requester(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A call that runs for no requester gets no usage report."""
+    context = _context(tmp_path, requester_id="")
+    collect = Mock(return_value=_Report("private"))
+    monkeypatch.setattr("mindroom.custom_tools.usage_stats.get_tool_runtime_context", lambda: context)
+    monkeypatch.setattr("mindroom.custom_tools.usage_stats.collect_private_usage", collect)
+
+    payload = json.loads(await UsageStatsTools(agent_name="usage").get_my_private_usage())
+
+    assert payload["code"] == "context_unavailable"
+    collect.assert_not_called()
+
+
 def test_admin_function_is_registered_only_when_configured() -> None:
     """The admin endpoint is absent unless the authored override enables it."""
-    assert _function_names(UsageStatsTools(agent_name="usage")) == {"get_my_usage"}
+    assert _function_names(UsageStatsTools(agent_name="usage")) == {"get_my_usage", "get_my_private_usage"}
     assert _function_names(UsageStatsTools(agent_name="usage", admin_scope=True)) == {
         "get_my_usage",
+        "get_my_private_usage",
         "get_all_usage",
     }
 
 
 def test_registration_keeps_usage_stats_local_and_configurable() -> None:
     """Tool metadata preserves the local primary execution boundary."""
-    metadata = TOOL_METADATA["usage_stats"]
+    metadata = builtin_tool_registry().entries["usage_stats"]
 
-    assert metadata.function_names == ("get_my_usage", "get_all_usage")
+    assert metadata.function_names == ("get_my_usage", "get_my_private_usage", "get_all_usage")
     assert metadata.default_execution_target.value == "primary"
     assert metadata.config_fields is None
     assert [field.name for field in metadata.agent_override_fields or []] == ["admin_scope"]
@@ -136,19 +233,21 @@ def test_admin_scope_requires_an_agent_override(tmp_path: Path) -> None:
         "usage_stats",
         runtime_paths,
         credential_overrides={"admin_scope": True},
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
     admin_toolkit = get_tool_by_name(
         "usage_stats",
         runtime_paths,
         tool_config_overrides={"admin_scope": True},
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
-    assert _function_names(ordinary_toolkit) == {"get_my_usage"}
-    assert _function_names(admin_toolkit) == {"get_my_usage", "get_all_usage"}
+    assert _function_names(ordinary_toolkit) == {"get_my_usage", "get_my_private_usage"}
+    assert _function_names(admin_toolkit) == {"get_my_usage", "get_my_private_usage", "get_all_usage"}
 
 
 def test_admin_scope_is_rejected_from_default_tools(tmp_path: Path) -> None:
@@ -177,16 +276,16 @@ def test_admin_scope_is_valid_on_an_agent_tool_entry(tmp_path: Path) -> None:
 
     bound = bind_runtime_paths(config, test_runtime_paths(tmp_path))
 
-    usage_entry = next(
-        entry for entry in bound.resolve_entity("usage").authored_tool_configs if entry.name == "usage_stats"
-    )
+    usage_entry = next(entry for entry in bound.resolve_agent("usage").tools.authored if entry.name == "usage_stats")
     assert usage_entry.tool_config_overrides == {"admin_scope": True}
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_daily", [False, True])
 async def test_admin_rejects_non_global_requester_before_collection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    include_daily: bool,
 ) -> None:
     """An admin-scoped tool still requires a canonical global user."""
     context = _context(tmp_path, requester_id="@outsider:example.test", administrators=["@admin:example.test"])
@@ -194,7 +293,9 @@ async def test_admin_rejects_non_global_requester_before_collection(
     monkeypatch.setattr("mindroom.custom_tools.usage_stats.get_tool_runtime_context", lambda: context)
     monkeypatch.setattr("mindroom.custom_tools.usage_stats.collect_admin_usage", collect)
 
-    payload = json.loads(await UsageStatsTools(agent_name="usage", admin_scope=True).get_all_usage())
+    payload = json.loads(
+        await UsageStatsTools(agent_name="usage", admin_scope=True).get_all_usage(include_daily=include_daily),
+    )
 
     assert payload["code"] == "authorization_error"
     collect.assert_not_called()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="wikipedia",
+    file_access=ToolFileAccess.NONE,
     display_name="Wikipedia",
     description="Search and retrieve information from Wikipedia",
     category=ToolCategory.RESEARCH,
@@ -21,13 +22,6 @@ if TYPE_CHECKING:
     icon="SiWikipedia",
     icon_color="text-gray-700",
     config_fields=[
-        ConfigField(
-            name="knowledge",
-            label="Knowledge",
-            type="text",
-            required=False,
-            default=None,
-        ),
         ConfigField(
             name="auto_suggest",
             label="Auto Suggest",
@@ -44,7 +38,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["wikipedia"],
-    docs_url="https://docs.agno.com/tools/toolkits/search/wikipedia",
+    docs_url="https://docs.mindroom.chat/tools/research-sources/#wikipedia",
     function_names=("search_wikipedia", "search_wikipedia_and_update_knowledge_base"),
 )
 def wikipedia_tools() -> type[WikipediaTools]:

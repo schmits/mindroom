@@ -1,34 +1,6 @@
 ---
-icon: lucide/layout-grid
+template: redirect.html
+location: ../rooms/#matrix-space
+fragments:
+  configuration: configuration_1
 ---
-
-# Matrix Space
-
-MindRoom can create and maintain a root Matrix Space that groups all managed rooms together.
-This makes it easy for users to discover and navigate MindRoom rooms in their Matrix client.
-
-## Configuration
-
-```yaml
-matrix_space:
-  enabled: true    # Default: true
-  name: MindRoom   # Default: "MindRoom"
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `true` | Whether to create and maintain a root Matrix Space for managed MindRoom rooms |
-| `name` | string | `"MindRoom"` | Display name for the root Matrix Space when enabled |
-
-## Behavior
-
-When `enabled` is `true`, MindRoom creates a Space on startup and adds all managed rooms as children.
-Rooms created later (by agents joining new rooms or config changes) are automatically added to the Space.
-MindRoom invites the union of managed-room `invite_users` to the root Space without granting those users root Space admin power.
-This lets owners add, remove, and reorder Space children in Matrix clients while keeping room-specific collaborators scoped to their rooms.
-Root Space admin reconciliation is grant-only and preserves existing Matrix admins.
-Demote stale Space admins manually in a Matrix client when needed.
-
-Set `enabled: false` to disable Space creation entirely.
-Disabling the setting does not delete an existing Space or remove its current child links.
-The `name` field controls the Space's display name and can be changed at any time.

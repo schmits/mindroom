@@ -5,10 +5,8 @@ from __future__ import annotations
 import secrets
 import shlex
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING
-
-from agno.tools import Toolkit
-from pydantic import ValidationError
 
 from mindroom.callbacks.script import build_callback_script, write_callback_script
 from mindroom.config.validation import non_empty_stripped
@@ -25,22 +23,25 @@ from mindroom.external_triggers.store import (
     ExternalTriggerTarget,
 )
 from mindroom.runtime_state import get_api_server_address
-from mindroom.tool_system.worker_routing import resolve_agent_owned_path
+from mindroom.tool_system.agent_tools import resolve_agent_tools
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.sandbox_proxy import tool_placement
+from mindroom.tool_system.worker_routing import shared_storage_root
+from mindroom.workers.backend import WorkerBackendError
+from mindroom.workers.runtime import worker_visible_storage_root
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 _CALLBACK_KIND = "mindroom.callback.completed"
 _MAX_LABEL_LENGTH = 200
+_CALLBACKS_DIR = Path(".mindroom/callbacks")
 
 
 def _callback_base_url(context: ToolRuntimeContext) -> str:
-    configured_url = context.runtime_paths.env_value("MINDROOM_URL")
-    base_url = configured_url.strip() if configured_url is not None else ""
-    if base_url:
-        return base_url.rstrip("/")
+    if (configured_url := context.runtime_paths.env_value("MINDROOM_URL")) is not None:
+        return configured_url.strip().rstrip("/")
     api_address = get_api_server_address()
     if api_address is not None:
         return api_address.base_url
@@ -66,6 +67,8 @@ class CallbackManagerTools(Toolkit):
 
         Give the returned instruction to the background agent.
         When it runs the script, its result wakes this agent in the current thread.
+        The wake-up needs the router in this room.
+        In a room without it, call `invite_router` first.
 
         Args:
             label: Short name for the background task shown in the wake-up message.
@@ -76,18 +79,22 @@ class CallbackManagerTools(Toolkit):
         store: ExternalTriggerStore | None = None
         try:
             context = self._context()
-            normalized_label = _callback_label(label)
             store = ExternalTriggerStore(context.runtime_paths)
+            normalized_label = _callback_label(label)
+            # The agent's own workspace: a private agent's is its requester's, which only that requester's worker mounts.
+            workspace_root = context.agent_workspace_root(create=True)
+            shell_workspace_root = _shell_workspace_root(context, workspace_root)
             token, token_hash = mint_trigger_capability()
+            thread_id = context.resolved_thread_id or context.thread_id
             record = store.create_single_use_capability_record(
                 trigger_id=f"callback_{secrets.token_hex(8)}",
                 owner_user_id=context.requester_id,
                 created_by_agent_name=context.agent_name,
                 created_in_room_id=context.room_id,
-                created_in_thread_id=context.resolved_thread_id or context.thread_id,
+                created_in_thread_id=thread_id,
                 target=ExternalTriggerTarget(
                     room_id=context.room_id,
-                    thread_id=context.resolved_thread_id or context.thread_id,
+                    thread_id=thread_id,
                     agent=context.agent_name,
                 ),
                 capability_token_hash=token_hash,
@@ -97,7 +104,8 @@ class CallbackManagerTools(Toolkit):
             )
             callback_url = f"{_callback_base_url(context)}/api/triggers/{record.trigger_id}"
             script_path = write_callback_script(
-                _workspace_callbacks_dir(context),
+                workspace_root,
+                _CALLBACKS_DIR,
                 callback_id=record.trigger_id,
                 script_text=build_callback_script(
                     callback_url=callback_url,
@@ -105,14 +113,20 @@ class CallbackManagerTools(Toolkit):
                     label=normalized_label,
                 ),
             )
-            instruction = f'When finished, run: bash {shlex.quote(str(script_path))} "<short result summary>"'
+            shell_path = str(shell_workspace_root / script_path.relative_to(workspace_root))
             return custom_tool_payload(
                 "callback_manager",
                 "ok",
-                script_path=str(script_path),
-                instruction=instruction,
+                script_path=shell_path,
+                instruction=f'When finished, run: bash {shlex.quote(shell_path)} "<short result summary>"',
             )
-        except (ExternalTriggerContextError, ExternalTriggerStoreError, OSError, ValidationError, ValueError) as exc:
+        except (
+            ExternalTriggerContextError,
+            ExternalTriggerStoreError,
+            OSError,
+            ValueError,
+            WorkerBackendError,
+        ) as exc:
             if record is not None and store is not None and context is not None:
                 with suppress(ExternalTriggerStoreError):
                     store.delete_record(
@@ -123,12 +137,19 @@ class CallbackManagerTools(Toolkit):
             return custom_tool_payload("callback_manager", "error", message=str(exc))
 
 
-def _workspace_callbacks_dir(context: ToolRuntimeContext) -> Path:
-    return resolve_agent_owned_path(
-        ".mindroom/callbacks",
-        agent_name=context.agent_name,
-        base_storage_path=context.runtime_paths.storage_root,
-    )
+def _shell_workspace_root(context: ToolRuntimeContext, workspace_root: Path) -> Path:
+    """Return the absolute path at which the agent's shell, in the primary or in its worker, sees its workspace."""
+    tools = config_plugins(context.config, context.runtime_paths).tools
+    agent_tools = resolve_agent_tools(context.config, context.agent_name, tools)
+    if not agent_tools.runs_in_worker("shell", tool_placement(context.runtime_paths, tools)):
+        return workspace_root
+    # Read only for a worker shell: an unconfigured worker backend must not stop a local shell from minting.
+    worker_root = worker_visible_storage_root(context.runtime_paths)
+    if worker_root is None:
+        # A static_runner sandbox that sees agent workspaces mounts them at MindRoom's paths, as the Kubernetes sidecar does.
+        return workspace_root
+    # A dedicated worker mounts each workspace at its path below the storage root, under its own storage mount.
+    return worker_root / workspace_root.relative_to(shared_storage_root(context.runtime_paths.storage_root))
 
 
 def _callback_label(label: str) -> str:

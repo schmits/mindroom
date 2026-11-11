@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel
@@ -25,24 +25,8 @@ class Product(BaseModel):
     metadata: ProductMetadata
 
 
-class PlanLimits(BaseModel):
-    """Plan limits and capabilities."""
-
-    max_agents: int | Literal["unlimited"]
-    max_messages_per_day: int | Literal["unlimited"]
-    storage_gb: int | Literal["unlimited"]
-    support: str
-    integrations: str
-    workflows: bool
-    analytics: str
-    sla: bool
-    training: bool
-    sso: bool
-    custom_development: bool
-    on_premise: bool
-    dedicated_infrastructure: bool
-
-
+# `pricing-config.yaml` keeps a `free` entry for accounts that never subscribed to a plan.
+# It is not offered as a plan, and entitlements never let it run a hosted instance.
 class Plan(BaseModel):
     """Pricing plan configuration."""
 
@@ -51,7 +35,6 @@ class Plan(BaseModel):
     price_yearly: int | Literal["custom"]
     description: str
     features: list[str]
-    limits: PlanLimits
     stripe_price_id_monthly: str | None = None
     stripe_price_id_yearly: str | None = None
     stripe_price_id_monthly_live: str | None = None
@@ -85,12 +68,15 @@ class PricingConfig(BaseModel):
     discounts: Discounts
 
 
+BillingCycle = Literal["monthly", "yearly"]
+
+
 @dataclass(frozen=True)
 class StripePriceMatch:
     """Canonical plan metadata for a configured Stripe price ID."""
 
     tier: str
-    billing_cycle: Literal["monthly", "yearly"]
+    billing_cycle: BillingCycle
 
 
 def find_pricing_config_path() -> Path:
@@ -124,22 +110,10 @@ def find_pricing_config_path() -> Path:
 config_path = find_pricing_config_path()
 
 
-def load_pricing_config() -> dict[str, Any]:
-    """Load pricing configuration from YAML file."""
-    with config_path.open() as f:
-        return yaml.safe_load(f)
-
-
 def load_pricing_config_model() -> PricingConfig:
-    """Load pricing configuration as a Pydantic model.
-
-    Returns:
-        PricingConfig: Validated pricing configuration model
-
-    """
-    config_dict = load_pricing_config()
-    # Pydantic will validate all required fields automatically
-    return PricingConfig(**config_dict)
+    """Load and validate the pricing configuration from its YAML file."""
+    with config_path.open() as f:
+        return PricingConfig(**yaml.safe_load(f))
 
 
 def _stripe_mode() -> Literal["test", "live"]:
@@ -231,45 +205,5 @@ def is_trial_enabled_for_plan(plan: str) -> bool:
     return plan in config.trial.applicable_plans
 
 
-def get_plan_limits_from_metadata(tier: str) -> dict[str, Any]:
-    """Get plan limits for a specific tier.
-
-    Args:
-        tier: Plan tier (e.g., 'free', 'byok', 'hobby', 'pro', 'enterprise')
-
-    Returns:
-        Dictionary of plan limits with keys like 'max_agents', 'max_messages_per_day'
-
-    """
-    plan = get_plan_details(tier)
-
-    if not plan:
-        available_plans = ", ".join(load_pricing_config_model().plans.keys())
-        msg = f"Plan '{tier}' not found in pricing configuration. Available plans: {available_plans}"
-        raise ValueError(msg)
-
-    # Convert Pydantic model to dict, handling "unlimited" values
-    limits = {}
-
-    # Handle unlimited as a very large number for database storage
-    if plan.limits.max_agents == "unlimited":
-        limits["max_agents"] = 999999
-    else:
-        limits["max_agents"] = plan.limits.max_agents
-
-    if plan.limits.max_messages_per_day == "unlimited":
-        limits["max_messages_per_day"] = 999999
-    else:
-        limits["max_messages_per_day"] = plan.limits.max_messages_per_day
-
-    if plan.limits.storage_gb == "unlimited":
-        limits["max_storage_gb"] = 999999
-    else:
-        limits["max_storage_gb"] = plan.limits.storage_gb
-
-    return limits
-
-
 # Export pricing data for easy access
-PRICING_CONFIG = load_pricing_config()
 PRICING_CONFIG_MODEL = load_pricing_config_model()

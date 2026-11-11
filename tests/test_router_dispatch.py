@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import nio
 import pytest
 
-from mindroom.attachments import _attachment_id_for_event, register_local_attachment
+from mindroom.attachments.storage import _attachment_id_for_event, register_local_attachment
 from mindroom.authorization import ResponderCandidatePermissions
+from mindroom.bot_runtime_view import BotRuntimeState
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import (
@@ -20,36 +21,38 @@ from mindroom.constants import (
     SOURCE_KIND_KEY,
 )
 from mindroom.conversation_resolver import MessageContext
+from mindroom.delivery_gateway import SendTextRequest
 from mindroom.dispatch_handoff import prepare_media_ingress
 from mindroom.dispatch_source import SCHEDULED_SOURCE_KIND
-from mindroom.handled_turns import TurnRecord
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
-from mindroom.router_relay import execute_router_relay
-from mindroom.teams import TeamResolution
+from mindroom.router.relay import _send_router_relay_after_readiness_recheck, execute_router_relay
+from mindroom.teams.formation import TeamResolution
 from mindroom.thread_utils import AgentResponseDecision
+from mindroom.turn_record import TurnRecord
+from mindroom.turns.dispatch import TurnDispatcher
 from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import (
     AgentBotTestBase,
     _attachment_record_stub,
     _room_send_response,
     _runtime_bound_config,
-    _set_turn_store_tracker,
     _wrap_extracted_collaborators,
     make_mock_agent_user,
     make_test_agent_bot,
 )
 from tests.conftest import (
     TEST_PASSWORD,
-    dispatch_context_result,
     drain_coalescing,
     install_generate_response_mock,
     install_runtime_journal_support,
     install_send_response_mock,
+    make_matrix_client_mock,
     runtime_paths_for,
 )
 from tests.identity_helpers import entity_ids
+from tests.runtime_fakes import ready_runtime
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -79,22 +82,10 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
         bot.logger = MagicMock()
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
-        bot._turn_controller._execute_router_relay = AsyncMock()
-
-        mock_context = MagicMock()
-        mock_context.am_i_mentioned = False
-        mock_context.mentioned_agents = []
-        mock_context.has_non_agent_mentions = False
-        mock_context.is_thread = False
-        mock_context.thread_id = None
-        mock_context.thread_history = []
-        bot._conversation_resolver.extract_message_context = AsyncMock(return_value=mock_context)
 
         room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_router:localhost")
         room.users = {
@@ -119,6 +110,7 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch("mindroom.turn_policy.thread_requires_explicit_agent_targeting", return_value=False),
             patch("mindroom.turn_policy.classify_responder_candidates_from_cached_room") as mock_get_available,
@@ -135,14 +127,18 @@ class TestAgentBot(AgentBotTestBase):
             await bot._on_media_message(room, event)
             await drain_coalescing(bot)
 
-        bot._turn_controller._execute_router_relay.assert_called_once_with(
+        mock_relay.assert_called_once_with(
+            bot._turn_dispatcher.deps,
             room,
             event,
-            [],
+            (),
             "$img_route",
             message="[Attached image]",
             requester_user_id="@user:localhost",
             extra_content={"com.mindroom.original_sender": "@user:localhost"},
+            media_events=None,
+            handled_turn=None,
+            scheduled_prompt=None,
         )
 
     @pytest.mark.asyncio
@@ -159,7 +155,7 @@ class TestAgentBot(AgentBotTestBase):
             access_token="mock_test_token",  # noqa: S106
         )
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_runtime_journal_support(bot)
         bot.rooms = ["!welcome:localhost"]
         bot.client = AsyncMock()
@@ -187,7 +183,6 @@ class TestAgentBot(AgentBotTestBase):
                 new=AsyncMock(return_value="Welcome"),
             ),
             patch("mindroom.bot_room_lifecycle.get_joined_rooms", new=AsyncMock(return_value=[])),
-            patch("mindroom.bot.restore_scheduled_tasks", new=AsyncMock(return_value=0)),
             patch("mindroom.bot.config_confirmation.restore_pending_changes", new=AsyncMock(return_value=0)),
         ):
             await bot.join_configured_rooms()
@@ -211,22 +206,10 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
         bot.logger = MagicMock()
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
-        bot._turn_controller._execute_router_relay = AsyncMock()
-
-        mock_context = MagicMock()
-        mock_context.am_i_mentioned = False
-        mock_context.mentioned_agents = []
-        mock_context.has_non_agent_mentions = False
-        mock_context.is_thread = False
-        mock_context.thread_id = None
-        mock_context.thread_history = []
-        bot._conversation_resolver.extract_message_context = AsyncMock(return_value=mock_context)
 
         room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_router:localhost")
         room.users = {
@@ -267,6 +250,7 @@ class TestAgentBot(AgentBotTestBase):
         assert attachment_record is not None
 
         with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch("mindroom.turn_policy.thread_requires_explicit_agent_targeting", return_value=False),
             patch("mindroom.turn_policy.classify_responder_candidates_from_cached_room") as mock_get_available,
@@ -287,12 +271,102 @@ class TestAgentBot(AgentBotTestBase):
             await bot._on_media_message(room, event)
             await drain_coalescing(bot)
 
-        bot._turn_controller._execute_router_relay.assert_called_once()
+        mock_relay.assert_called_once()
         mock_register_file.assert_not_awaited()
-        call_kwargs = bot._turn_controller._execute_router_relay.call_args.kwargs
+        call_kwargs = mock_relay.call_args.kwargs
         assert call_kwargs["message"] == "[Attached file]"
         assert call_kwargs["requester_user_id"] == "@user:localhost"
         assert call_kwargs["extra_content"] == {ORIGINAL_SENDER_KEY: "@user:localhost"}
+
+    @pytest.mark.parametrize("caption_in_upload_thread", [True, False])
+    @pytest.mark.asyncio
+    async def test_router_leaves_an_upload_to_the_agent_its_caption_names(
+        self,
+        tmp_path: Path,
+        caption_in_upload_thread: bool,
+    ) -> None:
+        """An upload whose caption names an agent must not also be routed elsewhere."""
+        agent_user = AgentMatrixUser(
+            agent_name="router",
+            user_id="@mindroom_router:localhost",
+            display_name="Router Agent",
+            password=TEST_PASSWORD,
+            access_token="mock_test_token",  # noqa: S106
+        )
+
+        config = self._config_for_storage(tmp_path)
+        # A top-level caption joins its upload only when sent within the debounce window of it.
+        config.defaults.coalescing.debounce_ms = 1000
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
+        _wrap_extracted_collaborators(bot)
+        bot.client = make_matrix_client_mock(user_id=agent_user.user_id)
+        bot.logger = MagicMock()
+
+        room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_router:localhost")
+        for user_id in (
+            "@mindroom_router:localhost",
+            "@mindroom_general:localhost",
+            "@mindroom_calculator:localhost",
+            "@user:localhost",
+        ):
+            room.add_member(user_id, None, None)
+        room.members_synced = True
+
+        upload = nio.RoomMessageFile.from_dict(
+            {
+                "event_id": "$upload",
+                "sender": "@user:localhost",
+                "origin_server_ts": 1234567890,
+                "content": {
+                    "msgtype": "m.file",
+                    "body": "report.pdf",
+                    "url": "mxc://localhost/test_file",
+                    "info": {"mimetype": "application/pdf"},
+                },
+            },
+        )
+        caption_content: dict[str, object] = {
+            "msgtype": "m.text",
+            "body": "@mindroom_general:localhost review this",
+            "m.mentions": {"user_ids": ["@mindroom_general:localhost"]},
+        }
+        if caption_in_upload_thread:
+            caption_content["m.relates_to"] = {"rel_type": "m.thread", "event_id": "$upload"}
+        caption = nio.RoomMessageText.from_dict(
+            {
+                "event_id": "$caption",
+                "sender": "@user:localhost",
+                "origin_server_ts": 1234567891,
+                "content": caption_content,
+            },
+        )
+        root_response = nio.RoomGetEventResponse()
+        root_response.event = upload
+        bot.client.room_get_event.return_value = root_response
+        plans: list[tuple[str, str | None, tuple[str, ...]]] = []
+
+        async def record_plan(_dispatcher: object, _room: object, prepared: object, plan: object, **_: object) -> None:
+            plans.append((plan.kind, plan.ignore_reason, tuple(prepared.handled_turn.source_event_ids)))
+
+        with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
+            patch("mindroom.turn_policy.classify_responder_candidates_from_cached_room") as mock_get_available,
+            patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+            patch.object(TurnDispatcher, "_apply_turn_plan", new=record_plan),
+        ):
+            mock_get_available.return_value = ResponderCandidatePermissions(
+                [
+                    entity_ids(config, runtime_paths_for(config))["general"],
+                    entity_ids(config, runtime_paths_for(config))["calculator"],
+                ],
+                [],
+            )
+            await bot._on_media_message(room, upload)
+            await bot._on_message(room, caption)
+            await drain_coalescing(bot)
+
+        assert plans == [("ignore", "router", ("$upload", "$caption"))]
+        mock_relay.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_router_routing_registers_file_with_effective_thread_scope(
@@ -320,9 +394,8 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
-        _set_turn_store_tracker(bot, MagicMock())
         send_response = AsyncMock(return_value="$route")
         install_send_response_mock(bot, send_response)
 
@@ -359,7 +432,7 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch(
-                "mindroom.router_relay.suggest_responder_for_message",
+                "mindroom.router.relay.suggest_responder_for_message",
                 new_callable=AsyncMock,
                 return_value="general",
             ),
@@ -369,7 +442,8 @@ class TestAgentBot(AgentBotTestBase):
                 return_value=attachment_record,
             ) as mock_register_file,
         ):
-            await bot._turn_controller._execute_router_relay(
+            await execute_router_relay(
+                bot._turn_dispatcher.deps,
                 room=room,
                 event=event,
                 thread_history=[],
@@ -435,16 +509,16 @@ class TestAgentBot(AgentBotTestBase):
         source_turn = TurnRecord.create([event.event_id])
         visible_responses = MagicMock()
         visible_responses.prepare_visible_delivery_turn = AsyncMock(return_value=(source_turn, None))
-        visible_responses.record_pending_visible_response = AsyncMock()
         turn_store = MagicMock()
-        turn_store.finalized_visible_echo_for_sources.return_value = None
+        turn_store.record_placeholder = AsyncMock()
+        turn_store.finalized_visible_echoes = AsyncMock(return_value=())
         turn_store.record_responded_turn = AsyncMock()
         delivery_gateway = MagicMock()
         delivery_gateway.send_text = AsyncMock(return_value="$route")
 
         await execute_router_relay(
             SimpleNamespace(
-                runtime=MagicMock(config=config, orchestrator=None),
+                runtime=BotRuntimeState(orchestrator=ready_runtime(config, runtime_paths)),
                 runtime_paths=runtime_paths,
                 logger=MagicMock(),
                 agent_name="router",
@@ -495,7 +569,6 @@ class TestAgentBot(AgentBotTestBase):
                 password=TEST_PASSWORD,
                 access_token="mock_test_token",  # noqa: S106
             ),
-            tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
@@ -507,32 +580,16 @@ class TestAgentBot(AgentBotTestBase):
                 password=TEST_PASSWORD,
                 access_token="mock_test_token",  # noqa: S106
             ),
-            tmp_path,
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
 
         router_bot.client = AsyncMock()
         general_bot.client = AsyncMock()
-        router_tracker = _set_turn_store_tracker(router_bot, MagicMock())
-        router_tracker.has_responded.return_value = False
-        general_tracker = _set_turn_store_tracker(general_bot, MagicMock())
-        general_tracker.has_responded.return_value = False
         router_send_response = AsyncMock(return_value="$route")
         install_send_response_mock(router_bot, router_send_response)
         general_generate_response = AsyncMock()
         install_generate_response_mock(general_bot, general_generate_response)
-
-        message_context = MessageContext(
-            am_i_mentioned=False,
-            is_thread=False,
-            thread_id=None,
-            thread_history=[],
-            mentioned_agents=[],
-            has_non_agent_mentions=False,
-        )
-        router_bot._conversation_resolver.extract_message_context = AsyncMock(return_value=message_context)
-        general_bot._conversation_resolver.extract_message_context = AsyncMock(return_value=message_context)
 
         router_room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_router:localhost")
         general_room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_general:localhost")
@@ -578,14 +635,13 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch(
                 "mindroom.turn_policy.decide_team_formation",
                 new_callable=MagicMock,
                 return_value=TeamResolution.none(),
             ),
             patch(
-                "mindroom.router_relay.suggest_responder_for_message",
+                "mindroom.router.relay.suggest_responder_for_message",
                 new_callable=AsyncMock,
                 return_value="general",
             ),
@@ -626,22 +682,9 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
-        bot._turn_controller._execute_router_relay = AsyncMock()
-        bot._conversation_resolver.extract_message_context = AsyncMock(
-            return_value=MessageContext(
-                am_i_mentioned=False,
-                is_thread=False,
-                thread_id=None,
-                thread_history=[],
-                mentioned_agents=[],
-                has_non_agent_mentions=False,
-            ),
-        )
 
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!test:localhost"
@@ -663,6 +706,7 @@ class TestAgentBot(AgentBotTestBase):
         image_event.source = {"content": {"body": "image.jpg"}}
 
         with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch("mindroom.turn_policy.thread_requires_explicit_agent_targeting", return_value=False),
             patch(
@@ -676,7 +720,6 @@ class TestAgentBot(AgentBotTestBase):
                 ),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch("mindroom.dispatch_handoff.extract_media_caption", return_value="[Attached image]"),
         ):
             await bot._on_message(room, text_event)
@@ -684,9 +727,9 @@ class TestAgentBot(AgentBotTestBase):
             await bot._on_media_message(room, image_event)
             await drain_coalescing(bot)
 
-        assert bot._turn_controller._execute_router_relay.await_count == 2
-        first_call = bot._turn_controller._execute_router_relay.await_args_list[0].kwargs
-        second_call = bot._turn_controller._execute_router_relay.await_args_list[1].kwargs
+        assert mock_relay.await_count == 2
+        first_call = mock_relay.await_args_list[0].kwargs
+        second_call = mock_relay.await_args_list[1].kwargs
         assert first_call["requester_user_id"] == "@user:localhost"
         assert first_call["message"] is None
         assert second_call["requester_user_id"] == "@user:localhost"
@@ -714,22 +757,9 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
-        bot._turn_controller._execute_router_relay = AsyncMock()
-        bot._conversation_resolver.extract_message_context = AsyncMock(
-            return_value=MessageContext(
-                am_i_mentioned=False,
-                is_thread=False,
-                thread_id=None,
-                thread_history=[],
-                mentioned_agents=[],
-                has_non_agent_mentions=False,
-            ),
-        )
 
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!test:localhost"
@@ -757,6 +787,7 @@ class TestAgentBot(AgentBotTestBase):
         }
 
         with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch("mindroom.turn_policy.thread_requires_explicit_agent_targeting", return_value=False),
             patch(
@@ -769,9 +800,8 @@ class TestAgentBot(AgentBotTestBase):
                     [],
                 ),
             ),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch(
-                "mindroom.router_relay.suggest_responder_for_message",
+                "mindroom.router.relay.suggest_responder_for_message",
                 new_callable=AsyncMock,
                 return_value="general",
             ),
@@ -779,8 +809,8 @@ class TestAgentBot(AgentBotTestBase):
             await bot._on_message(room, event)
             await drain_coalescing(bot)
 
-        bot._turn_controller._execute_router_relay.assert_awaited_once()
-        call = bot._turn_controller._execute_router_relay.await_args.kwargs
+        mock_relay.assert_awaited_once()
+        call = mock_relay.await_args.kwargs
         assert call["requester_user_id"] == "@user:localhost"
         assert call["extra_content"] == {
             ORIGINAL_SENDER_KEY: "@user:localhost",
@@ -807,10 +837,9 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
-        _set_turn_store_tracker(bot, MagicMock())
         send_response = AsyncMock(return_value="$handoff")
         install_send_response_mock(bot, send_response)
         bot._turn_policy.responder_candidates_for_room = AsyncMock(
@@ -827,7 +856,8 @@ class TestAgentBot(AgentBotTestBase):
             },
         )
 
-        await bot._turn_controller._execute_router_relay(
+        await execute_router_relay(
+            bot._turn_dispatcher.deps,
             room=room,
             event=event,
             thread_history=[],
@@ -858,7 +888,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
         install_send_response_mock(bot, AsyncMock(return_value=None))
@@ -876,14 +906,15 @@ class TestAgentBot(AgentBotTestBase):
         )
 
         with pytest.raises(RuntimeError, match="Failed to route to entity 'general'"):
-            await bot._turn_controller._execute_router_relay(
+            await execute_router_relay(
+                bot._turn_dispatcher.deps,
                 room=room,
                 event=event,
                 thread_history=[],
                 requester_user_id="@user:localhost",
             )
 
-        assert not bot._turn_store.is_handled(event.event_id)
+        assert not await bot._turn_store.is_handled(room.room_id, event.event_id)
 
     @pytest.mark.asyncio
     async def test_router_dispatch_parity_text_and_image_skip_under_same_conditions(self, tmp_path: Path) -> None:
@@ -904,22 +935,9 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
-        bot._turn_controller._execute_router_relay = AsyncMock()
-        bot._conversation_resolver.extract_message_context = AsyncMock(
-            return_value=MessageContext(
-                am_i_mentioned=False,
-                is_thread=False,
-                thread_id=None,
-                thread_history=[],
-                mentioned_agents=[],
-                has_non_agent_mentions=False,
-            ),
-        )
 
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!test:localhost"
@@ -935,6 +953,7 @@ class TestAgentBot(AgentBotTestBase):
         image_event = self._make_handler_event("image", sender="@user:localhost", event_id="$skip_img")
 
         with (
+            patch("mindroom.turns.dispatch.execute_router_relay", new_callable=AsyncMock) as mock_relay,
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch("mindroom.turn_policy.thread_requires_explicit_agent_targeting", return_value=False),
             patch(
@@ -945,7 +964,6 @@ class TestAgentBot(AgentBotTestBase):
                 ),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch("mindroom.dispatch_handoff.extract_media_caption", return_value="[Attached image]"),
         ):
             await bot._on_message(room, text_event)
@@ -953,7 +971,7 @@ class TestAgentBot(AgentBotTestBase):
             await bot._on_media_message(room, image_event)
             await drain_coalescing(bot)
 
-        bot._turn_controller._execute_router_relay.assert_not_awaited()
+        mock_relay.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_router_replies_with_guidance_when_only_router_is_mentioned(self, tmp_path: Path) -> None:
@@ -966,12 +984,10 @@ class TestAgentBot(AgentBotTestBase):
             access_token="mock_test_token",  # noqa: S106
         )
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(agent_user, config=config, runtime_paths=runtime_paths_for(config))
         _wrap_extracted_collaborators(bot)
         bot.client = AsyncMock()
         bot.client.room_send.return_value = _room_send_response("$router_guidance")
-        tracker = _set_turn_store_tracker(bot, MagicMock())
-        tracker.has_responded.return_value = False
 
         room = MagicMock(spec=nio.MatrixRoom)
         room.room_id = "!test:localhost"
@@ -997,7 +1013,6 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
         ):
             await bot._on_message(room, event)
             await drain_coalescing(bot)
@@ -1008,7 +1023,9 @@ class TestAgentBot(AgentBotTestBase):
         assert "router is not a conversational AI agent" in content["body"]
         assert "mention a specific agent or team" in content["body"]
         assert "one human and one agent or team are already talking in a thread" in content["body"]
-        assert "thread has multiple human users or multiple agent/team participants" in content["body"]
+        assert "eligible ad-hoc team of participating individual agents" in content["body"]
+        assert "In multi-human threads, explicitly tag who should answer" in content["body"]
+        assert "adaptive participation, but teams do not form automatically" in content["body"]
         assert "automatic routing can still choose an agent or team" in content["body"]
 
     @pytest.mark.asyncio
@@ -1019,12 +1036,9 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """After router routes an image, the selected agent should resolve it via attachments."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = AsyncMock()
 
-        tracker = MagicMock()
-        tracker.has_responded.return_value = False
-        _set_turn_store_tracker(bot, tracker)
         generate_response = AsyncMock(return_value="$response")
         install_generate_response_mock(bot, generate_response)
 
@@ -1032,15 +1046,13 @@ class TestAgentBot(AgentBotTestBase):
         room = nio.MatrixRoom(room_id="!test:localhost", own_user_id="@mindroom_calculator:localhost")
 
         bot._conversation_resolver.extract_dispatch_context = AsyncMock(
-            return_value=dispatch_context_result(
-                MessageContext(
-                    am_i_mentioned=True,
-                    is_thread=True,
-                    thread_id="$img_root",
-                    thread_history=ThreadHistoryResult([], is_full_history=True),
-                    mentioned_agents=[mock_agent_user.matrix_id],
-                    has_non_agent_mentions=False,
-                ),
+            return_value=MessageContext(
+                am_i_mentioned=True,
+                is_thread=True,
+                thread_id="$img_root",
+                thread_history=ThreadHistoryResult([], is_full_history=True),
+                mentioned_agents=[mock_agent_user.matrix_id],
+                has_non_agent_mentions=False,
             ),
         )
 
@@ -1059,7 +1071,6 @@ class TestAgentBot(AgentBotTestBase):
 
         with (
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-            patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
             patch("mindroom.turn_policy.get_agents_in_thread", return_value=[]),
             patch(
                 "mindroom.turn_policy.classify_responder_candidates_from_cached_room",
@@ -1092,3 +1103,28 @@ class TestAgentBot(AgentBotTestBase):
         assert list(call_kwargs["media"].images) == []
         assert call_kwargs["attachment_ids"] == ["att_img_root"]
         assert call_kwargs["model_prompt"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_relay_that_selected_no_agent_sends_its_reply_unchanged() -> None:
+    """With no agent selected there is no readiness to recheck, so the router's reply goes out as built."""
+    orchestrator = MagicMock()
+    delivery_gateway = MagicMock()
+    delivery_gateway.send_text = AsyncMock(return_value="$relay")
+    request = SendTextRequest(
+        target=MessageTarget.resolve("!room:localhost", None, "$event"),
+        response_text="No agent fits this request.",
+        extra_content={ORIGINAL_SENDER_KEY: "@alice:localhost"},
+    )
+
+    delivery = await _send_router_relay_after_readiness_recheck(
+        orchestrator=orchestrator,
+        delivery_gateway=delivery_gateway,
+        selected_entity=None,
+        suggested_entity=None,
+        delivery_request=request,
+    )
+
+    delivery_gateway.send_text.assert_awaited_once_with(request)
+    orchestrator.entity_first_sync_complete.assert_not_called()
+    assert delivery.event_id == "$relay"

@@ -58,7 +58,6 @@ export function TeamList() {
       icon={Users}
       items={teams as TeamListItem[]}
       selectedId={selectedTeamId || undefined}
-      onItemSelect={selectTeam}
       onCreateItem={handleCreateTeam}
       renderItem={renderTeam}
       showSearch={true}
@@ -69,7 +68,6 @@ export function TeamList() {
       emptyIcon={Users}
       emptyMessage="No teams found"
       emptySubtitle={'Click "Add" to create one'}
-      creationBorderVariant="orange"
     />
   );
 }

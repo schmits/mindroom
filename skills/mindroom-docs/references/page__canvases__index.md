@@ -1,0 +1,265 @@
+# Interactive Canvases
+
+An agent can show the user a web page it wrote, such as a dashboard, report, slide deck, form, or picker, in the Canvas panel beside the conversation in MindRoom Chat.
+The user can work in the page and send an answer, which reaches the agent as the user's next message.
+Use a canvas when seeing or clicking beats reading or typing; for a quick choice between a few options, a plain reply or an [interactive question](https://docs.mindroom.chat/interactive/) is simpler.
+
+=== "Overview · 27 s"
+
+    A narrated film of all four: a scheduling grid, a data fit, a slide deck, and a trip planner.
+
+    <video class="only-light" controls playsinline preload="none" poster="https://github.com/user-attachments/assets/5941fd9d-90d2-4a52-b0e9-abbff53354b4" aria-label="Canvas film: four agent canvases beside the conversation" style="width: 100%">
+      <source src="https://github.com/user-attachments/assets/3a2e29e3-90a0-4cf7-a3cb-c0e41765695a" type="video/mp4">
+    </video>
+    <video class="only-dark" controls playsinline preload="none" poster="https://github.com/user-attachments/assets/dc3e3352-7cef-45ce-95be-3edad3bc7fe5" aria-label="Canvas film: four agent canvases beside the conversation" style="width: 100%">
+      <source src="https://github.com/user-attachments/assets/a704564b-be05-45cd-9c74-2b5de4f5c875" type="video/mp4">
+    </video>
+
+=== "Scheduling"
+
+    A week grid of four people's availability; the pick goes back with **Send**, and the agent books the meeting after approval.
+
+    <video controls playsinline preload="metadata" aria-label="An agent shows a week grid; the user picks a slot and sends it, and the agent books it" style="width: 100%" poster="https://github.com/user-attachments/assets/21d0d8ad-a7c4-4937-8fac-3d178b047011" data-poster-light="https://github.com/user-attachments/assets/21d0d8ad-a7c4-4937-8fac-3d178b047011" data-poster-dark="https://github.com/user-attachments/assets/1247f0ca-1c73-4759-bfa7-1b06fb8c2635">
+      <source src="https://github.com/user-attachments/assets/2ae227fd-8edb-4aa2-af62-f1ef3c99a530" type="video/mp4" media="(prefers-color-scheme: dark)">
+      <source src="https://github.com/user-attachments/assets/3926d694-04cf-4f17-ae4b-70f00dde705e" type="video/mp4">
+    </video>
+
+=== "Data"
+
+    An interactive fit drawn in inline SVG with the theme variables; leaving out an outlier refits the curve live.
+
+    <video controls playsinline preload="metadata" aria-label="An agent shows a data fit; the user leaves out an outlier and sends back the fit" style="width: 100%" poster="https://github.com/user-attachments/assets/795ebae7-99dc-4660-bf7c-2754fdc5916d" data-poster-light="https://github.com/user-attachments/assets/795ebae7-99dc-4660-bf7c-2754fdc5916d" data-poster-dark="https://github.com/user-attachments/assets/61718584-7b95-4bac-87f3-2e71b3cb6ab4">
+      <source src="https://github.com/user-attachments/assets/7385503a-982b-4811-9146-0a3a0378084d" type="video/mp4" media="(prefers-color-scheme: dark)">
+      <source src="https://github.com/user-attachments/assets/36d79992-fc82-47e2-a012-6bc2c07b4956" type="video/mp4">
+    </video>
+
+=== "Slides"
+
+    A deck the agent writes to a workspace file and shows by `path`; after a change request it rewrites the file and the open deck updates in place.
+
+    <video controls playsinline preload="metadata" aria-label="An agent shows a slide deck from its workspace and updates it in place after a change request" style="width: 100%" poster="https://github.com/user-attachments/assets/0a8304cd-77bb-481a-8654-c735d91f5fd4" data-poster-light="https://github.com/user-attachments/assets/0a8304cd-77bb-481a-8654-c735d91f5fd4" data-poster-dark="https://github.com/user-attachments/assets/1e2819a7-8c5a-4095-8749-a7a3610dddc9">
+      <source src="https://github.com/user-attachments/assets/c033ea6b-fc57-4a66-a235-be716d33286c" type="video/mp4" media="(prefers-color-scheme: dark)">
+      <source src="https://github.com/user-attachments/assets/6219e504-dcf2-40a7-a919-fc5b372c13d6" type="video/mp4">
+    </video>
+
+=== "Trip planner"
+
+    One canvas, two steps: pick a stay, then plan the days against a live budget, updated in place with `canvas_event_id`.
+
+    <video controls playsinline preload="metadata" aria-label="One canvas, two steps: pick a stay, then plan the days against a live budget" style="width: 100%" poster="https://github.com/user-attachments/assets/fbe6bf8f-f1b4-4195-ad37-df3a2dfdbe80" data-poster-light="https://github.com/user-attachments/assets/fbe6bf8f-f1b4-4195-ad37-df3a2dfdbe80" data-poster-dark="https://github.com/user-attachments/assets/c71df2bd-54c9-4946-a8b1-54e191db5c3b">
+      <source src="https://github.com/user-attachments/assets/341cd5bd-7fb1-441f-8a6a-470b701359d6" type="video/mp4" media="(prefers-color-scheme: dark)">
+      <source src="https://github.com/user-attachments/assets/26870d8e-5303-4cfd-bb10-9fa66c1d6632" type="video/mp4">
+    </video>
+
+## Turn canvases on
+
+Canvases need two switches, and both are off by default.
+
+First, give the agent the [`chat_ui`](https://docs.mindroom.chat/tools/chat-ui/) toolkit with `enable_show_canvas: true`:
+
+```yaml
+agents:
+  planner:
+    display_name: Planner
+    role: Plan trips and compare the options visually.
+    model: default
+    tools:
+      - chat_ui:
+          enable_show_canvas: true
+```
+
+`enable_show_canvas` (boolean, default `false`) adds the `show_canvas` function; the rest of `chat_ui` works without it.
+It can also be set in the `chat_ui` tool's saved settings for every agent that uses `chat_ui`; an agent's own entry wins, as described in [How Settings Combine](https://docs.mindroom.chat/tools/#how-settings-combine).
+`mindroom config init` and newly provisioned hosted instances already turn it on for the starter Mind agent, so Mind needs only the Chat switch.
+
+Second, enable canvases in the MindRoom Chat deployment's runtime `config.json`:
+
+```json
+{
+  "mindroom": {
+    "canvas": {
+      "enabled": true
+    }
+  }
+}
+```
+
+The shipped MindRoom Chat configuration sets `enabled` to `false`, so only whoever deploys Chat can turn canvases on.
+
+### Let pages load libraries
+
+Pages can also load libraries such as Chart.js, D3, Mermaid, or KaTeX from jsDelivr's npm CDN, `https://cdn.jsdelivr.net/npm/`.
+This takes two more switches, both off by default; turn on both, because a page that needs a library breaks where Chat blocks it.
+
+```yaml
+agents:
+  planner:
+    display_name: Planner
+    role: Plan trips and compare the options visually.
+    model: default
+    tools:
+      - chat_ui:
+          enable_show_canvas: true
+          enable_canvas_libraries: true
+```
+
+```json
+{
+  "mindroom": {
+    "canvas": {
+      "enabled": true,
+      "libraries": true
+    }
+  }
+}
+```
+
+`enable_canvas_libraries` (boolean, default `false`) tells the agent it may use the source, and Chat's `libraries` lets pages load from it.
+Pages may then load scripts, styles, and fonts from `/npm/` paths only; fetching data, external images, workers, and every other site stay blocked, and libraries that evaluate strings, such as Alpine or Vue in-page templates, do not run.
+Opening a page that uses a library tells jsDelivr the viewer's IP address and which files they load, which is why Chat keeps libraries off unless its deployment allows them.
+
+## What the user sees
+
+Each canvas appears in the conversation as its title with an **Open canvas** button.
+Chat opens the panel by itself under the same conditions as other [Chat UI actions](https://docs.mindroom.chat/tools/chat-ui/#what-the-user-sees); otherwise the user chooses **Open canvas**.
+The panel names the agent that made the page, and the user can resize it or expand it to the full width of the conversation.
+The room header's **Canvas** button lists the conversation's canvases, newest update first, and reopens one after the user closed it.
+
+When the panel cannot open, the **Open canvas** button is disabled and a message below it says why:
+
+| Message | Cause |
+|---|---|
+| Interactive panels are turned off in this app. | The Chat deployment has not enabled canvases. |
+| Interactive panels are not available in the app yet. Open this conversation in a browser. | The native mobile app does not show canvases; Chat in a browser does. |
+| End the call to open interactive panels. | Chat does not run canvases during a call. |
+
+Other people in the room who use MindRoom Chat on the agent's homeserver see the title without the button; everyone else sees only the notice text, `Interactive panel: <title>. Open it in MindRoom Chat to respond.`
+
+### Find a canvas again
+
+A canvas the user comes back to, such as a landing page an agent keeps current or a checklist used every day, does not have to be found in its thread again.
+Where canvases are on, Chat's sidebar gets a **Canvases** button once the user has a canvas; it lists the canvases agents made for the user: pinned ones first, then the most recently updated, with the thread each was shown in (by its summary, as the sidebar names it), the room, the agent, and when each was updated and created.
+Choosing a title opens the canvas at its latest version, filling the conversation's column; choosing the thread or the room opens that conversation.
+
+Pins are kept in the user's Matrix account data (`io.mindroom.pinned_canvases`, room and event IDs only), so they show on every device.
+The rest of the list holds the canvases this browser has received, so a new device starts with recent canvases and older ones appear once their thread is opened.
+Users who don't want the button turn off **Show Canvases in the sidebar** under Settings → General → Interface; the choice follows them to every device.
+For a page the user returns to, update the same canvas with `canvas_event_id` rather than showing a new one, so its row and pin keep pointing at it.
+
+## Answering a canvas
+
+Typing, toggling, and moving between steps inside the page send nothing.
+When the page submits an answer, Chat shows the user exactly what will be sent, and nothing is sent until the user chooses **Send**.
+To change a pending answer, the user chooses **Discard** and answers again.
+
+The answer is an ordinary message from the user in the canvas's thread; it mentions the agent and starts the agent's next turn:
+
+```text
+@mindroom_planner:example.org Canvas response ($canvas-event, revision $canvas-event): Pro plan
+{"plan":"pro"}
+```
+
+The first ID is the canvas and the second is the version the user answered; when that is not the latest version, the user answered an earlier page.
+MindRoom Chat shows the answer as a one-line receipt that expands to the exact data.
+An answer can carry up to 512 KB of JSON data, enough for a long document the user edited in the canvas; larger or non-JSON data is ignored, so no **Send** prompt appears.
+
+When the page throws an error, fails to load a file, or tries to load something Chat blocks, the panel lists up to five of those errors with a **Tell** *agent* button.
+Nothing is sent unless the user chooses it; the report reaches the agent like an answer:
+
+```text
+@mindroom_planner:example.org Canvas error ($canvas-event, revision $canvas-event):
+Uncaught ReferenceError: drawChart is not defined (line 12)
+Blocked https://unpkg.com/chart.js (script-src-elem)
+```
+
+### Let the agent read the page without a Send button
+
+For a page whose choices the agent needs later, such as a checklist ticked over a few days, the agent shows the canvas with `share_state=True`.
+Chat then keeps a copy of what the page saved (its saved state and kept inputs) in the room, once the user has worked in the page and pauses for a moment, and when the panel closes or the tab is hidden.
+The copy never starts the agent's turn and never enters its conversation; the agent reads the newest copy when it wants, for example from a scheduled task:
+
+```python
+chat_ui.read_canvas_state(canvas_event_id="$canvas-event")
+```
+
+It returns the state, the inputs, and when the user's Chat shared them, or says nothing was shared yet; when the newest copy in the room cannot be read, it returns an error rather than an older copy.
+Sharing is decided when a canvas is first shown, and its updates keep it; the panel tells the user "Saved in this room: *agent* and others here can read what you enter."
+Each copy stays in the room's history like a message, and logging out does not remove it.
+
+## Update a canvas
+
+`show_canvas` returns the canvas `event_id`.
+Calling `show_canvas` again with `canvas_event_id` set to that ID replaces the page in place, for the next step of a flow or a new version of a file the agent edited, and the conversation keeps one card.
+An update may leave out `title` to keep the title the canvas was first shown with.
+An open panel switches to the new page at once, unless the user has been working in it; then Chat shows "*agent* updated this panel." with a **Load update** button, so unsent work is not lost.
+Every update stays available: once a canvas has more than one version, the panel header shows *Version n of m* with buttons to go back and forward, and an earlier version offers **Show latest**.
+The user can answer an earlier version; switching is unavailable while an answer waits for **Send** or is sending.
+An agent can update only canvases it showed to the same user in the same room and thread, or at room level; otherwise the call fails and the agent shows a new canvas instead.
+
+## Write a page
+
+Pass the page as `html`, or as a `path` to an HTML file, which suits pages the agent builds and refines, such as slides.
+Paths follow the same rules as [registering local files](https://docs.mindroom.chat/attachments/#registering-local-files); prefer workspace-relative paths such as `slides/deck.html`.
+
+```python
+chat_ui.show_canvas(
+    title="Choose a plan",
+    html="""
+<style>
+  .plans { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+  .plan { background: var(--mr-surface); border: 1px solid var(--mr-border);
+          border-radius: var(--mr-radius); padding: 16px; }
+  button { background: var(--mr-accent); color: var(--mr-accent-text); border: 0;
+           border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+</style>
+<div class="plans">
+  <div class="plan"><h3>Basic</h3><p>For trying things out.</p>
+    <button onclick="mindroom.submit({plan: 'basic'}, {label: 'Basic plan'})">Choose Basic</button></div>
+  <div class="plan"><h3>Pro</h3><p>For daily work.</p>
+    <button onclick="mindroom.submit({plan: 'pro'}, {label: 'Pro plan'})">Choose Pro</button></div>
+</div>
+""",
+)
+```
+
+- **Self-contained:** write inline CSS and JavaScript. The page cannot fetch data or load external images, and it loads libraries only where [allowed](#let-pages-load-libraries); otherwise draw charts with inline SVG or a `<canvas>` element, and always embed images as `data:` URLs.
+- **Submitting:** call `window.mindroom.submit(data, {label})` with JSON-serializable `data` and a short `label`, or use a `<form>`, whose fields become the data and whose `data-mindroom-label` attribute sets the label.
+- **Responsive:** the panel ranges from narrow to the full conversation width.
+- **Kept inputs:** inputs, selects, and textareas with an `id` or `name` keep their values on their own, across a reload, an update, and a switch to another version, matched by that `id` or `name` (a radio group by its name).
+  When the page loads, Chat sets the kept values and fires `input` and `change` on each, so a page that redraws on those events shows them.
+  Give a field a new `id` when its meaning changes between versions.
+  Never kept: password, file, and hidden inputs, fields with `autocomplete="off"`, and texts over 32K characters, which a page can keep with `saveState`.
+- **Saved state:** to keep anything else the user did in the page, call `window.mindroom.saveState(value)` on every change; Chat batches the writes, and a value over 256K characters of JSON throws.
+  Later loads of the canvas, after a reload, an update, or a switch to another version, start with it in `window.mindroom.state`, which is `undefined` when nothing is saved.
+  Read it defensively, since an earlier version of the page may have saved it in another shape.
+  It stays in that browser and reaches the agent only through an answer, or [when the canvas shares it](#let-the-agent-read-the-page-without-a-send-button).
+  The browser keeps it for the 100 most recently saved canvases and deletes it when the user logs out.
+- **Checking a page:** an agent with the [`browser`](https://docs.mindroom.chat/tools/web-scraping-and-browser/#browser) tool can open its page file with `browser_control(action="open", paths=[...])` and take a screenshot before showing it.
+  Chat's theme variables and `window.mindroom` are not there, so a page that gives its `var(--mr-...)` colors fallbacks looks closest to the panel.
+  The browser also does not block everything the panel blocks.
+- **Limits:** the `title` is one line of at most 120 characters, and the page is UTF-8 text of at most 4 MB.
+  Each update of a page larger than about 24 KB stores a new copy on the homeserver that users cannot delete, so iterate on large pages sparingly.
+
+Chat exposes its current theme as CSS variables, so a page can match light and dark mode:
+
+| Variable | Use |
+|---|---|
+| `--mr-bg` | Page background (the default body background) |
+| `--mr-surface`, `--mr-surface-raised` | Cards and raised elements |
+| `--mr-border` | Borders and dividers |
+| `--mr-text`, `--mr-text-muted` | Text (the default body color) and secondary text |
+| `--mr-accent`, `--mr-accent-text` | Primary actions and the text on them |
+| `--mr-success`, `--mr-warning`, `--mr-danger` | Status colors |
+| `--mr-radius`, `--mr-font` | Corner radius and font family |
+
+For choices the variables cannot make, such as a chart palette, `window.mindroom.colorScheme` is `light` or `dark`.
+
+## Privacy and safety
+
+- The page cannot read the user's Matrix account, messages, cookies, or storage, and it cannot open pop-ups or navigate away; a page that tries is stopped, and Chat shows "This panel tried to leave its sandbox and was stopped." with a **Reload panel** button.
+- In an encrypted room, the page, the answer, and a shared copy of the page's state are end-to-end encrypted like other messages.
+- A canvas shared with `share_state=True` lets its agent, and anyone else in the room, read what the page saved without asking each time; Chat says so in the panel.
+  Passwords and fields with `autocomplete="off"` are never kept automatically, but whatever the page passes to `saveState` is shared, so pages must keep secrets out of it.
+- A canvas is not a safe place for secrets: browsers do not let a page block WebRTC, and a page that loads libraries can put data in the addresses it requests, so a malicious page could leak what the user types into it.
+  Chat therefore names the agent that made each canvas and reminds the user that what they enter may leave the panel.
+- Agents should show only pages they wrote, never downloaded or untrusted pages, because every canvas appears as the agent's own.

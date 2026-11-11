@@ -17,19 +17,20 @@ from mindroom.constants import (
     PER_FIRE_THREAD_ROOT_KEY,
     SCHEDULED_HISTORY_LIMIT_KEY,
     SILENT_SCHEDULE_EVENT_TYPE,
+    SKIP_MENTIONS_KEY,
     SOURCE_KIND_KEY,
 )
 from mindroom.dispatch_source import SCHEDULED_SOURCE_KIND, SILENT_SCHEDULE_SOURCE_KIND
 from mindroom.entity_resolution import entity_identity_registry
-from mindroom.hooks import EVENT_SCHEDULE_FIRED, HookRegistry, ScheduleFiredContext, hook
+from mindroom.hooks import EVENT_SCHEDULE_FIRED, HookRegistry, HookRegistryState, ScheduleFiredContext, hook
 from mindroom.matrix.client_delivery import MatrixDeliveryFailure, MatrixDeliveryFailureKind
 from mindroom.message_target import MessageTarget
-from mindroom.scheduling import ScheduledWorkflow
-from mindroom.scheduling_executor import (
+from mindroom.scheduling.executor import (
     execute_scheduled_workflow,
     send_scheduled_failure_notice,
-    set_scheduling_hook_registry,
 )
+from mindroom.scheduling.tasks import ScheduledWorkflow
+from tests.bot_helpers import _hook_plugin as _plugin
 from tests.conftest import (
     bind_runtime_paths,
     delivered_matrix_side_effect,
@@ -39,7 +40,6 @@ from tests.conftest import (
 from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
     from pathlib import Path
 
 
@@ -51,7 +51,7 @@ def _agent_config(tmp_path: Path) -> Config:
     config = bind_runtime_paths(
         Config(
             agents={"research": AgentConfig(display_name="Research")},
-            models={"default": ModelConfig(provider="test", id="test-model")},
+            models={"default": ModelConfig(provider="openai", id="test-model")},
         ),
         test_runtime_paths(tmp_path),
     )
@@ -92,27 +92,6 @@ def _conversation_reader(*, latest_thread_event_id: str | None = None) -> AsyncM
     return reader
 
 
-def _plugin(name: str, callbacks: list[object]) -> object:
-    return type(
-        "PluginStub",
-        (),
-        {
-            "name": name,
-            "discovered_hooks": tuple(callbacks),
-            "entry_config": type("Entry", (), {"settings": {}, "hooks": {}})(),
-            "plugin_order": 0,
-        },
-    )()
-
-
-@pytest.fixture(autouse=True)
-def reset_schedule_registry() -> Generator[None, None, None]:
-    """Keep the module-global scheduling hook registry isolated per test."""
-    set_scheduling_hook_registry(HookRegistry.empty())
-    yield
-    set_scheduling_hook_registry(HookRegistry.empty())
-
-
 @pytest.mark.asyncio
 async def test_fire_task_with_valid_agent_delivers_in_thread(tmp_path: Path) -> None:
     """Firing a task targeting a known agent delivers the automated message into the thread."""
@@ -130,6 +109,7 @@ async def test_fire_task_with_valid_agent_delivers_in_thread(tmp_path: Path) -> 
             config,
             runtime_paths_for(config),
             conversation_reader,
+            HookRegistryState(HookRegistry.empty()),
             task_id="task-1",
         )
 
@@ -164,6 +144,7 @@ async def test_schedule_transport_preserves_requester_and_history_metadata(
     """Visible and silent fires retain provenance while choosing their transport."""
     config = _config(tmp_path)
     workflow = _workflow("Reconcile the queue", history_limit=5, silent=silent)
+    workflow.model = "default"
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
@@ -175,12 +156,14 @@ async def test_schedule_transport_preserves_requester_and_history_metadata(
             config,
             runtime_paths_for(config),
             _conversation_reader(latest_thread_event_id="$latest"),
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "delivered"
     content = mock_send.await_args.args[2]
     assert content[ORIGINAL_SENDER_KEY] == "@user:localhost"
     assert content[SCHEDULED_HISTORY_LIMIT_KEY] == 5
+    assert content["com.mindroom.scheduled_model"] == "default"
     assert content[SOURCE_KIND_KEY] == source_kind
     assert content["m.relates_to"]["event_id"] == "$thread"
     assert mock_send.await_args.kwargs["message_type"] == message_type
@@ -204,6 +187,7 @@ async def test_fire_task_with_history_limit_annotates_message_content(tmp_path: 
             config,
             runtime_paths_for(config),
             conversation_reader,
+            HookRegistryState(HookRegistry.empty()),
             task_id="task-1",
         )
 
@@ -231,6 +215,7 @@ async def test_fire_new_thread_task_posts_room_level_message(tmp_path: Path, sta
             config,
             runtime_paths_for(config),
             conversation_reader,
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "delivered"
@@ -257,6 +242,7 @@ async def test_silent_new_thread_fire_does_not_claim_a_visible_per_fire_root(tmp
             config,
             runtime_paths_for(config),
             _conversation_reader(),
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "delivered"
@@ -281,6 +267,7 @@ async def test_fire_room_level_task_without_new_thread_keeps_room_scope(tmp_path
             config,
             runtime_paths_for(config),
             _conversation_reader(),
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "delivered"
@@ -302,6 +289,7 @@ async def test_fire_task_without_room_id_is_typed_failure(tmp_path: Path) -> Non
             config,
             runtime_paths_for(config),
             _conversation_reader(),
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "failed"
@@ -328,6 +316,7 @@ async def test_typed_delivery_failure_yields_failure_and_notice(tmp_path: Path) 
             config,
             runtime_paths_for(config),
             conversation_reader,
+            HookRegistryState(HookRegistry.empty()),
         )
 
     assert outcome.status == "failed"
@@ -339,14 +328,19 @@ async def test_typed_delivery_failure_yields_failure_and_notice(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_delivery_exception_yields_failure_without_raising(tmp_path: Path) -> None:
-    """Send errors, including a failing notice send, never escape the executor."""
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [(RuntimeError("boom"), "boom"), (TimeoutError(), "TimeoutError")],
+    ids=["with_text", "without_text"],
+)
+async def test_delivery_exception_yields_failure_without_raising(tmp_path: Path, error: Exception, text: str) -> None:
+    """Send errors, including a failing notice send, never escape the executor; a failure without text names its type."""
     config = _config(tmp_path)
     workflow = _workflow("Check the queue depth")
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
-        new=AsyncMock(side_effect=RuntimeError("boom")),
+        new=AsyncMock(side_effect=error),
     ) as mock_send:
         outcome = await execute_scheduled_workflow(
             AsyncMock(),
@@ -354,10 +348,10 @@ async def test_delivery_exception_yields_failure_without_raising(tmp_path: Path)
             config,
             runtime_paths_for(config),
             _conversation_reader(latest_thread_event_id="$latest"),
+            HookRegistryState(HookRegistry.empty()),
         )
 
-    assert outcome.status == "failed"
-    assert outcome.failure_reason == "boom"
+    assert (outcome.status, outcome.failure_reason) == ("failed", text)
     assert mock_send.await_count == 2  # original send plus the (also failing) notice
 
 
@@ -372,7 +366,7 @@ async def test_hook_emission_fires_with_task_context(tmp_path: Path) -> None:
         ctx.message_text = f"{ctx.message_text} (hooked)"
 
     config = _config(tmp_path)
-    set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [rewrite])]))
+    hook_state = HookRegistryState(HookRegistry.from_plugins([_plugin("schedule-plugin", [rewrite])]))
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
@@ -384,6 +378,7 @@ async def test_hook_emission_fires_with_task_context(tmp_path: Path) -> None:
             config,
             runtime_paths_for(config),
             _conversation_reader(latest_thread_event_id="$latest"),
+            hook_state,
             task_id="task-hooked",
         )
 
@@ -407,7 +402,7 @@ async def test_running_schedule_hook_becomes_inactive_after_registry_replacement
         active_states.append(ctx.is_active())
 
     config = _config(tmp_path)
-    set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [observe_lifecycle])]))
+    hook_state = HookRegistryState(HookRegistry.from_plugins([_plugin("schedule-plugin", [observe_lifecycle])]))
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
@@ -420,10 +415,11 @@ async def test_running_schedule_hook_becomes_inactive_after_registry_replacement
                 config,
                 runtime_paths_for(config),
                 _conversation_reader(latest_thread_event_id="$latest"),
+                hook_state,
             ),
         )
         await hook_started.wait()
-        set_scheduling_hook_registry(HookRegistry.empty())
+        hook_state.registry = HookRegistry.empty()
         resume_hook.set()
         outcome = await execution
 
@@ -440,7 +436,7 @@ async def test_silent_hook_transform_is_sent_as_custom_event(tmp_path: Path) -> 
         ctx.message_text = "Transformed schedule"
 
     config = _config(tmp_path)
-    set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [rewrite])]))
+    hook_state = HookRegistryState(HookRegistry.from_plugins([_plugin("schedule-plugin", [rewrite])]))
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
@@ -452,6 +448,7 @@ async def test_silent_hook_transform_is_sent_as_custom_event(tmp_path: Path) -> 
             config,
             runtime_paths_for(config),
             _conversation_reader(latest_thread_event_id="$latest"),
+            hook_state,
         )
 
     assert outcome.status == "delivered"
@@ -468,7 +465,7 @@ async def test_empty_hook_transform_fails_before_silent_trigger_transport(tmp_pa
         ctx.message_text = " \n\t"
 
     config = _config(tmp_path)
-    set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [empty])]))
+    hook_state = HookRegistryState(HookRegistry.from_plugins([_plugin("schedule-plugin", [empty])]))
 
     with patch(
         "mindroom.matrix.client_delivery.send_message_outcome",
@@ -480,6 +477,7 @@ async def test_empty_hook_transform_fails_before_silent_trigger_transport(tmp_pa
             config,
             runtime_paths_for(config),
             _conversation_reader(),
+            hook_state,
         )
 
     assert outcome.status == "failed"
@@ -498,7 +496,7 @@ async def test_hook_suppression_is_undelivered_outcome(tmp_path: Path) -> None:
         ctx.suppress = True
 
     config = _config(tmp_path)
-    set_scheduling_hook_registry(HookRegistry.from_plugins([_plugin("schedule-plugin", [suppress])]))
+    hook_state = HookRegistryState(HookRegistry.from_plugins([_plugin("schedule-plugin", [suppress])]))
 
     with patch("mindroom.matrix.client_delivery.send_message_outcome", new=AsyncMock()) as mock_send:
         outcome = await execute_scheduled_workflow(
@@ -507,6 +505,7 @@ async def test_hook_suppression_is_undelivered_outcome(tmp_path: Path) -> None:
             config,
             runtime_paths_for(config),
             _conversation_reader(),
+            hook_state,
         )
 
     assert outcome.status == "suppressed"
@@ -516,7 +515,7 @@ async def test_hook_suppression_is_undelivered_outcome(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_send_scheduled_failure_notice_follows_workflow_target() -> None:
-    """Runner failure notices follow the workflow thread and reply to its latest event."""
+    """Runner failure notices follow the workflow thread, reply to its latest event, and wake no agent they name."""
     workflow = _workflow("Recurring job")
     target = MessageTarget.for_scheduled_task(workflow)
     conversation_reader = _conversation_reader(latest_thread_event_id="$latest")
@@ -527,7 +526,6 @@ async def test_send_scheduled_failure_notice_follows_workflow_target() -> None:
     ) as mock_send:
         await send_scheduled_failure_notice(
             AsyncMock(),
-            workflow,
             target,
             "❌ Recurring task failed: executor test task\nTask ID: task-9\nError: boom",
             conversation_reader,
@@ -538,3 +536,4 @@ async def test_send_scheduled_failure_notice_follows_workflow_target() -> None:
     assert content["body"].startswith("❌ Recurring task failed: executor test task")
     assert content["m.relates_to"]["event_id"] == "$thread"
     assert content["m.relates_to"]["m.in_reply_to"]["event_id"] == "$latest"
+    assert content[SKIP_MENTIONS_KEY] is True

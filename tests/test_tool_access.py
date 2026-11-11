@@ -1,0 +1,79 @@
+"""Transport-neutral tool discovery, schema, and validation helpers."""
+
+from __future__ import annotations
+
+import pytest
+from agno.tools.function import Function
+
+from mindroom.llm.provider import ToolSpec
+from mindroom.tool_system.tool_access import (
+    search_tool_metadata,
+    tool_definition,
+    validate_tool_arguments,
+)
+from tests.agent_tool_helpers import offered_agno_function
+
+
+def test_adapted_schema_is_a_copy_that_leaves_the_function_unchanged() -> None:
+    """Adapting a function derives the schema the model sees while preserving the live function and its binding."""
+
+    def list_files(path: str) -> str:
+        return path
+
+    required: list[object] = []
+    required.append(required)
+    function = Function(
+        name="list",
+        entrypoint=list_files,
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": required},
+    )
+
+    schema = offered_agno_function(function).parameters
+
+    assert schema["required"] == ["path"]
+    assert function.parameters["required"][0] is function.parameters["required"]
+    assert function.entrypoint is list_files
+
+
+def test_a_tool_definition_shows_the_model_its_name_description_and_schema_only() -> None:
+    """Strict mode and the approval flags are each route's to send, and a missing description shows as empty."""
+    parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+    tool = ToolSpec(
+        name="list",
+        description=None,
+        parameters=parameters,
+        strict=True,
+    )
+
+    definition = tool_definition(tool)
+
+    assert definition == {"name": "list", "description": "", "parameters": parameters}
+    assert definition["parameters"] is not parameters
+
+
+def test_search_tool_metadata_preserves_catalog_order_and_requires_all_words() -> None:
+    """Keyword matching is stable and searches every public metadata value."""
+    items = [
+        {"toolkit": "calendar", "function": "list", "description": "List calendar events"},
+        {"toolkit": "files", "function": "list", "description": "List shared files"},
+        {"toolkit": "files", "function": "read", "description": "Read a file"},
+    ]
+
+    assert search_tool_metadata(items, "files list", 5) == [items[1]]
+    assert search_tool_metadata(items, "", 2) == items[:2]
+
+
+def test_validate_tool_arguments_rejects_malformed_and_remote_schemas() -> None:
+    """Malformed arguments and network-resolved schemas fail before any tool body can run."""
+    schema = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+
+    validate_tool_arguments(schema, {"path": "/documents"})
+    with pytest.raises(ValueError, match="Invalid tool arguments"):
+        validate_tool_arguments(schema, {"path": 42})
+    with pytest.raises(ValueError, match="Invalid tool arguments"):
+        validate_tool_arguments({"$ref": "https://schema.example.org/remote.json"}, {})

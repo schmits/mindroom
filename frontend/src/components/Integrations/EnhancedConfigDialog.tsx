@@ -8,6 +8,8 @@ import {
   AlertCircle,
   Key,
   Lock,
+  Plus,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,7 +27,10 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
-import { API_BASE_URL, withAgentExecutionScope } from "@/lib/api";
+import {
+  apiErrorMessageFromResponse,
+  withAgentExecutionScope,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { WorkerScope } from "@/types/config";
 
@@ -44,7 +49,33 @@ interface ConfigField {
   };
 }
 
-type ConfigValue = string | boolean | number;
+type ConfigValue = string | boolean | number | string[];
+
+function configValueFor(field: ConfigField, raw: unknown): ConfigValue {
+  if (field.type === "boolean") {
+    return raw === true || raw === "true";
+  }
+  if (field.type === "number") {
+    const numericValue = Number(raw);
+    return Number.isFinite(numericValue) ? numericValue : String(raw);
+  }
+  if (field.type === "string[]") {
+    return raw as string[];
+  }
+  return String(raw);
+}
+
+const isSecretField = (field: ConfigField) =>
+  field.type === "password" ||
+  ["token", "key", "secret"].some((word) =>
+    field.name.toLowerCase().includes(word),
+  );
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === "string")
+  );
+}
 
 interface EnhancedConfigDialogProps {
   open: boolean;
@@ -57,8 +88,6 @@ interface EnhancedConfigDialogProps {
   isEditing?: boolean;
   docsUrl?: string | null;
   helperText?: string | null;
-  icon?: any;
-  iconColor?: string;
   agentName?: string | null;
   executionScope?: WorkerScope | null;
 }
@@ -74,8 +103,6 @@ export function EnhancedConfigDialog({
   isEditing = false,
   docsUrl,
   helperText,
-  icon: Icon,
-  iconColor,
   agentName,
   executionScope,
 }: EnhancedConfigDialogProps) {
@@ -105,7 +132,7 @@ export function EnhancedConfigDialog({
             href={url}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-blue-500 dark:text-blue-400 underline hover:text-blue-600 dark:hover:text-blue-300"
+            className="text-primary underline underline-offset-2"
           >
             {linkText}
           </a>
@@ -115,24 +142,30 @@ export function EnhancedConfigDialog({
     });
   };
 
-  // Just use the config fields as provided - no special filtering needed
-  const filteredFields = configFields;
-
   // Initialize default values and load existing credentials
   useEffect(() => {
     if (!open) return;
 
+    // Saved credentials win; other fields start from their defaults.
+    const initialValues = (credentials: Record<string, unknown>) => {
+      const values: Record<string, ConfigValue> = {};
+      configFields.forEach((field) => {
+        if (credentials[field.name] !== undefined) {
+          values[field.name] = configValueFor(field, credentials[field.name]);
+        } else if (field.default !== undefined && field.default !== null) {
+          values[field.name] = configValueFor(field, field.default);
+        }
+      });
+      return values;
+    };
+
     const loadExistingCredentials = async () => {
       setLoadingExisting(true);
 
-      // Use the config fields directly
-      let fieldsToUse = configFields;
-
       try {
-        // Try to load existing credentials
         const response = await fetch(
           withAgentExecutionScope(
-            `${API_BASE_URL}/api/credentials/${service}`,
+            `/api/credentials/${service}`,
             agentName,
             executionScope,
           ),
@@ -140,74 +173,24 @@ export function EnhancedConfigDialog({
         if (response.ok) {
           const data = await response.json();
           if (data.credentials) {
-            // Merge existing credentials with defaults
-            const defaults: Record<string, ConfigValue> = {};
-            fieldsToUse.forEach((field) => {
-              if (data.credentials[field.name] !== undefined) {
-                if (field.type === "boolean") {
-                  defaults[field.name] =
-                    data.credentials[field.name] === true ||
-                    data.credentials[field.name] === "true";
-                } else if (field.type === "number") {
-                  const numericValue = Number(data.credentials[field.name]);
-                  defaults[field.name] = Number.isFinite(numericValue)
-                    ? numericValue
-                    : String(data.credentials[field.name]);
-                } else {
-                  defaults[field.name] = String(data.credentials[field.name]);
-                }
-              } else if (
-                field.default !== undefined &&
-                field.default !== null
-              ) {
-                // Use default value with proper type
-                if (field.type === "boolean") {
-                  defaults[field.name] =
-                    field.default === true || field.default === "true";
-                } else if (field.type === "number") {
-                  const numericValue = Number(field.default);
-                  defaults[field.name] = Number.isFinite(numericValue)
-                    ? numericValue
-                    : String(field.default);
-                } else {
-                  defaults[field.name] = String(field.default);
-                }
-              }
-            });
-            setConfigValues(defaults);
-            setExistingConfigValues(defaults);
+            const values = initialValues(data.credentials);
+            setConfigValues(values);
+            setExistingConfigValues(values);
             setLoadingExisting(false);
             return;
           }
         }
-      } catch (error) {
+      } catch {
         console.log("No existing credentials found");
       }
 
-      // If no existing credentials, just use defaults
-      const defaults: Record<string, ConfigValue> = {};
-      fieldsToUse.forEach((field) => {
-        if (field.default !== undefined && field.default !== null) {
-          if (field.type === "boolean") {
-            defaults[field.name] =
-              field.default === true || field.default === "true";
-          } else if (field.type === "number") {
-            const numericValue = Number(field.default);
-            defaults[field.name] = Number.isFinite(numericValue)
-              ? numericValue
-              : String(field.default);
-          } else {
-            defaults[field.name] = String(field.default);
-          }
-        }
-      });
-      setConfigValues(defaults);
+      setConfigValues(initialValues({}));
       setExistingConfigValues({});
       setLoadingExisting(false);
     };
 
     loadExistingCredentials();
-  }, [service, open, configFields, agentName, executionScope]); // Use stable dependencies
+  }, [service, open, configFields, agentName, executionScope]);
 
   const validateField = (
     field: ConfigField,
@@ -215,6 +198,16 @@ export function EnhancedConfigDialog({
   ): string | null => {
     // Boolean fields don't need validation
     if (field.type === "boolean") {
+      return null;
+    }
+
+    if (field.type === "string[]") {
+      if (value !== undefined && !isStringArray(value)) {
+        return `${field.label} must be a list of strings`;
+      }
+      if (field.required && (value === undefined || value.length === 0)) {
+        return `${field.label} is required`;
+      }
       return null;
     }
 
@@ -226,7 +219,7 @@ export function EnhancedConfigDialog({
       field.requiredWhenFieldChanges &&
       (value === undefined || value === "")
     ) {
-      const trackedField = filteredFields.find(
+      const trackedField = configFields.find(
         (candidate) => candidate.name === field.requiredWhenFieldChanges,
       );
       const trackedFieldName = field.requiredWhenFieldChanges;
@@ -274,7 +267,7 @@ export function EnhancedConfigDialog({
     setConfigValues({ ...configValues, [field.name]: value });
 
     // Clear errors for the edited field and fields whose validation depends on it.
-    const dependentFieldNames = filteredFields
+    const dependentFieldNames = configFields
       .filter((candidate) => candidate.requiredWhenFieldChanges === field.name)
       .map((candidate) => candidate.name);
     if (
@@ -292,7 +285,7 @@ export function EnhancedConfigDialog({
 
   const normalizedConfigValuesForSave = (): Record<string, ConfigValue> => {
     const normalized: Record<string, ConfigValue> = {};
-    filteredFields.forEach((field) => {
+    configFields.forEach((field) => {
       const value = configValues[field.name];
       if (field.type === "number") {
         if (value !== undefined && value !== "") {
@@ -308,22 +301,10 @@ export function EnhancedConfigDialog({
     return normalized;
   };
 
-  const saveErrorMessage = async (response: Response): Promise<string> => {
-    try {
-      const data = await response.json();
-      if (typeof data.detail === "string" && data.detail) {
-        return data.detail;
-      }
-    } catch {
-      // Fall back to the generic message when the response has no JSON detail.
-    }
-    return "Failed to save configuration";
-  };
-
   const handleSave = async () => {
     // Validate all fields
     const errors: Record<string, string> = {};
-    filteredFields.forEach((field) => {
+    configFields.forEach((field) => {
       const error = validateField(field, configValues[field.name]);
       if (error) {
         errors[field.name] = error;
@@ -345,7 +326,7 @@ export function EnhancedConfigDialog({
       // Save all config values as environment variables using our credentials API
       const response = await fetch(
         withAgentExecutionScope(
-          `${API_BASE_URL}/api/credentials/${service}`,
+          `/api/credentials/${service}`,
           agentName,
           executionScope,
         ),
@@ -359,7 +340,12 @@ export function EnhancedConfigDialog({
       );
 
       if (!response.ok) {
-        throw new Error(await saveErrorMessage(response));
+        throw new Error(
+          await apiErrorMessageFromResponse(
+            response,
+            "Failed to save configuration",
+          ),
+        );
       }
 
       toast({
@@ -385,16 +371,76 @@ export function EnhancedConfigDialog({
     }
   };
 
-  const getFieldIcon = (field: ConfigField) => {
-    if (
-      field.type === "password" ||
-      field.name.toLowerCase().includes("token") ||
-      field.name.toLowerCase().includes("key") ||
-      field.name.toLowerCase().includes("secret")
-    ) {
-      return Key;
+  const renderStringArrayField = (field: ConfigField) => {
+    const value = configValues[field.name];
+    if (value !== undefined && !isStringArray(value)) {
+      return (
+        <div className="space-y-2">
+          <p role="alert" className="text-xs text-destructive">
+            The stored value is not a list of strings. Replace it to enter each
+            value separately.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => handleFieldChange(field, [])}
+          >
+            Replace with empty list
+          </Button>
+        </div>
+      );
     }
-    return null;
+
+    const items = value ?? [];
+    return (
+      <div role="group" aria-label={field.label} className="space-y-2">
+        {items.length === 0 && (
+          <p className="text-xs text-muted-foreground">No values.</p>
+        )}
+        {items.map((item, index) => (
+          <div
+            key={`${field.name}-${index}`}
+            className="flex items-center gap-2"
+          >
+            <Input
+              id={index === 0 ? field.name : `${field.name}-${index}`}
+              aria-label={`${field.label} value ${index + 1}`}
+              value={item}
+              placeholder={field.placeholder ?? field.label}
+              onChange={(event) => {
+                const nextItems = [...items];
+                nextItems[index] = event.target.value;
+                handleFieldChange(field, nextItems);
+              }}
+            />
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              aria-label={`Remove ${field.label} value ${index + 1}`}
+              onClick={() =>
+                handleFieldChange(
+                  field,
+                  items.filter((_, itemIndex) => itemIndex !== index),
+                )
+              }
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
+        ))}
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => handleFieldChange(field, [...items, ""])}
+        >
+          <Plus className="mr-2 h-4 w-4" />
+          Add value
+        </Button>
+      </div>
+    );
   };
 
   const togglePasswordVisibility = (fieldName: string) => {
@@ -405,20 +451,13 @@ export function EnhancedConfigDialog({
     <Dialog open={open} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-[600px]">
         <DialogHeader className="space-y-3">
-          <div className="flex items-center space-x-3">
-            {Icon && (
-              <div className={cn("p-2 rounded-lg bg-muted", iconColor)}>
-                <Icon className="h-5 w-5" />
-              </div>
-            )}
-            <div>
-              <DialogTitle className="text-xl">
-                {isEditing ? "Edit" : "Configure"} {displayName}
-              </DialogTitle>
-              <DialogDescription className="mt-1">
-                {description}
-              </DialogDescription>
-            </div>
+          <div>
+            <DialogTitle className="text-xl">
+              {isEditing ? "Edit" : "Configure"} {displayName}
+            </DialogTitle>
+            <DialogDescription className="mt-1">
+              {description}
+            </DialogDescription>
           </div>
 
           {/* Security Notice */}
@@ -444,7 +483,7 @@ export function EnhancedConfigDialog({
           {docsUrl && (
             <Button
               variant="outline"
-              className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-orange-50 to-amber-50 dark:from-orange-950/20 dark:to-amber-950/20 hover:from-orange-100 hover:to-amber-100 dark:hover:from-orange-950/30 dark:hover:to-amber-950/30 border-orange-200 dark:border-orange-800"
+              className="w-full flex items-center justify-center gap-2"
               onClick={() => window.open(docsUrl, "_blank")}
             >
               <ExternalLink className="h-4 w-4" />
@@ -465,7 +504,7 @@ export function EnhancedConfigDialog({
         ) : (
           <>
             <div className="space-y-4 py-2 max-h-[400px] overflow-y-auto px-1">
-              {filteredFields.length === 0 ? (
+              {configFields.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-8 text-center">
                   <CheckCircle className="h-12 w-12 text-green-500 mb-3" />
                   <p className="text-sm text-muted-foreground">
@@ -476,13 +515,9 @@ export function EnhancedConfigDialog({
                   </p>
                 </div>
               ) : (
-                filteredFields.map((field, index) => {
-                  const FieldIcon = getFieldIcon(field);
-                  const isPasswordField =
-                    field.type === "password" ||
-                    field.name.toLowerCase().includes("token") ||
-                    field.name.toLowerCase().includes("key") ||
-                    field.name.toLowerCase().includes("secret");
+                configFields.map((field, index) => {
+                  const isPasswordField = isSecretField(field);
+                  const FieldIcon = isPasswordField ? Key : null;
                   const hasError = !!fieldErrors[field.name];
 
                   return (
@@ -490,7 +525,7 @@ export function EnhancedConfigDialog({
                       {index > 0 && <Separator className="my-4" />}
 
                       {field.type === "boolean" ? (
-                        <div className="flex items-center space-x-3 p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-white/5 transition-all duration-200">
+                        <div className="flex items-center space-x-3 p-3 rounded-lg hover:bg-secondary transition-all duration-200">
                           <Checkbox
                             id={field.name}
                             checked={configValues[field.name] === true}
@@ -555,49 +590,49 @@ export function EnhancedConfigDialog({
                               </p>
                             )}
                           </div>
-                          <div className="relative">
-                            <Input
-                              id={field.name}
-                              type={
-                                isPasswordField && !showPassword[field.name]
-                                  ? "password"
-                                  : field.type === "number"
-                                    ? "number"
-                                    : "text"
-                              }
-                              placeholder={field.placeholder}
-                              value={String(configValues[field.name] ?? "")}
-                              onChange={(e) =>
-                                handleFieldChange(field, e.target.value)
-                              }
-                              min={field.validation?.min}
-                              max={field.validation?.max}
-                              className={cn(
-                                "pr-10",
-                                hasError &&
-                                  "border-destructive focus-visible:ring-destructive",
-                                isPasswordField && "font-mono",
-                              )}
-                            />
-
-                            {isPasswordField && (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon"
-                                className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
-                                onClick={() =>
-                                  togglePasswordVisibility(field.name)
+                          {field.type === "string[]" ? (
+                            renderStringArrayField(field)
+                          ) : (
+                            <div className="relative">
+                              <Input
+                                id={field.name}
+                                type={
+                                  isPasswordField && !showPassword[field.name]
+                                    ? "password"
+                                    : field.type === "number"
+                                      ? "number"
+                                      : "text"
                                 }
-                              >
-                                {showPassword[field.name] ? (
-                                  <Lock className="h-4 w-4 text-muted-foreground" />
-                                ) : (
-                                  <Lock className="h-4 w-4 text-muted-foreground" />
+                                placeholder={field.placeholder}
+                                value={String(configValues[field.name] ?? "")}
+                                onChange={(e) =>
+                                  handleFieldChange(field, e.target.value)
+                                }
+                                min={field.validation?.min}
+                                max={field.validation?.max}
+                                className={cn(
+                                  "pr-10",
+                                  hasError &&
+                                    "border-destructive focus-visible:ring-destructive",
+                                  isPasswordField && "font-mono",
                                 )}
-                              </Button>
-                            )}
-                          </div>
+                              />
+
+                              {isPasswordField && (
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon"
+                                  className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                                  onClick={() =>
+                                    togglePasswordVisibility(field.name)
+                                  }
+                                >
+                                  <Lock className="h-4 w-4 text-muted-foreground" />
+                                </Button>
+                              )}
+                            </div>
+                          )}
 
                           {hasError && (
                             <div className="flex items-center space-x-1 text-destructive">

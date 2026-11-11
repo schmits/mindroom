@@ -1,169 +1,90 @@
-"""Runtime integration for destructive history compaction."""
+"""Runtime integration for history text compaction."""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import re
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass, replace
+from functools import partial
+from typing import TYPE_CHECKING
 
-from mindroom import model_loading
-from mindroom.agent_storage import (
-    create_session_storage,
-    create_state_storage,
-    get_agent_runtime_state_dbs,
-    get_agent_session,
-    get_team_session,
-)
-from mindroom.constants import prompt_roles_for_history_storage, resolve_session_state_root
-from mindroom.history import agno_team_patch
+from mindroom.failure_text import failure_text
 from mindroom.history.compaction import (
+    ConversationChangedError,
+    clear_manual_compaction_request,
+    compact_running_turn,
     compact_scope_history,
-    estimate_prompt_visible_history_tokens,
-    estimate_session_summary_tokens,
-    scope_visible_runs,
+    load_summarizer,
+    scope_usage_recorder,
+    summarize_runs,
 )
+from mindroom.history.native import configure_native_history, native_history_route
 from mindroom.history.policy import (
     classify_compaction_decision,
     describe_compaction_unavailability,
     resolve_history_execution_plan,
 )
-from mindroom.history.prompt_tokens import estimate_agent_static_tokens, estimate_team_static_tokens
-from mindroom.history.storage import (
-    clear_force_compaction_state,
-    consume_pending_force_compaction_scope,
-    new_scope_session,
-    prune_reintroduced_runs,
-    read_scope_state,
-    set_force_compaction_state,
-    update_scope_state_on_latest,
+from mindroom.history.replay import (
+    configured_replay_plan,
+    estimate_prompt_visible_history_tokens,
+    estimate_summary_tokens,
+    has_effective_persisted_replay,
+    log_replay_plan,
+    plan_replay_that_fits,
+    prompt_visible_history,
+    scope_visible_runs,
 )
+from mindroom.history.storage import (
+    new_scope_session,
+    read_scope_state,
+    set_force_compaction,
+)
+from mindroom.history.summary_call import is_summary_timeout
 from mindroom.history.types import (
     CompactionDecision,
     CompactionLifecycleFailure,
     CompactionLifecycleProgress,
     CompactionLifecycleStart,
+    CompactionLifecycleStatus,
+    CompactionMode,
     CompactionReplyOutcome,
-    HistoryPolicy,
     HistoryScope,
     HistoryScopeState,
     PreparedHistoryState,
     ResolvedHistoryExecutionPlan,
     ResolvedHistorySettings,
-    ResolvedReplayPlan,
+    owner_scope,
 )
 from mindroom.logging_config import get_logger
-from mindroom.team_scope import ad_hoc_team_has_private_member, ad_hoc_team_scope_id
+from mindroom.redaction import redact_sensitive_text
+from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.timing import timed
-from mindroom.token_budget import estimate_text_tokens
+from mindroom.turn_model import ModelScope, resolve_turn_model
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
-    from pathlib import Path
-
-    from agno.agent import Agent
-    from agno.db.base import BaseDb
-    from agno.models.base import Model
-    from agno.session.agent import AgentSession
-    from agno.session.team import TeamSession
-    from agno.team import Team
+    from collections.abc import Awaitable, Callable, Sequence
 
     from mindroom.config.main import Config
-    from mindroom.config.models import CompactionConfig
     from mindroom.constants import RuntimePaths
-    from mindroom.history.types import CompactionLifecycle, CompactionOutcome
+    from mindroom.history.request_size import RequestFrame, RequestSize, RequestSizer
+    from mindroom.history.session_context import ScopeSessionContext
+    from mindroom.history.storage import FoldBasis
+    from mindroom.history.types import CompactionLifecycle, CompactionOutcome, NativeHistory
+    from mindroom.llm.provider import ModelIdentity, ModelProvider
+    from mindroom.llm.runs import AnyRunRecord
+    from mindroom.llm.usage import MessageMetrics
+    from mindroom.session_storage.store import ConversationStore
+    from mindroom.session_storage.summary_rows import Fold
+    from mindroom.session_storage.types import ConversationSession
     from mindroom.timing import DispatchPipelineTiming
-    from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+
 
 logger = get_logger(__name__)
-
-# Applied at history-runtime import so every entry point that replays persisted
-# history gets the Team roleful-input and historical-media stripping patch
-# before any Agno run; slim entry points that only read leaf history types skip it.
-agno_team_patch.apply_patch()
-
-_TEAM_STATE_ROOT_DIRNAME = "teams"
-_TEAM_STORAGE_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_]+")
 
 
 def _elapsed_ms(start: float) -> int:
     """Return elapsed monotonic milliseconds."""
     return int((time.monotonic() - start) * 1000)
-
-
-def _compaction_failure_status(error: BaseException) -> Literal["failed", "timeout"]:
-    failure_reason = str(error) or type(error).__name__
-    if isinstance(error, TimeoutError) or "timed out" in failure_reason.casefold():
-        return "timeout"
-    return "failed"
-
-
-@timed("system_prompt_assembly.history_prepare.compaction_model_init")
-def _load_compaction_model(
-    config: Config,
-    runtime_paths: RuntimePaths,
-    model_name: str,
-) -> Model:
-    """Load the compaction model with dedicated history-preparation timing."""
-    return model_loading.get_model_instance(config, runtime_paths, model_name)
-
-
-def _compaction_fallback_is_distinct(
-    config: Config,
-    *,
-    primary_model_name: str,
-    fallback_model_name: str,
-) -> bool:
-    """Return whether the configured fallback targets a different serving model.
-
-    A fallback that names the primary alias, or a different alias resolving to
-    the same ``(provider, id)``, would resend the refused request to the same
-    model, so it is not loaded at all. Providers are compared through
-    ``model_loading.canonical_provider`` — the same normalization model
-    dispatch uses — so spelling variants like ``vertexai-claude`` and
-    ``vertexai_claude`` count as the same serving model.
-    """
-    if fallback_model_name == primary_model_name:
-        is_distinct = False
-    else:
-        primary_config = config.models.get(primary_model_name)
-        fallback_config = config.models.get(fallback_model_name)
-        if primary_config is None or fallback_config is None:
-            return True
-        is_distinct = (model_loading.canonical_provider(primary_config.provider), primary_config.id) != (
-            model_loading.canonical_provider(fallback_config.provider),
-            fallback_config.id,
-        )
-    if not is_distinct:
-        logger.warning(
-            "Compaction fallback resolves to the primary serving model; continuing without a fallback",
-            compaction_model=primary_model_name,
-            fallback_model=fallback_model_name,
-        )
-    return is_distinct
-
-
-@dataclass(frozen=True)
-class ScopeSessionContext:
-    """Resolved storage/session context for one logical history scope."""
-
-    scope: HistoryScope
-    storage: BaseDb
-    session: AgentSession | TeamSession | None
-    session_id: str | None = None
-    storage_factory: Callable[[], BaseDb] | None = None
-
-
-@dataclass(frozen=True)
-class _BoundTeamScopeContext:
-    """Resolved stable owner and scope for one live team run."""
-
-    owner_agent: Agent
-    owner_agent_name: str
-    scope: HistoryScope
 
 
 def note_prepared_history_timing(
@@ -178,10 +99,9 @@ def note_prepared_history_timing(
         compaction_decision=decision.mode,
         compaction_reply_outcome=prepared_history.compaction_reply_outcome,
         compaction_reason=decision.reason,
-        compaction_current_history_tokens=decision.current_history_tokens,
-        compaction_trigger_budget_tokens=decision.trigger_budget_tokens,
-        compaction_hard_budget_tokens=decision.hard_budget_tokens,
-        compaction_fitted_replay_tokens=decision.fitted_replay_tokens,
+        compaction_request_tokens=decision.request_tokens,
+        compaction_trigger_tokens=decision.trigger_tokens,
+        compaction_limit_tokens=decision.limit_tokens,
         prepared_context_tokens=prepared_history.prepared_context_tokens,
         fitted_replay_tokens=(
             prepared_history.replay_plan.estimated_tokens if prepared_history.replay_plan is not None else None
@@ -189,41 +109,11 @@ def note_prepared_history_timing(
     )
 
 
-def _clear_forced_compaction_after_failure(
-    *,
-    storage: BaseDb,
-    session: AgentSession | TeamSession | None,
-    scope: HistoryScope,
-    state: HistoryScopeState,
-) -> None:
-    """Clear a consumed manual force marker after a compaction failure.
-
-    Clears against the freshest row unconditionally so a failing manual
-    compaction cannot retry-loop on every reply. This deliberately differs
-    from the no-candidates path (_persist_cleared_force_state_if_needed in
-    compaction.py), which refuses to clear when a concurrent write moved the
-    durable row, so a fresh manual request placed mid-run survives.
-    """
-    if session is None or not state.force_compact_before_next_run:
-        return
-    update_scope_state_on_latest(
-        storage,
-        session,
-        scope,
-        lambda latest: replace(latest, force_compact_before_next_run=False),
-    )
-
-
 @dataclass(frozen=True)
-class _HistoryPreparationInputs:
-    """Fully resolved policy/model/token inputs for one history preparation."""
+class HistoryPreparationInputs:
+    """The resolved history settings and execution plan of one history preparation."""
 
     history_settings: ResolvedHistorySettings
-    compaction_config: CompactionConfig
-    has_authored_compaction_config: bool
-    active_model_name: str
-    active_context_window: int | None
-    static_prompt_tokens: int
     execution_plan: ResolvedHistoryExecutionPlan
 
 
@@ -235,154 +125,101 @@ class _ScopeCompactionLifecycleResult:
 
 @dataclass(frozen=True)
 class PreparedScopeHistory:
-    """Durable history preparation result before final replay planning."""
+    """Durable history preparation result before final replay planning; ``session`` names its scope."""
 
-    scope: HistoryScope | None
-    session: AgentSession | TeamSession | None
-    resolved_inputs: _HistoryPreparationInputs
-    compaction_outcomes: list[CompactionOutcome] = field(default_factory=list)
-    compaction_decision: CompactionDecision = field(
-        default_factory=lambda: CompactionDecision(mode="none", reason="unclassified"),
-    )
+    session: ConversationSession | None
+    resolved_inputs: HistoryPreparationInputs
+    compaction_decision: CompactionDecision
+    # The native settings the run's requests carry, when the provider route manages history of its own.
+    native_history: NativeHistory | None
+    # The model the run's requests go to, whose route sizes the final replay plan.
+    model: ModelProvider
+    # The size of the provisional first request without its summary and history.
+    static_tokens: int
     compaction_reply_outcome: CompactionReplyOutcome = "none"
-
-
-@dataclass(frozen=True)
-class _SafeCompactionLifecycle:
-    """Best-effort compaction notice delivery: failures are logged, never raised."""
-
-    lifecycle: CompactionLifecycle | None
-
-    @property
-    def enabled(self) -> bool:
-        """Return whether lifecycle notices are delivered at all."""
-        return self.lifecycle is not None
-
-    async def start(self, event: CompactionLifecycleStart) -> str | None:
-        """Send the initial compaction notice and return its Matrix event id."""
-        if self.lifecycle is None:
-            return None
-        return await self._deliver(
-            self.lifecycle.start(event),
-            phase="start",
-            session_id=event.session_id,
-            scope=event.scope,
-        )
-
-    async def complete_success(self, outcome: CompactionOutcome) -> None:
-        """Edit the lifecycle notice after successful compaction."""
-        if self.lifecycle is None or outcome.lifecycle_notice_event_id is None:
-            return
-        await self._deliver(
-            self.lifecycle.complete_success(outcome),
-            phase="success",
-            session_id=outcome.session_id,
-            scope=outcome.scope,
-        )
-
-    async def progress(self, event: CompactionLifecycleProgress) -> None:
-        """Edit the lifecycle notice after persisted compaction progress."""
-        if self.lifecycle is None or event.notice_event_id is None:
-            return
-        await self._deliver(
-            self.lifecycle.progress(event),
-            phase="progress",
-            session_id=event.session_id,
-            scope=event.scope,
-        )
-
-    async def complete_failure(self, event: CompactionLifecycleFailure) -> None:
-        """Edit the lifecycle notice after failed compaction."""
-        if self.lifecycle is None or event.notice_event_id is None:
-            return
-        await self._deliver(
-            self.lifecycle.complete_failure(event),
-            phase=f"failure:{event.status}",
-            session_id=event.session_id,
-            scope=event.scope,
-        )
-
-    @staticmethod
-    async def _deliver[T](delivery: Awaitable[T], *, phase: str, session_id: str, scope: str) -> T | None:
-        try:
-            return await delivery
-        except Exception:
-            logger.exception(
-                "Compaction lifecycle notice delivery failed",
-                phase=phase,
-                session_id=session_id,
-                scope=scope,
-            )
-            return None
-
-
-def _resolve_history_scope(agent: Agent) -> HistoryScope | None:
-    """Return the persisted history scope addressed by one live agent."""
-    team_id = agent.team_id
-    if isinstance(team_id, str) and team_id:
-        return HistoryScope(kind="team", scope_id=team_id)
-    agent_id = agent.id
-    if isinstance(agent_id, str) and agent_id:
-        return HistoryScope(kind="agent", scope_id=agent_id)
-    return None
+    # The size of the provisional first request, when no compaction rewrote the history it holds.
+    request_size: RequestSize | None = None
 
 
 @timed("system_prompt_assembly.history_prepare.scope_history")
 async def prepare_scope_history(
     *,
-    agent: Agent,
-    agent_name: str,
-    resolved_inputs: _HistoryPreparationInputs,
+    sizer: RequestSizer,
+    frame: RequestFrame,
+    resolved_inputs: HistoryPreparationInputs,
     runtime_paths: RuntimePaths,
     config: Config,
-    scope_context: ScopeSessionContext | None = None,
-    scope: HistoryScope | None = None,
-    compaction_lifecycle: CompactionLifecycle | None = None,
-    pipeline_timing: DispatchPipelineTiming | None = None,
+    scope_context: ScopeSessionContext | None,
+    compaction_lifecycle: CompactionLifecycle | None,
+    pipeline_timing: DispatchPipelineTiming | None,
+    allow_native_compaction: bool,
 ) -> PreparedScopeHistory:
-    """Prepare durable scope history before final replay planning."""
-    resolved_scope = scope or _resolve_history_scope(agent)
+    """Prepare durable scope history before final replay planning; ``sizer`` sizes the run's requests.
+
+    ``frame`` holds what the run's first request holds around the scope's history, with the turn as provisionally
+    prepared; compaction is decided from that request's size.
+    """
+    model = sizer.model
+    execution_plan = resolved_inputs.execution_plan
+    # Encoding a long prompt would stall the replies sharing the event loop.
+    static_tokens = await asyncio.to_thread(model.request_tokens, frame.request())
+    configure_native = partial(
+        configure_native_history,
+        model,
+        plan=execution_plan,
+        history_settings=resolved_inputs.history_settings,
+        allowed=allow_native_compaction,
+        static_tokens=static_tokens,
+    )
     if scope_context is None or scope_context.session is None:
         return PreparedScopeHistory(
-            scope=resolved_scope,
             session=None,
             resolved_inputs=resolved_inputs,
             compaction_decision=CompactionDecision(mode="none", reason="missing_session"),
+            native_history=configure_native(session=None, runs=()),
+            model=model,
+            static_tokens=static_tokens,
         )
 
-    execution_plan = resolved_inputs.execution_plan
     session = scope_context.session
     if pipeline_timing is not None:
         pipeline_timing.mark("history_classify_start")
-    state = _prepare_scope_state_for_run(
-        storage=scope_context.storage,
-        session=session,
-        scope=scope_context.scope,
-        execution_plan=execution_plan,
+    # Preparing the scope state may write the session row; it runs in the database's lane, behind the session's
+    # other writes, and an in-flight write finishes before cancellation propagates.
+    state = await run_session_storage_operation(
+        lambda: scope_context.storage,
+        partial(_prepare_scope_state_for_run, session=session, execution_plan=execution_plan),
     )
-    compaction_outcomes: list[CompactionOutcome] = []
+    visible_runs = scope_visible_runs(session)
+    native_history = configure_native(session=session, runs=visible_runs)
+    if state.force_compact_before_next_run and native_history is not None:
+        native_history = native_history.without_native_compaction()
     compaction_reply_outcome: CompactionReplyOutcome = "none"
-    current_history_tokens = estimate_prompt_visible_history_tokens(
-        session=session,
-        scope=scope_context.scope,
-        history_settings=resolved_inputs.history_settings,
-    )
-    visible_runs = scope_visible_runs(session, scope_context.scope)
+    history = prompt_visible_history(session, resolved_inputs.history_settings)
+    request = partial(frame.request, summary=session.summary, history=history)
+    # Large provider projections spend seconds in tokenizers that release the GIL.
+    request_size = await asyncio.to_thread(sizer.size, request(native=native_history))
+    summary_tokens = await asyncio.to_thread(estimate_summary_tokens, session, model)
+    native_route = native_history_route(native_history)
     compaction_decision = classify_compaction_decision(
         plan=execution_plan,
         force_compact_before_next_run=state.force_compact_before_next_run,
-        current_history_tokens=current_history_tokens,
+        request_tokens=request_size.tokens,
+        summary_request_tokens=static_tokens + summary_tokens,
+        # Only an active native route compacts between the trigger and the limit; without one, text compaction must.
+        allow_native_compaction=native_route is not None,
     )
     logger.info(
         "History preparation check",
-        agent=agent_name,
-        auto_enabled=execution_plan.authored_compaction_enabled and execution_plan.destructive_compaction_available,
-        compaction_available=execution_plan.destructive_compaction_available,
-        trigger_budget=execution_plan.replay_budget_tokens,
-        hard_budget=execution_plan.hard_replay_budget_tokens,
+        scope=scope_context.scope.key,
+        auto_enabled=execution_plan.automatic_compaction and execution_plan.text_compaction_available,
+        compaction_available=execution_plan.text_compaction_available,
+        trigger_tokens=execution_plan.trigger_tokens,
+        limit_tokens=execution_plan.limit_tokens,
         replay_window=execution_plan.replay_window_tokens,
-        static_prompt_tokens=execution_plan.static_prompt_tokens,
-        current_tokens=current_history_tokens,
+        static_tokens=static_tokens,
+        request_tokens=request_size.tokens,
+        reported=request_size.reported,
         force=state.force_compact_before_next_run,
         compaction_decision=compaction_decision.mode,
         compaction_reason=compaction_decision.reason,
@@ -393,36 +230,58 @@ async def prepare_scope_history(
         pipeline_timing.note(
             compaction_decision=compaction_decision.mode,
             compaction_reason=compaction_decision.reason,
-            compaction_current_history_tokens=current_history_tokens,
-            compaction_trigger_budget_tokens=compaction_decision.trigger_budget_tokens,
-            compaction_hard_budget_tokens=compaction_decision.hard_budget_tokens,
-            compaction_fitted_replay_tokens=compaction_decision.fitted_replay_tokens,
+            compaction_request_tokens=compaction_decision.request_tokens,
+            compaction_trigger_tokens=compaction_decision.trigger_tokens,
+            compaction_limit_tokens=compaction_decision.limit_tokens,
         )
 
     if compaction_decision.mode == "required":
+        # The portable text owner always receives canonical history and counts.
+        if native_route is not None:
+            assert native_history is not None
+            native_history = native_history.without_native_compaction()
+            request_size = await asyncio.to_thread(sizer.size, request(native=native_history))
         if pipeline_timing is not None:
             pipeline_timing.mark("required_compaction_start")
+        # A trigger-level pass reports its budget against the trigger, any other against the limit; notices show the
+        # history's share of the request.
+        target = (
+            execution_plan.trigger_tokens
+            if compaction_decision.reason == "over_trigger_native_disabled"
+            else execution_plan.limit_tokens
+        )
+        history_budget = _history_share(target, static_tokens)
+        history_tokens = max(0, request_size.tokens - static_tokens)
         compaction_result = await _run_scope_compaction_with_lifecycle(
-            mode="manual" if state.force_compact_before_next_run else "auto",
-            storage=scope_context.storage,
-            session=session,
+            mode=state.compaction_mode,
+            session_id=session.session_id,
             scope=scope_context.scope,
-            state=state,
-            resolved_inputs=resolved_inputs,
-            history_budget=execution_plan.hard_replay_budget_tokens,
-            current_history_tokens=current_history_tokens,
+            execution_plan=execution_plan,
+            history_budget=history_budget,
+            current_history_tokens=history_tokens,
             runs_before=len(visible_runs),
-            config=config,
-            runtime_paths=runtime_paths,
             compaction_lifecycle=compaction_lifecycle,
+            compact=partial(
+                _compact_before_reply,
+                storage=scope_context.storage,
+                session=session,
+                state=state,
+                resolved_inputs=resolved_inputs,
+                history_budget=history_budget,
+                # A trigger-level pass may store a summary above its target, but never one the reply cannot replay.
+                max_summary_tokens=_history_share(execution_plan.limit_tokens, static_tokens),
+                before_tokens=history_tokens,
+                model=model,
+                config=config,
+                runtime_paths=runtime_paths,
+            ),
         )
         outcome = compaction_result.outcome
         compaction_reply_outcome = compaction_result.reply_outcome
         if outcome is not None:
-            compaction_outcomes.append(outcome)
             logger.info(
                 "Compaction completed",
-                agent=agent_name,
+                scope=scope_context.scope.key,
                 outcome_mode=outcome.mode,
                 before_tokens=outcome.before_tokens,
                 after_tokens=outcome.after_tokens,
@@ -432,281 +291,367 @@ async def prepare_scope_history(
             pipeline_timing.mark("required_compaction_ready")
             pipeline_timing.note(compaction_reply_outcome=compaction_reply_outcome)
     return PreparedScopeHistory(
-        scope=scope_context.scope,
         session=scope_context.session,
         resolved_inputs=resolved_inputs,
-        compaction_outcomes=compaction_outcomes,
         compaction_decision=compaction_decision,
         compaction_reply_outcome=compaction_reply_outcome,
+        native_history=native_history,
+        model=model,
+        static_tokens=static_tokens,
+        # A compaction rewrote the history that request held.
+        request_size=request_size if compaction_decision.mode != "required" else None,
     )
+
+
+# Runs one compaction under the lifecycle wrapper, given the callbacks that report its progress and its success.
+type _ScopeCompactor = Callable[
+    [
+        Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
+        Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+    ],
+    Awaitable[CompactionOutcome | None],
+]
 
 
 async def _run_scope_compaction_with_lifecycle(
     *,
-    mode: Literal["auto", "manual"],
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
+    mode: CompactionMode,
+    session_id: str,
     scope: HistoryScope,
-    state: HistoryScopeState,
-    resolved_inputs: _HistoryPreparationInputs,
+    execution_plan: ResolvedHistoryExecutionPlan,
     history_budget: int | None,
     current_history_tokens: int,
     runs_before: int,
-    config: Config,
-    runtime_paths: RuntimePaths,
     compaction_lifecycle: CompactionLifecycle | None,
+    compact: _ScopeCompactor,
 ) -> _ScopeCompactionLifecycleResult:
-    execution_plan = resolved_inputs.execution_plan
-    assert execution_plan.summary_input_budget_tokens is not None
-    lifecycle = _SafeCompactionLifecycle(compaction_lifecycle if runs_before else None)
+    lifecycle = compaction_lifecycle if runs_before else None
     compaction_start = time.monotonic()
-    notice_event_id = await lifecycle.start(
-        CompactionLifecycleStart(
-            mode=mode,
-            session_id=session.session_id,
-            scope=scope.key,
-            summary_model=execution_plan.compaction_model_name,
-            before_tokens=current_history_tokens,
-            history_budget_tokens=history_budget,
-            runs_before=runs_before,
-            threshold_tokens=execution_plan.trigger_threshold_tokens,
-        ),
+    notify = partial(_send_notice, session_id=session_id, scope=scope)
+    start = CompactionLifecycleStart(
+        mode=mode,
+        session_id=session_id,
+        scope=scope.key,
+        summary_model=execution_plan.compaction_model_name,
+        before_tokens=current_history_tokens,
+        history_budget_tokens=history_budget,
+        runs_before=runs_before,
+        threshold_tokens=execution_plan.trigger_threshold_tokens,
     )
+    notice_event_id = await notify(lifecycle, "start", lambda lifecycle: lifecycle.start(start))
+    # Later notices edit the start notice, so they are sent only when it was.
+    notices = lifecycle if notice_event_id is not None else None
 
     # Progress events report the model that actually served each persisted
     # chunk, so failure notices after a fallback switch name the fallback
     # instead of the configured primary.
     serving_summary_model = execution_plan.compaction_model_name
 
-    def _failure_event(status: Literal["failed", "timeout"], failure_reason: str) -> CompactionLifecycleFailure:
-        return CompactionLifecycleFailure(
+    async def _fail(status: CompactionLifecycleStatus, failure_reason: str) -> None:
+        failure = CompactionLifecycleFailure(
             notice_event_id=notice_event_id,
             mode=mode,
-            session_id=session.session_id,
+            session_id=session_id,
             scope=scope.key,
             summary_model=serving_summary_model,
             status=status,
             duration_ms=_elapsed_ms(compaction_start),
-            failure_reason=failure_reason,
+            failure_reason=redact_sensitive_text(failure_reason),
             history_budget_tokens=history_budget,
         )
+        await notify(notices, f"failure:{status}", lambda lifecycle: lifecycle.complete_failure(failure))
 
     async def _progress(event: CompactionLifecycleProgress) -> None:
         nonlocal serving_summary_model
         serving_summary_model = event.summary_model
-        await lifecycle.progress(replace(event, duration_ms=_elapsed_ms(compaction_start)))
+        event = replace(event, notice_event_id=notice_event_id, duration_ms=_elapsed_ms(compaction_start))
+        await notify(notices, "progress", lambda lifecycle: lifecycle.progress(event))
 
-    progress_callback = _progress if lifecycle.enabled else None
+    completed_successfully = False
+
+    async def _complete(outcome: CompactionOutcome) -> CompactionOutcome:
+        nonlocal completed_successfully
+        outcome = replace(outcome, lifecycle_notice_event_id=notice_event_id, duration_ms=_elapsed_ms(compaction_start))
+        await notify(notices, "success", lambda lifecycle: lifecycle.complete_success(outcome))
+        completed_successfully = True
+        return outcome
+
     try:
-        outcome = await _run_scope_compaction(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
-            resolved_inputs=resolved_inputs,
-            history_budget=history_budget,
-            config=config,
-            runtime_paths=runtime_paths,
-            lifecycle_notice_event_id=notice_event_id,
-            progress_callback=progress_callback,
-        )
+        outcome = await compact(_progress if lifecycle is not None else None, _complete)
     except asyncio.CancelledError as error:
-        await lifecycle.complete_failure(_failure_event("failed", str(error) or type(error).__name__))
+        if not completed_successfully:
+            await _fail("failed", failure_text(error))
         raise
     except Exception as error:
-        _clear_forced_compaction_after_failure(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
-        )
-        status = _compaction_failure_status(error)
-        await lifecycle.complete_failure(_failure_event(status, str(error) or type(error).__name__))
+        status = "timeout" if is_summary_timeout(error) else "failed"
+        await _fail(status, failure_text(error))
         logger.exception(
             "Compaction failed; continuing without compaction",
-            session_id=session.session_id,
+            session_id=session_id,
             scope=scope.key,
-            force_compact_before_next_run=state.force_compact_before_next_run,
+            mode=mode,
         )
-        return _ScopeCompactionLifecycleResult(
-            outcome=None,
-            reply_outcome="timeout" if status == "timeout" else "failed",
-        )
+        return _ScopeCompactionLifecycleResult(outcome=None, reply_outcome=status)
 
-    duration_ms = _elapsed_ms(compaction_start)
     if outcome is None:
-        await lifecycle.complete_failure(_failure_event("failed", "No compactable history remained."))
+        await _fail("failed", "No compactable history remained.")
         return _ScopeCompactionLifecycleResult(outcome=None, reply_outcome="failed")
 
-    outcome = replace(
-        outcome,
-        lifecycle_notice_event_id=notice_event_id,
-        duration_ms=duration_ms,
-    )
-    await lifecycle.complete_success(outcome)
     return _ScopeCompactionLifecycleResult(outcome=outcome, reply_outcome="success")
 
 
-async def _run_scope_compaction(
+async def _send_notice[T](
+    lifecycle: CompactionLifecycle | None,
+    phase: str,
+    send: Callable[[CompactionLifecycle], Awaitable[T]],
     *,
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
+    session_id: str,
     scope: HistoryScope,
+) -> T | None:
+    """Send one compaction notice through ``lifecycle``, if any; notices are best-effort, so a failure is only logged."""
+    if lifecycle is None:
+        return None
+    delivery = send(lifecycle)
+    try:
+        return await delivery
+    except Exception:
+        logger.exception(
+            "Compaction lifecycle notice delivery failed",
+            phase=phase,
+            session_id=session_id,
+            scope=scope.key,
+        )
+        return None
+
+
+async def _compact_before_reply(
+    progress: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
+    complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+    *,
+    storage: ConversationStore,
+    session: ConversationSession,
     state: HistoryScopeState,
-    resolved_inputs: _HistoryPreparationInputs,
+    resolved_inputs: HistoryPreparationInputs,
     history_budget: int | None,
+    max_summary_tokens: int | None,
+    before_tokens: int,
+    model: ModelProvider,
     config: Config,
     runtime_paths: RuntimePaths,
-    lifecycle_notice_event_id: str | None = None,
-    progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None = None,
 ) -> CompactionOutcome | None:
-    execution_plan = resolved_inputs.execution_plan
-    assert execution_plan.summary_input_budget_tokens is not None
-    summary_model = _load_compaction_model(
-        config,
-        runtime_paths,
-        execution_plan.compaction_model_name,
-    )
-    fallback_model_name = execution_plan.compaction_fallback_model_name
-    fallback_summary_input_budget = execution_plan.compaction_fallback_summary_input_budget_tokens
-    fallback_model: Model | None = None
-    if (
-        fallback_model_name is not None
-        and fallback_summary_input_budget is not None
-        and _compaction_fallback_is_distinct(
-            config,
-            primary_model_name=execution_plan.compaction_model_name,
-            fallback_model_name=fallback_model_name,
-        )
-    ):
-        # The fallback is an optional resilience knob: when its construction
-        # fails (missing SDK, credentials, client setup), compaction still
-        # runs on the healthy primary instead of aborting before any call.
-        try:
-            fallback_model = _load_compaction_model(config, runtime_paths, fallback_model_name)
-        except Exception:
-            logger.warning(
-                "Compaction fallback model failed to load; continuing without a fallback",
+    try:
+        return await compact_scope_history(
+            storage=storage,
+            session=session,
+            state=state,
+            summarizer=load_summarizer(
+                resolved_inputs.execution_plan,
+                resolved_inputs.history_settings,
+                config=config,
+                runtime_paths=runtime_paths,
                 session_id=session.session_id,
-                scope=scope.key,
-                compaction_model=execution_plan.compaction_model_name,
-                fallback_model=fallback_model_name,
-                exc_info=True,
-            )
-    return await compact_scope_history(
-        storage=storage,
-        session=session,
+                scope=owner_scope(session),
+                on_usage=scope_usage_recorder(storage, session.session_id),
+            ),
+            available_history_budget=history_budget,
+            max_summary_tokens=max_summary_tokens,
+            before_tokens=before_tokens,
+            replay_window_tokens=resolved_inputs.execution_plan.replay_window_tokens,
+            threshold_tokens=resolved_inputs.execution_plan.trigger_threshold_tokens,
+            progress=progress,
+            complete=complete,
+            model=model,
+        )
+    except ConversationChangedError:
+        # A request the conversation outran stays, so the next reply compacts what the conversation holds then.
+        raise
+    except Exception:
+        # A failing manual compaction must not retry on every reply.
+        await clear_manual_compaction_request(storage=storage, session=session, state=state)
+        raise
+
+
+async def summarize_run_locally(
+    *,
+    resolved_inputs: HistoryPreparationInputs,
+    previous_summary: str | None,
+    snapshots: Sequence[AnyRunRecord],
+    scope: HistoryScope,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    on_usage: Callable[[ModelIdentity, MessageMetrics], Awaitable[None]] | None,
+) -> str:
+    """Summarize one run's own folded messages, oldest first, with the scope's summary model, storing nothing."""
+    summarizer = load_summarizer(
+        resolved_inputs.execution_plan,
+        resolved_inputs.history_settings,
+        config=config,
+        runtime_paths=runtime_paths,
+        session_id=snapshots[0].session_id or "",
         scope=scope,
-        state=state,
-        history_settings=resolved_inputs.history_settings,
-        available_history_budget=history_budget,
-        summary_input_budget=execution_plan.summary_input_budget_tokens,
-        summary_model=summary_model,
-        summary_model_name=execution_plan.compaction_model_name,
-        replay_window_tokens=execution_plan.replay_window_tokens,
-        threshold_tokens=execution_plan.trigger_threshold_tokens,
-        summary_prompt=config.get_prompt("COMPACTION_SUMMARY_PROMPT"),
-        summary_timeout_seconds=execution_plan.compaction_timeout_seconds,
-        fallback_summary_model=fallback_model,
-        fallback_summary_model_name=fallback_model_name if fallback_model is not None else None,
-        fallback_summary_input_budget=fallback_summary_input_budget if fallback_model is not None else None,
-        lifecycle_notice_event_id=lifecycle_notice_event_id,
-        progress_callback=progress_callback,
+        on_usage=on_usage,
     )
+    summary, _ = await summarize_runs(summarizer, previous_summary, snapshots)
+    return summary
+
+
+async def compact_scope_mid_turn(
+    *,
+    storage: ConversationStore,
+    session: ConversationSession,
+    resolved_inputs: HistoryPreparationInputs,
+    basis: FoldBasis,
+    fold: Fold,
+    snapshots: Sequence[AnyRunRecord],
+    before_tokens: int,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    compaction_lifecycle: CompactionLifecycle | None,
+    max_summary_tokens: int,
+    model: ModelProvider,
+    on_commit: Callable[[str], None],
+    rewritten_request_tokens: Callable[[], int],
+) -> CompactionOutcome | None:
+    """Fold the stored runs after ``session``'s latest summary row and the running turn into one summary row.
+
+    A summary over ``max_summary_tokens``, as ``model``'s route sizes it, fails the compaction and stores nothing.
+    """
+    execution_plan = resolved_inputs.execution_plan
+    scope = owner_scope(session)
+
+    async def compact(
+        _progress: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
+        complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+    ) -> CompactionOutcome:
+        # One fold writes one row, so there is no per-chunk progress to report.
+        return await compact_running_turn(
+            storage=storage,
+            session=session,
+            basis=basis,
+            fold=fold,
+            snapshots=snapshots,
+            summarizer=load_summarizer(
+                execution_plan,
+                resolved_inputs.history_settings,
+                config=config,
+                runtime_paths=runtime_paths,
+                session_id=session.session_id,
+                scope=scope,
+                # A first turn's fold records its summary usage before any run of the conversation is stored.
+                on_usage=scope_usage_recorder(
+                    storage,
+                    session.session_id,
+                    initial_session=new_scope_session(session_id=session.session_id, scope=scope),
+                ),
+            ),
+            before_tokens=before_tokens,
+            replay_window_tokens=execution_plan.replay_window_tokens,
+            threshold_tokens=execution_plan.trigger_threshold_tokens,
+            available_history_budget=execution_plan.limit_tokens,
+            max_summary_tokens=max_summary_tokens,
+            model=model,
+            on_commit=on_commit,
+            rewritten_request_tokens=rewritten_request_tokens,
+            complete=complete,
+        )
+
+    result = await _run_scope_compaction_with_lifecycle(
+        mode="auto",
+        session_id=session.session_id,
+        scope=scope,
+        execution_plan=execution_plan,
+        history_budget=execution_plan.limit_tokens,
+        current_history_tokens=before_tokens,
+        runs_before=len(basis.runs) + 1,
+        compaction_lifecycle=compaction_lifecycle,
+        compact=compact,
+    )
+    return result.outcome
+
+
+def _history_share(total: int | None, static_tokens: int) -> int | None:
+    """Return the history's share of a whole-request size: what it holds beyond the request without its history."""
+    return None if total is None else max(0, total - static_tokens)
 
 
 def finalize_history_preparation(
     *,
     prepared_scope_history: PreparedScopeHistory,
-    config: Config,
-    static_prompt_tokens: int | None = None,
-    available_history_budget: int | None = None,
-    pipeline_timing: DispatchPipelineTiming | None = None,
+    frame: RequestFrame,
+    pipeline_timing: DispatchPipelineTiming | None,
 ) -> PreparedHistoryState:
-    """Return the final persisted-replay decision after durable history prep.
-
-    ``available_history_budget`` is an explicit replay-budget override; when
-    None the budget derives from the freshly resolved execution plan.
-    """
+    """Return the final persisted-replay decision after durable history prep, for the run's final ``frame``."""
     if pipeline_timing is not None:
         pipeline_timing.mark("replay_plan_start")
     resolved_inputs = prepared_scope_history.resolved_inputs
-    resolved_static_prompt_tokens = (
-        resolved_inputs.static_prompt_tokens if static_prompt_tokens is None else static_prompt_tokens
-    )
-    execution_plan = resolve_history_execution_plan(
-        config=config,
-        compaction_config=resolved_inputs.compaction_config,
-        has_authored_compaction_config=resolved_inputs.has_authored_compaction_config,
-        active_model_name=resolved_inputs.active_model_name,
-        active_context_window=resolved_inputs.active_context_window,
-        static_prompt_tokens=resolved_static_prompt_tokens,
-    )
-    history_budget = available_history_budget
-    if history_budget is None:
-        # hard_replay_budget_tokens and replay_budget_tokens are resolved together,
-        # so no further fallback is needed when the hard budget is unset.
-        history_budget = (
-            execution_plan.hard_replay_budget_tokens
-            if execution_plan.authored_compaction_enabled
-            else execution_plan.replay_budget_tokens
+    history_settings = resolved_inputs.history_settings
+    execution_plan = resolved_inputs.execution_plan
+    if execution_plan.automatic_compaction and execution_plan.unavailable_reason is not None:
+        logger.warning(
+            "Compaction unavailable for this run",
+            compaction_model=execution_plan.compaction_model_name,
+            reason=describe_compaction_unavailability(execution_plan),
         )
-        if execution_plan.authored_compaction_enabled and execution_plan.unavailable_reason is not None:
-            description = describe_compaction_unavailability(execution_plan)
-            logger.warning(
-                "Compaction unavailable for this run",
-                compaction_model=execution_plan.compaction_model_name,
-                reason=description,
-            )
-
-    if prepared_scope_history.scope is None or prepared_scope_history.session is None:
-        replay_plan = _configured_replay_plan(
-            history_settings=resolved_inputs.history_settings,
-            estimated_tokens=0,
-        )
-        prepared_context_tokens = resolved_static_prompt_tokens + replay_plan.estimated_tokens
-        if pipeline_timing is not None:
-            pipeline_timing.mark("replay_plan_ready")
-            pipeline_timing.note(
-                compaction_reply_outcome=prepared_scope_history.compaction_reply_outcome,
-                prepared_context_tokens=prepared_context_tokens,
-                fitted_replay_tokens=replay_plan.estimated_tokens,
-            )
-        return PreparedHistoryState(
-            compaction_outcomes=prepared_scope_history.compaction_outcomes,
-            replay_plan=replay_plan,
-            replays_persisted_history=False,
-            compaction_decision=prepared_scope_history.compaction_decision,
-            compaction_reply_outcome=prepared_scope_history.compaction_reply_outcome,
-            prepared_context_tokens=prepared_context_tokens,
-        )
-
-    current_history_tokens = estimate_prompt_visible_history_tokens(
-        session=prepared_scope_history.session,
-        scope=prepared_scope_history.scope,
-        history_settings=resolved_inputs.history_settings,
-    )
-    if history_budget is not None:
-        replay_plan = _plan_replay_that_fits(
-            session=prepared_scope_history.session,
-            scope=prepared_scope_history.scope,
-            history_settings=resolved_inputs.history_settings,
-            available_history_budget=history_budget,
-            current_history_tokens=current_history_tokens,
-        )
-        _log_replay_plan(
-            replay_plan=replay_plan,
-            scope=prepared_scope_history.scope,
-            available_history_budget=history_budget,
-            current_history_tokens=current_history_tokens,
-        )
+    model = prepared_scope_history.model
+    static_tokens = model.request_tokens(frame.request())
+    session = prepared_scope_history.session
+    native_history = prepared_scope_history.native_history
+    if session is None:
+        # A scope's first request holds no summary and no history.
+        replay_plan = configured_replay_plan(history_settings=history_settings, estimated_tokens=0)
+        replays_persisted_history = False
     else:
-        replay_plan = _configured_replay_plan(
-            history_settings=resolved_inputs.history_settings,
-            estimated_tokens=current_history_tokens,
+        estimate_history_tokens = partial(
+            estimate_prompt_visible_history_tokens,
+            session=session,
+            history_settings=history_settings,
+            model=model,
         )
+        request_size = prepared_scope_history.request_size
+        estimated: int | None = None
+        if request_size is not None:
+            # The final request holds the prepared one's history beside what the final frame holds, whose turn can
+            # hold unseen thread context the provisional turn did not.
+            request_tokens = request_size.tokens + static_tokens - prepared_scope_history.static_tokens
+        else:
+            # Only a required compaction leaves no size, and it turned native compaction off.
+            estimated = estimate_history_tokens()
+            request_tokens = static_tokens + estimated
+        # The history's share, which a reported size below the static estimate leaves at nothing.
+        history_tokens = max(0, request_tokens - static_tokens)
+        limit = execution_plan.limit_tokens
+        if limit is not None and request_tokens > limit:
+            if estimated is None:
+                estimated = estimate_history_tokens()
+            available_history_budget = _fitting_history_budget(
+                limit=limit,
+                static_tokens=static_tokens,
+                history_tokens=history_tokens,
+                estimated_history_tokens=estimated,
+                reported=request_size is not None and request_size.reported,
+            )
+            if native_history is not None:
+                # Never trim a native checkpoint by run/message count, and never let the provider checkpoint a trimmed
+                # request, which would replace history it never held. Fall back to the canonical guard.
+                native_history = native_history.without_native_compaction()
+            replay_plan = plan_replay_that_fits(
+                session=session,
+                history_settings=history_settings,
+                available_history_budget=available_history_budget,
+                current_history_tokens=estimated,
+                model=model,
+            )
+            log_replay_plan(
+                replay_plan=replay_plan,
+                scope=owner_scope(session),
+                available_history_budget=available_history_budget,
+                current_history_tokens=estimated,
+            )
+        else:
+            replay_plan = configured_replay_plan(history_settings=history_settings, estimated_tokens=history_tokens)
+        replays_persisted_history = has_effective_persisted_replay(session=session, replay_plan=replay_plan)
 
-    prepared_context_tokens = resolved_static_prompt_tokens + replay_plan.estimated_tokens
+    prepared_context_tokens = static_tokens + replay_plan.estimated_tokens
     if pipeline_timing is not None:
         pipeline_timing.mark("replay_plan_ready")
         pipeline_timing.note(
@@ -715,767 +660,85 @@ def finalize_history_preparation(
             fitted_replay_tokens=replay_plan.estimated_tokens,
         )
     return PreparedHistoryState(
-        compaction_outcomes=prepared_scope_history.compaction_outcomes,
         replay_plan=replay_plan,
-        replays_persisted_history=_has_effective_persisted_replay(
-            session=prepared_scope_history.session,
-            scope=prepared_scope_history.scope,
-            replay_plan=replay_plan,
-        ),
+        replays_persisted_history=replays_persisted_history,
         compaction_decision=prepared_scope_history.compaction_decision,
         compaction_reply_outcome=prepared_scope_history.compaction_reply_outcome,
         prepared_context_tokens=prepared_context_tokens,
+        native_history=native_history,
     )
 
 
-@timed("system_prompt_assembly.history_prepare.scope_history")
-async def prepare_bound_scope_history(
+def _fitting_history_budget(
     *,
-    agents: list[Agent],
-    team: Team | None = None,
-    full_prompt: str,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    scope_context: ScopeSessionContext | None = None,
-    team_name: str | None = None,
-    active_model_name: str | None = None,
-    active_context_window: int | None = None,
-    static_prompt_tokens: int | None = None,
-    compaction_lifecycle: CompactionLifecycle | None = None,
-    pipeline_timing: DispatchPipelineTiming | None = None,
-) -> PreparedScopeHistory:
-    """Prepare one team-owned scope by compacting its persisted session before the run."""
-    if scope_context is not None:
-        owner_agent, owner_agent_name = _resolve_bound_history_owner(agents)
-        bound_scope = (
-            _BoundTeamScopeContext(
-                owner_agent=owner_agent,
-                owner_agent_name=owner_agent_name,
-                scope=scope_context.scope,
-            )
-            if owner_agent is not None and owner_agent_name is not None
-            else None
-        )
-    elif team_name is None and ad_hoc_team_has_private_member(_ad_hoc_team_agent_names(agents), config.agents):
-        bound_scope = None
-    else:
-        bound_scope = resolve_bound_team_scope_context(
-            agents=agents,
-            config=config,
-            team_name=team_name,
-        )
-    resolved_static_prompt_tokens = (
-        static_prompt_tokens
-        if static_prompt_tokens is not None
-        else (
-            _estimate_preparation_static_tokens_for_team(
-                team,
-                full_prompt=full_prompt,
-            )
-            if team is not None
-            else _estimate_preparation_prompt_tokens(
-                full_prompt=full_prompt,
-            )
-        )
-    )
-    resolved_inputs = _resolve_entity_preparation_inputs(
-        config=config,
-        entity_name=team_name if team_name in config.teams else None,
-        static_prompt_tokens=resolved_static_prompt_tokens,
-        active_model_name=active_model_name,
-        active_context_window=active_context_window,
-    )
-    if bound_scope is None:
-        return PreparedScopeHistory(
-            scope=None,
-            session=None,
-            resolved_inputs=resolved_inputs,
-        )
-
-    return await prepare_scope_history(
-        agent=bound_scope.owner_agent,
-        agent_name=bound_scope.owner_agent_name,
-        resolved_inputs=resolved_inputs,
-        runtime_paths=runtime_paths,
-        config=config,
-        scope_context=scope_context,
-        scope=bound_scope.scope,
-        compaction_lifecycle=compaction_lifecycle,
-        pipeline_timing=pipeline_timing,
-    )
-
-
-def _resolve_bound_history_owner(agents: list[Agent]) -> tuple[Agent | None, str | None]:
-    """Return the canonical storage owner for one bound team run."""
-    candidates = [(agent_id, agent) for agent in agents if isinstance((agent_id := agent.id), str) and agent_id]
-    if not candidates:
-        return None, None
-
-    owner_agent_name = min(agent_id for agent_id, _agent in candidates)
-    for agent_id, agent in candidates:
-        if agent_id == owner_agent_name:
-            return agent, owner_agent_name
-    return None, None
-
-
-def resolve_bound_team_scope_context(
-    *,
-    agents: list[Agent],
-    config: Config,
-    team_name: str | None = None,
-    execution_identity: ToolExecutionIdentity | None = None,
-) -> _BoundTeamScopeContext | None:
-    """Resolve the stable owner and scope backing one live team run."""
-    owner_agent, owner_agent_name = _resolve_bound_history_owner(agents)
-    if owner_agent is None or owner_agent_name is None:
-        return None
-
-    if team_name is not None and team_name in config.teams:
-        team_scope_id = team_name
-    else:
-        team_scope_id = ad_hoc_team_scope_id(
-            _ad_hoc_team_agent_names(agents),
-            config.agents,
-            requester_user_id=execution_identity.requester_id if execution_identity is not None else None,
-        )
-    if team_scope_id is None:
-        return None
-    scope = HistoryScope(kind="team", scope_id=team_scope_id)
-    return _BoundTeamScopeContext(
-        owner_agent=owner_agent,
-        owner_agent_name=owner_agent_name,
-        scope=scope,
-    )
-
-
-def _estimate_preparation_prompt_tokens(
-    *,
-    full_prompt: str,
+    limit: int,
+    static_tokens: int,
+    history_tokens: int,
+    estimated_history_tokens: int,
+    reported: bool,
 ) -> int:
-    """Estimate prompt-only tokens for persisted replay planning."""
-    return estimate_text_tokens(full_prompt)
+    """Return the most history, in estimate units, a trimmed replay may keep beside ``static_tokens`` within ``limit``.
+
+    Trimming sizes candidate replays by estimate. When the provider's count of this conversation (``history_tokens``,
+    reported) shows the estimate undercounts by ``history_tokens / estimated_history_tokens``, the budget shrinks into
+    the estimate's units; it never widens, since that ratio fits the whole history and the newest runs trimming keeps
+    may overcount less. A static part at or over the limit leaves no room.
+    """
+    budget = max(0, limit - static_tokens)
+    if not reported or history_tokens <= 0:
+        return budget
+    return min(budget, budget * estimated_history_tokens // history_tokens)
 
 
-def _estimate_preparation_static_tokens_for_team(
-    team: Team,
-    *,
-    full_prompt: str,
-) -> int:
-    """Estimate team static tokens for persisted replay planning."""
-    return estimate_team_static_tokens(team, full_prompt)
-
-
-@contextmanager
-def _open_scope_storage(
-    *,
-    agent_name: str,
-    scope: HistoryScope,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    execution_identity: ToolExecutionIdentity | None,
-) -> Iterator[BaseDb]:
-    """Open the canonical storage for one persisted history scope."""
-    storage = create_scope_session_storage(
-        agent_name=agent_name,
-        scope=scope,
-        config=config,
-        runtime_paths=runtime_paths,
-        execution_identity=execution_identity,
-    )
-    try:
-        yield storage
-    finally:
-        storage.close()
-
-
-def _build_scope_session_context(
-    *,
-    scope: HistoryScope | None,
-    session_id: str | None,
-    storage: BaseDb,
-    storage_factory: Callable[[], BaseDb],
-    create_session_if_missing: bool = False,
-) -> ScopeSessionContext | None:
-    """Build one scope/session context from an already-open storage handle."""
-    if session_id is None or scope is None:
-        return None
-
-    session = get_team_session(storage, session_id) if scope.kind == "team" else get_agent_session(storage, session_id)
-    if session is None and create_session_if_missing:
-        session = new_scope_session(
-            session_id=session_id,
-            scope_id=scope.scope_id,
-            is_team=scope.kind == "team",
-        )
-    return ScopeSessionContext(
-        scope=scope,
-        storage=storage,
-        session=session,
-        session_id=session_id,
-        storage_factory=storage_factory,
-    )
-
-
-@contextmanager
-def open_resolved_scope_session_context(
-    *,
-    agent_name: str,
-    scope: HistoryScope | None,
-    session_id: str | None,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    execution_identity: ToolExecutionIdentity | None,
-    create_session_if_missing: bool = False,
-) -> Iterator[ScopeSessionContext | None]:
-    """Open one already-resolved persisted history scope for the current request."""
-    if session_id is None:
-        yield None
-        return
-    if scope is None:
-        yield None
-        return
-
-    def storage_factory() -> BaseDb:
-        return create_scope_session_storage(
-            agent_name=agent_name,
-            scope=scope,
-            config=config,
-            runtime_paths=runtime_paths,
-            execution_identity=execution_identity,
-        )
-
-    with _open_scope_storage(
-        agent_name=agent_name,
-        scope=scope,
-        runtime_paths=runtime_paths,
-        config=config,
-        execution_identity=execution_identity,
-    ) as storage:
-        yield _build_scope_session_context(
-            scope=scope,
-            session_id=session_id,
-            storage=storage,
-            storage_factory=storage_factory,
-            create_session_if_missing=create_session_if_missing,
-        )
-
-
-@contextmanager
-def open_scope_session_context(
-    *,
-    agent: Agent,
-    agent_name: str,
-    session_id: str | None,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    execution_identity: ToolExecutionIdentity | None,
-    scope: HistoryScope | None = None,
-    create_session_if_missing: bool = False,
-) -> Iterator[ScopeSessionContext | None]:
-    """Open the canonical persisted history scope for one live agent."""
-    resolved_scope = scope or _resolve_history_scope(agent)
-    with open_resolved_scope_session_context(
-        agent_name=agent_name,
-        scope=resolved_scope,
-        session_id=session_id,
-        runtime_paths=runtime_paths,
-        config=config,
-        execution_identity=execution_identity,
-        create_session_if_missing=create_session_if_missing,
-    ) as scope_context:
-        yield scope_context
-
-
-@contextmanager
-def open_bound_scope_session_context(
-    *,
-    agents: list[Agent],
-    session_id: str | None,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    execution_identity: ToolExecutionIdentity | None,
-    team_name: str | None = None,
-    scope: HistoryScope | None = None,
-    create_session_if_missing: bool = False,
-) -> Iterator[ScopeSessionContext | None]:
-    """Open the canonical scope-backed session context for one bound team run."""
-    if scope is not None:
-        _owner_agent, owner_agent_name = _resolve_bound_history_owner(agents)
-        if owner_agent_name is None:
-            yield None
-            return
-        with open_resolved_scope_session_context(
-            agent_name=owner_agent_name,
-            scope=scope,
-            session_id=session_id,
-            runtime_paths=runtime_paths,
-            config=config,
-            execution_identity=execution_identity,
-            create_session_if_missing=create_session_if_missing,
-        ) as scope_context:
-            yield scope_context
-        return
-    if not agents and team_name is not None and team_name in config.teams:
-        with open_resolved_scope_session_context(
-            agent_name=team_name,
-            scope=HistoryScope(kind="team", scope_id=team_name),
-            session_id=session_id,
-            runtime_paths=runtime_paths,
-            config=config,
-            execution_identity=execution_identity,
-            create_session_if_missing=create_session_if_missing,
-        ) as scope_context:
-            yield scope_context
-        return
-
-    bound_scope = resolve_bound_team_scope_context(
-        agents=agents,
-        config=config,
-        team_name=team_name,
-        execution_identity=execution_identity,
-    )
-    if bound_scope is None:
-        yield None
-        return
-    with open_resolved_scope_session_context(
-        agent_name=bound_scope.owner_agent_name,
-        scope=bound_scope.scope,
-        session_id=session_id,
-        runtime_paths=runtime_paths,
-        config=config,
-        execution_identity=execution_identity,
-        create_session_if_missing=create_session_if_missing,
-    ) as scope_context:
-        yield scope_context
-
-
-def create_scope_session_storage(
-    *,
-    agent_name: str,
-    scope: HistoryScope,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    execution_identity: ToolExecutionIdentity | None,
-) -> BaseDb:
-    """Create the canonical storage for one persisted history scope."""
-    if scope.kind == "agent":
-        return create_session_storage(
-            agent_name,
-            config,
-            runtime_paths,
-            execution_identity=execution_identity,
-        )
-
-    storage_name = _scope_session_storage_name(scope)
-    return create_state_storage(
-        storage_name=storage_name,
-        state_root=resolve_session_state_root(
-            _team_scope_state_root(storage_name=storage_name, runtime_paths=runtime_paths),
-            runtime_paths,
-        ),
-        subdir="sessions",
-        session_table=f"{storage_name}_sessions",
-        prompt_roles=prompt_roles_for_history_storage(),
-    )
-
-
-def _close_unique_state_dbs(*storages: BaseDb | None) -> None:
-    """Close each distinct state DB handle at most once."""
-    seen: set[int] = set()
-    for storage in storages:
-        if storage is None:
-            continue
-        storage_id = id(storage)
-        if storage_id in seen:
-            continue
-        seen.add(storage_id)
-        storage.close()
-
-
-def close_agent_runtime_state_dbs(
-    agent: Agent | None,
-    *,
-    shared_scope_storage: BaseDb | None = None,
-) -> None:
-    """Close one agent's runtime-owned state DB handles except a shared scope storage."""
-    if agent is None:
-        return
-    _close_unique_state_dbs(
-        *(storage for storage in get_agent_runtime_state_dbs(agent) if storage is not shared_scope_storage),
-    )
-
-
-def close_team_runtime_state_dbs(
-    *,
-    agents: list[Agent],
-    team_db: BaseDb | None,
-    shared_scope_storage: BaseDb | None = None,
-) -> None:
-    """Close all runtime-owned state DB handles for one team request."""
-    _close_unique_state_dbs(
-        *(
-            storage
-            for agent in agents
-            for storage in get_agent_runtime_state_dbs(agent)
-            if storage is not shared_scope_storage
-        ),
-        team_db if team_db is not shared_scope_storage else None,
-    )
-
-
-def _scope_session_storage_name(scope: HistoryScope) -> str:
-    if scope.kind == "agent":
-        return scope.scope_id
-    normalized_scope_id = _TEAM_STORAGE_NAME_PATTERN.sub("_", scope.scope_id).strip("_") or "team"
-    digest = hashlib.sha256(scope.key.encode()).hexdigest()[:12]
-    return f"team_{normalized_scope_id}_{digest}"
-
-
-def _team_scope_state_root(
-    *,
-    storage_name: str,
-    runtime_paths: RuntimePaths,
-) -> Path:
-    return runtime_paths.storage_root / _TEAM_STATE_ROOT_DIRNAME / storage_name
-
-
-def _ad_hoc_team_agent_names(agents: list[Agent]) -> tuple[str, ...]:
-    return tuple(agent_id for agent in agents if isinstance((agent_id := agent.id), str) and agent_id)
-
-
-def _history_settings_from_agent(agent: Agent) -> ResolvedHistorySettings:
-    if agent.num_history_messages is not None:
-        policy = HistoryPolicy(mode="messages", limit=agent.num_history_messages)
-    elif agent.num_history_runs is not None:
-        policy = HistoryPolicy(mode="runs", limit=agent.num_history_runs)
-    else:
-        policy = HistoryPolicy(mode="all")
-    return ResolvedHistorySettings(
-        policy=policy,
-        max_tool_calls_from_history=agent.max_tool_calls_from_history,
-        system_message_role=agent.system_message_role,
-    )
-
-
-def _resolve_entity_preparation_inputs(
+def resolve_entity_preparation_inputs(
     *,
     config: Config,
-    entity_name: str | None,
-    static_prompt_tokens: int,
-    active_model_name: str | None,
+    runtime_paths: RuntimePaths,
+    history_settings: ResolvedHistorySettings,
+    active_model_name: str,
     active_context_window: int | None,
-    history_settings: ResolvedHistorySettings | None = None,
-    compaction_config: CompactionConfig | None = None,
-    has_authored_compaction_config: bool | None = None,
-    execution_plan: ResolvedHistoryExecutionPlan | None = None,
-) -> _HistoryPreparationInputs:
-    resolved_entity = config.resolve_entity(entity_name)
-    resolved_history_settings = history_settings
-    if resolved_history_settings is None:
-        resolved_history_settings = resolved_entity.history_settings
+) -> HistoryPreparationInputs:
+    """Resolve the runtime model and plan for one agent or team scope.
 
-    resolved_compaction_config = compaction_config
-    if resolved_compaction_config is None:
-        resolved_compaction_config = resolved_entity.compaction_config
-
-    resolved_has_authored_compaction_config = has_authored_compaction_config
-    if resolved_has_authored_compaction_config is None:
-        resolved_has_authored_compaction_config = resolved_entity.has_authored_compaction_config
-
-    runtime_model = config.resolve_runtime_model(
-        entity_name=entity_name,
-        active_model_name=active_model_name,
-        active_context_window=active_context_window,
+    ``active_model_name`` is the model the turn resolved, which every scope prepares under, and
+    ``active_context_window`` its window when the turn set one. ``history_settings`` are the ones the entity's build
+    resolved, whose replay policy and compaction config the scope follows.
+    """
+    runtime_model = resolve_turn_model(
+        config,
+        runtime_paths,
+        ModelScope(
+            entity=None,
+            explicit=active_model_name,
+            explicit_context_window=active_context_window,
+        ),
+        None,
     )
-    resolved_execution_plan = (
-        execution_plan
-        if execution_plan is not None
-        else resolve_history_execution_plan(
+    return HistoryPreparationInputs(
+        history_settings=history_settings,
+        execution_plan=resolve_history_execution_plan(
             config=config,
-            compaction_config=resolved_compaction_config,
-            has_authored_compaction_config=resolved_has_authored_compaction_config,
+            history_settings=history_settings,
             active_model_name=runtime_model.model_name,
             active_context_window=runtime_model.context_window,
-            static_prompt_tokens=static_prompt_tokens,
-        )
-    )
-
-    return _HistoryPreparationInputs(
-        history_settings=resolved_history_settings,
-        compaction_config=resolved_compaction_config,
-        has_authored_compaction_config=resolved_has_authored_compaction_config,
-        active_model_name=runtime_model.model_name,
-        active_context_window=runtime_model.context_window,
-        static_prompt_tokens=static_prompt_tokens,
-        execution_plan=resolved_execution_plan,
-    )
-
-
-def resolve_agent_preparation_inputs(
-    *,
-    agent: Agent,
-    agent_name: str,
-    full_prompt: str,
-    config: Config,
-    history_settings: ResolvedHistorySettings | None = None,
-    compaction_config: CompactionConfig | None = None,
-    has_authored_compaction_config: bool | None = None,
-    active_model_name: str | None = None,
-    active_context_window: int | None = None,
-    static_prompt_tokens: int | None = None,
-    execution_plan: ResolvedHistoryExecutionPlan | None = None,
-) -> _HistoryPreparationInputs:
-    """Resolve every history-preparation input for one agent run in one place.
-
-    Explicitly provided values win; everything else falls back to the agent's
-    authored config (or the live Agent object for unconfigured agents).
-    """
-    resolved_static_prompt_tokens = static_prompt_tokens
-    if resolved_static_prompt_tokens is None:
-        resolved_static_prompt_tokens = estimate_agent_static_tokens(agent, full_prompt)
-    resolved_history_settings = history_settings
-    if resolved_history_settings is None and agent_name not in config.agents:
-        resolved_history_settings = _history_settings_from_agent(agent)
-    return _resolve_entity_preparation_inputs(
-        config=config,
-        entity_name=agent_name if agent_name in config.agents else None,
-        static_prompt_tokens=resolved_static_prompt_tokens,
-        active_model_name=active_model_name,
-        active_context_window=active_context_window,
-        history_settings=resolved_history_settings,
-        compaction_config=compaction_config,
-        has_authored_compaction_config=has_authored_compaction_config,
-        execution_plan=execution_plan,
+        ),
     )
 
 
 def _prepare_scope_state_for_run(
+    storage: ConversationStore,
     *,
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
+    session: ConversationSession,
     execution_plan: ResolvedHistoryExecutionPlan,
 ) -> HistoryScopeState:
-    state = read_scope_state(session, scope)
-    # Persists its own deletes; the session row has nothing new to write.
-    prune_reintroduced_runs(storage, session, state)
-    if consume_pending_force_compaction_scope(session, scope):
-        state = set_force_compaction_state(session, scope, state, force=True)
-        storage.upsert_session(session)
-    if state.force_compact_before_next_run and not execution_plan.destructive_compaction_available:
-        state = clear_force_compaction_state(session, scope, state)
-        storage.upsert_session(session)
-        description = describe_compaction_unavailability(execution_plan)
+    state = read_scope_state(session)
+    if state.force_compact_before_next_run and not execution_plan.text_compaction_available:
+        set_force_compaction(storage, session=session, forced=False)
+        state = HistoryScopeState()
         logger.warning(
-            "Forced compaction skipped because destructive compaction is unavailable",
+            "Forced compaction skipped because text compaction is unavailable",
             session_id=session.session_id,
-            scope=scope.key,
-            reason=description,
+            scope=owner_scope(session).key,
+            reason=describe_compaction_unavailability(execution_plan),
         )
     return state
-
-
-def _plan_replay_that_fits(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-    available_history_budget: int,
-    current_history_tokens: int,
-) -> ResolvedReplayPlan:
-    """Return the safest persisted-replay plan that fits the current run budget."""
-    if current_history_tokens <= available_history_budget:
-        return _configured_replay_plan(
-            history_settings=history_settings,
-            estimated_tokens=current_history_tokens,
-        )
-
-    limit_mode, max_limit = _context_window_guard_limit_bounds(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-    )
-    fitting_limit, fitting_tokens = _find_fitting_history_limit_for_budget(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-        available_history_budget=available_history_budget,
-        limit_mode=limit_mode,
-        max_limit=max_limit,
-    )
-    if fitting_limit > 0:
-        num_history_runs, num_history_messages = _history_limit_fields(limit_mode, fitting_limit)
-        return ResolvedReplayPlan(
-            mode="limited",
-            estimated_tokens=fitting_tokens,
-            add_history_to_context=True,
-            num_history_runs=num_history_runs,
-            num_history_messages=num_history_messages,
-        )
-
-    return ResolvedReplayPlan(
-        mode="disabled",
-        estimated_tokens=_session_summary_replay_tokens(session),
-        add_history_to_context=False,
-    )
-
-
-def apply_replay_plan(
-    *,
-    target: Agent | Team,
-    replay_plan: ResolvedReplayPlan,
-) -> None:
-    """Apply one resolved persisted-replay plan to a live Agent or Team."""
-    target.add_history_to_context = replay_plan.add_history_to_context
-    target.num_history_runs = replay_plan.num_history_runs
-    target.num_history_messages = replay_plan.num_history_messages
-
-
-def _context_window_guard_limit_bounds(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-) -> tuple[Literal["runs", "messages"], int]:
-    configured_limit = history_settings.policy.limit or 0
-    if history_settings.policy.mode == "messages":
-        return "messages", configured_limit
-
-    visible_run_count = len(scope_visible_runs(session, scope))
-    if history_settings.policy.mode == "all":
-        return "runs", visible_run_count
-    return "runs", min(configured_limit, visible_run_count)
-
-
-def _find_fitting_history_limit_for_budget(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-    available_history_budget: int,
-    limit_mode: Literal["runs", "messages"],
-    max_limit: int,
-) -> tuple[int, int]:
-    if max_limit <= 0 or available_history_budget <= 0:
-        return 0, 0
-
-    low = 1
-    high = max_limit
-    best = 0
-    best_tokens = 0
-    while low <= high:
-        mid = (low + high) // 2
-        candidate_tokens = estimate_prompt_visible_history_tokens(
-            session=session,
-            scope=scope,
-            history_settings=_history_settings_with_limit(
-                history_settings,
-                mode=limit_mode,
-                limit=mid,
-            ),
-        )
-        if candidate_tokens <= available_history_budget:
-            best = mid
-            best_tokens = candidate_tokens
-            low = mid + 1
-        else:
-            high = mid - 1
-    return best, best_tokens
-
-
-def _log_replay_plan(
-    *,
-    replay_plan: ResolvedReplayPlan,
-    scope: HistoryScope,
-    available_history_budget: int,
-    current_history_tokens: int,
-) -> None:
-    if replay_plan.mode == "configured":
-        return
-
-    if replay_plan.mode == "limited":
-        logger.warning(
-            "Replay planner reduced persisted replay for this run",
-            scope=scope.key,
-            num_history_runs=replay_plan.num_history_runs,
-            num_history_messages=replay_plan.num_history_messages,
-            estimated_tokens=current_history_tokens,
-            fitted_tokens=replay_plan.estimated_tokens,
-            available_history_budget=available_history_budget,
-        )
-        return
-
-    logger.warning(
-        "Replay planner disabled raw persisted replay for this run",
-        scope=scope.key,
-        estimated_tokens=current_history_tokens,
-        fitted_tokens=replay_plan.estimated_tokens,
-        available_history_budget=available_history_budget,
-    )
-
-
-def _configured_replay_plan(
-    *,
-    history_settings: ResolvedHistorySettings,
-    estimated_tokens: int,
-) -> ResolvedReplayPlan:
-    num_history_runs, num_history_messages = _history_limit_fields(
-        history_settings.policy.mode,
-        history_settings.policy.limit,
-    )
-    return ResolvedReplayPlan(
-        mode="configured",
-        estimated_tokens=estimated_tokens,
-        add_history_to_context=True,
-        num_history_runs=num_history_runs,
-        num_history_messages=num_history_messages,
-    )
-
-
-def _history_settings_with_limit(
-    history_settings: ResolvedHistorySettings,
-    *,
-    mode: Literal["runs", "messages"],
-    limit: int,
-) -> ResolvedHistorySettings:
-    return ResolvedHistorySettings(
-        policy=HistoryPolicy(mode=mode, limit=limit),
-        max_tool_calls_from_history=history_settings.max_tool_calls_from_history,
-        system_message_role=history_settings.system_message_role,
-    )
-
-
-def _history_limit_fields(
-    mode: Literal["all", "runs", "messages"],
-    limit: int | None,
-) -> tuple[int | None, int | None]:
-    if mode == "runs":
-        return limit, None
-    if mode == "messages":
-        return None, limit
-    return None, None
-
-
-def _has_effective_persisted_replay(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    replay_plan: ResolvedReplayPlan,
-) -> bool:
-    if _session_has_summary_replay(session):
-        return True
-    if not replay_plan.add_history_to_context:
-        return False
-    return bool(scope_visible_runs(session, scope))
-
-
-def _session_has_summary_replay(session: AgentSession | TeamSession) -> bool:
-    if session.summary is None:
-        return False
-    return bool(session.summary.summary.strip())
-
-
-def _session_summary_replay_tokens(session: AgentSession | TeamSession) -> int:
-    if session.summary is None:
-        return 0
-    return estimate_session_summary_tokens(session.summary.summary)

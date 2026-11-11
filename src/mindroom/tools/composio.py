@@ -1,27 +1,36 @@
 """Composio tool configuration."""
 
-from __future__ import annotations
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
-from typing import TYPE_CHECKING
-
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.vendor_telemetry import disable_vendor_telemetry
 
 if TYPE_CHECKING:
-    from composio_agno import ComposioToolSet
+    from agno.tools import Toolkit
 
 
 @register_tool_with_metadata(
     name="composio",
+    file_access=ToolFileAccess.UNCONFINED,
     display_name="Composio",
     description="Access 1000+ integrations including Gmail, Salesforce, GitHub, and more",
     category=ToolCategory.INTEGRATIONS,
     status=ToolStatus.REQUIRES_CONFIG,
     setup_type=SetupType.API_KEY,
+    requires_primary_runtime=True,
     icon="FaConnectdevelop",
     icon_color="text-blue-600",
     config_fields=[
+        ConfigField(
+            name="actions",
+            label="Actions",
+            type="string[]",
+            required=True,
+            placeholder="GITHUB_GET_THE_AUTHENTICATED_USER",
+            description="Nonempty list of Composio action IDs to expose to the agent",
+        ),
         # Authentication/Connection parameters first
         ConfigField(
             name="api_key",
@@ -55,39 +64,6 @@ if TYPE_CHECKING:
             required=False,
             placeholder="workspace_123",
             description="Workspace identifier for organizing tools and data",
-        ),
-        ConfigField(
-            name="workspace_config",
-            label="Workspace Config",
-            type="text",
-            required=False,
-            placeholder='{"type": "local"}',
-            description="JSON configuration for workspace settings",
-        ),
-        # Connection Configuration
-        ConfigField(
-            name="connected_account_ids",
-            label="Connected Account IDs",
-            type="text",
-            required=False,
-            placeholder='{"github": "account_123"}',
-            description="JSON mapping of app names to connected account IDs",
-        ),
-        # Advanced Configuration
-        ConfigField(
-            name="metadata",
-            label="Metadata",
-            type="text",
-            required=False,
-            placeholder='{"key": "value"}',
-            description="JSON metadata for tools and actions configuration",
-        ),
-        ConfigField(
-            name="processors",
-            label="Processors",
-            type="text",
-            required=False,
-            description="Custom processors configuration (JSON format)",
         ),
         ConfigField(
             name="output_dir",
@@ -147,56 +123,57 @@ if TYPE_CHECKING:
             default=True,
             description="Enable file locking for concurrent operations",
         ),
-        # Logging Configuration
-        ConfigField(
-            name="logging_level",
-            label="Logging Level",
-            type="text",
-            required=False,
-            default="INFO",
-            placeholder="INFO",
-            description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
-        ),
     ],
     dependencies=["composio-agno"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/composio",
+    docs_url="https://docs.mindroom.chat/tools/automation-and-platforms/#composio",
     supports_toolkit_filters=False,
-    function_names=(
-        "check_connected_account",
-        "create_integration",
-        "create_trigger_listener",
-        "delete_trigger",
-        "execute_action",
-        "execute_request",
-        "fetch_expected_integration_params",
-        "find_actions_by_tags",
-        "find_actions_by_use_case",
-        "get_action",
-        "get_action_schemas",
-        "get_active_triggers",
-        "get_agent_instructions",
-        "get_app",
-        "get_apps",
-        "get_auth_params",
-        "get_auth_scheme_for_app",
-        "get_auth_schemes",
-        "get_connected_account",
-        "get_connected_accounts",
-        "get_entity",
-        "get_expected_params_for_user",
-        "get_integration",
-        "get_integrations",
-        "get_tools",
-        "get_trigger",
-        "get_trigger_config_scheme",
-        "initiate_connection",
-        "set_workspace_id",
-        "validate_tools",
-    ),
 )
-def composio_tools() -> type[ComposioToolSet]:
-    """Return Composio tools for accessing 1000+ integrations."""
+def composio_tools() -> "type[Toolkit]":
+    """Return selected Composio actions as an Agno toolkit."""
+    from agno.tools import Toolkit
     from composio_agno import ComposioToolSet
 
     disable_vendor_telemetry()
-    return ComposioToolSet
+
+    class MindRoomComposioTools(Toolkit):
+        """Expose the SDK's selected action functions to MindRoom consumers."""
+
+        def __init__(
+            self,
+            actions: list[str] | None = None,
+            *,
+            api_key: str | None = None,
+            base_url: str | None = None,
+            entity_id: str = "default",
+            workspace_id: str | None = None,
+            output_dir: Path | None = None,
+            output_in_file: bool = False,
+            verbosity_level: int | None = None,
+            allow_tracing: bool = False,
+            max_retries: int = 3,
+            lockfile: Path | None = None,
+            lock: bool = True,
+        ) -> None:
+            if not actions:
+                msg = "Composio requires a nonempty actions list."
+                raise ValueError(msg)
+            super().__init__(name="composio")
+            toolset = ComposioToolSet(
+                api_key=api_key,
+                base_url=base_url,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                output_dir=output_dir,
+                output_in_file=output_in_file,
+                verbosity_level=verbosity_level,
+                allow_tracing=allow_tracing,
+                max_retries=max_retries,
+                lockfile=lockfile,
+                lock=lock,
+            )
+            for toolkit in cast("list[Toolkit]", toolset.get_tools(actions=actions)):
+                # Preserve SDK entrypoints and their deferred schema processing.
+                self.functions.update(toolkit.functions)
+                self.async_functions.update(toolkit.async_functions)
+
+    return MindRoomComposioTools

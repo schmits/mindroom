@@ -1,14 +1,16 @@
 """Tests for tool event formatting and metadata payloads."""
 
 import json
+from dataclasses import replace
 
 import pytest
-from agno.models.response import ToolExecution
 
+from mindroom import redaction
+from mindroom.llm.events import ReportedCall, ToolCallOrigin
+from mindroom.llm.runs import ToolExecution
 from mindroom.matrix.message_builder import markdown_to_html
 from mindroom.tool_system.events import (
     _MAX_TOOL_RESULT_DISPLAY_CHARS,
-    _MAX_TOOL_TRACE_EVENTS,
     _TOOL_TRACE_KEY,
     StreamingToolTracker,
     ToolTraceEntry,
@@ -17,10 +19,10 @@ from mindroom.tool_system.events import (
     complete_pending_tool_block,
     deserialize_tool_trace,
     ensure_visible_tool_marker_spacing,
-    extract_tool_completed_info,
     format_tool_combined,
     format_tool_completed_event,
     serialize_tool_trace,
+    with_stored_calls,
 )
 
 TEST_CURSOR = "cursor_1234567890"
@@ -35,12 +37,12 @@ def _room_threads_result(
 ) -> tuple[str, list[str]]:
     thread_ids = [f"$thread_{i}_{'X' * 40}:localhost" for i in range(thread_count)]
     payload = {
-        "action": "room-threads",
+        "action": "threads",
         "count": thread_count,
         "has_more": has_more,
         "next_token": next_token,
         "status": "ok",
-        "tool": "matrix_message",
+        "tool": "matrix_room",
         "threads": [
             {
                 "body_preview": "body " + ("y" * body_len),
@@ -187,7 +189,7 @@ def test_format_tool_combined_truncates_structured_room_threads_by_entry() -> No
     """Structured room-thread previews should drop whole entries and preserve metadata."""
     result, thread_ids = _room_threads_result(thread_count=4, body_len=400)
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert len(trace.result_preview) <= _MAX_TOOL_RESULT_DISPLAY_CHARS
@@ -213,7 +215,7 @@ def test_format_tool_combined_truncates_body_preview_without_dropping_only_entry
         next_token=None,
     )
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert len(trace.result_preview) <= _MAX_TOOL_RESULT_DISPLAY_CHARS
@@ -246,18 +248,18 @@ def test_format_tool_combined_falls_back_for_empty_threads_list_over_limit() -> 
     """Empty thread lists should use plain truncation instead of smart structured truncation."""
     result = json.dumps(
         {
-            "action": "room-threads",
+            "action": "threads",
             "count": 0,
             "has_more": True,
             "next_token": "N" * 600,
             "status": "ok",
             "threads": [],
-            "tool": "matrix_message",
+            "tool": "matrix_room",
         },
         sort_keys=True,
     )
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview is not None
     assert trace.result_preview == f"{result[: _MAX_TOOL_RESULT_DISPLAY_CHARS - 1]}…"
@@ -269,7 +271,7 @@ def test_format_tool_combined_preserves_exact_limit_structured_result() -> None:
     """Exact-at-limit thread payloads should not be marked truncated."""
     result, thread_ids = _exact_limit_room_threads_result()
 
-    _text, trace = format_tool_combined("matrix_message", {"action": "room-threads"}, result)
+    _text, trace = format_tool_combined("matrix_room", {"action": "threads"}, result)
 
     assert trace.result_preview == result
     assert trace.truncated is False
@@ -302,65 +304,37 @@ def test_format_tool_combined_with_empty_string_result() -> None:
 def test_complete_pending_tool_block_replaces_pending() -> None:
     """Should find a pending marker by id and mark it completed."""
     text = "hello\n\n🔧 `save_file` [1] ⏳\nworld"
-    updated, trace = complete_pending_tool_block(text, "save_file", "ok", tool_index=1)
+    updated = complete_pending_tool_block(text, "save_file", tool_index=1)
 
     assert "🔧 `save_file` [1]\n" in updated
     assert "⏳" not in updated
-    assert "\nok\n" not in updated  # results are no longer injected inline
     assert "world" in updated
-    assert trace.type == "tool_call_completed"
-    assert trace.result_preview == "ok"
 
 
 def test_complete_pending_tool_block_skips_already_completed() -> None:
     """Should leave an already-completed marker unchanged."""
     text = "🔧 `save_file` [1]"
-    updated, trace = complete_pending_tool_block(text, "save_file", "new_result", tool_index=1)
-
-    assert updated == text
-    assert trace.type == "tool_call_completed"
-    assert trace.result_preview == "new_result"
+    assert complete_pending_tool_block(text, "save_file", tool_index=1) == text
 
 
 def test_complete_pending_tool_block_noops_when_no_pending() -> None:
     """Should not synthesize a completed marker when no pending marker is found."""
     text = "some text"
-    updated, trace = complete_pending_tool_block(text, "save_file", "result", tool_index=3)
-
-    assert updated == text
-    assert trace.type == "tool_call_completed"
+    assert complete_pending_tool_block(text, "save_file", tool_index=3) == text
 
 
 def test_complete_pending_tool_block_requires_tool_index() -> None:
     """V2 completion markers must be matched by index."""
     text = "some text"
     with pytest.raises(ValueError, match="tool_index"):
-        complete_pending_tool_block(text, "save_file", None, tool_index=0)
-
-
-def test_complete_pending_tool_block_no_result_no_change() -> None:
-    """Should not modify anything when there's no result and no pending block."""
-    text = "some text"
-    updated, trace = complete_pending_tool_block(text, "save_file", None, tool_index=1)
-
-    assert updated == text
-    assert trace.result_preview is None
-
-
-def test_complete_pending_tool_block_no_result_marks_completed() -> None:
-    """Should mark pending block as completed even when result is None."""
-    text = "🔧 `save_file` [1] ⏳"
-    updated, trace = complete_pending_tool_block(text, "save_file", None, tool_index=1)
-
-    assert updated == "🔧 `save_file` [1]"
-    assert trace.result_preview is None
+        complete_pending_tool_block(text, "save_file", tool_index=0)
 
 
 def test_streaming_tool_tracker_records_hidden_pending_and_completion() -> None:
     """Hidden tool calls should still preserve pending and completed trace state."""
     tracker = StreamingToolTracker()
     visible_text, trace_entry = tracker.start(
-        ToolExecution(tool_call_id="call-1", tool_name="save_file", tool_args={"file": "a.py"}),
+        ToolExecution(tool_call_id="call-1", tool_name="save_file", tool_args={"file": "a.py"}).call,
     )
 
     assert visible_text
@@ -368,47 +342,45 @@ def test_streaming_tool_tracker_records_hidden_pending_and_completion() -> None:
     pending_tool = tracker.pending_tools[0]
     assert pending_tool.trace_entry == trace_entry
 
-    completed = tracker.complete(ToolExecution(tool_call_id="call-1", tool_name="save_file", result="ok"))
+    matched_pending_tool, completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="call-1", tool_name="save_file", result="ok").call,
+    )
 
-    assert completed is not None
-    tool_name, result, matched_pending_tool, _ = completed
     assert matched_pending_tool == pending_tool
-    assert tool_name == "save_file"
-    assert result == "ok"
+    assert (completed_trace.tool_name, completed_trace.result_preview) == ("save_file", "ok")
     assert tracker.pending_tools == []
     assert len(tracker.completed_tools) == 1
     assert tracker.completed_tools[0].result_preview == "ok"
 
 
-def test_streaming_tool_tracker_uses_scope_for_name_fallback_matching() -> None:
-    """Fallback matching by tool name must not cross team/member scopes."""
+def test_streaming_tool_tracker_uses_the_member_for_name_fallback_matching() -> None:
+    """A slot restored from a trace that kept no call ids matches by tool name, never across team and member slots."""
+    member_trace = ToolTraceEntry(type="tool_call_started", tool_name="search", member_id="code")
+    team_trace = ToolTraceEntry(type="tool_call_started", tool_name="search")
     tracker = StreamingToolTracker()
-    _member_msg, member_trace = tracker.start(
-        ToolExecution(tool_name="search", tool_args={"q": "member"}),
-        scope_key="agent:code",
+    tracker.restore_pending([team_trace, member_trace])
+
+    matched_pending_tool, completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="call-search", tool_name="search", result="team result").call,
     )
-    _team_msg, team_trace = tracker.start(ToolExecution(tool_name="search", tool_args={"q": "team"}), scope_key="team")
 
-    completed = tracker.complete(ToolExecution(tool_name="search", result="team result"), scope_key="team")
-
-    assert completed is not None
-    _tool_name, _result, matched_pending_tool, _completed_trace = completed
     assert matched_pending_tool is not None
-    assert matched_pending_tool.trace_entry == team_trace
+    assert matched_pending_tool.trace_entry is team_trace
     assert [pending.trace_entry for pending in tracker.pending_tools] == [member_trace]
+    assert completed_trace.member_id is None
 
 
 def test_streaming_tool_tracker_prefers_call_id_over_newest_same_named_tool() -> None:
     """Call IDs should keep same-named concurrent tools paired with their own completion."""
     tracker = StreamingToolTracker()
-    tracker.start(ToolExecution(tool_call_id="first", tool_name="save_file", tool_args={"file": "a.py"}))
+    tracker.start(ToolExecution(tool_call_id="first", tool_name="save_file", tool_args={"file": "a.py"}).call)
     first_pending_tool = tracker.pending_tools[0]
-    tracker.start(ToolExecution(tool_call_id="second", tool_name="save_file", tool_args={"file": "b.py"}))
+    tracker.start(ToolExecution(tool_call_id="second", tool_name="save_file", tool_args={"file": "b.py"}).call)
 
-    completed = tracker.complete(ToolExecution(tool_call_id="first", tool_name="save_file", result="saved a"))
+    matched_pending_tool, _completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="first", tool_name="save_file", result="saved a").call,
+    )
 
-    assert completed is not None
-    _tool_name, _result, matched_pending_tool, _completed_trace = completed
     assert matched_pending_tool == first_pending_tool
     assert [pending.tool_call_id for pending in tracker.pending_tools] == ["second"]
 
@@ -417,26 +389,27 @@ def test_streaming_tool_tracker_scopes_reused_call_ids_to_team_members() -> None
     """Independent member runs may reuse one provider call ID without sharing state."""
     tracker = StreamingToolTracker()
     tracker.start(
-        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "first"}),
-        scope_key="agent:first",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "first"}).call,
+        member_id="first",
         tool_index=1,
     )
     tracker.start(
-        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "second"}),
-        scope_key="agent:second",
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", tool_args={"item": "second"}).call,
+        member_id="second",
         tool_index=2,
     )
 
-    completed = tracker.complete(
-        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="first done"),
-        scope_key="agent:first",
+    matched_pending_tool, completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="call-1", tool_name="inspect", result="first done").call,
+        member_id="first",
     )
 
-    assert completed is not None
-    assert completed[2] is not None
-    assert completed[2].scope_key == "agent:first"
-    assert [(pending.scope_key, pending.tool_call_id) for pending in tracker.pending_tools] == [
-        ("agent:second", "call-1"),
+    assert matched_pending_tool is not None
+    assert matched_pending_tool.member_id == "first"
+    assert matched_pending_tool.trace_entry.member_id == "first"
+    assert completed_trace.member_id == "first"
+    assert [(pending.member_id, pending.tool_call_id) for pending in tracker.pending_tools] == [
+        ("second", "call-1"),
     ]
 
 
@@ -445,16 +418,17 @@ def test_streaming_tool_tracker_updates_visible_trace_slot() -> None:
     tracker = StreamingToolTracker()
     visible_trace: list[ToolTraceEntry] = []
     _tool_msg, trace_entry = tracker.start(
-        ToolExecution(tool_name="save_file", tool_args={"file": "a.py"}),
+        ToolExecution(tool_call_id="call-save_file", tool_name="save_file", tool_args={"file": "a.py"}).call,
         tool_index=1,
     )
     assert trace_entry is not None
     visible_trace.append(trace_entry)
 
-    completed = tracker.complete(ToolExecution(tool_name="save_file", result="ok"))
+    pending_tool, completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="call-save_file", tool_name="save_file", result="ok").call,
+    )
 
-    assert completed is not None
-    _tool_name, _result, pending_tool, completed_trace = completed
+    assert pending_tool is not None
     assert tracker.update_visible_trace_entry(visible_trace, pending_tool, completed_trace) is True
     assert visible_trace == [
         ToolTraceEntry(
@@ -466,16 +440,86 @@ def test_streaming_tool_tracker_updates_visible_trace_slot() -> None:
     ]
 
 
+def test_streaming_tool_tracker_marks_a_visible_slot_its_failed_call_completes() -> None:
+    """A visible slot a failed call completes is marked failed, as that call's completed trace is."""
+    tracker = StreamingToolTracker()
+    _tool_msg, trace_entry = tracker.start(
+        ToolExecution(tool_call_id="call-fetch", tool_name="fetch", tool_args={"url": "https://example.com"}).call,
+        tool_index=1,
+    )
+    assert trace_entry is not None
+    visible_trace = [trace_entry]
+
+    pending_tool, completed_trace = tracker.complete(
+        ToolExecution(tool_call_id="call-fetch", tool_name="fetch", result="HTTP 500", is_error=True).call,
+    )
+
+    assert pending_tool is not None
+    assert tracker.update_visible_trace_entry(visible_trace, pending_tool, completed_trace) is True
+    assert completed_trace.is_error is True
+    assert visible_trace[0].is_error is True
+
+
+def test_a_tracked_calls_entries_carry_it_whole_and_serialize_only_its_previews() -> None:
+    """A hidden CLI call's started slot and completion keep the call whole; the Matrix card and stored trace do not."""
+    # Assembled at runtime so no literal secret sits in the repository.
+    token = "sk-" + "proj" + "A1b2C3d4" * 5
+    started = ReportedCall("call-read", "read_file", {"path": f"{token}/" + "x" * 300})
+    finished = replace(started, result=f"key {token} " + "y" * 600)
+    origin = ToolCallOrigin("bash-1", "files")
+    tracker = StreamingToolTracker()
+    _marker, visible = tracker.start(started, tool_index=1, origin=origin)
+    assert visible is not None
+    assert visible.call == started
+    pending, completed = tracker.complete(finished, origin=origin)
+    assert pending is not None
+    assert tracker.update_visible_trace_entry([visible], pending, completed) is True
+
+    assert (visible.call, completed.call) == (finished, finished)
+    traced = [visible, completed]
+    bare = [replace(entry, call=None) for entry in traced]
+    card = json.dumps(build_tool_trace_content(traced))
+    assert card == json.dumps(build_tool_trace_content(bare))
+    assert token not in card
+    assert json.dumps(serialize_tool_trace(traced, include_internal=True)) == json.dumps(
+        serialize_tool_trace(bare, include_internal=True),
+    )
+
+
+def test_a_restored_trace_takes_each_call_its_run_stores_pairing_from_the_newest() -> None:
+    """Restored entries carry the calls the paused run stores; an earlier run's entry under a reused id keeps none."""
+
+    def entry(call_id: str | None) -> ToolTraceEntry:
+        return ToolTraceEntry(type="tool_call_completed", tool_name="read", tool_call_id=call_id)
+
+    tools = [
+        ToolExecution(tool_call_id="call-0", tool_name="read", tool_args={"n": 1}, result="one"),
+        ToolExecution(tool_call_id="call-0", tool_name="read", tool_args={"n": 2}, result="two"),
+        ToolExecution(tool_call_id="call-1", tool_name="write", tool_args={"n": 3}),
+    ]
+    trace = [entry("call-0"), entry("call-0"), entry("call-0"), entry("call-1"), entry("call-9"), entry(None)]
+
+    restored = with_stored_calls(trace, tools)
+
+    assert [restored_entry.call for restored_entry in restored] == [
+        None,
+        tools[0].call,
+        tools[1].call,
+        tools[2].call,
+        None,
+        None,
+    ]
+    assert restored[1:4] == trace[1:4]
+
+
 def test_build_tool_trace_content_preserves_all_events_for_v2_indexing() -> None:
     """V2 tool trace keeps all events so `[N] -> events[N-1]` remains valid."""
-    entries = [
-        ToolTraceEntry(type="tool_call_started", tool_name=f"tool_{i}") for i in range(_MAX_TOOL_TRACE_EVENTS + 5)
-    ]
+    entries = [ToolTraceEntry(type="tool_call_started", tool_name=f"tool_{i}") for i in range(125)]
     payload = build_tool_trace_content(entries)
     assert payload is not None
     trace = payload[_TOOL_TRACE_KEY]
     assert trace["version"] == 2
-    assert len(trace["events"]) == _MAX_TOOL_TRACE_EVENTS + 5
+    assert len(trace["events"]) == 125
     assert "events_truncated" not in trace
 
 
@@ -549,11 +593,16 @@ def test_format_tool_started_redacts_top_level_key_value_secret_args() -> None:
     assert "value=***redacted***" in trace.args_preview
 
 
-def test_format_tool_started_survives_structured_redaction_failure() -> None:
+def test_format_tool_started_survives_structured_redaction_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed argument redaction must not abort tool event formatting."""
+
+    def raise_redaction_error(_value: str) -> str:
+        raise RuntimeError
+
+    monkeypatch.setattr(redaction, "_redact_secret_assignments", raise_redaction_error)
     _text, trace = _format_tool_started(
         "run_shell",
-        {"command": "password=\n  hunter2"},
+        {"command": "password=hunter2"},
     )
 
     assert trace.args_preview == "command=[redaction failed]"
@@ -567,13 +616,12 @@ def test_complete_pending_tool_block_roundtrip_with_marker_id() -> None:
         tool_index=5,
     )
 
-    updated, trace = complete_pending_tool_block(pending_text, "save_file", "ok", tool_index=5)
+    updated = complete_pending_tool_block(pending_text, "save_file", tool_index=5)
 
     assert "`save_file`" in updated
     assert "[5]" in updated
     assert "⏳" not in updated
     assert updated.count("🔧") == 1
-    assert trace.result_preview == "ok"
 
 
 def test_format_tool_started_collapses_newlines_in_args() -> None:
@@ -602,41 +650,16 @@ def test_complete_pending_tool_block_roundtrip_with_multiline_args() -> None:
     assert "\n" not in marker_line
 
     # Completing should work and produce exactly one block
-    updated, trace = complete_pending_tool_block(pending_text, "save_file", "saved", tool_index=1)
+    updated = complete_pending_tool_block(pending_text, "save_file", tool_index=1)
 
     assert "⏳" not in updated
     assert updated.count("🔧") == 1
-    assert trace.result_preview == "saved"
 
 
-def test_extract_tool_completed_info_without_tool_returns_none() -> None:
-    """None tool should return None."""
-    assert extract_tool_completed_info(None) is None
-
-
-def test_extract_tool_completed_info_uses_tool_result() -> None:
-    """Should return tool.result (actual output)."""
-    tool = ToolExecution(tool_name="check", result="actual output")
-    info = extract_tool_completed_info(tool)
-    assert info is not None
-    tool_name, result = info
-    assert tool_name == "check"
-    assert result == "actual output"
-
-
-def test_format_tool_completed_event_without_tool_returns_empty() -> None:
-    """None tool should return empty text and no trace."""
-    text, trace = format_tool_completed_event(None)
-    assert text == ""
-    assert trace is None
-
-
-def test_format_tool_completed_event_formats_combined_block() -> None:
-    """Completion event helper should render canonical plain marker."""
-    tool = ToolExecution(tool_name="run_shell", tool_args={"cmd": "pwd"}, result="/app")
-    text, trace = format_tool_completed_event(tool, tool_index=1)
-    assert text == "\n\n🔧 `run_shell` [1]\n\n"
-    assert trace is not None
+def test_format_tool_completed_event_formats_its_trace() -> None:
+    """A completion's trace carries its tool, arguments, and result preview."""
+    tool = ToolExecution(tool_call_id="call-run_shell", tool_name="run_shell", tool_args={"cmd": "pwd"}, result="/app")
+    trace = format_tool_completed_event(tool.call)
     assert trace.type == "tool_call_completed"
     assert trace.tool_name == "run_shell"
     assert trace.args_preview == "cmd=pwd"
@@ -644,13 +667,13 @@ def test_format_tool_completed_event_formats_combined_block() -> None:
 
 
 def test_durable_tool_trace_round_trip_keeps_internal_identity_private() -> None:
-    """Restart state keeps exact call/scope identity without exposing it to Matrix clients."""
+    """Restart state keeps exact call and member identity without exposing it to Matrix clients."""
     trace = ToolTraceEntry(
         type="tool_call_started",
         tool_name="inspect",
         args_preview="path=report.txt",
         tool_call_id="call-1",
-        scope_key="member:GeneralAgent",
+        member_id="general",
     )
 
     durable = serialize_tool_trace([trace], include_internal=True)
@@ -663,15 +686,46 @@ def test_durable_tool_trace_round_trip_keeps_internal_identity_private() -> None
             "tool_name": "inspect",
             "args_preview": "path=report.txt",
             "tool_call_id": "call-1",
-            "scope_key": "member:GeneralAgent",
+            "member_id": "general",
         },
     )
     assert public is not None
     public_event = public[_TOOL_TRACE_KEY]["events"][0]
     assert "tool_call_id" not in public_event
-    assert "scope_key" not in public_event
+    assert "member_id" not in public_event
     assert restored[0].tool_call_id == "call-1"
-    assert restored[0].scope_key == "member:GeneralAgent"
+    assert restored[0].member_id == "general"
+
+
+@pytest.mark.parametrize(("scope_key", "member_id"), [("team", None), ("agent:code-review", "code-review")])
+def test_a_trace_entry_stored_with_a_scope_key_reads_as_its_member(scope_key: str, member_id: str | None) -> None:
+    """A reply record v2026.10.674 stored names a team slot as ``team`` or ``agent:<id>``; it reads as that member."""
+    stored = {"type": "tool_call_started", "tool_name": "inspect", "tool_call_id": "call-1", "scope_key": scope_key}
+
+    [restored] = deserialize_tool_trace([stored])
+
+    assert restored.member_id == member_id
+    assert "scope_key" not in serialize_tool_trace([restored], include_internal=True)[0]
+
+
+def test_durable_tool_trace_keeps_a_failed_calls_flag_private() -> None:
+    """Restart state keeps which call failed, Matrix clients never see it, and an entry stored without it did not fail."""
+    failed = ToolTraceEntry(
+        type="tool_call_completed",
+        tool_name="fetch",
+        result_preview="HTTP 500",
+        tool_call_id="call-1",
+        is_error=True,
+    )
+
+    durable = serialize_tool_trace([failed], include_internal=True)
+    public = build_tool_trace_content([failed])
+
+    assert durable[0]["is_error"] is True
+    assert public is not None
+    assert "is_error" not in public[_TOOL_TRACE_KEY]["events"][0]
+    assert deserialize_tool_trace(durable)[0].is_error is True
+    assert deserialize_tool_trace([{"type": "tool_call_completed", "tool_name": "fetch"}])[0].is_error is False
 
 
 @pytest.mark.parametrize(
@@ -680,8 +734,13 @@ def test_durable_tool_trace_round_trip_keeps_internal_identity_private() -> None
         {"type": "unknown", "tool_name": "inspect"},
         {"type": "tool_call_started", "tool_name": 7},
         {"type": "tool_call_started", "tool_name": "inspect", "tool_call_id": 7},
+        {"type": "tool_call_started", "tool_name": "inspect", "member_id": []},
+        {"type": "tool_call_started", "tool_name": "inspect", "member_id": ""},
         {"type": "tool_call_started", "tool_name": "inspect", "scope_key": []},
+        {"type": "tool_call_started", "tool_name": "inspect", "scope_key": "member:general"},
+        {"type": "tool_call_started", "tool_name": "inspect", "scope_key": "agent:"},
         {"type": "tool_call_completed", "tool_name": "inspect", "truncated": "yes"},
+        {"type": "tool_call_completed", "tool_name": "inspect", "is_error": "yes"},
     ],
 )
 def test_durable_tool_trace_rejects_malformed_events(malformed: dict[str, object]) -> None:
@@ -733,8 +792,8 @@ def test_tool_lifecycle_produces_expected_html() -> None:
     body = text1 + text2
 
     # 2. Both complete
-    body, _ = complete_pending_tool_block(body, "save_file", "ok", tool_index=1)
-    body, _ = complete_pending_tool_block(body, "run_shell", "/app", tool_index=2)
+    body = complete_pending_tool_block(body, "save_file", tool_index=1)
+    body = complete_pending_tool_block(body, "run_shell", tool_index=2)
 
     # 3. Convert to HTML
     html = markdown_to_html(body)

@@ -13,7 +13,6 @@ def create_session_id(room_id: str, thread_id: str | None) -> str:
     return f"{room_id}:{thread_id}" if thread_id else room_id
 
 
-def parse_session_id(session_id: str) -> tuple[str, str | None]:
-    """Parse the canonical persisted room/thread session ID."""
-    room_id, marker, thread_suffix = session_id.rpartition(":$")
-    return (room_id, f"${thread_suffix}") if marker else (session_id, None)
+def session_in_room(session_id: str, room_id: str) -> bool:
+    """Return whether a session ID names a conversation in this room: the room's own, or one of its threads."""
+    return session_id == room_id or session_id.startswith(f"{room_id}:")

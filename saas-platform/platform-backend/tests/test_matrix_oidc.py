@@ -1,4 +1,4 @@
-"""Matrix OIDC bridge for tenant Synapse login."""
+"""Matrix OIDC bridge for tenant homeserver login."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ from urllib.parse import parse_qs, urlparse
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import jwt
+import pytest
+from backend.routes import sso
+from backend.services.provisioner_service import _owner_matrix_user_id_from_email
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -25,12 +28,13 @@ def _patch_oidc(monkeypatch):
     import backend.routes.matrix_oidc as matrix_oidc
 
     monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_ENABLED", True)
-    monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_CLIENT_ID", "mindroom-synapse")
+    monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_CLIENT_ID", "mindroom-matrix")
     monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_CLIENT_SECRET", "client-secret")
     monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_PRIVATE_KEY", _test_private_key())
     monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_KEY_ID", "test-key")
     monkeypatch.setattr(matrix_oidc, "PLATFORM_DOMAIN", "mindroom.chat")
-    monkeypatch.setattr(matrix_oidc, "INSTANCE_BASE_DOMAIN", "mindroom.chat")
+    monkeypatch.setattr(sso, "PLATFORM_DOMAIN", "mindroom.chat")
+    monkeypatch.setattr(sso, "INSTANCE_BASE_DOMAIN", "mindroom.chat")
     return matrix_oidc
 
 
@@ -53,8 +57,8 @@ def test_matrix_oidc_authorize_redirects_anonymous_users_to_platform_login(monke
     client = TestClient(app)
     params = {
         "response_type": "code",
-        "client_id": "mindroom-synapse",
-        "redirect_uri": "https://1.matrix.mindroom.chat/_synapse/client/oidc/callback",
+        "client_id": "mindroom-matrix",
+        "redirect_uri": "https://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
         "scope": "openid profile email",
         "state": "state-123",
         "nonce": "nonce-123",
@@ -72,17 +76,75 @@ def test_matrix_oidc_authorize_redirects_anonymous_users_to_platform_login(monke
     )
 
 
-def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -> None:
+@pytest.mark.parametrize(("callback_client", "status"), [("tenant-matrix", 307), ("mindroom-matrix", 400)])
+def test_matrix_oidc_callback_names_the_configured_client(monkeypatch, callback_client: str, status: int) -> None:
+    """Tuwunel's callback path ends in the client ID, so only the configured client's callback gets a code."""
     matrix_oidc = _patch_oidc(monkeypatch)
+    monkeypatch.setattr(matrix_oidc, "MATRIX_OIDC_CLIENT_ID", "tenant-matrix")
+    client = TestClient(app)
+
+    response = client.get(
+        "/matrix-oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "tenant-matrix",
+            "redirect_uri": f"https://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/{callback_client}",
+            "scope": "openid",
+            "state": "state-123",
+        },
+        headers={"host": "api.mindroom.chat"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == status
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        "http://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+        "https://01.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+        "https://1.matrix.mindroom.chat:8448/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+        "https://user@1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+        "https://1.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+        "https://1.matrix.mindroom.chat/other",
+        "https://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/other-client",
+        "https://1.matrix.mindroom.chat/_synapse/client/oidc/callback",
+        "https://[::1/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+    ],
+)
+def test_matrix_oidc_authorize_rejects_non_instance_callbacks(monkeypatch, redirect_uri: str) -> None:
+    """Codes are only issued to the canonical Tuwunel callback for this client on one instance's Matrix host."""
+    _patch_oidc(monkeypatch)
+    client = TestClient(app)
+
+    response = client.get(
+        "/matrix-oidc/authorize",
+        params={
+            "response_type": "code",
+            "client_id": "mindroom-matrix",
+            "redirect_uri": redirect_uri,
+            "scope": "openid",
+            "state": "state-123",
+        },
+        headers={"host": "api.mindroom.chat"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+
+
+def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -> None:
+    _patch_oidc(monkeypatch)
     verify_user = AsyncMock(
         return_value={
             "user_id": "user-123",
             "account_id": "account-123",
-            "email": "alice@example.com",
+            "email": "_Alice=Ops@Example.com",
             "account": {"full_name": "Alice Example"},
         }
     )
-    monkeypatch.setattr(matrix_oidc, "verify_user", verify_user)
+    monkeypatch.setattr(sso, "verify_user", verify_user)
 
     instance_query = MagicMock()
     instance_query.select.return_value = instance_query
@@ -100,20 +162,20 @@ def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -
 
     supabase = MagicMock()
     supabase.table.side_effect = [instance_query, subscription_query]
-    monkeypatch.setattr(matrix_oidc, "ensure_supabase", lambda: supabase)
+    monkeypatch.setattr(sso, "ensure_supabase", lambda: supabase)
 
     client = TestClient(app)
     response = client.get(
         "/matrix-oidc/authorize",
         params={
             "response_type": "code",
-            "client_id": "mindroom-synapse",
-            "redirect_uri": "https://1.matrix.mindroom.chat/_synapse/client/oidc/callback",
+            "client_id": "mindroom-matrix",
+            "redirect_uri": "https://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
             "scope": "openid profile email",
             "state": "state-123",
             "nonce": "nonce-123",
         },
-        cookies={"mindroom_jwt": "supabase-access-token"},
+        cookies={sso.SSO_COOKIE_NAME: "supabase-access-token"},
         headers={"host": "api.mindroom.chat"},
         follow_redirects=False,
     )
@@ -131,8 +193,8 @@ def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -
         data={
             "grant_type": "authorization_code",
             "code": code,
-            "redirect_uri": "https://1.matrix.mindroom.chat/_synapse/client/oidc/callback",
-            "client_id": "mindroom-synapse",
+            "redirect_uri": "https://1.matrix.mindroom.chat/_matrix/client/unstable/login/sso/callback/mindroom-matrix",
+            "client_id": "mindroom-matrix",
             "client_secret": "client-secret",
         },
         headers={"host": "api.mindroom.chat"},
@@ -142,9 +204,14 @@ def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -
     tokens = token_response.json()
     claims = jwt.decode(tokens["id_token"], options={"verify_signature": False})
     assert claims["iss"] == "https://api.mindroom.chat/matrix-oidc"
-    assert claims["aud"] == "mindroom-synapse"
+    assert claims["aud"] == "mindroom-matrix"
     assert claims["sub"] == "user-123"
-    assert claims["email"] == "alice@example.com"
+    assert claims["email"] == "_Alice=Ops@Example.com"
+    # The homeserver names the account after this, so it must be the owner the provisioner authorizes.
+    assert claims["preferred_username"] == "=5falice=3dops"
+    assert f"@{claims['preferred_username']}:1.mindroom.chat" == _owner_matrix_user_id_from_email(
+        claims["email"], instance_id="1", base_domain="mindroom.chat"
+    )
     assert claims["name"] == "Alice Example"
     assert claims["nonce"] == "nonce-123"
 
@@ -153,4 +220,5 @@ def test_matrix_oidc_code_flow_maps_platform_user_to_owned_tenant(monkeypatch) -
         headers={"authorization": f"Bearer {tokens['access_token']}", "host": "api.mindroom.chat"},
     )
     assert userinfo_response.status_code == 200
-    assert userinfo_response.json()["email"] == "alice@example.com"
+    assert userinfo_response.json()["email"] == "_Alice=Ops@Example.com"
+    assert userinfo_response.json()["preferred_username"] == "=5falice=3dops"

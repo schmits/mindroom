@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mindroom.model_defaults import GOOGLE_IMAGE, GOOGLE_VEO
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="gemini",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("generate_image", "generate_video"),
     display_name="Gemini",
     description="Google AI API services for generating images and videos using Gemini models",
     category=ToolCategory.DEVELOPMENT,
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("GOOGLE_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="project_id",
+            env=("GOOGLE_CLOUD_PROJECT",),
             label="Project ID",
             type="text",
             required=False,
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="location",
+            env=("GOOGLE_CLOUD_LOCATION",),
             label="Location",
             type="text",
             required=False,
@@ -87,7 +92,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["google-genai"],
-    docs_url="https://docs.agno.com/tools/toolkits/models/gemini",
+    docs_url="https://docs.mindroom.chat/tools/ai-and-generation/#gemini",
     function_names=("generate_image", "generate_video"),
 )
 def gemini_tools() -> type[MindRoomGeminiTools]:

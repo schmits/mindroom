@@ -3,50 +3,174 @@
 from __future__ import annotations
 
 import asyncio
+import stat
+import sys
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
-import nio
 import pytest
 import typer
 from typer.testing import CliRunner
 
 import mindroom.cli.desktop as desktop_cli
 from mindroom.cli.desktop import desktop_app
+from mindroom.desktop.bridge import DesktopBridge, DesktopBridgePolicy
+from mindroom.desktop.bridge_session import DesktopBridgeSessionDeps, DesktopWorkerStoppedError
+from mindroom.desktop.command_journal import DesktopCommandJournal, controller_journal_key, desktop_journal_path
 from mindroom.desktop.login_method import DesktopLoginMethod
+from mindroom.desktop.native_config import (
+    NativeBrowserConfig,
+    NativeCaptureConfig,
+    NativeConfigError,
+    NativeDesktopConfig,
+    NativeFilesConfig,
+    NativeShellConfig,
+    load_native_config,
+    native_config_path,
+    save_native_config,
+)
 from mindroom.desktop.provider import DesktopProviderError
-from mindroom.desktop.session import DesktopMatrixSession, DesktopSessionError
-from mindroom.matrix.to_device import AuthenticatedToDeviceEvent
+from mindroom.desktop.session import DesktopMatrixSession, DesktopSessionError, save_desktop_session
+from mindroom.desktop.shell import DesktopShellError
+from mindroom.matrix.device_identity import PinnedMatrixDevice
+from tests.desktop_helpers import (
+    SAVED_SESSION,
+    FailingSource,
+    FakeMatrixOwner,
+    offline_session_deps,
+    runtime_paths,
+)
+from tests.desktop_helpers import empty_selected_root as empty_selected_root  # noqa: PLC0414
+from tests.desktop_helpers import login_environment as login_environment  # noqa: PLC0414
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Coroutine
+
+    import nio
 
 runner = CliRunner()
+_RUN_ARGS = [
+    "run",
+    "--controller-user-id",
+    "@cloud:example.org",
+    "--controller-device-id",
+    "CLOUD",
+    "--controller-ed25519",
+    "fingerprint",
+    "--allow-requester",
+    "@alice:example.org",
+    "--allow-agent",
+    "computer",
+    "--allow-app",
+    "com.example.Editor",
+]
+_PAIRING_ARGS = [
+    "--code",
+    "short-code",
+    "--controller-user-id",
+    "@computer:example.org",
+    "--controller-device-id",
+    "CLOUD",
+    "--controller-ed25519",
+    "cloud-fingerprint",
+]
+_SETUP_ARGS = [
+    "setup",
+    "--allow-agent",
+    "computer",
+    "--user-id",
+    "@alice:example.org",
+    "--homeserver",
+    "https://matrix.example.org",
+    *_PAIRING_ARGS,
+]
 
 
-def test_desktop_runtime_default_is_independent_of_working_directory(
+@pytest.fixture
+def cli_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    """Activate a CLI runtime rooted at `tmp_path`."""
+    paths = SimpleNamespace(storage_root=tmp_path)
+    monkeypatch.setattr(desktop_cli, "activate_cli_runtime", lambda *_args, **_kwargs: paths)
+    return paths
+
+
+def _stub_run_command(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, cloudflare_access: bool = False) -> MagicMock:
+    """Stub what `desktop run` needs before the bridge starts, and return the dependency installer."""
+    ensure_dependencies = MagicMock()
+    monkeypatch.setattr(
+        desktop_cli,
+        "activate_cli_runtime",
+        lambda *_args, **_kwargs: SimpleNamespace(storage_root=tmp_path),
+    )
+    monkeypatch.setattr("mindroom.logging_config.setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(desktop_cli, "_ensure_desktop_dependencies", ensure_dependencies)
+    monkeypatch.setattr(
+        "mindroom.desktop.session.load_desktop_session",
+        lambda _path: SimpleNamespace(homeserver="https://matrix.example.org", cloudflare_access=cloudflare_access),
+    )
+    return ensure_dependencies
+
+
+def _run_config(
+    *,
+    roots: tuple[Path, ...],
+    apps: tuple[str, ...] = (),
+    shell_enabled: bool = False,
+) -> NativeDesktopConfig:
+    """Return the resolved configuration a terminal run passes to the bridge."""
+    return NativeDesktopConfig(
+        revision=1,
+        enabled=True,
+        controller=PinnedMatrixDevice("@cloud:example.org", "CLOUD", "fingerprint"),
+        allowed_requester_ids=("@alice:example.org",),
+        allowed_agent_names=("computer",),
+        allowed_app_ids=apps,
+        capture=NativeCaptureConfig(max_screenshot_width=1600, jpeg_quality=80),
+        browser=NativeBrowserConfig(),
+        files=NativeFilesConfig(roots),
+        shell=NativeShellConfig(enabled=shell_enabled),
+    )
+
+
+def test_native_helper_command_uses_explicit_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The CLI native entry shares the same runtime identity as setup and bridge commands."""
+    runtime_paths = SimpleNamespace(storage_root=tmp_path)
+    activate = MagicMock(return_value=runtime_paths)
+    serve = AsyncMock()
+    monkeypatch.setattr(desktop_cli, "_activate_desktop_runtime", activate)
+    monkeypatch.setattr("mindroom.desktop.native_host.run_native_stdio", serve)
+    result = runner.invoke(
+        desktop_app,
+        ["app", "--config", str(tmp_path / "config.yaml"), "--storage-path", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    activate.assert_called_once_with(tmp_path / "config.yaml", storage_path=tmp_path)
+    assert serve.await_args.args == (runtime_paths,)
+
+
+@pytest.mark.parametrize(
+    ("chdir", "environment"),
+    [(True, {}), (False, {"MINDROOM_STORAGE_PATH": "/shared/mindroom-data"})],
+    ids=["other_working_directory", "storage_override"],
+)
+def test_desktop_runtime_default_is_the_user_level_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    *,
+    chdir: bool,
+    environment: dict[str, str],
 ) -> None:
-    """Local Desktop sessions use one user-level location across shell directories."""
+    """Local Desktop sessions use one user-level config across shell directories, even with a storage override."""
     activate = MagicMock(return_value=SimpleNamespace())
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr("mindroom.constants.exported_process_env", dict)
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", activate)
-
-    desktop_cli._activate_desktop_runtime(None, storage_path=None)
-
-    activate.assert_called_once_with(Path.home() / ".mindroom" / "config.yaml", storage_path=None)
-
-
-def test_desktop_runtime_storage_override_does_not_restore_working_directory_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A storage override keeps the stable user-level Desktop config selection."""
-    activate = MagicMock(return_value=SimpleNamespace())
-    monkeypatch.setattr(
-        "mindroom.constants.exported_process_env",
-        lambda: {"MINDROOM_STORAGE_PATH": "/shared/mindroom-data"},
-    )
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", activate)
+    if chdir:
+        monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("mindroom.constants.exported_process_env", lambda: dict(environment))
+    monkeypatch.setattr(desktop_cli, "activate_cli_runtime", activate)
 
     desktop_cli._activate_desktop_runtime(None, storage_path=None)
 
@@ -71,14 +195,13 @@ def test_login_identity_output_routes_users_to_chat_pairing(capsys: pytest.Captu
     assert "cloud agent's desktop tool configuration" not in output
 
 
+@pytest.mark.usefixtures("cli_runtime")
 def test_desktop_login_accepts_explicit_homeserver(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A fresh local machine can target cloud Matrix without hidden environment setup."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     headers_path = tmp_path / "matrix-http-headers.json"
     headers_path.write_text('{"X-Access-Client": "test-secret"}', encoding="utf-8")
     headers_path.chmod(0o600)
     login = AsyncMock()
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr(desktop_cli, "_login_and_save", login)
     monkeypatch.setenv("MINDROOM_DESKTOP_MATRIX_PASSWORD", "test-password")
 
@@ -105,18 +228,16 @@ def test_desktop_login_accepts_explicit_homeserver(monkeypatch: pytest.MonkeyPat
     assert login.await_args.kwargs["cloudflare_access"] is False
 
 
+@pytest.mark.usefixtures("cli_runtime")
 def test_desktop_login_uses_cloudflare_access_before_matrix_discovery(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """CLI authentication reaches login-method discovery and persists its transport mode."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     headers = {"cf-access-token": "access-token"}
     access_headers = MagicMock(return_value=headers)
     discover = AsyncMock(return_value=DesktopLoginMethod.PASSWORD)
     login = AsyncMock()
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
-    monkeypatch.setattr("mindroom.desktop.cloudflare_access.cloudflare_access_headers", access_headers)
+    monkeypatch.setattr("mindroom.desktop.session.desktop_http_headers", access_headers)
     monkeypatch.setattr("mindroom.desktop.session.resolve_desktop_login_method", discover)
     monkeypatch.setattr(desktop_cli, "_login_and_save", login)
     monkeypatch.setenv("MINDROOM_DESKTOP_MATRIX_PASSWORD", "test-password")
@@ -134,25 +255,20 @@ def test_desktop_login_uses_cloudflare_access_before_matrix_discovery(
     )
 
     assert result.exit_code == 0, result.output
-    access_headers.assert_called_once_with("https://matrix.example.org", None)
+    access_headers.assert_called_once_with("https://matrix.example.org", None, cloudflare_access=True)
     assert discover.await_args.kwargs["http_headers"] is headers
     assert login.await_args.kwargs["http_headers"] is headers
     assert login.await_args.kwargs["cloudflare_access"] is True
 
 
+@pytest.mark.usefixtures("cli_runtime")
 def test_desktop_login_uses_browser_sso_without_password_or_user_id(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """SSO-only homeservers open a browser and persist the returned Matrix session."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     login = AsyncMock()
     discover = AsyncMock(return_value=DesktopLoginMethod.SSO)
-
-    def receive_token(*_args: object, **_kwargs: object) -> str:
-        return "short-lived-token"
-
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
+    receive_token = MagicMock(return_value="short-lived-token")
     monkeypatch.setattr("mindroom.desktop.session.resolve_desktop_login_method", discover)
     monkeypatch.setattr("mindroom.desktop.sso.receive_sso_login_token", receive_token)
     monkeypatch.setattr(desktop_cli, "_login_and_save", login)
@@ -169,16 +285,14 @@ def test_desktop_login_uses_browser_sso_without_password_or_user_id(
     assert login.await_args.kwargs["login_token"] == "short-lived-token"  # noqa: S105 - Test-only token.
 
 
+@pytest.mark.usefixtures("cli_runtime")
 def test_desktop_login_sso_idp_selects_sso_and_reaches_browser(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """A named IdP selects SSO and is forwarded to the browser redirect."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     login = AsyncMock()
     discover = AsyncMock(return_value=DesktopLoginMethod.SSO)
     receive_token = MagicMock(return_value="short-lived-token")
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr("mindroom.desktop.session.resolve_desktop_login_method", discover)
     monkeypatch.setattr("mindroom.desktop.sso.receive_sso_login_token", receive_token)
     monkeypatch.setattr(desktop_cli, "_login_and_save", login)
@@ -193,11 +307,9 @@ def test_desktop_login_sso_idp_selects_sso_and_reaches_browser(
     assert receive_token.call_args.kwargs["idp_id"] == "company-sso"
 
 
-def test_desktop_password_login_requires_user_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_password_login_requires_user_id() -> None:
     """Explicit password mode fails before prompting when its identity is missing."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
-
     result = runner.invoke(
         desktop_app,
         ["login", "--homeserver", "https://matrix.example.org", "--login-method", "password"],
@@ -207,29 +319,15 @@ def test_desktop_password_login_requires_user_id(monkeypatch: pytest.MonkeyPatch
     assert "--user-id is required" in result.output
 
 
-def test_desktop_pair_sends_claim_with_saved_local_session(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_pair_sends_claim_with_saved_local_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """The setup command can present its token from the already logged-in local device."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     session = SimpleNamespace(homeserver="https://matrix.example.org", cloudflare_access=False)
     pair = AsyncMock(return_value="VERIFY123")
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr("mindroom.desktop.session.load_desktop_session", lambda _path: session)
     monkeypatch.setattr(desktop_cli, "_pair_desktop", pair)
 
-    result = runner.invoke(
-        desktop_app,
-        [
-            "pair",
-            "--code",
-            "short-code",
-            "--controller-user-id",
-            "@computer:example.org",
-            "--controller-device-id",
-            "CLOUD",
-            "--controller-ed25519",
-            "cloud-fingerprint",
-        ],
-    )
+    result = runner.invoke(desktop_app, ["pair", *_PAIRING_ARGS])
 
     assert result.exit_code == 0, result.output
     assert pair.await_args.kwargs["session"] is session
@@ -239,6 +337,7 @@ def test_desktop_pair_sends_claim_with_saved_local_session(monkeypatch: pytest.M
 
 
 @pytest.mark.parametrize("session_exists", [False, True])
+@pytest.mark.usefixtures("cli_runtime")
 def test_desktop_setup_logs_in_only_when_needed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -246,82 +345,243 @@ def test_desktop_setup_logs_in_only_when_needed(
     session_exists: bool,
 ) -> None:
     """One setup command creates a missing session and always claims pairing."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     session_path = tmp_path / "desktop_bridge" / "matrix_session.json"
     if session_exists:
-        session_path.parent.mkdir(parents=True)
-        session_path.touch()
-    login = MagicMock()
+        save_desktop_session(
+            session_path,
+            DesktopMatrixSession("https://matrix.example.org/", "@alice:example.org", "DESKTOP", "saved-token"),
+        )
+    login = MagicMock(
+        side_effect=lambda **_: save_desktop_session(
+            session_path,
+            DesktopMatrixSession("https://matrix.example.org", "@alice:example.org", "DESKTOP", "saved-token"),
+        ),
+    )
     pair = MagicMock()
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr(desktop_cli, "desktop_login", login)
     monkeypatch.setattr(desktop_cli, "desktop_pair", pair)
 
-    result = runner.invoke(
-        desktop_app,
-        [
-            "setup",
-            "--user-id",
-            "@alice:example.org",
-            "--homeserver",
-            "https://matrix.example.org",
-            "--code",
-            "short-code",
-            "--controller-user-id",
-            "@computer:example.org",
-            "--controller-device-id",
-            "CLOUD",
-            "--controller-ed25519",
-            "cloud-fingerprint",
-        ],
-    )
+    result = runner.invoke(desktop_app, _SETUP_ARGS)
 
     assert result.exit_code == 0, result.output
     assert login.called is not session_exists
     assert pair.call_args.kwargs["code"] == "short-code"
 
 
+@pytest.mark.parametrize(("content", "mode", "saved_revision"), [("{", 0o600, 0), (None, 0o644, 1)])
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_setup_repairs_malformed_or_exposed_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    content: str | None,
+    mode: int,
+    saved_revision: int,
+) -> None:
+    """Setup saves fresh settings over a file the load error says saving can repair."""
+    save_desktop_session(
+        tmp_path / "desktop_bridge" / "matrix_session.json",
+        DesktopMatrixSession("https://matrix.example.org", "@alice:example.org", "DESKTOP", "saved-token"),
+    )
+    path = native_config_path(tmp_path)
+    if content is None:
+        save_native_config(path, replace(_run_config(roots=()), revision=0), expected_revision=0)
+    else:
+        path.write_text(content, encoding="utf-8")
+    path.chmod(mode)
+    monkeypatch.setattr(desktop_cli, "desktop_pair", MagicMock())
+
+    result = runner.invoke(desktop_app, _SETUP_ARGS)
+
+    assert result.exit_code == 0, result.output
+    saved = load_native_config(path)
+    assert saved.revision == saved_revision + 1
+    assert saved.controller == PinnedMatrixDevice("@computer:example.org", "CLOUD", "cloud-fingerprint")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(("journal_device_id", "accepted"), [("CLOUD", True), ("OTHER", False)])
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_setup_pairs_only_the_controller_the_bridge_journal_is_bound_to(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    journal_device_id: str,
+    *,
+    accepted: bool,
+) -> None:
+    """Setup refuses, before pairing, a controller that the existing command journal would reject at run time."""
+    save_desktop_session(
+        tmp_path / "desktop_bridge" / "matrix_session.json",
+        DesktopMatrixSession("https://matrix.example.org", "@alice:example.org", "DESKTOP", "saved-token"),
+    )
+    DesktopCommandJournal.load(
+        desktop_journal_path(tmp_path),
+        controller_key=controller_journal_key(
+            PinnedMatrixDevice("@computer:example.org", journal_device_id, "cloud-fingerprint"),
+        ),
+    ).close()
+    pair = MagicMock()
+    monkeypatch.setattr(desktop_cli, "desktop_pair", pair)
+
+    result = runner.invoke(desktop_app, _SETUP_ARGS)
+
+    assert result.exit_code == (0 if accepted else 1), result.output
+    assert pair.called is accepted
+    assert ("different controller" in result.output) is not accepted
+    assert native_config_path(tmp_path).exists() is accepted
+
+
+@pytest.mark.parametrize("shell_enabled", [False, True])
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_setup_asks_for_access_while_only_a_browser_is_saved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    shell_enabled: bool,
+) -> None:
+    """Browser control needs a saved app, so setup asks for access until apps, folders, or shell are saved."""
+    save_desktop_session(
+        tmp_path / "desktop_bridge" / "matrix_session.json",
+        DesktopMatrixSession("https://matrix.example.org", "@alice:example.org", "DESKTOP", "saved-token"),
+    )
+    saved = replace(
+        _run_config(roots=(), shell_enabled=shell_enabled),
+        revision=0,
+        controller=PinnedMatrixDevice("@computer:example.org", "CLOUD", "cloud-fingerprint"),
+        browser=NativeBrowserConfig(enabled=True),
+    )
+    save_native_config(native_config_path(tmp_path), saved, expected_revision=0)
+    monkeypatch.setattr(desktop_cli, "desktop_pair", MagicMock())
+
+    result = runner.invoke(desktop_app, _SETUP_ARGS)
+
+    assert result.exit_code == 0, result.output
+    assert load_native_config(native_config_path(tmp_path)).shell.enabled is shell_enabled
+    assert ("open Computer access" in result.output) is not shell_enabled
+
+
+@pytest.mark.parametrize(
+    ("saved_homeserver", "saved_user_id"),
+    [
+        ("https://staging.example.org", "@alice:example.org"),
+        ("https://matrix.example.org", "@other:example.org"),
+    ],
+)
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_setup_rejects_saved_session_for_another_account(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    saved_homeserver: str,
+    saved_user_id: str,
+) -> None:
+    """A saved session for another homeserver or user cannot silently receive this pairing."""
+    session_path = tmp_path / "desktop_bridge" / "matrix_session.json"
+    save_desktop_session(
+        session_path,
+        DesktopMatrixSession(saved_homeserver, saved_user_id, "DESKTOP", "saved-token"),
+    )
+    login = MagicMock()
+    pair = MagicMock()
+    monkeypatch.setattr(desktop_cli, "desktop_login", login)
+    monkeypatch.setattr(desktop_cli, "desktop_pair", pair)
+
+    result = runner.invoke(desktop_app, _SETUP_ARGS)
+
+    assert result.exit_code == 1
+    assert "--storage-path" in result.output
+    assert saved_homeserver in result.output
+    assert not login.called
+    assert not pair.called
+
+
+@pytest.mark.usefixtures("cli_runtime")
+def test_desktop_setup_compares_saved_session_with_default_homeserver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without --homeserver, setup compares the saved session with the homeserver login would use."""
+    save_desktop_session(
+        tmp_path / "desktop_bridge" / "matrix_session.json",
+        DesktopMatrixSession("https://staging.example.org", "@alice:example.org", "DESKTOP", "saved-token"),
+    )
+    pair = MagicMock()
+    monkeypatch.setattr(
+        "mindroom.constants.runtime_matrix_homeserver",
+        lambda _runtime_paths: "https://matrix.example.org",
+    )
+    monkeypatch.setattr(desktop_cli, "desktop_pair", pair)
+
+    result = runner.invoke(desktop_app, ["setup", "--allow-agent", "computer", *_PAIRING_ARGS])
+
+    assert result.exit_code == 1
+    assert "https://staging.example.org" in result.output
+    assert not pair.called
+
+
+@pytest.mark.parametrize("inside_tmux", [False, True])
+def test_missing_macos_permission_says_to_restart_the_terminal_app(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    inside_tmux: bool,
+) -> None:
+    """A granted but not yet applied permission is the common case, so the restart comes first."""
+    monkeypatch.setattr("mindroom.desktop.provider.request_macos_desktop_permissions", lambda: ("Accessibility",))
+    if inside_tmux:
+        monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1,0")
+    else:
+        monkeypatch.delenv("TMUX", raising=False)
+
+    with pytest.raises(DesktopProviderError) as raised:
+        desktop_cli._request_required_desktop_permissions()
+
+    message = str(raised.value)
+    assert message.startswith("macOS has not applied Accessibility permission")
+    assert "already listed and enabled" in message
+    assert "Cmd-Q" in message
+    assert ("tmux kill-server" in message) is inside_tmux
+
+
 def test_desktop_run_loads_matrix_http_headers(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Long-running sync receives the same proxy headers as one-time login."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
     headers_path = tmp_path / "matrix-http-headers.json"
     headers_path.write_text('{"X-Access-Client": "test-secret"}', encoding="utf-8")
     headers_path.chmod(0o600)
     bridge = AsyncMock()
-    ensure_dependencies = MagicMock()
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
-    monkeypatch.setattr("mindroom.logging_config.setup_logging", lambda **_kwargs: None)
-    monkeypatch.setattr(desktop_cli, "_ensure_desktop_dependencies", ensure_dependencies)
-    monkeypatch.setattr(
-        "mindroom.desktop.session.load_desktop_session",
-        lambda _path: SimpleNamespace(homeserver="https://matrix.example.org", cloudflare_access=False),
-    )
+    ensure_dependencies = _stub_run_command(monkeypatch, tmp_path)
     monkeypatch.setattr(desktop_cli, "_run_bridge", bridge)
 
-    result = runner.invoke(
-        desktop_app,
-        [
-            "run",
-            "--controller-user-id",
-            "@cloud:example.org",
-            "--controller-device-id",
-            "CLOUD",
-            "--controller-ed25519",
-            "fingerprint",
-            "--allow-requester",
-            "@alice:example.org",
-            "--allow-agent",
-            "computer",
-            "--allow-app",
-            "com.example.Editor",
-            "--matrix-http-headers-file",
-            str(headers_path),
-        ],
-    )
+    result = runner.invoke(desktop_app, [*_RUN_ARGS, "--matrix-http-headers-file", str(headers_path)])
 
     assert result.exit_code == 0, result.output
-    ensure_dependencies.assert_called_once_with(runtime_paths)
+    ensure_dependencies.assert_called_once_with(SimpleNamespace(storage_root=tmp_path))
     assert bridge.await_args.kwargs["http_headers"] == {"X-Access-Client": "test-secret"}
+
+
+@pytest.mark.parametrize("shell_enabled", [False, True])
+def test_desktop_run_refuses_a_saved_browser_without_apps_folders_or_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    shell_enabled: bool,
+) -> None:
+    """A browser alone cannot be controlled without a saved app, so the run says what to choose instead of starting."""
+    save_native_config(
+        native_config_path(tmp_path),
+        replace(
+            _run_config(roots=(), shell_enabled=shell_enabled),
+            revision=0,
+            browser=NativeBrowserConfig(enabled=True),
+        ),
+        expected_revision=0,
+    )
+    bridge = AsyncMock()
+    _stub_run_command(monkeypatch, tmp_path)
+    monkeypatch.setattr(desktop_cli, "_run_bridge", bridge)
+
+    result = runner.invoke(desktop_app, ["run"])
+
+    assert result.exit_code == (0 if shell_enabled else 1), result.output
+    assert bridge.await_count == int(shell_enabled)
+    assert ("Choose and save apps, folders, or shell access" in result.output) is not shell_enabled
 
 
 def test_desktop_run_restores_saved_cloudflare_access_mode(
@@ -329,39 +589,17 @@ def test_desktop_run_restores_saved_cloudflare_access_mode(
     tmp_path: Path,
 ) -> None:
     """One-time login choice automatically applies to later bridge runs."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
-    session = SimpleNamespace(homeserver="https://matrix.example.org", cloudflare_access=True)
     headers = MagicMock()
     access_headers = MagicMock(return_value=headers)
     bridge = AsyncMock()
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
-    monkeypatch.setattr("mindroom.logging_config.setup_logging", lambda **_kwargs: None)
-    monkeypatch.setattr(desktop_cli, "_ensure_desktop_dependencies", MagicMock())
-    monkeypatch.setattr("mindroom.desktop.session.load_desktop_session", lambda _path: session)
-    monkeypatch.setattr("mindroom.desktop.cloudflare_access.cloudflare_access_headers", access_headers)
+    _stub_run_command(monkeypatch, tmp_path, cloudflare_access=True)
+    monkeypatch.setattr("mindroom.desktop.session.desktop_http_headers", access_headers)
     monkeypatch.setattr(desktop_cli, "_run_bridge", bridge)
 
-    result = runner.invoke(
-        desktop_app,
-        [
-            "run",
-            "--controller-user-id",
-            "@cloud:example.org",
-            "--controller-device-id",
-            "CLOUD",
-            "--controller-ed25519",
-            "fingerprint",
-            "--allow-requester",
-            "@alice:example.org",
-            "--allow-agent",
-            "computer",
-            "--allow-app",
-            "com.example.Editor",
-        ],
-    )
+    result = runner.invoke(desktop_app, _RUN_ARGS)
 
     assert result.exit_code == 0, result.output
-    access_headers.assert_called_once_with("https://matrix.example.org", None)
+    access_headers.assert_called_once_with("https://matrix.example.org", None, cloudflare_access=True)
     assert bridge.await_args.kwargs["http_headers"] is headers
 
 
@@ -397,37 +635,33 @@ def test_desktop_dependency_install_failure_is_provider_error(monkeypatch: pytes
         desktop_cli._ensure_desktop_dependencies(SimpleNamespace())
 
 
-def test_browser_profile_paths_require_extension_mode(tmp_path: Path) -> None:
-    """Profile options cannot be silently ignored when extension mode is absent."""
+@pytest.mark.parametrize(
+    ("enabled", "executable"),
+    [(False, "Brave"), (True, "missing-brave")],
+    ids=["without_extension_mode", "missing_path"],
+)
+def test_browser_profile_paths_need_extension_mode_and_must_exist(
+    tmp_path: Path,
+    *,
+    enabled: bool,
+    executable: str,
+) -> None:
+    """Profile options are never silently ignored, and bad local paths fail before Matrix login and sync startup."""
     with pytest.raises(typer.Exit) as exc_info:
         desktop_cli._validate_browser_options(
-            enabled=False,
-            executable_path=tmp_path / "Brave",
+            enabled=enabled,
+            executable_path=tmp_path / executable,
             user_data_dir=None,
         )
 
     assert exc_info.value.exit_code == 2
 
 
-def test_browser_profile_paths_must_exist(tmp_path: Path) -> None:
-    """Bad local browser paths fail before Matrix login and sync startup."""
-    with pytest.raises(typer.Exit) as exc_info:
-        desktop_cli._validate_browser_options(
-            enabled=True,
-            executable_path=tmp_path / "missing-brave",
-            user_data_dir=None,
-        )
-
-    assert exc_info.value.exit_code == 2
-
-
+@pytest.mark.usefixtures("cli_runtime")
 def test_login_command_preserves_unexpected_environment_errors(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """Session persistence failures remain distinguishable from expected login errors."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr(desktop_cli, "_login_and_save", AsyncMock(side_effect=PermissionError("test write failure")))
     monkeypatch.setenv("MINDROOM_DESKTOP_MATRIX_PASSWORD", "test-password")
 
@@ -447,13 +681,11 @@ def test_login_command_preserves_unexpected_environment_errors(
     assert isinstance(result.exception, PermissionError)
 
 
+@pytest.mark.usefixtures("cli_runtime")
 def test_run_command_preserves_unexpected_environment_errors(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """Unexpected session I/O errors are not flattened into a friendly domain failure."""
-    runtime_paths = SimpleNamespace(storage_root=tmp_path)
-    monkeypatch.setattr("mindroom.cli.config.activate_cli_runtime", lambda *_args, **_kwargs: runtime_paths)
     monkeypatch.setattr("mindroom.logging_config.setup_logging", lambda **_kwargs: None)
 
     def denied(_path: Path) -> None:
@@ -462,125 +694,398 @@ def test_run_command_preserves_unexpected_environment_errors(
 
     monkeypatch.setattr("mindroom.desktop.session.load_desktop_session", denied)
 
-    result = runner.invoke(
-        desktop_app,
-        [
-            "run",
-            "--controller-user-id",
-            "@cloud:example.org",
-            "--controller-device-id",
-            "CLOUD",
-            "--controller-ed25519",
-            "fingerprint",
-            "--allow-requester",
-            "@alice:example.org",
-            "--allow-agent",
-            "computer",
-            "--allow-app",
-            "com.example.Editor",
-        ],
-    )
+    result = runner.invoke(desktop_app, _RUN_ARGS)
 
     assert isinstance(result.exception, PermissionError)
 
 
-class _FakeBridgeClient:
-    def __init__(self) -> None:
-        self.to_device_callback: object | None = None
-        self.response_callback: object | None = None
-        self.sync_error: nio.SyncError | None = None
-        self.stopped = False
-
-    def add_to_device_callback(self, callback: object, _event_type: object) -> None:
-        self.to_device_callback = callback
-
-    def add_response_callback(self, callback: object, _response_type: object) -> None:
-        self.response_callback = callback
-
-    async def sync_forever(self, **_kwargs: object) -> None:
-        if self.sync_error is not None and self.response_callback is not None:
-            await self.response_callback(self.sync_error)  # type: ignore[operator]
-
-    def stop_sync_forever(self) -> None:
-        self.stopped = True
-
-    async def close(self) -> None:
-        return None
-
-
-@pytest.mark.asyncio
-async def test_bridge_pins_controller_before_consuming_initial_sync(
+@pytest.mark.parametrize("app_id", ["chat.mindroom.menubar", "chat.mindroom.desktophelper"])
+@pytest.mark.usefixtures("cli_runtime")
+def test_run_refuses_mindroom_itself_as_a_one_run_app(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    app_id: str,
 ) -> None:
-    """Fresh stores can authenticate queued commands before the initial sync acknowledges them."""
-    client = _FakeBridgeClient()
-    bridge = SimpleNamespace(on_to_device_event=AsyncMock())
-    request_permissions = MagicMock(return_value=())
-    lifecycle: list[str] = []
-    controller_resolved = False
+    """MindRoom's windows grant shell auto-approval and control, so `--allow-app` cannot name them for a run."""
+    bridge = AsyncMock()
+    monkeypatch.setattr("mindroom.logging_config.setup_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(desktop_cli, "_run_bridge", bridge)
 
-    async def open_client(*_args: object, **_kwargs: object) -> _FakeBridgeClient:
-        lifecycle.append("open")
-        return client
+    result = runner.invoke(desktop_app, [*_RUN_ARGS, "--allow-app", app_id])
 
-    async def prepare_client(preparing_client: _FakeBridgeClient) -> None:
-        lifecycle.append("prepare")
-        assert controller_resolved
-        assert preparing_client.to_device_callback is not None
-        event = AuthenticatedToDeviceEvent(
-            source={"content": {}},
-            sender="@cloud:example.org",
-            type="io.mindroom.desktop.command.v1",
-            authenticated_device_id="CLOUD",
-        )
-        preparing_client.to_device_callback(event)  # type: ignore[operator]
-        await asyncio.sleep(0)
+    assert result.exit_code == 1
+    assert f"control MindRoom itself ({app_id})" in " ".join(result.output.split())
+    bridge.assert_not_awaited()
 
-    async def resolve_device(*_args: object, **_kwargs: object) -> None:
-        nonlocal controller_resolved
-        lifecycle.append("resolve")
-        controller_resolved = True
 
-    monkeypatch.setattr("mindroom.desktop.session.open_desktop_client", open_client)
-    monkeypatch.setattr("mindroom.desktop.session.prepare_desktop_client", prepare_client)
-    monkeypatch.setattr("mindroom.matrix.olm_to_device.resolve_pinned_device", resolve_device)
-    monkeypatch.setattr("mindroom.desktop.provider.PyAutoGuiDesktopProvider", lambda **_kwargs: object())
-    monkeypatch.setattr(desktop_cli, "_request_required_desktop_permissions", request_permissions)
-    monkeypatch.setattr("mindroom.desktop.bridge.DesktopBridge", lambda **_kwargs: bridge)
+def _offline_run_deps(
+    owner: FakeMatrixOwner,
+    prepare_client: Callable[[nio.AsyncClient, PinnedMatrixDevice], Awaitable[None]] | None = None,
+) -> desktop_cli._BridgeRunDeps:
+    """Run the terminal bridge against a fake Matrix owner whose controller check passes unless told otherwise."""
+    return desktop_cli._BridgeRunDeps(session=offline_session_deps(owner, prepare_client))
 
-    await desktop_cli._run_bridge(
-        runtime_paths=SimpleNamespace(storage_root=tmp_path),
-        session=DesktopMatrixSession(
-            homeserver="https://matrix.example.org",
-            user_id="@desktop:example.org",
-            device_id="DESKTOP",
-            access_token="token",  # noqa: S106 - Test-only Matrix session fixture.
-        ),
-        controller_user_id="@cloud:example.org",
-        controller_device_id="CLOUD",
-        controller_ed25519="fingerprint",
-        allow_requester=frozenset({"@alice:example.org"}),
-        allow_agent=frozenset({"computer"}),
-        allow_app=frozenset({"com.example.Editor"}),
-        allow_control=False,
+
+def _run_offline(
+    tmp_path: Path,
+    config: NativeDesktopConfig,
+    deps: desktop_cli._BridgeRunDeps,
+    *,
+    allow_control: bool = False,
+    shell_auto_approve_minutes: int | None = None,
+) -> Coroutine[object, object, None]:
+    """Return the terminal bridge run for the saved session with a 15-minute control lease."""
+    return desktop_cli._run_bridge(
+        runtime_paths=runtime_paths(tmp_path),
+        session=SAVED_SESSION,
+        config=config,
+        allow_control=allow_control,
         lease_minutes=15,
-        max_screenshot_width=1600,
-        jpeg_quality=80,
+        shell_auto_approve_minutes=shell_auto_approve_minutes,
+        deps=deps,
     )
 
-    assert lifecycle == ["open", "resolve", "prepare"]
-    request_permissions.assert_called_once_with()
-    bridge.on_to_device_event.assert_awaited_once()
+
+@pytest.mark.asyncio
+async def test_run_without_shell_skips_shell_prompt_and_login_capture_and_fails_when_a_worker_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    empty_selected_root: Path,
+) -> None:
+    """The control lease lasts the chosen minutes, and a worker returning on its own is never a clean exit."""
+    policies: list[DesktopBridgePolicy] = []
+
+    class Bridge(DesktopBridge):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            policies.append(self.policy)
+
+        async def run(self) -> None:
+            return
+
+    owner = FakeMatrixOwner()
+    monkeypatch.setitem(sys.modules, "mindroom.desktop.shell_prompt", None)
+    monkeypatch.setitem(sys.modules, "mindroom.desktop.login_environment", None)
+    monkeypatch.setattr("mindroom.desktop.bridge_session.DesktopBridge", Bridge)
+
+    with pytest.raises(DesktopWorkerStoppedError):
+        await _run_offline(
+            tmp_path,
+            _run_config(roots=(empty_selected_root,)),
+            _offline_run_deps(owner),
+            allow_control=True,
+        )
+
+    # Stopping the bridge revokes control, so the lease is read as the run started it.
+    [policy] = policies
+    assert policy.allow_control is True
+    assert policy.control_lease_expires_at_ms is not None
+    assert 14 * 60 < policy.control_lease_expires_at_ms / 1000 - time.time() <= 15 * 60
+    assert owner.closed.is_set()
+    assert owner.client.to_device_callbacks == []
+
+
+def test_desktop_run_reports_a_stopped_worker_as_a_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A run whose worker stopped on its own exits non-zero with the reason instead of looking like a clean stop."""
+    _stub_run_command(monkeypatch, tmp_path)
+    monkeypatch.setattr(desktop_cli, "_run_bridge", AsyncMock(side_effect=DesktopWorkerStoppedError()))
+
+    result = runner.invoke(desktop_app, _RUN_ARGS)
+
+    assert result.exit_code == 1
+    assert "Desktop bridge failed: A desktop worker stopped unexpectedly." in " ".join(result.output.split())
 
 
 @pytest.mark.asyncio
-async def test_permanent_sync_error_stops_bridge_with_clear_failure() -> None:
-    """A revoked desktop token exits instead of spinning under an online banner."""
-    client = _FakeBridgeClient()
-    client.sync_error = nio.SyncError("Access token revoked", status_code="M_UNKNOWN_TOKEN")
+@pytest.mark.parametrize("shutdown", ["transport_failure", "cancellation"])
+async def test_cli_drains_native_work_before_releasing_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    empty_selected_root: Path,
+    shutdown: str,
+) -> None:
+    """Neither transport failure nor cancellation may release ownership over live input."""
+    started = asyncio.Event()
+    shutdown_started = asyncio.Event()
+    release_native = threading.Event()
+    native_finished = threading.Event()
+    loop = asyncio.get_running_loop()
 
-    with pytest.raises(DesktopSessionError, match="permanent authentication failure"):
-        await desktop_cli._sync_desktop_client(client)
+    def native_action() -> None:
+        loop.call_soon_threadsafe(started.set)
+        release_native.wait(5)
+        native_finished.set()
 
-    assert client.stopped
+    class ActiveBridge(DesktopBridge):
+        async def run(self) -> None:
+            async with self._execution_lock:
+                await asyncio.to_thread(native_action)
+            await asyncio.Event().wait()
+
+        async def stop(self) -> None:
+            shutdown_started.set()
+            await super().stop()
+
+    class Owner(FakeMatrixOwner):
+        async def close(self) -> None:
+            shutdown_started.set()
+            await super().close()
+
+    source = FailingSource()
+    owner = Owner(source=source)
+    monkeypatch.setattr("mindroom.desktop.bridge_session.DesktopBridge", ActiveBridge)
+    task = asyncio.create_task(
+        _run_offline(tmp_path, _run_config(roots=(empty_selected_root,)), _offline_run_deps(owner)),
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        if shutdown == "cancellation":
+            task.cancel()
+        else:
+            source.fail.set()
+        await asyncio.wait_for(shutdown_started.wait(), 2)
+        assert not owner.closed.is_set()
+        assert not native_finished.is_set()
+        assert not task.done()
+        release_native.set()
+        expected = asyncio.CancelledError if shutdown == "cancellation" else RuntimeError
+        with pytest.raises(expected):
+            await task
+        assert native_finished.is_set()
+        assert owner.closed.is_set()
+    finally:
+        release_native.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("apps", "expected_calls"),
+    [((), ["open"]), (("com.example.Editor",), ["permissions", "open"])],
+)
+async def test_only_application_access_requests_gui_permissions_before_matrix_opens(
+    tmp_path: Path,
+    empty_selected_root: Path,
+    apps: tuple[str, ...],
+    expected_calls: list[str],
+) -> None:
+    """Applications need macOS GUI permissions before Matrix opens; folder and shell access never ask for them."""
+    calls: list[str] = []
+
+    async def unavailable_matrix(*_args: object) -> NoReturn:
+        calls.append("open")
+        msg = "Matrix unavailable"
+        raise ConnectionError(msg)
+
+    deps = desktop_cli._BridgeRunDeps(
+        request_permissions=lambda: calls.append("permissions"),
+        session=DesktopBridgeSessionDeps(open_client=unavailable_matrix),
+    )
+    with pytest.raises(ConnectionError, match="Matrix unavailable"):
+        await _run_offline(tmp_path, _run_config(apps=apps, roots=(empty_selected_root,), shell_enabled=True), deps)
+
+    assert calls == expected_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("login_environment")
+async def test_folder_and_shell_bridge_revokes_shell_access_on_stop(
+    tmp_path: Path,
+    empty_selected_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A terminal bridge serves folders and shell without a GUI provider, and stopping it ends the local grant."""
+    prepared = asyncio.Event()
+
+    async def prepare_client(*_args: object) -> None:
+        prepared.set()
+
+    owner = FakeMatrixOwner()
+    task = asyncio.create_task(
+        _run_offline(
+            tmp_path,
+            _run_config(roots=(empty_selected_root,), shell_enabled=True),
+            _offline_run_deps(owner, prepare_client),
+            shell_auto_approve_minutes=5,
+        ),
+    )
+    try:
+        await asyncio.wait_for(prepared.wait(), 5)
+        # The run registers exactly one admission callback: the built bridge's.
+        [registration] = owner.client.to_device_callbacks
+        bridge = registration.func.__self__
+        assert isinstance(bridge, DesktopBridge)
+        assert 290 < bridge.local_status()["shell"]["auto_approve_remaining_seconds"] <= 300
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    shell = bridge.shell
+    assert shell is not None
+    assert shell.status()["auto_approve_remaining_seconds"] == 0
+    with pytest.raises(DesktopShellError, match="closed"):
+        shell.grant(60)
+    assert owner.client.to_device_callbacks == []
+    output = " ".join(capsys.readouterr().out.split())
+    assert "Applications: none" in output
+    assert f"Read-only folders: {empty_selected_root}" in output
+    assert "every locally allowed requester and agent" in output
+    assert "for 5 minutes" in output
+    assert "observe-only" not in output
+    assert "emergency stop" not in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("login_environment")
+async def test_terminal_approver_stops_reading_before_the_bridge_settles_pending_approval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    empty_selected_root: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Stopping a shell run cancels terminal approval first, then drains the bridge and reports the revoked grant."""
+    lifecycle: list[str] = []
+    approving = asyncio.Event()
+
+    class Bridge(DesktopBridge):
+        async def stop(self) -> None:
+            lifecycle.append("bridge_stop")
+            await super().stop()
+
+    async def approvals(*_args: object, **_kwargs: object) -> None:
+        approving.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            lifecycle.append("approvals_stopped")
+
+    monkeypatch.setattr("mindroom.desktop.bridge_session.DesktopBridge", Bridge)
+    monkeypatch.setattr("mindroom.desktop.shell_prompt.serve_terminal_shell_approvals", approvals)
+    config = _run_config(roots=(empty_selected_root,), shell_enabled=True)
+    task = asyncio.create_task(_run_offline(tmp_path, config, _offline_run_deps(FakeMatrixOwner())))
+    await asyncio.wait_for(approving.wait(), 5)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert lifecycle == ["approvals_stopped", "bridge_stop"]
+    assert "Shell access revoked; pending and running shell commands were stopped." in capsys.readouterr().out
+
+
+@pytest.fixture
+def narrow_runtime(cli_runtime: SimpleNamespace, narrow_markup_dir: Path) -> Path:
+    """Root the CLI runtime at a folder whose path Rich would read as markup, with the CLI at 80 columns."""
+    cli_runtime.storage_root = narrow_markup_dir
+    return narrow_markup_dir
+
+
+def test_desktop_login_prints_the_session_and_errors_whole_on_one_line(
+    narrow_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Login prints its session path and IPv6 user ID, and each error on stderr, as written and whole on one line."""
+    text = str(narrow_runtime)
+    session_path = narrow_runtime / "desktop_bridge" / "matrix_session.json"
+    session = DesktopMatrixSession("https://matrix.example.org", "@laptop:[fe80::1]", "LAPTOP", "saved-token")
+    save_desktop_session(session_path, session)
+    monkeypatch.setattr(
+        desktop_cli,
+        "_login_and_save",
+        AsyncMock(side_effect=DesktopSessionError(f"Cannot save {text}")),
+    )
+    monkeypatch.setenv("MINDROOM_DESKTOP_MATRIX_PASSWORD", "test-password")
+    login = ["login", "--user-id", "@laptop:example.org", "--homeserver", "https://matrix.example.org"]
+
+    existing = runner.invoke(desktop_app, login).stderr.splitlines()
+    failed = runner.invoke(desktop_app, [*login, "--login-method", "password", "--replace"]).stderr.splitlines()
+    desktop_cli._print_device_identity(session, fingerprint="fingerprint", session_path=session_path)
+
+    assert f"Error: Session already exists at {session_path}. Use --replace explicitly." in existing
+    assert f"Desktop login failed: Cannot save {text}" in failed
+    identity = capsys.readouterr().out.splitlines()
+    assert f"  Session: {session_path}" in identity
+    assert "  User: @laptop:[fe80::1]" in identity
+
+
+def test_desktop_pair_setup_and_access_print_their_errors_whole_on_one_line(
+    narrow_runtime: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pairing, setup, a saved session for another account, and an access update print each error whole."""
+    text = str(narrow_runtime)
+    session_path = narrow_runtime / "desktop_bridge" / "matrix_session.json"
+    own_session = DesktopMatrixSession("https://matrix.example.org", "@alice:example.org", "DESKTOP", "token")
+    save_desktop_session(session_path, own_session)
+    monkeypatch.setattr(desktop_cli, "_pair_desktop", AsyncMock(side_effect=ValueError(f"Cannot pair {text}")))
+    paired = runner.invoke(desktop_app, ["pair", *_PAIRING_ARGS]).stderr.splitlines()
+    session_path.write_text("{", encoding="utf-8")
+    unreadable = runner.invoke(desktop_app, _SETUP_ARGS).stderr.splitlines()
+    other_homeserver = f"https://matrix.example.org{text}"
+    save_desktop_session(session_path, replace(own_session, homeserver=other_homeserver))
+    mismatched = runner.invoke(desktop_app, _SETUP_ARGS).stderr.splitlines()
+    save_desktop_session(session_path, own_session)
+    monkeypatch.setattr(desktop_cli, "desktop_pair", MagicMock(side_effect=ValueError(f"Cannot save {text}")))
+    unsaved = runner.invoke(desktop_app, _SETUP_ARGS).stderr.splitlines()
+    monkeypatch.setattr(
+        "mindroom.desktop.native_config.load_native_config",
+        MagicMock(side_effect=NativeConfigError("invalid_config", f"Bad {text}")),
+    )
+    access = runner.invoke(desktop_app, ["access", "--shell"]).stderr.splitlines()
+
+    assert f"Desktop pairing failed: Cannot pair {text}" in paired
+    assert any(line.startswith("Desktop setup failed: ") and str(session_path) in line for line in unreadable)
+    assert (
+        f"Desktop setup failed: The saved session at {session_path} belongs to @alice:example.org on "
+        f"{other_homeserver}, not @alice:example.org on https://matrix.example.org. Pass --storage-path for a "
+        "separate setup, or run 'mindroom desktop login --replace' to replace the saved session."
+    ) in mismatched
+    assert f"Desktop setup failed: Cannot save {text}" in unsaved
+    assert f"Desktop access update failed: Bad {text}" in access
+
+
+def test_desktop_run_prints_its_errors_whole_on_one_line(
+    narrow_markup_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed bridge and missing browser profile paths print their error and path whole on one line."""
+    text = str(narrow_markup_dir)
+    _stub_run_command(monkeypatch, narrow_markup_dir)
+    monkeypatch.setattr(desktop_cli, "_run_bridge", AsyncMock(side_effect=ValueError(f"Cannot read {text}")))
+
+    failed = runner.invoke(desktop_app, _RUN_ARGS).stderr.splitlines()
+    for executable, profile in ((narrow_markup_dir / "browser", None), (None, narrow_markup_dir / "profile")):
+        with pytest.raises(typer.Exit):
+            desktop_cli._validate_browser_options(enabled=True, executable_path=executable, user_data_dir=profile)
+
+    assert f"Desktop bridge failed: Cannot read {text}" in failed
+    errors = capsys.readouterr().err.splitlines()
+    assert f"Error: Browser executable does not exist: {narrow_markup_dir / 'browser'}" in errors
+    assert f"Error: Browser user-data directory does not exist: {narrow_markup_dir / 'profile'}" in errors
+
+
+@pytest.mark.usefixtures("narrow_runtime")
+def test_desktop_login_prints_the_sso_url_whole_on_one_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a browser, the SSO URL to open is longer than the terminal is wide and still copies whole."""
+    url = f"https://matrix.example.org/_matrix/client/v3/login/sso/redirect?redirectUrl={'http%3A%2F%2F127.0.0.1' * 4}"
+
+    def receive_token(*_args: object, announce: Callable[[str], None], **_kwargs: object) -> str:
+        announce(f"Waiting for Matrix SSO. Press Ctrl-C to cancel.\nOpen this URL in a browser:\n{url}")
+        return "short-lived-token"
+
+    monkeypatch.setattr(
+        "mindroom.desktop.session.resolve_desktop_login_method",
+        AsyncMock(return_value=DesktopLoginMethod.SSO),
+    )
+    monkeypatch.setattr("mindroom.desktop.sso.receive_sso_login_token", receive_token)
+    monkeypatch.setattr(desktop_cli, "_login_and_save", AsyncMock())
+
+    result = runner.invoke(desktop_app, ["login", "--homeserver", "https://matrix.example.org"])
+
+    assert result.exit_code == 0, result.output
+    assert url in result.stdout.splitlines()
+
+
+def test_desktop_plain_lines_keep_emoji_codes_as_written(capsys: pytest.CaptureFixture[str]) -> None:
+    """Saved folders and requesters print as written, even when a name looks like an emoji code."""
+    desktop_cli._print_plain("  Read-only folders: /home/me/:rocket:-notes")
+
+    assert capsys.readouterr().out == "  Read-only folders: /home/me/:rocket:-notes\n"

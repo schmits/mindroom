@@ -8,7 +8,6 @@ team a requested model name maps to.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
@@ -16,6 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from mindroom.api.openai_streaming_protocol import error_response
+from mindroom.config.resolution import agent_policy
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 
@@ -141,8 +141,6 @@ def convert_messages(
             text = _extract_content_text(msg.content)
             if text:
                 system_parts.append(text)
-        elif msg.role == "tool":
-            continue
         elif msg.role in ("user", "assistant"):
             text = _extract_content_text(msg.content)
             if text:
@@ -156,11 +154,7 @@ def convert_messages(
                     ),
                 )
 
-    system_prompt = "\n\n".join(system_parts) if system_parts else ""
-
-    if not conversation:
-        return system_prompt, None
-
+    system_prompt = "\n\n".join(system_parts)
     result = _find_last_user_message(conversation)
     if result is None:
         return system_prompt, None
@@ -176,18 +170,18 @@ def convert_messages(
 def derive_session_id(
     model: str,
     request: Request,
+    key_namespace: str,
 ) -> str:
     """Derive a session ID from request headers or content.
 
+    ``key_namespace`` identifies the authenticated API key, so two keys never
+    share a session.
+
     Priority cascade:
-    1. X-Session-Id header (namespaced with API key to prevent cross-key collision)
+    1. X-Session-Id header
     2. X-LibreChat-Conversation-Id header + model
     3. Random UUID fallback (collision-safe default when no conversation ID is provided)
     """
-    # Namespace prefix from API key to prevent session hijack across keys
-    auth = request.headers.get("authorization", "")
-    key_namespace = hashlib.sha256(auth.encode()).hexdigest()[:8] if auth else "noauth"
-
     # 1. Explicit session ID (namespaced to prevent cross-key collision)
     session_id = request.headers.get("x-session-id")
     if session_id:
@@ -244,7 +238,7 @@ def _openai_incompatible_agent_closure(
             closures=delegation_closures,
         )
         if target_name in config.agents
-        and config.resolve_entity(target_name).execution_scope not in _OPENAI_COMPAT_SUPPORTED_WORKER_SCOPES
+        and agent_policy(config, target_name).effective_execution_scope not in _OPENAI_COMPAT_SUPPORTED_WORKER_SCOPES
     )
 
 
@@ -261,7 +255,7 @@ def _unsupported_worker_scope_error(agent_names: list[str], config: Config) -> J
         )
     }
     invalid_execution_scopes = {
-        config.resolve_entity(agent_name).execution_scope
+        agent_policy(config, agent_name).effective_execution_scope
         for agent_name in invalid_scope_agents
         if agent_name in config.agents
     }

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="brandfetch",
+    file_access=ToolFileAccess.NONE,
     display_name="Brandfetch",
     description="Retrieve brand data including logos, colors, and fonts by domain or name",
     category=ToolCategory.RESEARCH,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("BRANDFETCH_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="client_id",
+            env=("BRANDFETCH_CLIENT_ID",),
             label="Client ID",
             type="text",
             required=False,
@@ -72,7 +75,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["httpx"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/brandfetch",
+    docs_url="https://docs.mindroom.chat/tools/media-and-content/#brandfetch",
     helper_text="Get API keys from [Brandfetch Developers](https://developers.brandfetch.com/)",
     function_names=("asearch_by_brand", "asearch_by_identifier", "search_by_brand", "search_by_identifier"),
 )

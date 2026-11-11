@@ -23,8 +23,9 @@ from cryptography.hazmat.primitives.serialization import (
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from mindroom.config.validation import non_empty_stripped
+from mindroom.delivery_replay import DeliveryReplayStore
 from mindroom.durable_write import write_json_file_durable
-from mindroom.entity_resolution import configured_routable_entity_names_for_room
+from mindroom.entity_resolution import configured_routable_entity_names_for_room, names_room
 from mindroom.entity_rooms import get_rooms_for_entity
 from mindroom.external_triggers.policy import is_external_trigger_administrator
 from mindroom.file_locks import advisory_file_lock
@@ -58,7 +59,7 @@ class ExternalTriggerTarget(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    room_id: str = Field(description="Configured room key, room alias, or Matrix room ID")
+    room_id: str = Field(description="Configured room key, that room's full alias, or Matrix room ID")
     thread_id: str | None = Field(default=None, description="Optional Matrix thread event ID")
     agent: str = Field(description="Agent or team name to mention")
     new_thread: bool = Field(default=False, description="Whether the trigger starts a new thread")
@@ -237,6 +238,7 @@ class ExternalTriggerStore:
         self._root = runtime_paths.control_state_root / _EXTERNAL_TRIGGER_STATE_DIR
         self._store_path = self._root / _TRIGGER_RECORDS_FILENAME
         self._lock_path = self._root / f"{_TRIGGER_RECORDS_FILENAME}.lock"
+        self._replay_store = external_trigger_replay_store(runtime_paths.control_state_root)
 
     @property
     def store_path(self) -> Path:
@@ -432,7 +434,14 @@ class ExternalTriggerStore:
                 msg = "single-use trigger changed before it could be consumed"
                 raise ExternalTriggerStoreError(msg)
             records.triggers.pop(trigger_id)
-            self._write_records(records)
+            # Lets a concurrent duplicate get a duplicate answer until the next trigger write; the delivery path's current-scope check is what refuses it.
+            self._write_records(records, retained_scope=_replay_scope(record))
+
+    def is_current_replay_scope(self, trigger_id: str, replay_scope: str) -> bool:
+        """Return whether ``replay_scope`` still authenticates deliveries for ``trigger_id``."""
+        with advisory_file_lock(self._lock_path, exclusive=False):
+            record = self._read_records().triggers.get(trigger_id)
+        return record is not None and _replay_scope(record) == replay_scope
 
     def delivery_snapshot(
         self,
@@ -475,7 +484,7 @@ class ExternalTriggerStore:
             allowed_kinds=record.allowed_kinds,
             replay_window_seconds=min(record.replay_window_seconds, policy.max_replay_window_seconds),
             max_body_bytes=min(record.max_body_bytes, policy.max_body_bytes),
-            replay_scope=f"{record.uid}:{record.auth_epoch}",
+            replay_scope=_replay_scope(record),
         )
 
     def _require_owned_record(
@@ -499,7 +508,7 @@ class ExternalTriggerStore:
         return record
 
     def _validate_record_against_config(self, record: ExternalTriggerRecord, config: Config) -> None:
-        _validate_owner(record.owner_user_id, config, self._runtime_paths)
+        require_human_owner(record.owner_user_id, config, self._runtime_paths)
         _validate_target(record, config, self._runtime_paths)
 
     def _read_records(self) -> _SerializedTriggerRecords:
@@ -512,7 +521,11 @@ class ExternalTriggerStore:
             msg = "invalid external trigger store"
             raise ExternalTriggerStoreError(msg) from exc
 
-    def _write_records(self, records: _SerializedTriggerRecords) -> None:
+    def _write_records(self, records: _SerializedTriggerRecords, *, retained_scope: str | None = None) -> None:
+        """Publish ``records``, then drop the replay records of every scope but theirs and ``retained_scope``."""
+        live_scopes = {_replay_scope(record) for record in records.triggers.values()}
+        if retained_scope is not None:
+            live_scopes.add(retained_scope)
         try:
             write_json_file_durable(
                 self._store_path,
@@ -521,18 +534,29 @@ class ExternalTriggerStore:
                 indent=2,
                 sort_keys=True,
             )
+            self._replay_store.retain_scopes(live_scopes)
         except OSError as exc:
             msg = "external trigger store is unavailable"
             raise ExternalTriggerStoreError(msg) from exc
 
 
-def _validate_trigger_id(trigger_id: str) -> str:
+def external_trigger_replay_store(control_state_root: Path) -> DeliveryReplayStore:
+    """Return the replay store for external trigger deliveries, including the shared file older releases wrote."""
+    state_dir = control_state_root / _EXTERNAL_TRIGGER_STATE_DIR
+    return DeliveryReplayStore(root=state_dir / "replay", legacy_shared_file=state_dir / "replay.json")
+
+
+def _replay_scope(record: ExternalTriggerRecord) -> str:
+    """Return the replay scope that one trigger's current signing key authenticates."""
+    return f"{record.uid}:{record.auth_epoch}"
+
+
+def _validate_trigger_id(trigger_id: str) -> None:
     """Validate one route-safe trigger id."""
     normalized = non_empty_stripped(trigger_id, field_name="trigger_id")
     if re.fullmatch(_TRIGGER_ID_PATTERN, normalized) is None:
         msg = "trigger_id must contain only ASCII letters, digits, underscore, or hyphen"
         raise ExternalTriggerStoreError(msg)
-    return normalized
 
 
 def _normalize_public_key(public_key: str) -> tuple[str, bytes]:
@@ -608,7 +632,7 @@ def _public_key_fingerprint_from_bytes(public_key_bytes: bytes) -> str:
     return f"sha256:{hashlib.sha256(public_key_bytes).hexdigest()}"
 
 
-def _validate_owner(owner_user_id: str, config: Config, runtime_paths: RuntimePaths) -> None:
+def require_human_owner(owner_user_id: str, config: Config, runtime_paths: RuntimePaths) -> None:
     """Require an external human owner, not a managed bot identity."""
     MatrixID.parse(owner_user_id)
     if not is_human_requester_id(owner_user_id, config, runtime_paths):
@@ -622,6 +646,10 @@ def _validate_target(record: ExternalTriggerRecord, config: Config, runtime_path
     if target.agent not in config.agents and target.agent not in config.teams:
         msg = f"external trigger target references unknown agent or team: {target.agent}"
         raise ExternalTriggerStoreError(msg)
+    # Delivery reads the room through MindRoom's record, so an alias it cannot map would never deliver.
+    if not names_room(config, target.room_id, runtime_paths):
+        msg = "external trigger target room must be a room key MindRoom manages, that room's full alias, or a ! room ID"
+        raise ExternalTriggerStoreError(msg)
     if target.room_id in get_rooms_for_entity(target.agent, config):
         return
     resolved_room_id = resolve_room_id(target.room_id, runtime_paths)
@@ -633,23 +661,24 @@ def _validate_target(record: ExternalTriggerRecord, config: Config, runtime_path
     )
     if target.agent in configured_entities:
         return
-    if _targets_private_current_room(record, config, runtime_paths):
+    # A room with configured responders answers only them, so another agent's trigger there would never be answered.
+    if not configured_entities and _targets_own_current_room(record, config, runtime_paths):
         return
     msg = "external trigger target room must already be configured for the target entity"
     raise ExternalTriggerStoreError(msg)
 
 
-def _targets_private_current_room(
+def _targets_own_current_room(
     record: ExternalTriggerRecord,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> bool:
-    """Allow private current-agent triggers for dynamic rooms created outside config."""
+    """Allow a private, personal, or created agent's own trigger for the dynamic room it was created in."""
     target = record.target
     if target.agent != record.created_by_agent_name:
         return False
     agent_config = config.agents.get(target.agent)
-    if agent_config is None or agent_config.private is None:
+    if agent_config is None or (agent_config.private is None and config.generated_agent(target.agent) is None):
         return False
     return _room_ids_match(target.room_id, record.created_in_room_id, runtime_paths)
 

@@ -3,20 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from agno.tools import Toolkit
-
-from mindroom.authorization import is_platform_administrator
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
-from mindroom.requester_identity import resolve_human_requester_alias
+from mindroom.requester_identity import is_platform_administrator, resolve_human_requester_alias
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
-    build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
 )
-from mindroom.usage_stats import collect_admin_usage, collect_self_usage
+from mindroom.usage.stats import collect_admin_usage, collect_private_usage, collect_self_usage
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -30,7 +26,7 @@ class UsageStatsTools(Toolkit):
     def __init__(self, *, agent_name: str | None = None, admin_scope: bool = False) -> None:
         self._agent_name = agent_name
         self._admin_scope = admin_scope
-        functions: list[Callable[..., Awaitable[str]]] = [self.get_my_usage]
+        functions: list[Callable[..., Awaitable[str]]] = [self.get_my_usage, self.get_my_private_usage]
         if admin_scope:
             functions.append(self.get_all_usage)
         super().__init__(name="usage_stats", tools=functions)
@@ -46,17 +42,7 @@ class UsageStatsTools(Toolkit):
     @classmethod
     def _context_or_error(cls) -> ToolRuntimeContext | str:
         context = get_tool_runtime_context()
-        if context is None:
-            return cls._error(
-                "context_unavailable",
-                "Usage statistics are unavailable without an active requester context.",
-            )
-        if (
-            not context.agent_name
-            or not context.requester_id
-            or context.config is None
-            or context.runtime_paths is None
-        ):
+        if context is None or not context.agent_name or not context.requester_id:
             return cls._error(
                 "context_unavailable",
                 "Usage statistics are unavailable without an active requester context.",
@@ -85,8 +71,13 @@ class UsageStatsTools(Toolkit):
             )
         return resolved, config
 
-    async def get_my_usage(self) -> str:
-        """Return retained usage for the current agent and canonical requester."""
+    async def get_my_usage(self, include_daily: bool = False) -> str:
+        """Return retained usage for the current agent and canonical requester.
+
+        Args:
+            include_daily: Include token totals, per-model breakdowns, and run counts by UTC date.
+
+        """
         resolved = self._context_or_error()
         if isinstance(resolved, str):
             return resolved
@@ -102,22 +93,43 @@ class UsageStatsTools(Toolkit):
             config,
             context.runtime_paths,
         )
-        execution_identity = replace(
-            build_execution_identity_from_runtime_context(context),
-            agent_name=self._agent_name,
-        )
         report = await asyncio.to_thread(
             collect_self_usage,
             agent_name=self._agent_name,
             requester_id=requester_id,
             config=config,
             runtime_paths=context.runtime_paths,
-            execution_identity=execution_identity,
+            execution_identity=context.execution_identity,
+            include_daily=include_daily,
         )
         return self._payload("ok", **report.to_dict())
 
-    async def get_all_usage(self) -> str:
-        """Return retained usage for all sources when both admin gates grant access."""
+    async def get_my_private_usage(self, include_daily: bool = False) -> str:
+        """Return usage for all of the current requester's private agents.
+
+        Args:
+            include_daily: Include retained token totals and per-model breakdowns by UTC date.
+
+        """
+        context = self._context_or_error()
+        if isinstance(context, str):
+            return context
+        report = await asyncio.to_thread(
+            collect_private_usage,
+            requester_id=context.requester_id,
+            config=context.current_config,
+            runtime_paths=context.runtime_paths,
+            include_daily=include_daily,
+        )
+        return self._payload("ok", **report.to_dict())
+
+    async def get_all_usage(self, include_daily: bool = False) -> str:
+        """Return retained usage for all sources when both admin gates grant access.
+
+        Args:
+            include_daily: Include token totals, per-model breakdowns, and run counts by UTC date.
+
+        """
         resolved = self._admin_context_or_error()
         if isinstance(resolved, str):
             return resolved
@@ -126,5 +138,6 @@ class UsageStatsTools(Toolkit):
             collect_admin_usage,
             config=config,
             runtime_paths=context.runtime_paths,
+            include_daily=include_daily,
         )
         return self._payload("ok", **report.to_dict())

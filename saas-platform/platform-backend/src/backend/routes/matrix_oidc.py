@@ -1,4 +1,4 @@
-"""First-party OpenID Connect issuer for hosted Synapse login."""
+"""First-party OpenID Connect issuer for tenant homeserver login."""
 
 from __future__ import annotations
 
@@ -9,11 +9,10 @@ import json
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote
 
 import jwt
 from backend.config import (
-    INSTANCE_BASE_DOMAIN,
     MATRIX_OIDC_CLIENT_ID,
     MATRIX_OIDC_CLIENT_SECRET,
     MATRIX_OIDC_ENABLED,
@@ -22,9 +21,14 @@ from backend.config import (
     MATRIX_OIDC_PRIVATE_KEY,
     PLATFORM_DOMAIN,
 )
-from backend.deps import _extract_bearer_token, ensure_supabase, limiter, verify_user
-from backend.entitlements import assert_instance_entitlement
-from backend.services import instances_data
+from backend.deps import _extract_bearer_token, limiter
+from backend.routes.sso import (
+    assert_instance_login_allowed,
+    parse_instance_url,
+    platform_cookie_user,
+    platform_login_redirect,
+)
+from backend.services.provisioner_service import matrix_localpart_from_email
 from cachetools import TTLCache
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey, RSAPublicKey
@@ -93,40 +97,11 @@ def _authorize_url(request: Request) -> str:
     return f"{_issuer()}/authorize{suffix}"
 
 
-def _platform_login_redirect(request: Request) -> RedirectResponse:
-    target = quote(_authorize_url(request), safe="")
-    return RedirectResponse(f"https://app.{PLATFORM_DOMAIN}/auth/login?redirect_to={target}")
-
-
 def _validate_redirect_uri(redirect_uri: str) -> str:
-    parsed = urlparse(redirect_uri)
-    if parsed.scheme != "https" or parsed.path != "/_synapse/client/oidc/callback":
+    target = parse_instance_url(redirect_uri, host_prefix="matrix.")
+    if target is None or target.path != f"/_matrix/client/unstable/login/sso/callback/{MATRIX_OIDC_CLIENT_ID}":
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
-
-    hostname = (parsed.hostname or "").lower()
-    suffix = f".matrix.{(INSTANCE_BASE_DOMAIN or PLATFORM_DOMAIN).lower()}"
-    if not hostname.endswith(suffix):
-        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
-
-    instance_id = hostname[: -len(suffix)]
-    if not instance_id or "." in instance_id:
-        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
-    return instance_id
-
-
-def _load_owned_instance(instance_id: str, account_id: str) -> dict[str, Any]:
-    instance = instances_data.get_owned_instance(ensure_supabase(), instance_id, account_id)
-    if instance is None:
-        raise HTTPException(status_code=403, detail="Instance not found or access denied")
-    return instance
-
-
-def _assert_instance_subscription_allows_login(instance: dict[str, Any]) -> None:
-    sb = ensure_supabase()
-    result = sb.table("subscriptions").select("*").eq("id", instance["subscription_id"]).limit(1).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Subscription not found")
-    assert_instance_entitlement(result.data[0], "sign in to")
+    return target.instance_id
 
 
 def _subject_from_user(user: dict[str, Any]) -> str:
@@ -153,6 +128,7 @@ def _build_code_claims(
     *, user: dict[str, Any], instance_id: str, redirect_uri: str, scope: str, nonce: str | None
 ) -> dict[str, Any]:
     now = _now()
+    email = _email_from_user(user)
     return {
         "typ": "matrix_oidc_code",
         "iss": _issuer(),
@@ -166,8 +142,10 @@ def _build_code_claims(
         "redirect_uri": redirect_uri,
         "scope": scope,
         "nonce": nonce,
-        "email": _email_from_user(user),
+        "email": email,
         "email_verified": True,
+        # The tenant homeserver names the account after this, so it is the owner MXID the provisioner authorizes.
+        "preferred_username": matrix_localpart_from_email(email),
         "name": _display_name_from_user(user),
     }
 
@@ -229,6 +207,7 @@ def _build_id_token_claims(code_claims: dict[str, Any]) -> dict[str, Any]:
         "auth_time": code_claims["iat"],
         "email": code_claims["email"],
         "email_verified": code_claims["email_verified"],
+        "preferred_username": code_claims["preferred_username"],
         "name": code_claims["name"],
     }
     if code_claims.get("nonce"):
@@ -247,6 +226,7 @@ def _build_access_token_claims(code_claims: dict[str, Any]) -> dict[str, Any]:
         "exp": _epoch(now + timedelta(seconds=ACCESS_TOKEN_TTL_SECONDS)),
         "email": code_claims["email"],
         "email_verified": code_claims["email_verified"],
+        "preferred_username": code_claims["preferred_username"],
         "name": code_claims["name"],
     }
 
@@ -255,7 +235,7 @@ def _build_access_token_claims(code_claims: dict[str, Any]) -> dict[str, Any]:
 @router.get("/.well-known/openid-configuration/matrix-oidc")
 @limiter.limit("60/minute")
 async def openid_configuration(request: Request) -> dict[str, Any]:
-    """Return OIDC discovery metadata for Synapse."""
+    """Return OIDC discovery metadata for tenant homeservers."""
     _require_enabled()
     issuer = _issuer()
     return {
@@ -270,7 +250,7 @@ async def openid_configuration(request: Request) -> dict[str, Any]:
         "id_token_signing_alg_values_supported": ["RS256"],
         "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
         "scopes_supported": ["openid", "profile", "email"],
-        "claims_supported": ["sub", "email", "email_verified", "name"],
+        "claims_supported": ["sub", "email", "email_verified", "preferred_username", "name"],
     }
 
 
@@ -295,23 +275,17 @@ async def authorize(
     state: str,
     nonce: str | None = None,
 ) -> RedirectResponse:
-    """Issue an authorization code to Synapse after platform-cookie authentication."""
+    """Issue an authorization code to a tenant homeserver after platform-cookie authentication."""
     _require_enabled()
     if response_type != "code" or client_id != MATRIX_OIDC_CLIENT_ID:
         raise HTTPException(status_code=400, detail="Invalid OIDC authorization request")
 
     instance_id = _validate_redirect_uri(redirect_uri)
-    token = request.cookies.get("mindroom_jwt")
-    if not token:
-        return _platform_login_redirect(request)
+    user = await platform_cookie_user(request)
+    if user is None:
+        return platform_login_redirect(_authorize_url(request))
 
-    try:
-        user = await verify_user(authorization=f"Bearer {token}", request=request)
-    except HTTPException:
-        return _platform_login_redirect(request)
-
-    instance = _load_owned_instance(instance_id, str(user["account_id"]))
-    _assert_instance_subscription_allows_login(instance)
+    assert_instance_login_allowed(instance_id, str(user["account_id"]))
     code = _sign_claims(
         _build_code_claims(user=user, instance_id=instance_id, redirect_uri=redirect_uri, scope=scope, nonce=nonce)
     )
@@ -322,7 +296,7 @@ async def authorize(
 @router.post("/matrix-oidc/token")
 @limiter.limit("60/minute")
 async def token(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """Exchange a Synapse authorization code for OIDC tokens."""
+    """Exchange a tenant homeserver authorization code for OIDC tokens."""
     _require_enabled()
     params = _parse_request_body(await request.body())
     _require_client_auth(params, authorization)
@@ -345,7 +319,7 @@ async def token(request: Request, authorization: str | None = Header(default=Non
 @router.get("/matrix-oidc/userinfo")
 @limiter.limit("60/minute")
 async def userinfo(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """Return user claims for Synapse's OIDC userinfo fetch."""
+    """Return user claims for a tenant homeserver's OIDC userinfo fetch."""
     _require_enabled()
     access_token = _extract_bearer_token(authorization)
     claims = _decode_claims(access_token, audience="matrix_oidc_userinfo")
@@ -355,5 +329,6 @@ async def userinfo(request: Request, authorization: str | None = Header(default=
         "sub": claims["sub"],
         "email": claims["email"],
         "email_verified": claims.get("email_verified") is True,
+        "preferred_username": claims["preferred_username"],
         "name": claims.get("name") or claims["email"],
     }

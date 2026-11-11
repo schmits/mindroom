@@ -14,12 +14,13 @@ from mindroom.cli.api import get_api_response
 from mindroom.cli.config import CONFIG_PATH_OPTION, activate_cli_runtime
 
 if TYPE_CHECKING:
-    from mindroom.config_reload import ConfigReloadStatus
+    from mindroom.config.reload_status import ConfigReloadStatus
     from mindroom.constants import RuntimePaths
 
 
-def _request_status(runtime_paths: RuntimePaths, url: str | None, timeout: float) -> ConfigReloadStatus:
-    from mindroom.config_reload import ConfigReloadStatus  # noqa: PLC0415
+def request_reload_status(runtime_paths: RuntimePaths, url: str | None, timeout: float) -> ConfigReloadStatus:
+    """Read the latest runtime reload result, rejecting malformed or conflicting responses."""
+    from mindroom.config.reload_status import ConfigReloadStatus  # noqa: PLC0415
 
     response = get_api_response(runtime_paths, url, "/api/config/reload-status", timeout, require_key=True)
     if response.status_code not in {200, 503}:
@@ -36,14 +37,15 @@ def _request_status(runtime_paths: RuntimePaths, url: str | None, timeout: float
     return status
 
 
-def _wait_for_applied(
+def wait_for_applied(
     runtime_paths: RuntimePaths,
     url: str | None,
     expected: str,
     wait: float,
     timeout: float,
 ) -> ConfigReloadStatus:
-    from mindroom.config_reload import ConfigReloadStatus  # noqa: PLC0415
+    """Poll until the runtime settles the expected fingerprint; other fingerprints read as pending."""
+    from mindroom.config.reload_status import ConfigReloadStatus  # noqa: PLC0415
 
     for name, value in (("wait", wait), ("timeout", timeout)):
         if not math.isfinite(value):
@@ -55,7 +57,7 @@ def _wait_for_applied(
     while True:
         request_timeout = min(timeout, max(0.001, deadline - time.monotonic())) if wait else timeout
         try:
-            status = _request_status(runtime_paths, url, request_timeout)
+            status = request_reload_status(runtime_paths, url, request_timeout)
         except TimeoutError:
             if status is not None and wait and time.monotonic() >= deadline:
                 return status
@@ -79,7 +81,7 @@ def _fingerprint(path: Path) -> str:
     )
 
     try:
-        data, digests = load_yaml_config_source_with_digests(path)
+        data, digests, _uses_includes = load_yaml_config_source_with_digests(path)
     except CONFIG_LOAD_USER_ERROR_TYPES as exc:
         msg = "Cannot fingerprint config; check its YAML and include paths."
         raise ValueError(msg) from exc
@@ -93,7 +95,7 @@ def _fingerprint(path: Path) -> str:
 
 
 def config_fingerprint(path: Path | None = CONFIG_PATH_OPTION) -> None:
-    """Print the config source SHA-256, including all transitively included files."""
+    """Print the SHA-256 of the config and every file it includes."""
     try:
         typer.echo(_fingerprint(activate_cli_runtime(path).config_path))
     except (ValueError, OSError) as exc:
@@ -109,15 +111,17 @@ def config_check_applied(
     timeout: float = typer.Option(10.0, min=0.001, help="HTTP timeout in seconds."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable JSON."),
 ) -> None:
-    """Confirm config application; exit 0 applied, 1 pending/mismatch, 2 failed/restart-required/unavailable.
+    """Confirm that the runtime applied a config.
 
-    The expected fingerprint is captured once, before polling. This reads
-    status only: it does not write config or trigger a reload.
+    Exits 0 when applied, 1 when pending or mismatched, and 2 when failed, restart-required, or unavailable.
+
+    The expected fingerprint is captured once, before polling.
+    This reads status only: it does not write config or trigger a reload.
     """
     try:
         runtime_paths = activate_cli_runtime(path)
         expected = fingerprint if fingerprint is not None else _fingerprint(runtime_paths.config_path)
-        status = _wait_for_applied(runtime_paths, url, expected, wait, timeout)
+        status = wait_for_applied(runtime_paths, url, expected, wait, timeout)
     except (ValueError, OSError) as exc:
         if json_output:
             typer.echo(json.dumps({"status": "unavailable", "detail": str(exc)}))

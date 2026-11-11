@@ -4,37 +4,54 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
+import ssl
 import stat
 from collections.abc import Iterator, Mapping
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID
 
 import aiohttp
 import nio
 import pytest
+from aiohttp import web
 from nio.durable import DurableSyncConfig
 from nio.store.database import DefaultStore, SqliteStore
+from structlog.testing import capture_logs
 
 from mindroom.constants import (
     CONFIG_CONFIRMATION_REACTION_KEY,
     STREAM_STATUS_KEY,
     VISIBLE_ROUTER_VOICE_ECHO_KEY,
     RuntimePaths,
+    resolve_runtime_paths,
 )
 from mindroom.event_journal import EventJournalStore
 from mindroom.event_journal.models import IngestionConsumer
 from mindroom.matrix import _owned_session, client_session
+from mindroom.matrix.client_delivery import send_room_event_result
 from mindroom.matrix.client_session import (
-    MatrixSyncStorage,
     MindRoomAsyncClient,
     PermanentMatrixStartupError,
+    create_matrix_http_client,
     login_flows,
-    login_with_token,
     matrix_client_config,
 )
+from tests.conftest import legacy_default_store_client
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+def _runtime_paths(tmp_path: Path) -> RuntimePaths:
+    return RuntimePaths(
+        config_path=tmp_path / "config.yaml",
+        config_dir=tmp_path,
+        env_path=tmp_path / ".env",
+        storage_root=tmp_path / "data",
+    )
 
 
 def test_encryption_exposes_only_mindroom_recovery_markers(
@@ -156,13 +173,79 @@ def test_matrix_client_config_enables_sync_token_storage() -> None:
     assert config.store_sync_tokens is True
 
 
-def test_matrix_client_config_supports_application_owned_sync_tokens() -> None:
-    """Classic ingress can leave its cursor under application ownership."""
-    config = matrix_client_config(
-        sync_storage=MatrixSyncStorage(store_tokens=False),
-    )
+_ROOM_ID = "!room:example.org"
+_MESSAGE = {"msgtype": "m.text", "body": "hello"}
 
-    assert config.store_sync_tokens is False
+
+@pytest.mark.asyncio
+async def test_matrix_requests_give_up_on_a_homeserver_that_stays_down(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An event lookup and a send end in an error instead of retrying forever, after outlasting a one-minute restart."""
+    waits: list[float] = []
+    nio_wait = nio.AsyncClient.get_timeout_retry_wait_time
+
+    async def skip_wait(client: nio.AsyncClient, got_timeouts: int) -> float:
+        waits.append(await nio_wait(client, got_timeouts))
+        return 0.0
+
+    monkeypatch.setattr(nio.AsyncClient, "get_timeout_retry_wait_time", skip_wait)
+    with socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+    client = create_matrix_http_client(f"http://127.0.0.1:{port}", runtime_paths, "@mindroom_agent:example.org")
+    client.access_token = "token"  # noqa: S105
+
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(aiohttp.ClientConnectionError):
+                await client.room_get_event(_ROOM_ID, "$event")
+            assert 60 < sum(waits) < 120
+            waits.clear()
+            assert await send_room_event_result(client, _ROOM_ID, "m.room.message", _MESSAGE) is None
+            assert 60 < sum(waits) < 120
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_matrix_requests_give_up_on_a_homeserver_that_keeps_rate_limiting(tmp_path: Path) -> None:
+    """An event lookup and a send return the 429 after a bounded number of tries instead of retrying forever."""
+    attempts: list[str] = []
+
+    async def rate_limited(request: web.Request) -> web.Response:
+        attempts.append(request.path)
+        return web.json_response(
+            {"errcode": "M_LIMIT_EXCEEDED", "error": "Too many requests", "retry_after_ms": 1},
+            status=429,
+        )
+
+    app = web.Application()
+    app.router.add_route("*", "/{path:.*}", rate_limited)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    assert site._server is not None
+    port = site._server.sockets[0].getsockname()[1]
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+    client = create_matrix_http_client(f"http://127.0.0.1:{port}", runtime_paths, "@mindroom_agent:example.org")
+    client.access_token = "token"  # noqa: S105
+
+    try:
+        async with asyncio.timeout(5):
+            lookup = await client.room_get_event(_ROOM_ID, "$event")
+            send = await send_room_event_result(client, _ROOM_ID, "m.room.message", _MESSAGE)
+    finally:
+        await client.close()
+        await runner.cleanup()
+
+    assert isinstance(lookup, nio.RoomGetEventError)
+    assert isinstance(send, nio.RoomSendError)
+    assert lookup.status_code == send.status_code == "M_LIMIT_EXCEEDED"
+    assert len(attempts) == 2 * 21
 
 
 @pytest.mark.asyncio
@@ -268,185 +351,19 @@ async def test_process_shutdown_transport_fence_stops_send_after_header_preparat
     assert replacement_sessions == []
 
 
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="POSIX permission bits are unavailable on Windows",
-)
-def test_matrix_store_directory_is_owner_only(tmp_path: Path) -> None:
-    """Private Olm identity material is inaccessible to other local users."""
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
-
-    client = client_session._create_matrix_client(
-        "https://matrix.example.org",
-        runtime_paths,
-        "@desktop:example.org",
-        "matrix-access-token",
-    )
-
-    assert client.store_path is not None
-    assert stat.S_IMODE(Path(client.store_path).stat().st_mode) == 0o700
-
-
 @pytest.mark.asyncio
-async def test_login_with_token_restores_returned_device(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Token exchange uses no guessed identity and restores exactly returned credentials."""
-    response = nio.LoginResponse(
-        "@desktop:example.org",
-        "DESKTOP",
-        "matrix-access-token",
-    )
-    login_client = SimpleNamespace(
-        login=AsyncMock(return_value=response),
-        close=AsyncMock(),
-    )
-    create_login_client = Mock(return_value=login_client)
-    restored_client = object()
-    create_authenticated = Mock(return_value=restored_client)
-    monkeypatch.setattr(client_session, "_create_matrix_client", create_login_client)
-    monkeypatch.setattr(
-        client_session,
-        "create_authenticated_client",
-        create_authenticated,
-    )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
-
-    result = await login_with_token(
-        "https://matrix.example.org",
-        "short-lived-token",
-        runtime_paths,
-        expected_user_id="@desktop:example.org",
-        http_headers={"X-Access-Client": "test-secret"},
-    )
-
-    assert result is restored_client
-    create_login_client.assert_called_once_with(
+async def test_matrix_client_is_http_only_for_its_account(tmp_path: Path) -> None:
+    """Registration and collision logins never open an encryption store, so they leave none behind."""
+    runtime_paths = _runtime_paths(tmp_path)
+    async with client_session.matrix_client(
         "https://matrix.example.org",
         runtime_paths,
-        http_headers={"X-Access-Client": "test-secret"},
-        sync_storage=MatrixSyncStorage(),
-    )
-    login_client.login.assert_awaited_once_with(
-        token="short-lived-token",  # noqa: S106 - Test-only login token.
-        device_name="MindRoom Desktop Bridge",
-    )
-    login_client.close.assert_awaited_once()
-    create_authenticated.assert_called_once_with(
-        "https://matrix.example.org",
-        "@desktop:example.org",
-        "DESKTOP",
-        "matrix-access-token",
-        runtime_paths,
-        http_headers={"X-Access-Client": "test-secret"},
-        sync_storage=MatrixSyncStorage(),
-    )
-
-
-@pytest.mark.asyncio
-async def test_login_with_token_uses_supplied_sync_storage_for_both_clients(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Token exchange and restored client retain one caller's sync policy.
-
-    This fails if ``login_with_token`` drops the policy at either client
-    construction boundary.
-    """
-    response = nio.LoginResponse(
-        "@desktop:example.org",
-        "DESKTOP",
-        "matrix-access-token",
-    )
-    login_client = SimpleNamespace(
-        login=AsyncMock(return_value=response),
-        close=AsyncMock(),
-    )
-    create_login_client = Mock(return_value=login_client)
-    restored_client = object()
-    create_authenticated = Mock(return_value=restored_client)
-    monkeypatch.setattr(client_session, "_create_matrix_client", create_login_client)
-    monkeypatch.setattr(
-        client_session,
-        "create_authenticated_client",
-        create_authenticated,
-    )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
-    sync_storage = MatrixSyncStorage(store_tokens=True)
-
-    result = await login_with_token(
-        "https://matrix.example.org",
-        "short-lived-token",
-        runtime_paths,
-        sync_storage=sync_storage,
-    )
-
-    assert result is restored_client
-    assert create_login_client.call_args.kwargs["sync_storage"] is sync_storage
-    assert create_authenticated.call_args.kwargs["sync_storage"] is sync_storage
-
-
-@pytest.mark.asyncio
-async def test_login_with_token_revokes_unexpected_identity(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """SSO cannot silently enroll a different Matrix account than requested."""
-    login_client = SimpleNamespace(
-        login=AsyncMock(
-            return_value=nio.LoginResponse(
-                "@wrong:example.org",
-                "WRONG",
-                "access-token",
-            ),
-        ),
-        logout=AsyncMock(return_value=nio.LogoutResponse()),
-        close=AsyncMock(),
-    )
-    monkeypatch.setattr(
-        client_session,
-        "_create_matrix_client",
-        Mock(return_value=login_client),
-    )
-    create_authenticated = Mock()
-    monkeypatch.setattr(
-        client_session,
-        "create_authenticated_client",
-        create_authenticated,
-    )
-
-    with pytest.raises(PermanentMatrixStartupError, match=r"@wrong:example\.org"):
-        await login_with_token(
-            "https://matrix.example.org",
-            "short-lived-token",
-            RuntimePaths(
-                config_path=tmp_path / "config.yaml",
-                config_dir=tmp_path,
-                env_path=tmp_path / ".env",
-                storage_root=tmp_path / "data",
-            ),
-            expected_user_id="@desktop:example.org",
-        )
-
-    login_client.logout.assert_awaited_once()
-    login_client.close.assert_awaited_once()
-    create_authenticated.assert_not_called()
+        "@mindroom_agent:example.org",
+    ) as client:
+        assert client.user_id == "@mindroom_agent:example.org"
+        assert client.store_path is None
+        assert client.config.encryption_enabled is False
+    assert not client_session.olm_store_dir("@mindroom_agent:example.org", runtime_paths).exists()
 
 
 @pytest.mark.asyncio
@@ -462,13 +379,8 @@ async def test_login_flows_uses_proxy_headers_and_closes_client(
         close=AsyncMock(),
     )
     create_client = Mock(return_value=client)
-    monkeypatch.setattr(client_session, "_create_matrix_client", create_client)
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    monkeypatch.setattr(client_session, "create_matrix_http_client", create_client)
+    runtime_paths = _runtime_paths(tmp_path)
 
     flows = await login_flows(
         "https://matrix.example.org",
@@ -480,6 +392,7 @@ async def test_login_flows_uses_proxy_headers_and_closes_client(
     create_client.assert_called_once_with(
         "https://matrix.example.org",
         runtime_paths,
+        "",
         http_headers={"X-Access-Client": "test-secret"},
     )
     client.close.assert_awaited_once()
@@ -499,23 +412,14 @@ async def test_password_credentials_use_storeless_client_and_close_before_return
     temporary = SimpleNamespace(
         login=AsyncMock(return_value=response),
         close=AsyncMock(),
-        store=None,
-        olm=None,
-        store_path=None,
     )
     create_temporary = Mock(return_value=temporary)
     monkeypatch.setattr(
         _owned_session,
         "create_matrix_http_client",
         create_temporary,
-        raising=False,
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
 
     credentials = await _owned_session.login_password_credentials(
         "https://matrix.example.org",
@@ -568,22 +472,13 @@ async def test_password_credentials_close_temporary_client_on_failure_or_cancel(
     temporary = SimpleNamespace(
         login=login,
         close=AsyncMock(),
-        store=None,
-        olm=None,
-        store_path=None,
     )
     monkeypatch.setattr(
         _owned_session,
         "create_matrix_http_client",
         Mock(return_value=temporary),
-        raising=False,
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
 
     with pytest.raises(expected_exception):
         await _owned_session.login_password_credentials(
@@ -603,7 +498,6 @@ async def test_restored_credentials_verify_identity_storeless_and_close(
 ) -> None:
     """Restored tokens are verified before any configured store is opened."""
     temporary = SimpleNamespace(
-        user_id="",
         device_id="",
         access_token="",
         whoami=AsyncMock(
@@ -614,9 +508,6 @@ async def test_restored_credentials_verify_identity_storeless_and_close(
             ),
         ),
         close=AsyncMock(),
-        store=None,
-        olm=None,
-        store_path=None,
     )
     create_temporary = Mock(return_value=temporary)
     monkeypatch.setattr(
@@ -624,12 +515,7 @@ async def test_restored_credentials_verify_identity_storeless_and_close(
         "create_matrix_http_client",
         create_temporary,
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
 
     credentials = await _owned_session.restore_credentials(
         "https://matrix.example.org",
@@ -645,15 +531,7 @@ async def test_restored_credentials_verify_identity_storeless_and_close(
         "AGENTDEVICE",
         "access-token",
     )
-    assert (
-        temporary.user_id,
-        temporary.device_id,
-        temporary.access_token,
-    ) == (
-        credentials.user_id,
-        credentials.device_id,
-        credentials.access_token,
-    )
+    assert (temporary.device_id, temporary.access_token) == (credentials.device_id, credentials.access_token)
     create_temporary.assert_called_once_with(
         "https://matrix.example.org",
         runtime_paths,
@@ -681,12 +559,7 @@ async def test_owned_matrix_session_factory_creates_one_fresh_store_and_binding(
         return IngestionConsumer(generation, stream_id)
 
     consumer_store.bind_ingestion_stream.side_effect = bind_stream
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials(
         "@agent:example.org",
         "AGENTDEVICE",
@@ -737,12 +610,7 @@ async def test_owned_matrix_session_factory_reopens_with_established_consumer_id
     """A later creation candidate must reopen the exact durable consumer."""
     first_candidate = UUID("22222222-2222-4222-8222-222222222222")
     later_candidate = UUID("33333333-3333-4333-8333-333333333333")
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials(
         "@agent:example.org",
         "AGENTDEVICE",
@@ -824,12 +692,7 @@ async def test_owned_matrix_session_factory_failure_closes_http_and_reopens(
             ),
         ),
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials(
         "@agent:example.org",
         "AGENTDEVICE",
@@ -894,12 +757,7 @@ async def test_owned_matrix_session_factory_cancellation_releases_bootstrap(
         ),
         bind_ingestion_stream=AsyncMock(side_effect=bind_stream),
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials(
         "@agent:example.org",
         "AGENTDEVICE",
@@ -953,18 +811,13 @@ async def test_owned_matrix_session_factory_adopts_default_then_reopens_marked(
         load_or_create_ingestion_consumer=AsyncMock(side_effect=load_consumer),
         bind_ingestion_stream=AsyncMock(side_effect=bind_stream),
     )
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials(
         "@agent:example.org",
         "AGENTDEVICE",
         "access-token",
     )
-    legacy = client_session.create_authenticated_client(
+    legacy = legacy_default_store_client(
         "https://matrix.example.org",
         credentials.user_id,
         credentials.device_id,
@@ -1016,12 +869,7 @@ async def test_owned_matrix_session_factory_adopts_default_then_reopens_marked(
 @pytest.mark.parametrize("existing_directory", [False, True])
 async def test_owned_crypto_directory_is_private(tmp_path: Path, existing_directory: bool) -> None:
     """An owned store must protect keys even under a permissive parent and umask."""
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     credentials = _owned_session.MatrixCredentials("@bot:example.org", "DEVICE", "token")
     directory = client_session.olm_store_dir(credentials.user_id, runtime_paths)
     if existing_directory:
@@ -1051,12 +899,7 @@ async def test_owned_crypto_directory_is_private(tmp_path: Path, existing_direct
 @pytest.mark.asyncio
 async def test_credential_renewal_requests_the_existing_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A soft-logged-out device keeps its identity instead of getting a new stream."""
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     temporary = _owned_session.create_matrix_http_client("https://example.org", runtime_paths, "@bot:example.org")
     requested_devices = []
 
@@ -1085,12 +928,7 @@ async def test_restore_only_renews_a_soft_logged_out_device(
     soft_logout: bool,
 ) -> None:
     """A deleted server device cannot be recreated with stale published crypto state."""
-    runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "data",
-    )
+    runtime_paths = _runtime_paths(tmp_path)
     temporary = _owned_session.create_matrix_http_client("https://example.org", runtime_paths, "@bot:example.org")
     monkeypatch.setattr(
         temporary,
@@ -1116,3 +954,191 @@ async def test_restore_only_renews_a_soft_logged_out_device(
     else:
         with pytest.raises(PermanentMatrixStartupError):
             await restore
+
+
+def _bare_tls_context() -> ssl.SSLContext:
+    """A verifying client context without any trust roots, like a Python whose OpenSSL CA paths are absent."""
+    return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def test_matrix_tls_trusts_certifi_roots_when_system_paths_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Matrix logins verify certificates even when the Python build cannot find the system trust store."""
+    monkeypatch.setattr(client_session.ssl_module, "create_default_context", _bare_tls_context)
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+
+    context = client_session.maybe_ssl_context("https://mindroom.chat", runtime_paths=runtime_paths)
+
+    assert context is not None
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.cert_store_stats()["x509_ca"] > 0
+
+
+@pytest.mark.parametrize(
+    ("homeserver", "verify_mode"),
+    [
+        ("https://matrix.dev.test", ssl.CERT_NONE),
+        ("https://matrix.dev.test/", ssl.CERT_NONE),
+        ("https://mindroom.chat", ssl.CERT_REQUIRED),
+    ],
+)
+def test_matrix_ssl_verify_opt_out_covers_only_the_configured_homeserver(
+    tmp_path: Path,
+    homeserver: str,
+    verify_mode: ssl.VerifyMode,
+) -> None:
+    """MATRIX_SSL_VERIFY=false set for a dev homeserver never turns off checks for another one, such as the desktop's."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        process_env={"MATRIX_HOMESERVER": "https://matrix.dev.test", "MATRIX_SSL_VERIFY": "false"},
+    )
+
+    context = client_session.maybe_ssl_context(homeserver, runtime_paths=runtime_paths)
+
+    assert context is not None
+    assert context.verify_mode == verify_mode
+
+
+def test_matrix_tls_respects_explicit_trust_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An operator's SSL_CERT_FILE or SSL_CERT_DIR choice is left to OpenSSL without adding certifi."""
+    monkeypatch.setattr(client_session.ssl_module, "create_default_context", _bare_tls_context)
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        process_env={"SSL_CERT_FILE": str(tmp_path / "private-ca.pem")},
+    )
+
+    context = client_session.maybe_ssl_context("https://mindroom.chat", runtime_paths=runtime_paths)
+
+    assert context is not None
+    assert context.cert_store_stats()["x509_ca"] == 0
+
+
+def _connection_key(host: str, port: int) -> aiohttp.client_reqrep.ConnectionKey:
+    return aiohttp.client_reqrep.ConnectionKey(host, port, True, True, None, None, None)
+
+
+def _certificate_failure() -> aiohttp.ClientConnectorCertificateError:
+    """Build the error aiohttp raises, chained from the verification error like aiohttp's connector does."""
+    verification_error = ssl.SSLCertVerificationError(
+        1,
+        "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate",
+    )
+    with pytest.raises(aiohttp.ClientConnectorCertificateError) as raised:
+        raise aiohttp.ClientConnectorCertificateError(
+            _connection_key("matrix.example.org", 443),
+            verification_error,
+        ) from verification_error
+    return raised.value
+
+
+def _connection_refused() -> aiohttp.ClientConnectorError:
+    return aiohttp.ClientConnectorError(
+        _connection_key("matrix.example.org", 443),
+        ConnectionRefusedError(111, "Connection refused"),
+    )
+
+
+def _install_scripted_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    *outcomes: object,
+) -> tuple[list[int], asyncio.Event]:
+    """Make nio HTTP sessions raise or return each outcome in turn, then block until cancelled."""
+    requests: list[int] = []
+    blocked = asyncio.Event()
+
+    class ScriptedSession:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            self.connector = SimpleNamespace(connect=lambda: None)
+
+        async def request(self, *_args: object, **_kwargs: object) -> object:
+            requests.append(1)
+            if len(requests) <= len(outcomes):
+                outcome = outcomes[len(requests) - 1]
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+            blocked.set()
+            await asyncio.Event().wait()
+            raise AssertionError
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("nio.client.async_client.ClientSession", ScriptedSession)
+    return requests, blocked
+
+
+@pytest.mark.asyncio
+async def test_certificate_failure_keeps_nio_retrying_and_logs_the_aiohttp_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A certificate failure (captive portal, TLS interception) may heal, so nio retries and the log names it."""
+    requests, blocked = _install_scripted_transport(monkeypatch, _certificate_failure())
+    client = MindRoomAsyncClient("https://matrix.example.org", "@mindroom_router:example.org")
+    client.access_token = "token"  # noqa: S105
+
+    with capture_logs() as logs:
+        sync = asyncio.create_task(client._send(nio.SyncResponse, "GET", "/_matrix/client/v3/sync?timeout=0"))
+        await asyncio.wait_for(blocked.wait(), timeout=1.0)
+        sync.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sync
+
+    assert requests == [1, 1]
+    [failure] = [entry for entry in logs if entry["event"] == "matrix_request_transport_failed"]
+    assert failure["log_level"] == "warning"
+    assert failure["error_type"] == "ClientConnectorCertificateError"
+    assert "self-signed certificate" in failure["error"]
+    assert "SSL_CERT_FILE" not in failure["error"]
+
+
+@pytest.mark.asyncio
+async def test_transient_transport_failure_logs_the_underlying_error_before_nio_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Each retried transport failure names its real cause instead of only nio's generic timeout line."""
+    requests, blocked = _install_scripted_transport(monkeypatch, _connection_refused())
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", process_env={})
+
+    with capture_logs() as logs:
+        login_flows = asyncio.create_task(
+            client_session.login_flows("https://matrix.example.org", runtime_paths),
+        )
+        await asyncio.wait_for(blocked.wait(), timeout=1.0)
+        login_flows.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await login_flows
+
+    assert requests == [1, 1]
+    transport_errors = [entry for entry in logs if entry["event"] == "matrix_request_transport_failed"]
+    assert len(transport_errors) == 1
+    assert transport_errors[0]["homeserver"] == "https://matrix.example.org"
+    assert transport_errors[0]["error_type"] == "ClientConnectorError"
+    assert "Connection refused" in transport_errors[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_transport_failures_warn_once_until_a_request_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An outage warns once per client; repeats drop to debug until a request gets through again."""
+    success = object()
+    _install_scripted_transport(monkeypatch, _connection_refused(), TimeoutError(), success, _connection_refused())
+    client = MindRoomAsyncClient("https://matrix.example.org", "@mindroom_router:example.org")
+
+    with capture_logs() as logs:
+        for expected in (aiohttp.ClientConnectorError, TimeoutError):
+            with pytest.raises(expected):
+                await client.send("GET", "/_matrix/client/v3/sync")
+        assert await client.send("GET", "/_matrix/client/v3/sync") is success
+        with pytest.raises(aiohttp.ClientConnectorError):
+            await client.send("GET", "/_matrix/client/v3/sync")
+
+    failures = [entry for entry in logs if entry["event"] == "matrix_request_transport_failed"]
+    assert [(entry["log_level"], entry["error_type"]) for entry in failures] == [
+        ("warning", "ClientConnectorError"),
+        ("debug", "TimeoutError"),
+        ("warning", "ClientConnectorError"),
+    ]
+    assert failures[1]["error"] == "TimeoutError"

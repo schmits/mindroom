@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path  # noqa: TC003
 from unittest.mock import AsyncMock
 
 import pytest
 
-from mindroom.agent_reply_membership import AgentReplyMembershipIndex
-from mindroom.agent_reply_membership_sync import AgentReplyMembershipSync
-from mindroom.bot import TeamBot
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.constants import ROUTER_AGENT_NAME
@@ -18,6 +14,7 @@ from mindroom.matrix.client_room_admin import RoomJoinOutcome
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.orchestrator import _MultiAgentOrchestrator
+from mindroom.turn_policy import ResponseAction
 from tests.authorization_helpers import (
     make_test_bot_for_entity,
 )
@@ -26,28 +23,14 @@ from tests.conftest import (
     bind_runtime_paths,
     install_runtime_journal_support,
     orchestrator_runtime_paths,
+    published_config_load,
     runtime_paths_for,
 )
-from tests.identity_helpers import persist_entity_accounts
-
-
-def _router_membership_dependencies() -> tuple[AgentReplyMembershipIndex, AgentReplyMembershipSync]:
-    """Return one consistent shared index and router sync owner for factory tests."""
-    memberships = AgentReplyMembershipIndex()
-    return memberships, AgentReplyMembershipSync(memberships)
+from tests.matrix_state_helpers import save_matrix_state
 
 
 def _bind_runtime_paths(config: Config, tmp_path: Path) -> Config:
-    runtime_paths = orchestrator_runtime_paths(
-        tmp_path,
-        config_path=tmp_path / "config.yaml",
-    )
-    bound_config = bind_runtime_paths(
-        config,
-        runtime_paths,
-    )
-    persist_entity_accounts(bound_config, runtime_paths)
-    return bound_config
+    return bind_runtime_paths(config, orchestrator_runtime_paths(tmp_path, config_path=tmp_path / "config.yaml"))
 
 
 @pytest.fixture
@@ -80,21 +63,10 @@ def config_with_rooms() -> Config:
 @pytest.mark.asyncio
 async def test_router_gets_all_configured_rooms(
     config_with_rooms: Config,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Test that the router agent is configured to join all rooms from agents and teams."""
     config_with_rooms = _bind_runtime_paths(config_with_rooms, tmp_path)
-
-    # Mock resolve_room_aliases to return the same aliases (no resolution)
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
 
     # Create a temporary user for the router
     router_user = AgentMatrixUser(
@@ -105,15 +77,11 @@ async def test_router_gets_all_configured_rooms(
     )
 
     # Create the router bot
-    memberships, membership_sync = _router_membership_dependencies()
     router_bot = make_test_bot_for_entity(
         ROUTER_AGENT_NAME,
         router_user,
         config_with_rooms,
         runtime_paths_for(config_with_rooms),
-        tmp_path,
-        agent_reply_memberships=memberships,
-        agent_reply_membership_sync=membership_sync,
     )
 
     # Check that the router has all rooms
@@ -124,22 +92,12 @@ async def test_router_gets_all_configured_rooms(
 
 def test_team_bot_uses_defaults_streaming_setting(
     config_with_rooms: Config,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Team bots should inherit defaults.enable_streaming from config."""
     config_with_rooms = _bind_runtime_paths(config_with_rooms, tmp_path)
     runtime_paths = runtime_paths_for(config_with_rooms)
 
-    # Mock resolve_room_aliases to return the same aliases (no resolution)
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
     config_with_rooms.defaults.enable_streaming = False
 
     team_user = AgentMatrixUser(
@@ -154,16 +112,14 @@ def test_team_bot_uses_defaults_streaming_setting(
         team_user,
         config_with_rooms,
         runtime_paths,
-        tmp_path,
     )
 
     assert team_bot is not None
-    assert team_bot.enable_streaming is False
+    assert team_bot._runtime_view.config.defaults.enable_streaming is False
 
 
 def test_team_bot_uses_persisted_member_usernames(
     config_with_rooms: Config,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Team bots should resolve configured members through live persisted usernames."""
@@ -172,16 +128,7 @@ def test_team_bot_uses_persisted_member_usernames(
     state = MatrixState.load(runtime_paths=runtime_paths)
     state.add_account("agent_agent1", "mindroom_agent1_oldns", "pw", domain=config_with_rooms.get_domain(runtime_paths))
     state.add_account("agent_agent2", "mindroom_agent2_oldns", "pw", domain=config_with_rooms.get_domain(runtime_paths))
-    state.save(runtime_paths=runtime_paths)
-
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
+    save_matrix_state(state, runtime_paths)
 
     team_bot = make_test_bot_for_entity(
         "team1",
@@ -193,11 +140,11 @@ def test_team_bot_uses_persisted_member_usernames(
         ),
         config_with_rooms,
         runtime_paths,
-        tmp_path,
     )
 
-    assert isinstance(team_bot, TeamBot)
-    assert [member.full_id for member in team_bot.current_configured_team_agents()] == [
+    action = team_bot._turn_policy.effective_response_action(ResponseAction(kind="individual"))
+    assert action.form_team is not None
+    assert [member.full_id for member in action.form_team.requested_members] == [
         "@mindroom_agent1_oldns:localhost",
         "@mindroom_agent2_oldns:localhost",
     ]
@@ -221,28 +168,6 @@ async def test_router_joins_rooms_on_start(
     monkeypatch.setattr("mindroom.matrix.client_room_admin.join_room", mock_join_room)
     monkeypatch.setattr("mindroom.bot_room_lifecycle.get_joined_rooms", AsyncMock(return_value=[]))
 
-    # Mock restore_scheduled_tasks
-    async def mock_restore_scheduled_tasks(
-        _client: AsyncMock,
-        _room_id: str,
-        _config: Config,
-        _runtime_paths: object,
-        _conversation_reader: object,
-    ) -> int:
-        return 0
-
-    monkeypatch.setattr("mindroom.bot.restore_scheduled_tasks", mock_restore_scheduled_tasks)
-
-    # Mock resolve_room_aliases to return the same aliases (no resolution)
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
-
     # Create router user
     router_user = AgentMatrixUser(
         agent_name=ROUTER_AGENT_NAME,
@@ -252,15 +177,11 @@ async def test_router_joins_rooms_on_start(
     )
 
     # Create and configure the router bot
-    memberships, membership_sync = _router_membership_dependencies()
     router_bot = make_test_bot_for_entity(
         ROUTER_AGENT_NAME,
         router_user,
         config_with_rooms,
         runtime_paths_for(config_with_rooms),
-        tmp_path,
-        agent_reply_memberships=memberships,
-        agent_reply_membership_sync=membership_sync,
     )
 
     # Mock the client
@@ -278,36 +199,15 @@ async def test_router_joins_rooms_on_start(
 
 
 @pytest.mark.asyncio
-@pytest.mark.requires_matrix  # Requires real Matrix server for router room management
-@pytest.mark.timeout(10)  # Add timeout to prevent hanging on real server connection
 async def test_orchestrator_creates_router_with_all_rooms(
     config_with_rooms: Config,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Test that the orchestrator properly initializes the router with all rooms."""
     config_with_rooms = _bind_runtime_paths(config_with_rooms, tmp_path)
 
-    # Mock resolve_room_aliases to return the same aliases (no resolution needed for test)
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
-
-    # Mock load_config to return our test config
-    def mock_load_config(_runtime_paths: object | None = None, **_kwargs: object) -> Config:
-        return config_with_rooms
-
-    monkeypatch.setattr("mindroom.orchestrator.load_config", mock_load_config)
-    monkeypatch.setattr("mindroom.orchestrator._MultiAgentOrchestrator._ensure_user_account", AsyncMock())
-    monkeypatch.setattr("mindroom.orchestrator._MultiAgentOrchestrator._setup_rooms_and_memberships", AsyncMock())
-
     # Create orchestrator
-    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path), config=config_with_rooms)
 
     try:
         # Initialize (creates all bots)
@@ -324,76 +224,51 @@ async def test_orchestrator_creates_router_with_all_rooms(
 
 
 @pytest.mark.asyncio
-@pytest.mark.requires_matrix  # Requires real Matrix server for router room updates
-@pytest.mark.timeout(10)  # Add timeout to prevent hanging on real server connection
-async def test_router_updates_rooms_on_config_change(  # noqa: PLR0915
+async def test_router_updates_rooms_on_config_change(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Test that the router updates its room list when config changes."""
     # Initial config with some rooms
-    initial_config = Config(
-        agents={
-            "agent1": AgentConfig(
-                display_name="Agent 1",
-                role="Test agent",
-                rooms=["room1"],
-            ),
-        },
+    initial_config = _bind_runtime_paths(
+        Config(
+            agents={
+                "agent1": AgentConfig(
+                    display_name="Agent 1",
+                    role="Test agent",
+                    rooms=["room1"],
+                ),
+            },
+        ),
+        tmp_path,
     )
 
-    # Updated config with more rooms
-    updated_config = Config(
-        agents={
-            "agent1": AgentConfig(
-                display_name="Agent 1",
-                role="Test agent",
-                rooms=["room1", "room2"],
-            ),
-            "agent2": AgentConfig(
-                display_name="Agent 2",
-                role="New agent",
-                rooms=["room3"],
-            ),
-        },
+    # Updated config with more rooms and a new agent
+    updated_config = _bind_runtime_paths(
+        Config(
+            agents={
+                "agent1": AgentConfig(
+                    display_name="Agent 1",
+                    role="Test agent",
+                    rooms=["room1", "room2"],
+                ),
+                "agent2": AgentConfig(
+                    display_name="Agent 2",
+                    role="New agent",
+                    rooms=["room3"],
+                ),
+            },
+        ),
+        tmp_path,
     )
 
-    def mock_resolve_room_aliases(
-        aliases: list[str],
-        runtime_paths: object | None = None,
-    ) -> list[str]:
-        del runtime_paths
-        return list(aliases)
-
-    monkeypatch.setattr("mindroom.bot.resolve_room_aliases", mock_resolve_room_aliases)
-
-    # Mock load_config to return different configs on different calls
-    load_config_returns = [initial_config, updated_config]
-    load_config_counter = [0]
-
-    def mock_load_config(_runtime_paths: object | None = None, **_kwargs: object) -> Config:
-        result = load_config_returns[min(load_config_counter[0], len(load_config_returns) - 1)]
-        load_config_counter[0] += 1
-        return result
-
-    monkeypatch.setattr("mindroom.orchestrator.load_config", mock_load_config)
-    monkeypatch.setattr("mindroom.orchestration.config_lifecycle.load_config", mock_load_config)
-    monkeypatch.setattr("mindroom.orchestrator._MultiAgentOrchestrator._ensure_user_account", AsyncMock())
     setup_rooms = AsyncMock()
-    monkeypatch.setattr("mindroom.orchestrator._MultiAgentOrchestrator._setup_rooms_and_memberships", setup_rooms)
-
-    # Create orchestrator with initial config
-    # Mock start/sync_forever at class level so newly created bots in update_config don't perform real login/sync
+    monkeypatch.setattr("mindroom.orchestration.rooms.RoomSetup.setup", setup_rooms)
+    # The agent the update adds starts without logging in.
     monkeypatch.setattr("mindroom.bot.AgentBot.start", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.AgentBot.sync_forever", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.AgentBot.join_configured_rooms", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.AgentBot.leave_unconfigured_rooms", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.TeamBot.start", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.TeamBot.sync_forever", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.TeamBot.join_configured_rooms", AsyncMock())
-    monkeypatch.setattr("mindroom.bot.TeamBot.leave_unconfigured_rooms", AsyncMock())
 
-    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path))
+    orchestrator = _MultiAgentOrchestrator(runtime_paths=orchestrator_runtime_paths(tmp_path), config=initial_config)
+    monkeypatch.setattr(orchestrator.config_reload, "load_config", lambda: published_config_load(updated_config))
 
     try:
         await orchestrator.initialize()
@@ -404,29 +279,13 @@ async def test_router_updates_rooms_on_config_change(  # noqa: PLR0915
         assert set(router_bot.rooms) == {"room1"}
 
         async def reconcile_room_aliases(bots: list[object]) -> None:
-            orchestrator._resolve_bot_room_aliases(bots, orchestrator._require_config())  # type: ignore[arg-type]
+            orchestrator._rooms.resolve_aliases(bots, orchestrator.config)  # type: ignore[arg-type]
 
-        setup_rooms.reset_mock()
         setup_rooms.side_effect = reconcile_room_aliases
 
-        # Mock bot operations using monkeypatch to avoid method assignment errors
-        async def mock_stop(*, shutdown_intent: object | None = None) -> None:
-            del shutdown_intent
-
-        async def mock_start() -> None:
-            pass
-
-        async def mock_ensure_user_account() -> None:
-            pass
-
-        async def mock_sync_forever() -> None:
-            raise asyncio.CancelledError
-
+        # A reload reconciles the rooms of running bots only.
         for bot in orchestrator.agent_bots.values():
-            monkeypatch.setattr(bot, "stop", mock_stop)
-            monkeypatch.setattr(bot, "start", mock_start)
-            monkeypatch.setattr(bot, "ensure_user_account", mock_ensure_user_account)
-            monkeypatch.setattr(bot, "sync_forever", mock_sync_forever)
+            bot.running = True
 
         # Update config
         updated = await orchestrator.config_reload._update_config()

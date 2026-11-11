@@ -41,7 +41,7 @@ def personal_snapshot(tmp_path: Path, enforce_turn_authorization: None) -> ApiSn
             },
         },
     )
-    return ApiSnapshot(generation=1, runtime_paths=paths, config_data=config.model_dump(), runtime_config=config)
+    return ApiSnapshot(generation=1, runtime_paths=paths, runtime_config=config)
 
 
 @pytest.mark.parametrize("scope", [None, "shared", "user", "user_agent"])
@@ -70,6 +70,45 @@ def test_shared_tool_target_uses_authored_scope(personal_snapshot: ApiSnapshot, 
     with pytest.raises(HTTPException) as denied:
         connection_agents.resolve_connection_agent(user, "personal")
     assert denied.value.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("scope", "default_scope", "opt_in", "exposed"),
+    [
+        (None, None, False, False),
+        ("shared", None, False, False),
+        (None, "shared", False, False),
+        (None, None, True, True),
+        ("shared", None, True, True),
+        ("user", None, False, True),
+        ("user_agent", None, False, True),
+        (None, "user", False, True),
+    ],
+)
+def test_gateway_requires_opt_in_for_shared_credential_agents(
+    personal_snapshot: ApiSnapshot,
+    scope: str | None,
+    default_scope: str | None,
+    opt_in: bool,
+    exposed: bool,
+) -> None:
+    """Agents whose tools run with credentials every requester shares stay out of MCP unless opted in."""
+    config = personal_snapshot.runtime_config
+    assert config is not None
+    config.defaults.worker_scope = default_scope
+    config.agents["shared"] = AgentConfig.model_validate(
+        {
+            "display_name": "Shared tools",
+            "role": "Shared tools",
+            "tools": ["calculator"],
+            "worker_scope": scope,
+            "mcp_gateway_shared_credentials": opt_in,
+            "access": {"users": ["@alice:example.org"]},
+        },
+    )
+    alice = connection_agents.resolve_connection_user(personal_snapshot, "@alice:example.org")
+    assert alice.agent_names == ("personal", "shared")
+    assert alice.gateway_agent_names == (("personal", "shared") if exposed else ("personal",))
 
 
 def test_connection_user_has_no_implicit_agent_authority(personal_snapshot: ApiSnapshot) -> None:
@@ -163,22 +202,37 @@ def test_personal_scope_rejects_nonprivate_agent(personal_snapshot: ApiSnapshot)
     with pytest.raises(HTTPException) as error:
         connection_agents.resolve_connection_user(personal_snapshot, "@alice:example.org")
     assert error.value.status_code == 403
+    assert error.value.detail == "MINDROOM_CONNECTIONS_AGENT must name a private agent"
 
 
-@pytest.mark.parametrize(("mode", "status"), [("disabled", 404), ("missing_config", 503)])
-def test_personal_scope_fails_closed_without_configuration(
-    personal_snapshot: ApiSnapshot,
-    mode: str,
-    status: int,
-) -> None:
-    """Missing selection or configuration cannot fall back to another agent."""
-    if mode == "disabled":
-        personal_snapshot = replace(
-            personal_snapshot,
-            runtime_paths=replace(personal_snapshot.runtime_paths, process_env={}),
-        )
-    else:
-        personal_snapshot = replace(personal_snapshot, runtime_config=None)
+def test_connection_user_fails_closed_without_configuration(personal_snapshot: ApiSnapshot) -> None:
+    """A snapshot without a loaded configuration lists nothing."""
     with pytest.raises(HTTPException) as error:
-        connection_agents.resolve_connection_user(personal_snapshot, "@alice:example.org")
-    assert error.value.status_code == status
+        connection_agents.resolve_connection_user(replace(personal_snapshot, runtime_config=None), "@alice:example.org")
+    assert error.value.status_code == 503
+
+
+def test_every_usable_private_agent_is_listed_without_a_named_agent(personal_snapshot: ApiSnapshot) -> None:
+    """Without `MINDROOM_CONNECTIONS_AGENT`, each private agent a user may use is theirs to connect; others stay hidden."""
+    config = personal_snapshot.runtime_config
+    assert config is not None
+    config.agents["other"] = AgentConfig.model_validate(
+        {
+            "display_name": "Other private agent",
+            "role": "Private assistant",
+            "tools": ["calculator"],
+            "private": {"per": "user"},
+            "access": {"users": ["@bob:example.org"]},
+            "credential_managers": ["@alice:example.org"],
+        },
+    )
+    snapshot = replace(personal_snapshot, runtime_paths=replace(personal_snapshot.runtime_paths, process_env={}))
+    alice = connection_agents.resolve_connection_user(snapshot, "@alice:example.org")
+    # Credential management covers only shared agents, so Alice's grant on the private one shows her nothing.
+    assert (alice.visible_agent_names, alice.credential_agent_names, alice.personal_agent_name) == (
+        ("personal",),
+        (),
+        None,
+    )
+    bob = connection_agents.resolve_connection_user(snapshot, "@bob:example.org")
+    assert bob.visible_agent_names == bob.gateway_agent_names == ("personal", "other")

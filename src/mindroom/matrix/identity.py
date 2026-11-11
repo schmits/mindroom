@@ -12,6 +12,7 @@ from mindroom.matrix.state import matrix_state_for_runtime
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
+    from mindroom.matrix.state import MatrixAccount
 
 _CURRENT_USER_LOCALPART_PATTERN = re.compile(r"^[a-z0-9._=/+-]+$")
 _SERVER_DNS_LABEL_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,63}$")
@@ -21,10 +22,12 @@ __all__ = [
     "MatrixID",
     "managed_account_key",
     "managed_account_user_id",
+    "matrix_account_user_id",
     "matrix_user_id_from_email",
     "parse_current_matrix_user_id",
     "parse_historical_matrix_user_id",
     "try_parse_historical_matrix_user_id",
+    "valid_matrix_server_name",
     "validate_email_to_matrix_mapping",
 ]
 
@@ -169,7 +172,7 @@ def _validate_matrix_user_id_common(parsed: MatrixID, matrix_id: str) -> None:
     if _contains_surrogate(parsed.username):
         msg = f"Invalid Matrix ID localpart: {matrix_id}"
         raise ValueError(msg)
-    if not _valid_current_server_name(parsed.domain):
+    if not valid_matrix_server_name(parsed.domain):
         msg = f"Invalid Matrix ID server name: {matrix_id}"
         raise ValueError(msg)
     try:
@@ -186,7 +189,7 @@ def _contains_surrogate(value: str) -> bool:
     return any(0xD800 <= ord(char) <= 0xDFFF for char in value)
 
 
-def _valid_current_server_name(server_name: str) -> bool:
+def valid_matrix_server_name(server_name: str) -> bool:
     """Return whether a value matches the Matrix server_name grammar."""
     if not server_name:
         return False
@@ -248,4 +251,13 @@ def managed_account_user_id(account_key: str, domain: str, runtime_paths: Runtim
     account = matrix_state_for_runtime(runtime_paths).get_account(account_key)
     if account is None:
         return None
+    return matrix_account_user_id(account, domain)
+
+
+def matrix_account_user_id(account: MatrixAccount, domain: str) -> str:
+    """Return a persisted account's full Matrix user ID, using ``domain`` when the account saved none.
+
+    Loops over many entities read Matrix state once and call this per account,
+    instead of calling ``managed_account_user_id`` per entity.
+    """
     return MatrixID.from_username(account.username, account.domain or domain).full_id

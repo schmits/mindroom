@@ -9,6 +9,7 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolStatus,
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
@@ -21,10 +22,14 @@ if TYPE_CHECKING:
     name="script",
     display_name="Background Scripts",
     description="Run Python scripts in the background, monitor them, or cancel them",
+    docs_url="https://docs.mindroom.chat/tools/background-scripts/",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.NONE,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.PRIMARY,
+    requires_primary_runtime=True,
     icon="FileCode2",
     icon_color="text-cyan-500",
     config_fields=[
@@ -65,7 +70,6 @@ if TYPE_CHECKING:
             validation={"min": 0.01},
         ),
     ],
-    dependencies=["agno"],
     requires_room_context=True,
     function_names=(
         "start_script",
@@ -74,6 +78,7 @@ if TYPE_CHECKING:
         "cancel_script",
         "list_scripts",
     ),
+    workspace_writers=("start_script",),
     supports_toolkit_filters=False,
 )
 def script_tools() -> type[ScriptTools]:

@@ -2,27 +2,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from fnmatch import fnmatchcase
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from mindroom.access_policy import resolve_responder_access
-from mindroom.constants import ORIGINAL_SENDER_KEY
-from mindroom.dispatch_source import source_kind_allows_trusted_original_sender, source_kind_from_content
+from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.entity_resolution import (
     MissingManagedEntityAccountError,
     configured_routable_entity_ids_for_room,
-    current_internal_sender_ids,
+    current_entity_id,
     entity_identity_registry,
 )
 from mindroom.logging_config import get_logger
-from mindroom.matrix.room_membership import cached_joined_member_ids, ensure_room_membership_synced
-from mindroom.requester_identity import resolve_human_requester_alias
+from mindroom.matrix.identity import try_parse_historical_matrix_user_id
+from mindroom.matrix.room_membership import (
+    cached_joined_member_ids,
+    ensure_room_membership_synced,
+    room_membership_is_complete,
+)
+from mindroom.requester_identity import (
+    equivalent_requester_ids,
+    is_human_requester_id,
+    resolve_human_requester_alias,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     import nio
 
@@ -60,7 +67,13 @@ def is_sender_allowed_for_responder(
     *,
     require_resolved_membership: bool = False,
 ) -> bool:
-    """Apply the complete membership policy, failing closed on uncertainty."""
+    """Apply the complete membership policy, failing closed on uncertainty.
+
+    This answers whether a sender may converse with one responder. ``room_id``
+    only adds the opt-in ``access.current_room_members`` grant; it never proves
+    that the sender belongs to that room. Callers acting on a requester-chosen
+    target room must additionally require current membership of that room.
+    """
     decision = _responder_reply_authorization(
         sender_id,
         entity_name,
@@ -81,9 +94,16 @@ def _responder_reply_authorization(
     config: Config,
     runtime_paths: RuntimePaths,
     membership_index: AgentReplyMembershipIndex,
+    *,
+    observed_room: nio.MatrixRoom | None = None,
 ) -> _ReplyAuthorizationDecision:
-    """Allow any proven grant before considering unresolved relevant membership."""
-    allowed = sender_id in _current_internal_sender_ids_for_auth(config, runtime_paths)
+    """Allow any proven grant before considering unresolved relevant membership.
+
+    A responder always admits its own account; other MindRoom accounts need a grant like any requester.
+    ``observed_room`` is the answering bot's own synced view of ``room_id``. Its roster never grants
+    access; it only lets a same-room denial wait briefly for the router to apply a join.
+    """
+    allowed = _is_own_account(sender_id, entity_name, runtime_paths)
     resolved_sender = resolve_human_requester_alias(sender_id, config, runtime_paths)
     access = resolve_responder_access(config, entity_name)
     allowed = allowed or resolved_sender in config.administrators
@@ -110,6 +130,22 @@ def _responder_reply_authorization(
         current_room_id=room_id if access.current_room_members else None,
     ):
         return _ReplyAuthorizationDecision.PENDING
+    if (
+        room_id is not None
+        and observed_room is not None
+        and observed_room.room_id == room_id
+        and membership_index.awaits_router_join(
+            resolved_sender,
+            room_id,
+            cached_joined_member_ids(observed_room),
+            room_keys=access.members_of_rooms,
+            current_room=access.current_room_members,
+            config=config,
+            runtime_paths=runtime_paths,
+        )
+    ):
+        logger.info("reply_authorization_awaits_router_join", room_id=room_id, entity_name=entity_name)
+        return _ReplyAuthorizationDecision.PENDING
     return _ReplyAuthorizationDecision.DENIED
 
 
@@ -122,8 +158,14 @@ def is_sender_allowed_for_agent_reply_in_room(
     membership_index: AgentReplyMembershipIndex,
     *,
     require_resolved_membership: bool = False,
+    observed_room: nio.MatrixRoom | None = None,
 ) -> bool:
-    """Require both current-room access and entity reply access."""
+    """Require conversation access to one agent, evaluated for one current room.
+
+    ``room_id`` is the conversation the sender is already part of, not a target
+    room this predicate entitles them to; see ``is_sender_allowed_for_responder``.
+    ``observed_room`` is the answering bot's own synced view of that room.
+    """
     return is_sender_allowed_for_entity_replies_in_room(
         sender_id,
         (agent_name,),
@@ -132,6 +174,7 @@ def is_sender_allowed_for_agent_reply_in_room(
         runtime_paths,
         membership_index,
         require_resolved_membership=require_resolved_membership,
+        observed_room=observed_room,
     )
 
 
@@ -144,8 +187,14 @@ def is_sender_allowed_for_entity_replies_in_room(
     membership_index: AgentReplyMembershipIndex,
     *,
     require_resolved_membership: bool = False,
+    observed_room: nio.MatrixRoom | None = None,
 ) -> bool:
-    """Require membership access for every execution entity."""
+    """Require conversation access to every execution entity for one current room.
+
+    ``room_id`` is the conversation the sender is already part of, not a target
+    room this predicate entitles them to; see ``is_sender_allowed_for_responder``.
+    ``observed_room`` is the answering bot's own synced view of that room.
+    """
     decisions = {
         _responder_reply_authorization(
             sender_id,
@@ -154,6 +203,7 @@ def is_sender_allowed_for_entity_replies_in_room(
             config,
             runtime_paths,
             membership_index,
+            observed_room=observed_room,
         )
         for entity_name in entity_names
     }
@@ -166,13 +216,12 @@ def is_sender_allowed_for_entity_replies_in_room(
     return True
 
 
-def _current_internal_sender_ids_for_auth(config: Config, runtime_paths: RuntimePaths) -> frozenset[str]:
-    """Return internal sender IDs when prepared, or an empty set before provisioning."""
+def _is_own_account(sender_id: str, entity_name: str, runtime_paths: RuntimePaths) -> bool:
+    """Return whether a sender is the responder's own prepared Matrix account."""
     try:
-        return current_internal_sender_ids(config, runtime_paths)
+        return sender_id == current_entity_id(entity_name, runtime_paths).full_id
     except MissingManagedEntityAccountError:
-        logger.debug("managed_entity_accounts_unavailable_for_auth_check")
-        return frozenset()
+        return False
 
 
 def is_sender_allowed_for_agent_credential_management(
@@ -189,62 +238,39 @@ def is_sender_allowed_for_agent_credential_management(
     return resolved_sender in config.administrators or resolved_sender in agent.credential_managers
 
 
-def is_sender_allowed_for_agent_oauth_connection_management(
+def is_sender_allowed_for_agent_oauth_connection(
     sender_id: str,
     agent_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
+    *,
+    requester_owned: bool,
 ) -> bool:
-    """Check whether a requester may manage their OAuth connection for one agent.
+    """Check whether a requester may connect or reset one of an agent's OAuth accounts.
 
-    Callers granting the private-agent exception must resolve credentials to the
-    authenticated requester's isolated user or user-agent target.
+    Administrators and credential managers may manage any of the agent's connections, and every
+    requester may manage their own connection to a private agent. A requester-owned connection
+    holds only the requester's own credentials, so anyone who may use the agent may manage it,
+    as on the Connections portal. Callers must resolve the credentials to the authenticated
+    requester's own user or user-agent target before relying on either requester rule.
     """
-    if not sender_id:
-        return False
     agent = config.agents.get(agent_name)
-    if agent is None:
+    if not sender_id or agent is None:
         return False
-    if agent.private is not None:
+    if agent.private is not None or is_sender_allowed_for_agent_credential_management(
+        sender_id,
+        agent_name,
+        config,
+        runtime_paths,
+    ):
         return True
-    return is_sender_allowed_for_agent_credential_management(sender_id, agent_name, config, runtime_paths)
-
-
-def is_platform_administrator(sender_id: str, config: Config, runtime_paths: RuntimePaths) -> bool:
-    """Return whether a requester has platform-wide administrative authority."""
-    resolved_sender = resolve_human_requester_alias(sender_id, config, runtime_paths)
-    return resolved_sender in config.administrators
-
-
-def get_effective_sender_id_for_reply_permissions(
-    sender_id: str,
-    event_source: Mapping[str, Any] | None,
-    config: Config,
-    runtime_paths: RuntimePaths,
-) -> str:
-    """Return the sender ID used for per-agent reply permission checks.
-
-    Internal MindRoom senders may relay user-originated messages (voice
-    transcriptions, scheduled task fires, etc.) and include the original sender
-    in event content. For trusted internal senders and trusted source kinds, use
-    that embedded sender.
-    """
-    is_internal_mindroom_sender = sender_id in current_internal_sender_ids(config, runtime_paths)
-    if not is_internal_mindroom_sender:
-        return sender_id
-    if not event_source:
-        return sender_id
-
-    content = event_source.get("content")
-    if not isinstance(content, Mapping):
-        return sender_id
-    if not source_kind_allows_trusted_original_sender(source_kind_from_content(content)):
-        return sender_id
-
-    original_sender = content.get(ORIGINAL_SENDER_KEY)
-    if isinstance(original_sender, str) and original_sender:
-        return original_sender
-    return sender_id
+    return (
+        requester_owned
+        and try_parse_historical_matrix_user_id(sender_id) is not None
+        and is_human_requester_id(sender_id, config, runtime_paths)
+        and is_sender_allowed_for_responder(sender_id, agent_name, None, config, runtime_paths, membership_index)
+    )
 
 
 def filter_responders_by_sender_permissions(
@@ -270,6 +296,21 @@ def filter_responders_by_sender_permissions(
         ):
             result.append(responder)
     return result
+
+
+def addressable_responder_names(
+    sender_id: str,
+    room_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    membership_index: AgentReplyMembershipIndex,
+) -> tuple[str, ...]:
+    """Return every configured agent, team, and the router that *sender_id* may converse with in *room_id*."""
+    return tuple(
+        entity_name
+        for entity_name in (*config.agents, *config.teams, ROUTER_AGENT_NAME)
+        if is_sender_allowed_for_responder(sender_id, entity_name, room_id, config, runtime_paths, membership_index)
+    )
 
 
 def _available_responders_from_member_ids(
@@ -334,6 +375,22 @@ async def _get_available_responders_for_sender_authoritative(
     return _get_available_responders_for_sender(room, sender_id, config, runtime_paths, membership_index)
 
 
+async def is_requester_joined_to_room(
+    client: nio.AsyncClient,
+    room: nio.MatrixRoom,
+    requester_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> bool:
+    """Return whether a requester, under any of its bridge aliases, is a joined member of the room.
+
+    Invited members do not count, and membership that cannot be refreshed counts as absent.
+    """
+    if not await ensure_room_membership_synced(client, room, sender_id=requester_id):
+        return False
+    return not cached_joined_member_ids(room).isdisjoint(equivalent_requester_ids(requester_id, config, runtime_paths))
+
+
 @dataclass(frozen=True)
 class ResponderCandidatePermissions:
     """Separate proven candidates from unresolved grants at durable planning."""
@@ -348,9 +405,15 @@ def classify_responder_candidates_from_cached_room(
     config: Config,
     runtime_paths: RuntimePaths,
     membership_index: AgentReplyMembershipIndex,
+    *,
+    require_complete_discovery: bool = False,
 ) -> ResponderCandidatePermissions:
-    """Preserve membership uncertainty without deciding which candidates matter."""
-    responders = _configured_responder_entities_for_room(room, config, runtime_paths)
+    """Classify known candidates, requiring complete discovery before strict denial.
+
+    A proven grant remains usable when an ad-hoc member snapshot is partial.
+    """
+    responders = configured_responder_entities_for_room(room, config, runtime_paths)
+    discovery_complete = responders is not None or room_membership_is_complete(room)
     if responders is None:
         responders = get_available_responders_in_room(room, config, runtime_paths)
     registry = entity_identity_registry(config, runtime_paths)
@@ -372,6 +435,8 @@ def classify_responder_candidates_from_cached_room(
             allowed.append(responder)
         elif decision is _ReplyAuthorizationDecision.PENDING:
             pending.append(responder)
+    if require_complete_discovery and not allowed and not discovery_complete:
+        raise ReplyMembershipPendingError
     return ResponderCandidatePermissions(allowed, pending)
 
 
@@ -392,7 +457,7 @@ def responder_candidate_entities_from_cached_room(
     ).allowed
 
 
-def _configured_responder_entities_for_room(
+def configured_responder_entities_for_room(
     room: nio.MatrixRoom,
     config: Config,
     runtime_paths: RuntimePaths,
@@ -420,7 +485,7 @@ async def responder_candidate_entities_with_membership_refresh(
     membership_index: AgentReplyMembershipIndex,
 ) -> list[MatrixID]:
     """Return candidates, refreshing unsynced ad-hoc room membership when possible."""
-    configured_entities = _configured_responder_entities_for_room(room, config, runtime_paths)
+    configured_entities = configured_responder_entities_for_room(room, config, runtime_paths)
     if configured_entities is not None:
         return filter_responders_by_sender_permissions(
             configured_entities,

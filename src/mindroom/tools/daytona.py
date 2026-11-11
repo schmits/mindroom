@@ -2,36 +2,23 @@
 
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
+from mindroom.tools.string_mapping import parse_string_mapping
 
 if TYPE_CHECKING:
     from agno.tools.daytona import DaytonaTools
 
 
-def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str) -> dict[str, str] | None:
-    """Parse one JSON-authored mapping while preserving native mappings."""
-    if value is None or isinstance(value, dict):
-        return value
-    if not value.strip():
-        return None
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict) or not all(
-        isinstance(key, str) and isinstance(item, str) for key, item in parsed.items()
-    ):
-        msg = f"{field_name} must be a JSON object with string keys and values"
-        raise ValueError(msg)
-    return parsed
-
-
 @register_tool_with_metadata(
     name="daytona",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Daytona",
     description="Execute code in secure, remote sandbox environments",
-    category=ToolCategory.DEVELOPMENT,  # others/ maps to DEVELOPMENT
+    category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,  # Requires API key
     setup_type=SetupType.API_KEY,  # Uses API key authentication
     icon="FaTerminal",  # Terminal icon for code execution
@@ -40,6 +27,7 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
         # Authentication parameters
         ConfigField(
             name="api_key",
+            env=("DAYTONA_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -48,6 +36,7 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
         ),
         ConfigField(
             name="api_url",
+            env=("DAYTONA_API_URL",),
             label="API URL",
             type="url",
             required=False,
@@ -107,7 +96,7 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
         ConfigField(
             name="sandbox_env_vars",
             label="Sandbox Environment Variables",
-            type="text",
+            type="password",
             required=False,
             placeholder='{"ENV_VAR": "value"}',
             description="Environment variables for the sandbox (JSON format)",
@@ -151,7 +140,7 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
             label="Verify SSL",
             type="boolean",
             required=False,
-            default=False,
+            default=True,
             description="Whether to verify SSL certificates",
         ),
         ConfigField(
@@ -160,7 +149,7 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
             type="boolean",
             required=False,
             default=True,
-            description="Whether to reuse the same sandbox within the current agent session",
+            description="Whether to reuse the same sandbox across calls within one reply",
         ),
         ConfigField(
             name="sandbox_public",
@@ -178,17 +167,9 @@ def _parse_string_mapping(value: dict[str, str] | str | None, *, field_name: str
             placeholder="Custom guidelines for the toolkit",
             description="Custom instructions for the toolkit",
         ),
-        ConfigField(
-            name="add_instructions",
-            label="Add Instructions",
-            type="boolean",
-            required=False,
-            default=False,
-            description="Whether to add instructions to the agent",
-        ),
     ],
     dependencies=["daytona"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/daytona",
+    docs_url="https://docs.mindroom.chat/tools/automation-and-platforms/#daytona",
     function_names=(
         "change_directory",
         "create_file",
@@ -223,11 +204,10 @@ def daytona_tools() -> type[DaytonaTools]:
             organization_id: str | None = None,
             timeout: int = 300,
             auto_create_sandbox: bool = True,
-            verify_ssl: bool | None = False,
+            verify_ssl: bool | None = True,
             persistent: bool = True,
             instructions: str | None = None,
-            add_instructions: bool = False,
-            **kwargs: object,
+            **kwargs: Any,  # noqa: ANN401 - mirrors Agno Toolkit passthrough kwargs.
         ) -> None:
             normalized_language = sandbox_language.strip() if isinstance(sandbox_language, str) else sandbox_language
             if isinstance(normalized_language, str):
@@ -243,16 +223,23 @@ def daytona_tools() -> type[DaytonaTools]:
                 sandbox_os=sandbox_os,
                 auto_stop_interval=auto_stop_interval,
                 sandbox_os_user=sandbox_os_user,
-                sandbox_env_vars=_parse_string_mapping(sandbox_env_vars, field_name="sandbox_env_vars"),
-                sandbox_labels=_parse_string_mapping(sandbox_labels, field_name="sandbox_labels"),
+                sandbox_env_vars=parse_string_mapping(sandbox_env_vars, field_name="sandbox_env_vars"),
+                sandbox_labels=parse_string_mapping(sandbox_labels, field_name="sandbox_labels"),
                 sandbox_public=sandbox_public,
                 organization_id=organization_id,
                 timeout=timeout,
                 auto_create_sandbox=auto_create_sandbox,
-                verify_ssl=verify_ssl,
+                # AGNO_COMPAT: Daytona disables TLS verification process-wide for any falsy verify_ssl.
+                # Reason: Agno 3.0.9 treats None like False and then patches daytona_api_client.Configuration.__init__
+                # for the whole process until it restarts, so one such toolkit disables checks for every Daytona client.
+                # Upstream issue: Tracking gap; no matching issue has been verified for either behavior.
+                # Upstream PR: No matching fix identified.
+                # Remove when: Agno disables verification only for an explicit False and scopes it to its own client
+                # configuration; keep MindRoom's true default for unset and null values.
+                # Coverage: tests/test_tool_config_sync.py::test_daytona_verifies_tls_certificates_unless_explicitly_disabled.
+                verify_ssl=verify_ssl is not False,
                 persistent=persistent,
                 instructions=instructions,
-                add_instructions=add_instructions,
                 **kwargs,
             )
 

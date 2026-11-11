@@ -4,305 +4,130 @@ icon: lucide/message-square
 
 # Matrix Integration
 
-MindRoom uses the Matrix protocol for all agent communication. The integration is implemented in `src/mindroom/matrix/`.
+This page records the Matrix contracts that MindRoom's code does not make obvious: one identity invariant, the custom key namespace, the room-level reply relation, the conversation-notice marker, and the room accounts list and model-selection wire protocol that external clients implement.
+User-facing Matrix behavior is on [Matrix Integration](../matrix.md), event-journal decisions and homeserver behaviour are on [Matrix Event-Journal Contracts](matrix-event-journal-contracts.md), and invites and delivery epochs are on [Bot Runtime](bot-runtime.md#durable-dispatch-boundary).
 
-## Why Matrix?
+## Identity Invariant
 
-- **Federated** - Connect to any Matrix homeserver
-- **Bridgeable** - Bridge to Discord, Slack, Telegram, and more
-- **Open** - Open standard and open-source implementations
-- **End-to-End Encryption** - Secure communication with encrypted room support
+Code must resolve an entity's Matrix ID through the persisted identity registry, keyed by configured alias, and never derive it from the requested localpart, because the actual account can differ (see [Agent Users](../matrix.md#agent-users)).
 
-## Matrix Client
+## Custom Key Namespace
 
-MindRoom uses `mindroom-nio` for Matrix communication with SSL context handling and encryption key storage.
+New custom Matrix event types, state event types, and content keys use the `io.mindroom.*` namespace.
+Existing names under other prefixes, such as the `com.mindroom.*` keys, `org.mindroom.personal_room`, and `chat.mindroom.call_failure`, keep their names and are never migrated, because events already in room history, MindRoom Chat, and documented procedures use those names.
 
-### Environment Variables
+## Room-Level Reply Relation
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MATRIX_HOMESERVER` | `http://localhost:8008` | Matrix homeserver URL |
-| `MATRIX_SERVER_NAME` | (from homeserver) | Federation server name |
-| `MATRIX_SSL_VERIFY` | `true` | Set to `false` for dev/self-signed certs |
-| `MATRIX_MANAGED_ACCOUNT_AUTH` | `password` | Authentication for accounts created and operated by MindRoom: `password` or `appservice` |
-| `MATRIX_APPSERVICE_TOKEN` | -- | Application-service token used when managed account auth is `appservice` |
-| `MATRIX_APPSERVICE_TOKEN_FILE` | -- | File alternative to `MATRIX_APPSERVICE_TOKEN` |
+A reply outside a thread, such as every reply in `thread_mode: room`, names its source as `m.relates_to: {"io.mindroom.in_reply_to": {"event_id": "<source>"}}` instead of `m.in_reply_to`, because clients render `m.in_reply_to` as a quote of the source above the answer.
+The link stays inside `m.relates_to` rather than in a top-level content key because every path that handles an event's relation already carries or drops that object whole: nio copies it into the cleartext of an encrypted event, and long-message previews and segments, attachment-backed content, queued edits, and the room-level relation strip in dispatch treat it as one unit.
+A top-level key would need its own handling in each of those paths, and the reply would stop counting as a relation, so it would become eligible as a thread root.
+Clients, bridges, and homeservers treat a relation with neither `rel_type` nor `m.in_reply_to` as no relation, so the reply shows as a plain message.
 
-Streaming behavior is configured in `config.yaml` with `defaults.enable_streaming` (default: `true`).
+## Conversation Notices
 
-## Agent Users
+A notice that asks its reader to reply in its thread, such as a contact request asking its owner to accept or decline, carries `"io.mindroom.conversation": true` in its content, and in the `m.new_content` of any edit to it.
+MindRoom Chat lists an agent's notice as a conversation, and lets it make its room unread, only when the notice carries this key or its thread has replies, so an unmarked notice that asks for a reply would leave its room looking read.
+Informational notices stay unmarked.
 
-Each agent, team, and router has its own Matrix user.
+## Room Accounts List
 
-The configured alias is the user-facing runtime handle, such as `@assistant` in chat.
+The router publishes which joined members of a room are MindRoom accounts, so clients can recognize agents and teams whose user names do not start with `mindroom_`, such as personal agents with a custom `matrix_username`.
+The room state event has type `io.mindroom.accounts`, the router's user ID as its state key, and the sorted user IDs of the joined router, agent, and team accounts of the router's installation:
 
-Provisioning may request localparts such as `mindroom_assistant` or `mindroom_router`, but persisted Matrix state is authoritative after provisioning and may contain a different username.
-
-For example, a persisted Matrix account such as `@assistant_live:example.com` can become the live assistant account even if the original provisioning request used `mindroom_assistant`.
-
-Users are automatically created during orchestrator startup and credentials are persisted in `mindroom_data/matrix_state.yaml`.
-
-Password mode generates a separate password for every managed account and uses normal Matrix registration and login.
-Application-service mode registers passwordless accounts inside an exclusive application-service namespace, then obtains a normal per-user device token for encryption and sync.
-Set `MATRIX_MANAGED_ACCOUNT_AUTH=appservice` and provide exactly one of `MATRIX_APPSERVICE_TOKEN` or `MATRIX_APPSERVICE_TOKEN_FILE`.
-The application-service token is used only for account registration and fresh device login; normal agent traffic uses each account's own persisted device token.
-Existing passwords are removed from `matrix_state.yaml` after a successful application-service login.
-
-## Room Management
-
-Agents can join existing rooms, create new rooms with AI-generated topics, respond to invites automatically, leave unconfigured rooms, and set room avatars.
-
-Rooms are auto-created via `_ensure_room_exists()` (private) and `ensure_all_rooms_exist()` (public). DM rooms can be detected with `async is_dm_room(client, room_id) -> bool`.
-
-## Threading (MSC3440)
-
-MindRoom emits thread replies following [MSC3440](https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/3440-threading-via-relations.md), using `m.relates_to` with `rel_type: m.thread`.
-
-Explicit `m.thread` metadata remains the primary source of thread conversation context.
-For clients or bridges that send plain replies without thread metadata (`m.in_reply_to` but no `rel_type: m.thread`), MindRoom applies a transitive compatibility rule.
-If a reply chain eventually reaches explicit thread `T` or a proven thread root, MindRoom treats the new reply as part of `T`.
-Replies that never reach threaded context stay room-level.
-
-### Resolution Rules
-
-When deriving context for an incoming event, MindRoom:
-
-1. Uses explicit `m.thread` relations as the primary inbound thread identity.
-2. Lets plain replies inherit thread membership transitively when their reply chain reaches a threaded ancestor or proven thread root.
-3. Lets edits, reactions, redactions, and other target-bound operations inherit the canonical thread membership of their target event.
-4. May start a new thread under a room-root event when agent thread mode requires it.
-
-```
-├── User: @assistant help with this code
-│   ├── Assistant: I can help! Let me look at it...
-│   ├── User: It should return a list
-│   └── Assistant: Here's the updated version...
+```json
+{"accounts":["@alice.mind:example.org","@mindroom_research:example.org","@mindroom_router:example.org"]}
 ```
 
-Use `build_message_content()` from `message_builder.py` to construct thread-aware messages, and `EventInfo.from_event()` to analyze event relations (threads, edits, replies, reactions).
+The router publishes it on startup and after every config reload, and updates it when one of those accounts joins or leaves the room.
+Matrix accepts a state key that starts with `@` only from that user, but any member allowed to send the type can send it under another state key.
+So a client reads only the event keyed by a router's user ID, and trusts it only when its sender is a MindRoom router (`@mindroom_router:<server>`, or `@mindroom_router_<namespace>:<server>` for a namespaced installation) on the viewer's own homeserver.
+Each MindRoom installation in a room has its own router, which lists only its own accounts.
+The router can send the event only where the room's power levels allow it, which the rooms MindRoom creates do; managed rooms regain that power level at every startup, personal rooms regain it at startup while their owner is still in an onboarding room, other rooms keep the power levels they were created with, and a client that creates rooms should give the type power level 0 too.
 
-## Message Flow
+## Model Selection Protocol
 
-### Sync Loop
+See [Model Overrides in Chat](../configuration/models.md#model-overrides-in-chat).
 
-Each agent bot runs an owned Nio ingestion session with a five-second long-polling timeout.
-The default `matrix_sync.mode: classic` streams events through classic `/v3/sync` and backfills limited-timeline gaps from `/messages`.
-Set `matrix_sync.mode: sliding` to use MSC4186 Simplified Sliding Sync on homeservers advertising `org.matrix.simplified_msc3575`.
-Each agent uses a stable connection ID, a discovery range of `[0,99]`, and explicit subscriptions for its configured resolved rooms.
-Subscriptions refresh after deferred joins and room configuration changes without replacing the durable session or discarding accepted input.
-`matrix_sync.sliding_timeline_limit` defaults to 100 events per room window.
-A durable store is bound to its transport; changing this setting does not convert an existing store.
-Nio owns transport cursors, crypto preparation, and persisted per-event provenance.
-Both transports distinguish initial history, live continuations, and recovered gaps; MindRoom uses the provenance Nio supplies without reclassifying it.
-This provenance remains attached across recovery, restart, and decryption independently of application turn settlement.
-`matrix/durable_ingestion.py` converts one trusted Nio batch and atomically commits its receipt, ordered membership effects, semantic events, and conversation projection in the MindRoom journal before acknowledging that batch to Nio.
-An admission failure leaves the batch unsettled for retry, and replay after a committed admission returns the original receipt without duplicating semantic work.
-Typing, presence and read receipts are excluded from durable admission.
-MindRoom requires `mindroom-nio[e2e]==1.0.6`, and `uv.lock` pins the same published release.
-Nio 1.0.2 avoids rereading queued payloads for byte accounting on SQLite 3.43 and newer, preserving exact accounting on older drivers.
-Nio 1.0.3 returns typed membership errors for refused durable joined-member queries and preserves Matrix error codes after retry exhaustion.
-Nio 1.0.4 avoids repeated pending-queue size scans during durable sync preparation while preserving queue limits and rollback.
-Nio 1.0.5 moves durable sync response decoding and captured-input replay off the event loop while preserving durable capture and membership ordering.
-Nio 1.0.6 uses unfiltered incremental Classic sync for local joins proven fresh at the current cursor, while retaining full-state recovery for stale evidence or incomplete room baselines.
-It retains the encrypted-attachment and null room-avatar parsing fixes that prevent those event shapes from blocking history hydration.
-Admission is fail-closed at every provenance, not only for recovery, because an event the journal never accepted is one no later process would see again.
-Silent schedules use the custom `io.mindroom.scheduled.trigger` timeline event so clients do not render the task body as a room message.
-Ingress admits that hidden event only from a managed sender, leaves it out of the visible-message projection, and classifies cold-history copies as context-only.
-Journal dispatch validates and normalizes a live or recovered trigger into the existing formatted-message turn path, while an intentional no-report result records the turn and settles the trigger without a visible response.
-Conversation history is hydrated on demand rather than pre-warmed at join: a bounded backward walk fills one room or thread and records the membership epoch it filled under, so a rejoin rebuilds from what the new membership can see instead of merging two memberships into one conversation.
-Every derived conversation row, pending turn, and delivery outbox entry is tied to that membership epoch.
-A departure advances the epoch, removes old projected history, retires unsent old-membership delivery work, and prevents an in-flight response admitted before departure from being sent after rejoin.
-Attempted but unacknowledged deliveries retain their frozen transaction identity for exact reconciliation instead of being blindly resent.
-Changing `matrix_sync` restarts running entities on config hot reload.
-Sync loops are wrapped with `sync_forever_with_restart()` for automatic restart on connection failures.
+Discovery uses Olm-encrypted to-device events, including for unencrypted rooms, so it needs no room-state advertisement, state permissions, or external endpoint.
+Only the router answers discovery.
+It authenticates the actual requesting device and requires the requester and router to be currently joined, plus at least one configured, joined agent the requester may address.
+An included thread must be a readable, unredacted root in that room, whether or not it is encrypted.
+Replies go only to the authenticated device, and sending a catalog never verifies a previously untrusted device.
+Blocked devices, malformed requests, and unauthorized room or thread scopes receive no response.
 
-An event reaches an agent through durable admission, never straight from the sync callback:
+Send type `io.mindroom.models.request` with exact content:
 
-1. Sync receives the event via long-polling, and nio states its provenance once.
-2. The owned ingestion pump validates and commits each batch through `PrincipalStore.admit_ingestion_batch()` before acknowledging it to Nio.
-3. Control-room departures and history loss revoke uncertain grants before admission; live membership grant changes run after the durable commit, before the next batch.
-4. `PendingEventWorker` drains what is still pending, so an event whose turn was interrupted is re-dispatched instead of lost.
-5. `TurnController` owns the turn and the agent responds in thread.
-
-Invites are the deliberate event-journal exception because an invite has no stable Matrix event ID to key a journal row on.
-The owned ingestion callback stores the pending room and inviter before starting background handling.
-The pending record wakes unfinished work, but it does not make Matrix repeat an already-checkpointed invite and does not grant authority.
-The stored inviter is not authorization evidence: routers and agents require nio's current invite sender after fence persistence and immediately before starting the Matrix join request.
-Nio owns invited-room cache updates, and the join path rechecks current inviter evidence immediately before its membership command.
-A restart without current invite-cache evidence may require another invitation.
-All activity after joining uses ordinary responder conversation authorization.
-See [Bot Runtime](bot-runtime.md) for the full durable dispatch boundary.
-
-### Streaming Responses
-
-Agents stream responses by progressively editing messages.
-When requester identity is available, `should_use_streaming()` enables streaming only while that requester is online, avoiding progressive Matrix edits for offline users.
-When requester identity is unavailable, the presence check cannot run and `should_use_streaming()` defaults to streaming.
-See [Streaming Responses](../streaming.md) for the full feature documentation.
-
-Tool call telemetry is emitted as plain inline markers and mirrored in `io.mindroom.tool_trace` metadata on the same message content.
-
-Marker format:
-```text
-🔧 `tool_name` [N] ⏳     ← pending
-🔧 `tool_name` [N]        ← completed
+```json
+{"version":1,"request_id":"random-uuid","room_id":"!room:example.org","thread_id":"$root"}
 ```
 
-Where `N` is 1-indexed per message and maps to `io.mindroom.tool_trace.events[N-1]`.
+Omit `thread_id` for room capability discovery; `null` is invalid.
+Request IDs allow up to 128 characters; room/thread IDs allow up to 1024.
+Do not add claimed sender or device fields.
 
-## Presence
+The private reply type is `io.mindroom.models.response`:
 
-Agents set their Matrix presence with status messages containing model and role information (e.g., "🤖 Model: anthropic/claude-sonnet-5 | 💼 Code assistant | 🔧 5 tools available").
-
-**Presence States:**
-- **online** - Agent running and ready
-- **unavailable** - Agent idle but connected (treated as online for streaming)
-- **offline** - Agent stopped or disconnected
-
-## Typing Indicators
-
-Agents show typing indicators while processing via `typing_indicator()` context manager.
-The indicator auto-refreshes at `min(timeout/2, 15)` seconds to remain visible during long operations.
-
-## Mentions
-
-Mentions are parsed via `format_message_with_mentions()` which handles multiple formats:
-- `@calculator` - Stable configured agent or team key
-- `@actual_calculator:localhost` - Current full Matrix ID
-
-Bare Matrix account localparts such as `@actual_calculator` are not runtime handles.
-A generated-looking full Matrix ID such as `@mindroom_calculator:localhost` is not a runtime handle unless it is the current persisted Matrix ID for that agent or team.
-
-Returns content with `m.mentions` and `formatted_body` containing clickable links.
-
-## Large Messages
-
-Messages exceeding the 64KB Matrix event limit are automatically handled by `prepare_large_message()`:
-
-- Messages > 55,000 bytes and edits > 27,000 bytes use a fallback event
-- Full original Matrix message content is uploaded as a JSON sidecar (`message-content.json`)
-- Preview text included in message body (maximum that fits)
-- Custom metadata dict `io.mindroom.long_text` contains `version: 2`, `encoding: "matrix_event_content_json"`, original and preview sizes, and a completeness flag
-- Preview event is compact (for example no inline `io.mindroom.tool_trace`), while the sidecar preserves full content fidelity
-- Encrypted rooms: sidecar JSON is encrypted before upload (`message-content.json.enc`)
-
-With `defaults.large_message_strategy: split`, an oversized final text response is instead delivered as several complete rich-text events by `segment_matrix_content()` in `matrix/segmented_messages.py`.
-The body is cut at paragraph or line boundaries, never inside a fenced code block, and concatenating the segment bodies reproduces the original exactly.
-The first segment stays a final `m.replace` of the streaming placeholder when there is one; continuations are plain messages that stay in the thread when there is one.
-Every segment is rendered as standalone Markdown with `m.mentions` attached to the segment whose body carries the mention.
-Continuation payloads are frozen in the local outbox row and sent under deterministic transaction IDs, so a retry or restart resends only the segments the room does not already hold.
-Non-text payloads, metadata that alone exceeds the budget, and a single code fence larger than one event still use the sidecar path.
-
-## Response Tracking
-
-Duplicate responses are prevented at two durable layers, both in `tracking/event_journal.db` under `mindroom_data/`.
-
-`journal_events` is keyed `(principal_id, event_id)`, so a Matrix event redelivered by a sync reconnection or a `/messages` walk is recognised as already admitted rather than admitted twice.
-A settled row is retained for exactly that reason, with only its replay payload cleared.
-
-`TurnStore` owns the answer to "has this turn finished?", through the handled-turn ledger in `handled_turns.py`.
-It shares the journal's database, so a terminal turn record and the settlement of the journal sources it answers commit in one transaction instead of two substrates approximately agreeing.
-Its scope is the agent rather than the sync principal, because the proof that a message was already answered stays true across a re-login.
-
-Delivery itself is owned by the `matrix_delivery_outbox` table, keyed `(principal_id, delivery_id, stage)` over `INITIAL` and `FINAL` delivery stages.
-A `FINAL` stage edits an existing event when it has an edit target and otherwise publishes a standalone terminal event.
-Each row freezes its explicit Matrix event type, payload, and deterministic transaction ID before the first send attempt, so ordinary responses and tool-approval cards recover through the same worker after a crash between sending and recording.
-The claim also stores the sending device, because a transaction ID is only idempotent for the device that used it and a re-login would otherwise let a resend post a duplicate.
-After a device change, standalone deliveries that reply outside a journal turn reconcile by exact frozen content and retain their debt when history cannot prove which event won.
-
-## Room Cleanup
-
-On startup, MindRoom detects orphaned bot memberships left over from a previous configuration.
-When an agent is removed from `config.yaml`, its Matrix bot account may still be a member of rooms it previously joined.
-The global sweep removes only persisted bot identities that no longer belong to a configured router, agent, or team.
-Current entities reconcile their own configured and retained rooms after startup hooks and invitation handling, so the early global sweep cannot remove them before that reconciliation.
-An entity that cannot start keeps its memberships until its own lifecycle recovers.
-Unreadable or invalid retention files stop membership initialization instead of being treated as empty ownership records.
-This runs automatically — no manual intervention is needed.
-
-## Identity Management
-
-The `MatrixID` class handles Matrix user ID parsing.
-Runtime entity resolution uses the persisted identity registry, keyed by configured alias:
-
-```python
-mid = MatrixID.parse("@assistant_live:example.com")
-mid.username  # "assistant_live"
-mid.domain    # "example.com"
-mid.full_id   # "@assistant_live:example.com"
-
-# Resolve the current persisted Matrix ID for a configured alias
-registry = entity_identity_registry(config, runtime_paths)
-assistant_id = registry.current_id("assistant")
-agent_name = registry.current_entity_name_for_user_id(assistant_id.full_id)
+```json
+{
+  "version": 1,
+  "request_id": "random-uuid",
+  "room_id": "!room:example.org",
+  "thread_id": "$root",
+  "capabilities": ["model_selection"],
+  "agent_user_ids": ["@mindroom_helper:example.org"],
+  "catalog_revision": "sha256-of-published-entries",
+  "models": [{"key":"fast","display_name":"Quick helper","provider":"openai","id":"gpt-6-astra","icon_url":"mxc://example.org/image"}],
+  "selection": {"override":null,"inherited":[{"entity":"helper","model":"fast"}]}
+}
 ```
 
-## Root Space
+The response omits `thread_id` when the request did.
+`selection.override` is always present and is `null` for absent or deleted model overrides.
+It names a thread override only when every requester-visible responding entity uses that override, and is `null` when those entities have different thread overrides or some have none.
+`inherited` lists requester-visible responding entities with their room-level model, ignoring thread overrides.
+This explains what resetting the thread will use, including different defaults across agents and teams.
 
-MindRoom can create and maintain a root Matrix Space that groups all managed rooms.
+Each request reads current config.
+Models are sorted by stable key; the SHA-256 revision covers only published entries, including labels and resolved Matrix icons.
+Display names may repeat and fall back to the key.
+Icons use Matrix `mxc://` URIs only; other local icon rules are on the [model configuration page](../configuration/models.md).
 
-```yaml
-matrix_space:
-  enabled: true        # Default: true
-  name: MindRoom       # Display name for the Space
+The router stops processing a request after 12 seconds, but a response already handed to nio is not retracted.
+Admission caps queued/in-flight requests at eight, and at two per Matrix user across all of that user's devices, and accepts at most eight fresh requests per user in 12 seconds; concurrent duplicate requests share the active request.
+Authorization is last checked when the response is handed to nio, so a requester who loses room access while nio prepares or retries the send can still receive that already-authorized catalog.
+Clients must independently enforce current joined-agent eligibility and discard expired responses.
+
+Clients register their response listener before sending, correlate request, room, thread, and actual authenticated runtime device, and independently check returned agent membership.
+Candidate runtime accounts are hints; clients require an owner-signed runtime device.
+Multiple runtime devices remain separate choices.
+Refresh on picker opening; expire requests after 12 seconds and discard late results.
+
+### Thread Changes and Acknowledgements
+
+Mutations use the ordinary `m.room.message` / `m.text` path with readable body `!model fast` or `!model reset`, carrying this additional content:
+
+```json
+{"io.mindroom.model_selection":{"version":1,"runtime_user_id":"@mindroom_router:example.org","runtime_device_id":"ROUTER_DEVICE","operation":"set","model":"fast"}}
 ```
 
-When enabled, `ensure_root_space()` creates the Space on first boot (or resolves an existing one by alias), links all managed rooms as children, and sets the Space avatar from workspace or bundled assets.
-The Space name is reconciled on each startup to match the configured value.
-Root Space admin power is granted before child links are written.
-Concrete users from effective managed-room `invite_users` policies are invited to the root Space without receiving Space admin power.
-Platform `administrators`, room `admins`, responder users, and credential managers are not root Space invitation sources.
-MindRoom does not remove existing Space admins during reconciliation.
+`operation` is `set` or `reset`; reset omits `model`.
+Explicit set permits keys such as `default`, `reset`, or `list`.
+The required runtime device ID comes from authenticated discovery, routes the command, and grants no authority.
+Actual room and canonical thread come from Matrix event routing.
+Malformed structured metadata is rejected without falling back to text parsing; unrelated runtime users/devices ignore targeted commands.
+Existing authorization, command policy, and durable deduplication still apply.
 
-## Delivery Policy
+The normal command reply carries the persisted result alongside readable text:
 
-Outgoing encrypted Matrix sends always deliver to unverified devices.
-MindRoom bots have no interactive device-verification flow, so enforcing nio's device-trust checks would fail every send to an encrypted room with an `OlmUnverifiedDeviceError` and the agent would appear to silently ignore messages.
-A configurable trust policy only becomes meaningful once a device-verification mechanism exists (for example trust-on-first-use, a verification command, or cross-signing support).
-
-While a room's timeline is still recovering from a limited sync, nio rejects sends to that room with `SendRetryError` until the gap closes, so MindRoom retries the affected delivery in place instead of dropping it.
-Streaming progress updates and completed terminal deliveries reuse the identical prepared payload and retry for up to 30 seconds — one recovery pump — backing off from 50ms to 500ms between attempts.
-Cancelled and errored terminal updates never wait on recovery, so a stopped or failed turn still settles immediately.
-If the window expires the delivery is reported as failed, the placeholder settles as a delivery failure, and the failure update itself is sent without waiting on recovery again.
-
-## End-to-End Encryption
-
-Agents fully participate in encrypted rooms: they decrypt inbound text and media, reply encrypted, and re-fetch and decrypt thread history from the homeserver.
-Managed rooms can be created encrypted through `room_defaults.encrypted: true` or `rooms.<key>.encrypted: true`, and existing managed rooms are reconciled to encrypted on startup and config reload when so configured.
-Users can also enable encryption in any room with `!encrypt confirm` (room admin only), and `!e2ee` reports encryption diagnostics.
-Enabling encryption on a Matrix room is irreversible; MindRoom never disables it.
-
-When an agent receives an event it cannot decrypt from an authorized sender, it logs a `matrix_event_decryption_failed` warning, sends a best-effort room-key request once per session (delivered to the bot account's own devices, so recovery normally needs the sender to post a new message), and posts one notice per (room, session) so the user knows to resend.
-All bots share a disk-backed notice ledger, so the first bot that fails on a session posts the only notice and multi-agent rooms never storm.
-After a live room join, decryption-failure callbacks for that exact unfinished join stay fenced across restarts until a trusted sync response confirms joined membership.
-A rejected sync certification keeps that join fence closed; once admission succeeds again, the next trusted response atomically advances continuity and clears the fence.
-The fence suppresses only the user-visible notice, so a fenced failure still logs diagnostics, updates E2EE statistics, and requests missing keys without claiming the visible-notice ledger.
-Cold history is admitted rather than rejected: nio's `HISTORY` provenance classes an event context-only, so it joins the conversation the projection serves but can never start a turn.
-`LIVE` and recovered events are admitted as actionable independently of response-level sync positions, recovery gaps, and sync-certification state.
-The join fence does not compare federated event timestamps with the local wall clock.
-Decryption-failure counters are exposed on `/api/health` under `e2ee`.
-
-Each agent bootstraps a self-managed cross-signing identity at login (master and self-signing keys persisted next to its encryption store) and signs its own device, so clients that exclude non-cross-signed devices (MSC4153) keep sharing room keys with agents.
-`!e2ee` reports the cross-signing status.
-When the homeserver no longer has the uploaded identity (for example after a dev-server reset that kept `encryption_keys/`), the bootstrap detects the divergence and re-uploads the persisted keys instead of wedging.
-
-If a bot's encryption store under `mindroom_data/encryption_keys/` is lost while its device identity persists, startup logs in as a fresh device instead of restoring a wedged crypto identity, and re-signs the new device with the persisted cross-signing keys; `mindroom doctor` reports missing stores.
-Messages encrypted only to the lost device stay undecryptable, but the durable visible-message projection preserves the agent's conversational context.
-
-## Configuration
-
-Matrix settings are derived from `config.yaml`:
-
-```yaml
-agents:
-  assistant:
-    rooms: [lobby, dev]  # Room aliases (auto-created if needed)
-
-teams:
-  research_team:
-    rooms: [research]
+```json
+{"io.mindroom.model_selection_result":{"version":1,"command_event_id":"$command","room_id":"!room:example.org","thread_id":"$root","runtime_user_id":"@mindroom_router:example.org","runtime_device_id":"ROUTER_DEVICE","operation":"set","model":"fast","status":"applied","override":"fast"}}
 ```
 
-Room aliases are resolved to room IDs automatically. Full room IDs (starting with `!`) are also supported.
-
-When a room doesn't exist, it's created with an AI-generated topic, power users are invited, and managed avatars are resolved from workspace overrides or bundled defaults if available.
+Applied reset omits `model` and has `override:null`.
+Rejection has `status:"rejected"`, no `override`, and may include a readable `error`.
+Uncertain crash recovery may omit result metadata; clients refresh after timeout rather than infer success from sending.
+Accept an acknowledgement only for the client's current pending command event, exact room/thread, runtime user/device, operation, and model.
+Encrypted events additionally authenticate the sender device.
+In plaintext rooms, Matrix authenticates the sender account; device metadata only correlates the result.
+Serialize pending changes per runtime/thread and prevent earlier discovery results from replacing later confirmed changes.
+Other clients and text commands become visible on refresh; there is no global selection revision.

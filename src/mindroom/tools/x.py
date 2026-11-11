@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="x",
+    file_access=ToolFileAccess.NONE,
     display_name="X (Twitter)",
     description="Post tweets, send DMs, and search Twitter/X content",
     category=ToolCategory.SOCIAL,
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
         # Authentication/Connection parameters first
         ConfigField(
             name="bearer_token",
+            env=("X_BEARER_TOKEN",),
             label="Bearer Token",
             type="password",
             required=False,
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="consumer_key",
+            env=("X_CONSUMER_KEY",),
             label="Consumer Key",
             type="password",
             required=False,
@@ -40,6 +43,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="consumer_secret",
+            env=("X_CONSUMER_SECRET",),
             label="Consumer Secret",
             type="password",
             required=False,
@@ -48,6 +52,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="access_token",
+            env=("X_ACCESS_TOKEN",),
             label="Access Token",
             type="password",
             required=False,
@@ -56,6 +61,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="access_token_secret",
+            env=("X_ACCESS_TOKEN_SECRET",),
             label="Access Token Secret",
             type="password",
             required=False,
@@ -83,7 +89,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["tweepy"],
-    docs_url="https://docs.agno.com/tools/toolkits/social/x",
+    docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#x",
     function_names=(
         "create_post",
         "get_home_timeline",

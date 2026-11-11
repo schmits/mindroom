@@ -1,44 +1,48 @@
 """Unit tests for conversation identity and ingress envelope assembly.
 
 These are characterization tests for ConversationResolver: they pin down
-thread root resolution, reply-chain fallback, candidate demotion, target
-building, and the per-turn cache scope so the planned refactor of this layer
-has a direct safety net.
+the one thread decision ingress makes, reply-chain fallback, the context read
+in the decided thread, target building, and the per-turn cache scope.
 """
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import nio
 import pytest
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.constants import SKIP_MENTIONS_KEY
+from mindroom.constants import ATTACHMENT_IDS_KEY, SKIP_MENTIONS_KEY
 from mindroom.conversation_resolver import ConversationResolver, ConversationResolverDeps
+from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.event_journal import (
+    ConversationCursor,
     ConversationPage,
     EventClass,
     EventJournalStore,
     EventKind,
+    RefreshRequest,
     VisibleMessage,
 )
 from mindroom.logging_config import get_logger
 from mindroom.matrix.conversation_hydration import ConversationHydrator
 from mindroom.matrix.conversation_reads import ConversationReader
+from mindroom.matrix.identity import MatrixID
 from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
 from mindroom.matrix.relation_lookup import RelationLookup
-from mindroom.matrix.thread_membership import ThreadMembershipLookupError
+from mindroom.matrix.thread_membership import RelatedEventUnavailableError, ThreadMembershipLookupError
 from mindroom.message_target import MessageTarget
+from mindroom.turn_origin import TurnTrust
 from tests.conftest import (
     bind_runtime_paths,
+    make_ingress_facts,
     make_matrix_client_mock,
     make_relation_lookup,
     runtime_paths_for,
@@ -46,7 +50,7 @@ from tests.conftest import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
     from pathlib import Path
 
 _ROOM_ID = "!test:localhost"
@@ -110,25 +114,6 @@ def _projected(event_id: str, body: str) -> VisibleMessage:
     )
 
 
-def _empty_conversation_reader() -> ConversationReader:
-    """Return a reader for a harness that has no journal store behind it.
-
-    Not the same thing as stubbing a reader that does: these harnesses build a
-    resolver directly, so there is no projection to reach and a fake page is
-    the honest analogue of the conversation-cache mock they already carry.
-    """
-    page = ConversationPage(messages=(), refresh_pending=(), next_cursor=None)
-    return cast(
-        "ConversationReader",
-        SimpleNamespace(
-            may_have_unread_history=AsyncMock(return_value=False),
-            hydration_was_truncated=AsyncMock(return_value=False),
-            read=AsyncMock(return_value=page),
-            read_strict=AsyncMock(return_value=page),
-        ),
-    )
-
-
 @dataclass
 class _ClientWithoutEvents:
     """A homeserver that has never heard of the event being asked about."""
@@ -168,7 +153,7 @@ def _resolver(
             agent_name="general",
             matrix_id=registry.current_id("general"),
             relations=relations or make_relation_lookup(),
-            conversation_reader=conversation_reader or _empty_conversation_reader(),
+            conversation_reader=conversation_reader or _conversation_reader(),
         ),
     )
 
@@ -211,17 +196,47 @@ def _room() -> nio.MatrixRoom:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", ["refresh", "cursor", "truncated"])
+async def test_dispatch_repairs_pending_refresh_before_counting_participants(config: Config, incomplete: str) -> None:
+    """Repair a withheld streamed reply before planning, without retrying permanent bounds."""
+    messages = (
+        replace(_projected(_THREAD_ROOT, "First participant"), thread_id=_THREAD_ROOT),
+        replace(_projected("$second", "Second participant"), thread_id=_THREAD_ROOT, sender=_HUMAN_USER_ID),
+    )
+    reader = _conversation_reader(*messages)
+    reader.read.return_value = ConversationPage(  # type: ignore[attr-defined]
+        messages=messages,
+        refresh_pending=(RefreshRequest(_ROOM_ID, _THREAD_ROOT, "$answer", "$final-edit", 1, 1),)
+        if incomplete == "refresh"
+        else (),
+        next_cursor=ConversationCursor(500, "$older") if incomplete == "cursor" else None,
+    )
+    reader.hydration_was_truncated.return_value = incomplete == "truncated"  # type: ignore[attr-defined]
+    resolver = _resolver(config, conversation_reader=reader)
+
+    context = await resolver.extract_dispatch_context(_room(), _threaded_event(), thread_id=_THREAD_ROOT)
+
+    if incomplete == "refresh":
+        reader.read_strict.assert_awaited_once()  # type: ignore[attr-defined]
+        assert not context.planning_thread_history_unavailable
+        assert {message.sender for message in context.planning_thread_history} == {_SENDER, _HUMAN_USER_ID}
+    else:
+        reader.read_strict.assert_not_awaited()  # type: ignore[attr-defined]
+        assert context.planning_thread_history_unavailable
+
+
+@pytest.mark.asyncio
 async def test_threaded_event_resolves_explicit_thread_root(config: Config) -> None:
-    """An m.thread relation is authoritative for thread identity and the delivery target."""
+    """An m.thread relation is authoritative for the turn's thread and its context."""
     resolver = _resolver(config)
 
-    result = await resolver.extract_dispatch_context(_room(), _threaded_event())
+    thread_id = await resolver.coalescing_thread_id(_room(), _threaded_event())
+    context = await resolver.extract_dispatch_context(_room(), _threaded_event(), thread_id=thread_id)
 
-    assert result.context.is_thread is True
-    assert result.context.thread_id == _THREAD_ROOT
-    assert result.context.requires_model_history_refresh is False
-    assert result.thread_context is not None
-    assert result.thread_context.stable_target.resolved_thread_id == _THREAD_ROOT
+    assert thread_id == _THREAD_ROOT
+    assert context.is_thread is True
+    assert context.thread_id == _THREAD_ROOT
+    assert context.requires_model_history_refresh is False
 
 
 @pytest.mark.asyncio
@@ -229,12 +244,7 @@ async def test_reply_chain_inherits_the_thread_the_journal_recorded(config: Conf
     """A plain reply inherits the thread its parent was admitted into."""
     resolver = _resolver(config, relations=make_relation_lookup(threads={_PARENT: _THREAD_ROOT}))
 
-    result = await resolver.extract_dispatch_context(_room(), _reply_event())
-
-    assert result.context.is_thread is True
-    assert result.context.thread_id == _THREAD_ROOT
-    assert result.thread_context is not None
-    assert result.thread_context.stable_target.resolved_thread_id == _THREAD_ROOT
+    assert await resolver.coalescing_thread_id(_room(), _reply_event()) == _THREAD_ROOT
 
 
 @pytest.mark.asyncio
@@ -245,75 +255,111 @@ async def test_reply_to_proven_thread_root_joins_that_thread(config: Config) -> 
         conversation_reader=_conversation_reader(_projected("$child:localhost", "child")),
     )
 
-    result = await resolver.extract_dispatch_context(_room(), _reply_event())
+    thread_id = await resolver.coalescing_thread_id(_room(), _reply_event())
+    context = await resolver.extract_dispatch_context(_room(), _reply_event(), thread_id=thread_id)
 
-    assert result.context.is_thread is True
-    assert result.context.thread_id == _PARENT
-    assert [message.event_id for message in result.context.thread_history] == ["$child:localhost"]
+    assert thread_id == _PARENT
+    assert context.is_thread is True
+    assert [message.event_id for message in context.thread_history] == ["$child:localhost"]
+
+
+@pytest.mark.asyncio
+async def test_reaction_target_thread_is_read_from_local_state_while_history_is_unread(config: Config) -> None:
+    """A reaction's hook context wants its target's thread, which a page with unread history still proves."""
+    reader = _conversation_reader(_projected(_CHILD, "child"))
+    reader.may_have_unread_history.return_value = True  # type: ignore[attr-defined]
+    resolver = _resolver(config, conversation_reader=reader)
+
+    assert await resolver.resolve_related_event_thread_id_dispatch_snapshot_best_effort(_ROOM_ID, _PARENT) == _PARENT
 
 
 @pytest.mark.asyncio
 async def test_reply_to_plain_message_demotes_to_room_level(config: Config) -> None:
     """Replying to a childless event stays room-level with a room-level delivery target."""
     resolver = _resolver(config)
+    reply = _reply_event()
 
-    result = await resolver.extract_dispatch_context(_room(), _reply_event())
+    thread_id = await resolver.coalescing_thread_id(_room(), reply)
+    target = resolver.build_message_target(
+        room_id=_ROOM_ID,
+        thread_id=thread_id,
+        reply_to_event_id=reply.event_id,
+        event_source=reply.source,
+    )
 
-    assert result.context.is_thread is False
-    assert result.context.thread_id is None
-    assert result.thread_context is not None
-    assert result.thread_context.candidate_thread_root_id is None
+    assert thread_id is None
     # A reply event carries a relation, so per MSC3440 it cannot become a thread root itself.
-    assert result.thread_context.stable_target.source_thread_id is None
-    assert result.thread_context.stable_target.resolved_thread_id is None
-    assert result.thread_context.stable_target.reply_to_event_id == _EVENT_ID
+    assert target.source_thread_id is None
+    assert target.resolved_thread_id is None
+    assert target.reply_to_event_id == _EVENT_ID
 
 
 @pytest.mark.asyncio
-async def test_reply_to_missing_parent_keeps_unproven_candidate(config: Config) -> None:
-    """An unresolvable parent demotes to room level but keeps the candidate for replay safety."""
+async def test_reply_to_a_parent_the_homeserver_will_not_serve_is_unplaceable(config: Config) -> None:
+    """A parent the homeserver will not serve cannot place the turn, so ingress ends it rather than guess a thread."""
     resolver = _resolver(config, relations=make_relation_lookup(client=_ClientWithoutEvents()))
 
-    result = await resolver.extract_dispatch_context(_room(), _reply_event())
+    with pytest.raises(RelatedEventUnavailableError):
+        await resolver.coalescing_thread_id(_room(), _reply_event())
 
-    assert result.context.is_thread is False
-    assert result.context.thread_id is None
-    assert result.thread_context is not None
-    assert result.thread_context.candidate_thread_root_id == _PARENT
-    assert result.thread_context.replay_guard_degraded is True
-    # Unproven candidates must not adopt a thread target.
-    assert result.thread_context.stable_target.resolved_thread_id is None
+
+@pytest.mark.parametrize(("thread_mode", "one_conversation"), [("thread", False), ("room", True)])
+def test_room_is_one_conversation_only_in_room_thread_mode(
+    tmp_path: Path,
+    thread_mode: str,
+    one_conversation: bool,
+) -> None:
+    """Room thread mode makes the whole room, threads included, one conversation."""
+    config = bind_runtime_paths(
+        Config(agents={"general": AgentConfig(display_name="General", thread_mode=thread_mode)}),
+        test_runtime_paths(tmp_path),
+    )
+
+    assert _resolver(config).room_is_one_conversation(_ROOM_ID) is one_conversation
 
 
 @pytest.mark.asyncio
-async def test_room_thread_mode_skips_thread_resolution(tmp_path: Path) -> None:
-    """Agents in room thread mode treat every message as room-level."""
+async def test_room_thread_mode_decides_every_message_room_level(tmp_path: Path) -> None:
+    """Agents in room thread mode place an ordinary threaded message at room level without reading its thread."""
     config = bind_runtime_paths(
         Config(agents={"general": AgentConfig(display_name="General", thread_mode="room")}),
         test_runtime_paths(tmp_path),
     )
-    reader = _empty_conversation_reader()
+    reader = _conversation_reader()
     resolver = _resolver(config, conversation_reader=reader)
 
-    result = await resolver.extract_dispatch_context(_room(), _threaded_event())
+    thread_id = await resolver.coalescing_thread_id(_room(), _threaded_event())
 
-    assert result.context.is_thread is False
-    assert result.context.thread_id is None
-    assert result.thread_context is None
+    assert thread_id is None
     reader.read.assert_not_awaited()  # type: ignore[attr-defined]
     reader.read_strict.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_thread_the_target_names_in_a_room_mode_room_is_read_like_any_other(tmp_path: Path) -> None:
+    """Context reads any thread it is given in a room-mode room, which is where a per-fire thread arrives."""
+    config = bind_runtime_paths(
+        Config(agents={"general": AgentConfig(display_name="General", thread_mode="room")}),
+        test_runtime_paths(tmp_path),
+    )
+    reader = _conversation_reader()
+    resolver = _resolver(config, conversation_reader=reader)
+
+    context = await resolver.extract_dispatch_context(_room(), _threaded_event(), thread_id=_THREAD_ROOT)
+
+    assert (context.is_thread, context.thread_id) == (True, _THREAD_ROOT)
+    reader.read.assert_awaited_once()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
 async def test_router_relay_context_ignores_the_thread_a_relayed_edit_names(config: Config) -> None:
     """A relayed edit cannot choose the thread the response is delivered into.
 
-    This context deliberately skips the canonical resolver so the relay does not pay for thread
-    hydration before the lock. That makes the relation written inside an ``m.new_content`` the one
-    value here nothing would ever check - and Matrix ignores it in any case, placing an edit by the
-    event it replaces. Reading it would let whoever authored the relayed payload pick the thread.
+    The relation written inside an ``m.new_content`` is one Matrix ignores, placing an edit by the
+    event it replaces. Reading it would let whoever authored the relayed payload pick the thread,
+    so the relay context takes the thread ingress decided from the edited original.
     """
-    resolver = _resolver(config)
+    resolver = _resolver(config, relations=make_relation_lookup(threads={_PARENT: None}))
     relayed_edit = _event(
         {
             "body": "* updated",
@@ -326,21 +372,30 @@ async def test_router_relay_context_ignores_the_thread_a_relayed_edit_names(conf
         },
     )
 
-    result = await resolver.extract_trusted_router_relay_context(_room(), relayed_edit)
+    thread_id = await resolver.coalescing_thread_id(_room(), relayed_edit)
+    context = await resolver.extract_trusted_router_relay_context(_room(), relayed_edit, thread_id=thread_id)
 
-    assert result.context.thread_id is None
-    assert result.context.is_thread is False
+    assert thread_id is None
+    assert context.thread_id is None
+    assert context.is_thread is False
+    assert context.requires_model_history_refresh is False
 
 
 @pytest.mark.asyncio
 async def test_router_relay_context_keeps_the_relays_own_thread_relation(config: Config) -> None:
-    """A relay that really is in a thread still resolves to it without a lookup."""
-    resolver = _resolver(config)
+    """A relay in a thread keeps it and defers the thread read until after the lock."""
+    reader = _conversation_reader()
+    resolver = _resolver(config, conversation_reader=reader)
 
-    result = await resolver.extract_trusted_router_relay_context(_room(), _threaded_event())
+    context = await resolver.extract_trusted_router_relay_context(_room(), _threaded_event(), thread_id=_THREAD_ROOT)
 
-    assert result.context.thread_id == _THREAD_ROOT
-    assert result.context.is_thread is True
+    assert context.thread_id == _THREAD_ROOT
+    assert context.is_thread is True
+    assert context.thread_history == ()
+    assert context.requires_model_history_refresh is True
+    assert context.planning_thread_history_unavailable is True
+    reader.read.assert_not_awaited()  # type: ignore[attr-defined]
+    reader.read_strict.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -350,18 +405,6 @@ async def test_coalescing_thread_id_for_threaded_and_room_level_events(config: C
 
     assert await resolver.coalescing_thread_id(_room(), _threaded_event()) == _THREAD_ROOT
     assert await resolver.coalescing_thread_id(_room(), _event({"body": "plain"})) is None
-
-
-@pytest.mark.asyncio
-async def test_coalescing_thread_id_is_room_scoped_in_room_thread_mode(tmp_path: Path) -> None:
-    """Room thread mode collapses coalescing scope to the room even for threaded events."""
-    config = bind_runtime_paths(
-        Config(agents={"general": AgentConfig(display_name="General", thread_mode="room")}),
-        test_runtime_paths(tmp_path),
-    )
-    resolver = _resolver(config)
-
-    assert await resolver.coalescing_thread_id(_room(), _threaded_event()) is None
 
 
 def test_build_message_target_for_thread_message(config: Config) -> None:
@@ -416,13 +459,15 @@ async def test_the_turn_scope_makes_one_turn_pay_for_one_lookup(config: Config) 
     resolver = _resolver(config, relations=make_relation_lookup(client=client))
 
     async with resolver.turn_lookup_scope():
-        await resolver.extract_dispatch_context(_room(), _reply_event())
-        await resolver.extract_dispatch_context(_room(), _reply_event())
+        for _ in range(2):
+            with pytest.raises(RelatedEventUnavailableError):
+                await resolver.coalescing_thread_id(_room(), _reply_event())
     scoped = client.lookups
 
     client.lookups = 0
-    await resolver.extract_dispatch_context(_room(), _reply_event())
-    await resolver.extract_dispatch_context(_room(), _reply_event())
+    for _ in range(2):
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), _reply_event())
     unscoped = client.lookups
 
     # The exact counts are the resolver's business; that the scope reduces them
@@ -445,11 +490,11 @@ async def test_dispatch_context_extracts_agent_mentions(config: Config) -> None:
         },
     )
 
-    result = await resolver.extract_dispatch_context(_room(), event)
+    context = await resolver.extract_dispatch_context(_room(), event, thread_id=None)
 
-    assert result.context.am_i_mentioned is True
-    assert [agent.full_id for agent in result.context.mentioned_agents] == [general_id.full_id]
-    assert result.context.has_non_agent_mentions is False
+    assert context.am_i_mentioned is True
+    assert [agent.full_id for agent in context.mentioned_agents] == [general_id.full_id]
+    assert context.has_non_agent_mentions is False
 
 
 @pytest.mark.parametrize(
@@ -483,9 +528,9 @@ async def test_dispatch_context_only_counts_joined_non_agent_mentions(
         },
     )
 
-    result = await resolver.extract_dispatch_context(room, event)
+    context = await resolver.extract_dispatch_context(room, event, thread_id=None)
 
-    assert result.context.has_non_agent_mentions is expected
+    assert context.has_non_agent_mentions is expected
 
 
 @pytest.mark.asyncio
@@ -502,16 +547,16 @@ async def test_skip_mentions_metadata_suppresses_mention_extraction(config: Conf
         },
     )
 
-    result = await resolver.extract_dispatch_context(_room(), event)
+    context = await resolver.extract_dispatch_context(_room(), event, thread_id=None)
 
-    assert result.context.am_i_mentioned is False
-    assert result.context.mentioned_agents == []
-    assert result.context.has_non_agent_mentions is False
+    assert context.am_i_mentioned is False
+    assert context.mentioned_agents == []
+    assert context.has_non_agent_mentions is False
 
 
 @pytest.mark.asyncio
-async def test_build_ingress_envelope_carries_event_identity(config: Config) -> None:
-    """The lightweight ingress envelope mirrors the inbound event without thread extraction."""
+async def test_build_envelope_carries_event_identity(config: Config) -> None:
+    """The envelope mirrors the inbound event and its classified provenance without thread extraction."""
     resolver = _resolver(config)
     event = _event({"body": "hello"})
     target = resolver.build_message_target(
@@ -520,11 +565,7 @@ async def test_build_ingress_envelope_carries_event_identity(config: Config) -> 
         reply_to_event_id=_EVENT_ID,
     )
 
-    envelope = resolver.build_ingress_envelope(
-        event=event,
-        requester_user_id=_SENDER,
-        target=target,
-    )
+    envelope = resolver.build_envelope(event=event, facts=make_ingress_facts(_SENDER), target=target)
 
     assert envelope.source_event_id == _EVENT_ID
     assert envelope.room_id == _ROOM_ID
@@ -535,6 +576,45 @@ async def test_build_ingress_envelope_carries_event_identity(config: Config) -> 
     assert envelope.mentioned_agents == ()
     assert envelope.agent_name == "general"
     assert envelope.source_kind == "message"
+
+
+@pytest.mark.parametrize(("body", "expected_body"), [(None, "hello"), ("", "hello"), ("override", "override")])
+def test_envelope_carries_mentions_body_fallback_attachments_and_relay_provenance(
+    config: Config,
+    body: str | None,
+    expected_body: str,
+) -> None:
+    """The envelope keeps mentions, the body fallback, attachments, and the relay provenance its facts carry."""
+    resolver = _resolver(config)
+    event = _event({"body": "hello", ATTACHMENT_IDS_KEY: [" a ", "a", "b"]})
+    target = MessageTarget.resolve(_ROOM_ID, _THREAD_ROOT, _EVENT_ID)
+    facts = make_ingress_facts(
+        _BOT_USER_ID,
+        source_kind=TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
+        requester_user_id=_HUMAN_USER_ID,
+        original_sender=_HUMAN_USER_ID,
+        original_sender_is_human=True,
+        hook_source="test-hook",
+        message_received_depth=2,
+        sender_entity_name="general",
+    )
+
+    envelope = resolver.build_envelope(
+        event=event,
+        facts=facts,
+        target=target,
+        mentioned_agents=[MatrixID.parse(_BOT_USER_ID)],
+        body=body,
+    )
+
+    assert envelope.body == expected_body
+    assert envelope.attachment_ids == ("a", "b")
+    assert envelope.mentioned_agents == ("general",)
+    assert envelope.hook_source == "test-hook"
+    assert envelope.message_received_depth == 2
+    assert envelope.origin == facts.origin
+    assert envelope.origin.trust is TurnTrust.TRUSTED_USER_RELAY
+    assert envelope.dispatch_policy_source_kind is None
 
 
 def _parse(source: dict[str, Any]) -> nio.Event:
@@ -707,25 +787,6 @@ async def _resolver_on_a_cold_journal(
 
 
 @pytest.mark.asyncio
-async def test_unhydrated_candidate_root_still_gets_a_coalescing_scope(
-    config: Config,
-    tmp_path: Path,
-) -> None:
-    """A plain reply resolves its scope even when nothing has walked that conversation.
-
-    Coalescing reads dispatch-safe, so an unhydrated conversation answers with
-    a page that proves nothing, and an unproven root is INDETERMINATE. Raising
-    there fails the whole turn, and coalescing is the one caller with nothing
-    downstream to correct a wrong key with -- the batch is formed here -- so it
-    repairs the answer with a strict read instead of giving up.
-    """
-    async with _resolver_on_a_cold_journal(config, tmp_path) as resolver:
-        scope = await resolver.coalescing_thread_id(_room(), _reply_event())
-
-    assert scope == _PARENT
-
-
-@pytest.mark.asyncio
 async def test_unhydrated_candidate_root_is_not_demoted_to_room_level(
     config: Config,
     tmp_path: Path,
@@ -738,11 +799,12 @@ async def test_unhydrated_candidate_root_is_not_demoted_to_room_level(
     from the empty page the dispatch-safe read started with.
     """
     async with _resolver_on_a_cold_journal(config, tmp_path) as resolver:
-        result = await resolver.extract_dispatch_context(_room(), _reply_event())
+        thread_id = await resolver.coalescing_thread_id(_room(), _reply_event())
+        context = await resolver.extract_dispatch_context(_room(), _reply_event(), thread_id=thread_id)
 
-    assert result.context.is_thread is True
-    assert result.context.thread_id == _PARENT
-    assert [message.event_id for message in result.context.thread_history] == [_PARENT, _CHILD]
+    assert thread_id == _PARENT
+    assert context.is_thread is True
+    assert [message.event_id for message in context.thread_history] == [_PARENT, _CHILD]
 
 
 @pytest.mark.asyncio
@@ -782,94 +844,148 @@ async def test_coalescing_still_fails_closed_when_the_repair_cannot_prove_the_ro
             await resolver.coalescing_thread_id(_room(), _reply_event())
 
 
+@dataclass
+class _HomeserverRefusingEveryEvent(_HomeserverWithAThread):
+    """A homeserver that answers every event lookup with one fixed error."""
+
+    errcode: str = "M_NOT_FOUND"
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Refuse the event, whatever it is."""
+        del room_id, event_id
+        return nio.RoomGetEventError("refused", self.errcode)
+
+
+def _reference_event() -> nio.RoomMessageText:
+    return _event(
+        {
+            "body": "a reference",
+            "m.relates_to": {"rel_type": "m.reference", "event_id": "$fabricated:localhost"},
+        },
+    )
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("newer_during_download", [False, True])
-@pytest.mark.parametrize("aliased_requester", [False, True])
-async def test_exact_source_pages_and_resolves_sidecar_with_revision_proof(
+@pytest.mark.parametrize("errcode", ["M_NOT_FOUND", "M_FORBIDDEN"])
+@pytest.mark.parametrize("make_event", [_reply_event, _reference_event])
+async def test_coalescing_reports_a_relation_target_the_homeserver_will_not_serve(
     config: Config,
-    journal_store: EventJournalStore,
-    monkeypatch: pytest.MonkeyPatch,
-    newer_during_download: bool,
-    aliased_requester: bool,
+    tmp_path: Path,
+    errcode: str,
+    make_event: Callable[[], nio.RoomMessageText],
 ) -> None:
-    """Exact refill reads past the prompt window and rejects a stale sidecar snapshot."""
-    principal = journal_store.principal("general")
-    requester_id = "@canonical:test" if aliased_requester else _SENDER
-    if aliased_requester:
-        config.authorization.aliases = {requester_id: [_SENDER]}
-    source_id = "$a-source"
-    sidecar = _event(
-        {
-            "msgtype": "m.file",
-            "body": "preview",
-            "url": "mxc://server/source",
-            "info": {"mimetype": "application/json"},
-            "io.mindroom.long_text": {"version": 2, "encoding": "matrix_event_content_json"},
-            "m.relates_to": {"rel_type": "m.thread", "event_id": _PARENT},
-        },
-        event_id=source_id,
-    )
-    newer = _event(
-        {
-            "body": "newer unrelated",
-            "m.relates_to": {"rel_type": "m.thread", "event_id": _PARENT},
-        },
-        event_id="$z-newer",
-    )
-    await principal.install_hydrated_conversation(
-        room_id=_ROOM_ID,
-        thread_id=_PARENT,
-        complete=True,
-        expected_membership_epoch=await principal.membership_epoch(_ROOM_ID),
-        events=tuple(
-            _projected_event(_ROOM_ID, event, EventKind.MESSAGE, self_sender=_BOT_USER_ID) for event in (sidecar, newer)
-        ),
-    )
-    resolver = _resolver(config)
-    runtime = resolver.deps.runtime
-    reader = ConversationReader(
-        store=principal,
-        hydrator=ConversationHydrator(store=principal, runtime=runtime, self_sender=_BOT_USER_ID),
-    )
-    resolver.deps = replace(resolver.deps, conversation_reader=reader)
-    monkeypatch.setattr("mindroom.conversation_resolver.HYDRATED_PROMPT_WINDOW_MESSAGES", 1)
+    """A target that is missing or hidden fails the same way on every retry.
 
-    async def download(*_args: object, **_kwargs: object) -> nio.DownloadResponse:
-        if newer_during_download:
-            edit = _event(
-                {
-                    "body": "* NEWER_SURVIVING",
-                    "m.new_content": {"msgtype": "m.text", "body": "NEWER_SURVIVING"},
-                    "m.relates_to": {"rel_type": "m.replace", "event_id": source_id},
-                },
-                event_id="$latest-edit",
-            )
-            await principal.admit(
-                _inbound_event(_ROOM_ID, edit, EventKind.MESSAGE, EventClass.ACTIONABLE),
-                _projected_event(_ROOM_ID, edit, EventKind.MESSAGE, self_sender=_BOT_USER_ID),
-            )
-            snapshot = await principal.read_conversation(room_id=_ROOM_ID, thread_id=_PARENT, limit=10)
-            assert any(message.revision_event_id == "$latest-edit" for message in snapshot.messages), snapshot
-        return MagicMock(
-            spec=nio.DownloadResponse,
-            body=json.dumps({"msgtype": "m.text", "body": "FULL_SIDECAR_BODY"}).encode(),
+    Anyone in the room can name one, so the caller has to be able to tell it
+    from a lookup that failed for a moment, or one message holds up the room.
+    """
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode=errcode),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), make_event())
+
+
+@dataclass
+class _HomeserverServingAStateEvent(_HomeserverWithAThread):
+    """A homeserver whose ``$parent`` is a membership event, not a message."""
+
+    async def room_get_event(
+        self,
+        room_id: str,
+        event_id: str,
+    ) -> nio.RoomGetEventResponse | nio.RoomGetEventError:
+        """Serve a join event under the ID every relation in these tests names."""
+        del room_id, event_id
+        response = nio.RoomGetEventResponse()
+        response.event = _parse(
+            {
+                "event_id": _PARENT,
+                "sender": _SENDER,
+                "origin_server_ts": 1_000,
+                "type": "m.room.member",
+                "state_key": _SENDER,
+                "room_id": _ROOM_ID,
+                "content": {"membership": "join"},
+            },
         )
+        return response
 
-    assert runtime.client is not None
-    response = nio.RoomGetEventResponse()
-    response.event = sidecar
-    monkeypatch.setattr(runtime.client, "room_get_event", AsyncMock(return_value=response))
-    monkeypatch.setattr(runtime.client, "download", download)
-    target = MessageTarget.resolve(_ROOM_ID, _PARENT, source_id)
-    resolved = await resolver.resolve_exact_source(
-        target=target,
-        source_event_id=source_id,
-        requester_id=requester_id,
+
+@pytest.mark.asyncio
+async def test_coalescing_reports_a_relation_target_that_is_not_a_message(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """An event's type never changes, so a reply to a join fails the same way on every retry."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverServingAStateEvent(),
+    ) as resolver:
+        with pytest.raises(RelatedEventUnavailableError):
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+
+@pytest.mark.asyncio
+async def test_coalescing_keeps_a_server_failure_retryable(
+    config: Config,
+    tmp_path: Path,
+) -> None:
+    """A homeserver that failed to answer may answer next time, so it is not a refusal."""
+    async with _resolver_on_a_cold_journal(
+        config,
+        tmp_path,
+        client=_HomeserverRefusingEveryEvent(errcode="M_UNKNOWN"),
+    ) as resolver:
+        with pytest.raises(ThreadMembershipLookupError) as raised:
+            await resolver.coalescing_thread_id(_room(), _reply_event())
+
+    assert not isinstance(raised.value, RelatedEventUnavailableError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_mode", ["thread", "room"])
+async def test_edit_context_reads_its_recorded_thread_strictly_whatever_the_thread_mode(
+    tmp_path: Path,
+    thread_mode: str,
+) -> None:
+    """Edit regeneration reads the recorded thread strictly, even after its room switched to room mode."""
+    config = bind_runtime_paths(
+        Config(agents={"general": AgentConfig(display_name="General", thread_mode=thread_mode)}),
+        test_runtime_paths(tmp_path),
     )
-    assert resolved.body == ("NEWER_SURVIVING" if newer_during_download else "FULL_SIDECAR_BODY")
-    assert resolved.event_id == source_id
-    assert resolved.latest_event_id == ("$latest-edit" if newer_during_download else source_id)
-    with pytest.raises(ThreadMembershipLookupError, match="requester"):
-        await resolver.resolve_exact_source(target=target, source_event_id=source_id, requester_id="@wrong:test")
-    with pytest.raises(ThreadMembershipLookupError, match="unavailable"):
-        await resolver.resolve_exact_source(target=target, source_event_id="$absent", requester_id=_SENDER)
+    reader = _conversation_reader()
+    resolver = _resolver(config, conversation_reader=reader)
+
+    context = await resolver.extract_message_context(_room(), _event({"body": "edited"}), thread_id=_THREAD_ROOT)
+
+    assert (context.is_thread, context.thread_id) == (True, _THREAD_ROOT)
+    reader.read_strict.assert_awaited_once()
+    reader.read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("next_cursor", "refresh"), [(None, False), (ConversationCursor(500, "$older"), True)])
+async def test_dispatch_context_asks_for_a_model_history_refresh_only_for_a_partial_thread(
+    config: Config,
+    next_cursor: ConversationCursor | None,
+    refresh: bool,
+) -> None:
+    """A page of a longer thread is not the thread, so the prompt must read the rest before answering."""
+    page = ConversationPage(messages=(_projected(_PARENT, "first"),), refresh_pending=(), next_cursor=next_cursor)
+    reader = _conversation_reader()
+    reader.read.return_value = page
+    reader.read_strict.return_value = page
+    resolver = _resolver(config, conversation_reader=reader)
+
+    context = await resolver.extract_dispatch_context(_room(), _event({"body": "next"}), thread_id=_PARENT)
+
+    assert context.thread_id == _PARENT
+    assert context.requires_model_history_refresh is refresh

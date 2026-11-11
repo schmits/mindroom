@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="unsplash",
+    file_access=ToolFileAccess.NONE,
     display_name="Unsplash",
     description="Search and retrieve high-quality, royalty-free images from Unsplash",
     category=ToolCategory.RESEARCH,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="access_key",
+            env=("UNSPLASH_ACCESS_KEY",),
             label="Access Key",
             type="password",
             required=True,
@@ -73,7 +75,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=[],
-    docs_url="https://docs.agno.com/tools/toolkits/others/unsplash",
+    docs_url="https://docs.mindroom.chat/tools/media-and-content/#unsplash",
     helper_text="Get a free API key from [Unsplash Developers](https://unsplash.com/developers)",
     function_names=("download_photo", "get_photo", "get_random_photo", "search_photos"),
 )

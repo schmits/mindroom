@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock
 
@@ -48,10 +49,13 @@ from mindroom.matrix.journal_ingress import (
     ingestion_timeline_views,
     parse_journal_event,
 )
-from mindroom.pending_event_worker import _BATCH_SIZE, PendingEventWorker
+from mindroom.pending_event_worker import _BATCH_SIZE, _MAX_RETRY_DELAY_SECONDS, PendingEventWorker
 from mindroom.response_lifecycle import ResponseLifecycleCoordinator, response_lifecycle_reservation_context
-from tests.conftest import request_envelope
+from tests.approval_card_helpers import resolve_card_event
+from tests.approval_continuation_helpers import claim_continuation
+from tests.conftest import SETTLE_TIMEOUT_SECONDS, request_envelope
 from tests.journal_helpers import admit_dispatch_event
+from tests.reply_span_helpers import paused_for_approval
 from tests.test_event_journal_store import TestApprovalContinuations as _ApprovalContinuations
 from tests.test_event_journal_store import corrupt
 
@@ -472,6 +476,42 @@ class TestAdmissionAdapter:
 
         assert views is None
         assert any("ValidationError" in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.parametrize("msgtype", [[], {}, 5], ids=["list", "dict", "number"])
+    @pytest.mark.parametrize("encrypted", [False, True])
+    async def test_a_msgtype_that_is_not_text_settles_as_malformed(
+        self,
+        msgtype: object,
+        encrypted: bool,
+    ) -> None:
+        """Any room member writes the msgtype, so a value that is not text settles instead of raising."""
+        source = image_event("$invalid", encrypted=encrypted).source
+        source["content"]["msgtype"] = msgtype
+
+        views = ingestion_timeline_views(
+            room_id=ROOM,
+            source=source,
+            self_sender=BOT,
+            provenance=nio.TimelineEventProvenance.LIVE,
+        )
+
+        assert views is None
+
+    @pytest.mark.parametrize("in_content", [False, True], ids=["top-level", "content"])
+    async def test_a_redaction_naming_no_event_settles_as_malformed(self, in_content: bool) -> None:
+        """Nio accepts an empty redaction target, which names nothing to delete."""
+        source = redaction_event("$redaction", "").source
+        if in_content:
+            source["content"]["redacts"] = source.pop("redacts")
+
+        views = ingestion_timeline_views(
+            room_id=ROOM,
+            source=source,
+            self_sender=BOT,
+            provenance=nio.TimelineEventProvenance.LIVE,
+        )
+
+        assert views is None
 
     async def test_a_threaded_message_lands_in_its_thread(self) -> None:
         """A threaded message lands in its thread."""
@@ -894,6 +934,50 @@ class TestStreamingProgressIsTransport:
         # Admitted, projected, and never work.
         assert await alice.pending() == ()
 
+    async def test_another_agents_text_placeholder_is_conversation_and_only_its_answer_is_work(
+        self,
+        alice: PrincipalStore,
+    ) -> None:
+        """An unfinished `m.text` reply is projected but never queued; its terminal edit is.
+
+        The runtime sends an answer's placeholder as `m.text` with a `pending`
+        status, and every agent in the room receives every agent's placeholder.
+        No turn ever answers an unfinished reply, so admitting each one as work
+        only held every agent's room lane, ahead of the prompts behind it.
+        """
+        other_agent = "@mindroom_other:example.org"
+        placeholder = nio.Event.parse_event(
+            {
+                "event_id": "$their_placeholder",
+                "sender": other_agent,
+                "origin_server_ts": 1_000,
+                "type": "m.room.message",
+                "content": {"msgtype": "m.text", "body": PLACEHOLDER_BODY, STREAM_STATUS_KEY: STREAM_STATUS_PENDING},
+            },
+        )
+        assert isinstance(placeholder, nio.Event)
+
+        await self._admit_live(alice, placeholder)
+
+        assert _event_class_for(nio.TimelineEventProvenance.LIVE, placeholder) is EventClass.CONTEXT_ONLY
+        assert (await self._one_visible(alice)).logical_event_id == "$their_placeholder"
+        assert await alice.pending() == ()
+
+        await self._admit_live(
+            alice,
+            stream_event(
+                "$their_answer",
+                "the whole answer",
+                STREAM_STATUS_COMPLETED,
+                replaces="$their_placeholder",
+                sender=other_agent,
+                ts=1_200,
+            ),
+        )
+
+        assert (await self._one_visible(alice)).content["body"] == "the whole answer"
+        assert [event.event_id for event in await alice.pending()] == ["$their_answer"]
+
     async def test_the_production_stream_sequence_leaves_one_visible_answer(
         self,
         alice: PrincipalStore,
@@ -1037,16 +1121,17 @@ class TestStreamingProgressIsTransport:
         assert visible.content["body"] == "first question"
         assert visible.revision_event_id == "$fix"
 
-    async def test_a_crash_mid_stream_leaves_the_placeholder_until_cleanup_speaks(
+    async def test_a_crash_mid_stream_leaves_the_placeholder_until_a_terminal_edit_lands(
         self,
         alice: PrincipalStore,
     ) -> None:
         """The row a crash leaves behind is the placeholder, and that is correct.
 
         No intermediate body was durable, so there is nothing to half-restore.
-        Startup stale-stream cleanup rewrites the visible message with a
-        terminal status, and that echo reduces like any other terminal edit —
-        which is what makes skipping progress safe rather than lossy.
+        The replay that continues the reply, or the restart note that ends it,
+        rewrites the visible message with a terminal status, and that echo
+        reduces like any other terminal edit — which is what makes skipping
+        progress safe rather than lossy.
         """
         progress = [
             stream_event(
@@ -1655,8 +1740,8 @@ class TestPendingEventWorker:
             async def is_pending(self, event_id: str) -> bool:
                 return await self.inner.is_pending(event_id)
 
-            async def settle(self, event_id: str) -> None:
-                await self.inner.settle(event_id)
+            async def settle(self, event_id: str) -> tuple[str, ...]:
+                return await self.inner.settle(event_id)
 
         async def handle(event: JournalEvent) -> bool:
             del event
@@ -2294,7 +2379,7 @@ class TestRoomRetryBackoff:
             await TestPendingEventWorker._admit(alice, text_event(event_id))
         worker = PendingEventWorker(store=alice, handle=handle, deferral_is_live=lambda event: event.event_id in live)
         try:
-            await asyncio.wait_for(worker.drain_once(), timeout=1)
+            await asyncio.wait_for(worker.drain_once(), timeout=SETTLE_TIMEOUT_SECONDS)
             assert attempts == ["$first", "$second"]
             await _eventually(lambda: len(retry_sleeps) == 1)
             assert retry_sleeps[0][0] == 1
@@ -2332,7 +2417,7 @@ class TestRoomRetryBackoff:
         await TestPendingEventWorker._admit(alice, text_event("$healthy"), "!healthy:example.org")
         worker = PendingEventWorker(store=alice, handle=handle, deferral_is_live=lambda _event: False)
         try:
-            await asyncio.wait_for(worker.drain_once(), timeout=1)
+            await asyncio.wait_for(worker.drain_once(), timeout=SETTLE_TIMEOUT_SECONDS)
             assert sorted(attempts) == ["$earlier", "$healthy"]
             await _eventually(lambda: len(retry_sleeps) == 1)
             assert retry_sleeps[0][0] == 1
@@ -2490,7 +2575,7 @@ class TestRoomRetryBackoff:
                 )
                 if not approval_created:
                     approval_created = True
-                    await alice.create_approval_continuation(_ApprovalContinuations.continuation(state="waiting"))
+                    await paused_for_approval(alice, _ApprovalContinuations.continuation(state="waiting"))
                 return page
 
         handled: list[str] = []
@@ -2528,13 +2613,14 @@ class TestRoomRetryBackoff:
             if event.event_id != "$source-1":
                 return True
             if attempts.count("$source-1") == 1:
-                created = await alice.create_approval_continuation(
+                created = await paused_for_approval(
+                    alice,
                     replace(_ApprovalContinuations.continuation(state="waiting"), runtime_generation=generation),
                 )
                 assert created is not None
                 await _ApprovalContinuations.remember_card(alice)
             else:
-                claimed = await alice.claim_approval_continuation("approval-1", runtime_generation=generation)
+                claimed = await claim_continuation(alice, "approval-1", runtime_generation=generation)
                 assert claimed is not None
                 assert claimed.state == "claimed"
             return False
@@ -2549,7 +2635,9 @@ class TestRoomRetryBackoff:
             assert attempts == ["$source-1", "$middle"]
             assert store.tail_read_after == middle.receipt_order
             worker.release(("$source-1",))
-            recorded = await alice.resolve_continuation_approval_card(
+            recorded = await resolve_card_event(
+                alice.approvals,
+                room_id=ROOM,
                 card_event_id="$approval",
                 requested_status="approved",
                 reason=None,
@@ -2596,7 +2684,7 @@ class TestRoomRetryBackoff:
             await TestPendingEventWorker._admit(alice, text_event("$later"))
             await TestPendingEventWorker._admit(alice, text_event("$healthy"), "!healthy:example.org")
             if drain:
-                await asyncio.wait_for(worker.drain_once(), timeout=1)
+                await asyncio.wait_for(worker.drain_once(), timeout=SETTLE_TIMEOUT_SECONDS)
             else:
                 await _dispatch_worker_pass(worker)
 
@@ -2643,6 +2731,81 @@ class TestRoomRetryBackoff:
             assert retry_sleeps[-1][0] == 1
         finally:
             await worker.stop()
+
+    async def test_a_long_outage_retries_the_event_until_it_succeeds(
+        self,
+        alice: PrincipalStore,
+        retry_sleeps: list[tuple[float, asyncio.Event]],
+    ) -> None:
+        """A callback failure never settles its event, however long the outage lasts.
+
+        An exception says nothing about whether the event itself is at fault, so
+        an unreachable homeserver or model provider must hold the room's lane
+        rather than drop the user's message. Deterministic refusals settle
+        inside the callback instead.
+        """
+        outage_failures = 25
+        attempts: list[str] = []
+
+        async def handle(event: JournalEvent) -> bool:
+            attempts.append(event.event_id)
+            if event.event_id == "$message" and attempts.count("$message") <= outage_failures:
+                msg = "homeserver unavailable"
+                raise RuntimeError(msg)
+            return True
+
+        await TestPendingEventWorker._admit(alice, text_event("$message", ts=1_000))
+        await TestPendingEventWorker._admit(alice, text_event("$later", ts=2_000))
+        worker = PendingEventWorker(store=alice, handle=handle)
+        worker.start()
+        try:
+            for index in range(outage_failures):
+                await _eventually(lambda index=index: len(retry_sleeps) > index)
+                assert await alice.is_pending("$message")
+                retry_sleeps[index][1].set()
+            await _eventually_async(lambda: alice.pending(room_id=ROOM))
+        finally:
+            await worker.stop()
+
+        assert attempts == ["$message"] * (outage_failures + 1) + ["$later"]
+        assert retry_sleeps[-1][0] == _MAX_RETRY_DELAY_SECONDS
+
+    @pytest.mark.parametrize("failing_sources", [1, 2, 3])
+    async def test_sources_handed_back_by_their_turn_back_off_together(
+        self,
+        alice: PrincipalStore,
+        retry_sleeps: list[tuple[float, asyncio.Event]],
+        failing_sources: int,
+    ) -> None:
+        """Handed-off sources that keep coming back failed still back off.
+
+        Each source is deferred to a turn that fails and returns it. Reaching
+        the second one used to count as progress past the first, so a room with
+        two such sources retried every second forever.
+        """
+        worker: PendingEventWorker
+
+        async def hand_back(event_id: str) -> None:
+            await asyncio.sleep(0)
+            worker.release((event_id,))
+            worker.wake(room_id=ROOM)
+
+        async def handle(event: JournalEvent) -> bool:
+            asyncio.get_running_loop().create_task(hand_back(event.event_id), name="failed_turn")
+            return False
+
+        for index in range(failing_sources):
+            await TestPendingEventWorker._admit(alice, text_event(f"$m{index}", ts=1_000 + index))
+        worker = PendingEventWorker(store=alice, handle=handle)
+        worker.start()
+        try:
+            for index in range(7):
+                await _eventually(lambda index=index: len(retry_sleeps) > index)
+                retry_sleeps[index][1].set()
+        finally:
+            await worker.stop()
+
+        assert [delay for delay, _release in retry_sleeps[:7]] == [1, 2, 4, 8, 16, 30, 30]
 
     async def test_each_room_wakes_at_its_own_retry_without_new_admission(
         self,
@@ -3063,6 +3226,40 @@ class TestRoomRetryBackoff:
         assert attempts == ["$failed", "$failed"]
 
 
+async def test_a_follow_up_whose_turn_is_gone_is_dispatched_again(alice: PrincipalStore) -> None:
+    """A follow-up waits for the fleet at startup and for its live turn, and runs again once that turn is gone."""
+    owners: set[str] = set()
+
+    async def noop(_room: nio.MatrixRoom, _event: nio.Event) -> None:
+        return None
+
+    dispatcher = JournalDispatcher(
+        store=alice,
+        callbacks=JournalCallbacks(
+            on_message=cast("Any", noop),
+            on_media=cast("Any", noop),
+            on_reaction=cast("Any", noop),
+            on_approval=cast("Any", noop),
+            on_room_lifecycle=cast("Any", noop),
+            on_redaction=cast("Any", noop),
+            on_approval_continuation=AsyncMock(return_value=None),
+            source_has_live_owner=lambda event_id: event_id in owners,
+            turn_has_live_claim=lambda _event_id: False,
+            replies_ended=lambda _reply_ids: None,
+            on_job_follow_up=AsyncMock(),
+            on_job_cancel=AsyncMock(),
+        ),
+        room_for_id=lambda _room_id: room(),
+    )
+    follow_up = cast("JournalEvent", SimpleNamespace(kind=EventKind.JOB_FOLLOW_UP, event_id="job-follow-up:1"))
+    assert dispatcher._deferral_is_live(follow_up)
+    dispatcher.release_turn_replay()
+    owners.add(follow_up.event_id)
+    assert dispatcher._deferral_is_live(follow_up)
+    owners.clear()
+    assert not dispatcher._deferral_is_live(follow_up)
+
+
 class TestOutOfBandDispatch:
     """An event its caller runs itself is still an event with one handler."""
 
@@ -3088,6 +3285,9 @@ class TestOutOfBandDispatch:
                 on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: False,
                 turn_has_live_claim=lambda _event_id: False,
+                replies_ended=lambda _reply_ids: None,
+                on_job_follow_up=AsyncMock(),
+                on_job_cancel=AsyncMock(),
             ),
             room_for_id=lambda _room_id: room(),
         )
@@ -3169,6 +3369,9 @@ class TestDeferralOwnership:
                 on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: gate_owns,
                 turn_has_live_claim=lambda _event_id: turn_claimed,
+                replies_ended=lambda _reply_ids: None,
+                on_job_follow_up=AsyncMock(),
+                on_job_cancel=AsyncMock(),
             ),
             room_for_id=lambda _room_id: room(),
         )
@@ -3623,12 +3826,12 @@ class _FlakyReplayView:
             raise RuntimeError(msg)
         return await self.inner.is_pending(event_id)
 
-    async def settle(self, event_id: str) -> None:
+    async def settle(self, event_id: str) -> tuple[str, ...]:
         if event_id in self.fail_settle:
             self.fail_settle.discard(event_id)
             msg = "the journal is unwritable"
             raise RuntimeError(msg)
-        await self.inner.settle(event_id)
+        return await self.inner.settle(event_id)
 
 
 @dataclass
@@ -3797,6 +4000,9 @@ class TestRecoveryDoesNotReenterALiveTurn:
                 on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: gate_owns,
                 turn_has_live_claim=lambda event_id: event_id in live_claims,
+                replies_ended=lambda _reply_ids: None,
+                on_job_follow_up=AsyncMock(),
+                on_job_cancel=AsyncMock(),
             ),
             room_for_id=lambda _room_id: room(),
         )
@@ -4032,6 +4238,9 @@ class TestAdmittedWorkReachesItsCallback:
                 on_approval_continuation=AsyncMock(return_value=None),
                 source_has_live_owner=lambda _event_id: False,
                 turn_has_live_claim=lambda _event_id: False,
+                replies_ended=lambda _reply_ids: None,
+                on_job_follow_up=AsyncMock(),
+                on_job_cancel=AsyncMock(),
             ),
             room_for_id=lambda _room_id: room(),
             schedule_trigger_sender_is_managed=lambda sender: sender == BOT,

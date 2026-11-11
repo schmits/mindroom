@@ -8,18 +8,25 @@ call ends, recoverable context is stored through the configured memory backend.
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from mindroom.config.resolution import memory_backend as agent_memory_backend
 from mindroom.logging_config import get_logger
-from mindroom.memory import add_agent_memory
+from mindroom.matrix_rtc.spoken_turns import spoken_continuation
+from mindroom.memory import add_agent_memory, redact_memory_text
+from mindroom.path_confinement import open_directory_within_root, open_regular_file_at, read_regular_file_within_root
 from mindroom.runtime_resolution import resolve_agent_runtime
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import TextIO
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
@@ -37,6 +44,14 @@ def _new_call_transcript_path(base: Path, *, room_id: str, started_at: datetime)
     return base / f"{stamp}_{uuid4().hex}_{safe_room}.md"
 
 
+def _open_transcript_for_append(reference_root: Path, relative_path: Path) -> TextIO:
+    """Open one transcript for appending through a no-follow walk from the workspace."""
+    reference_root.mkdir(parents=True, exist_ok=True)
+    with open_directory_within_root(reference_root, relative_path.parent, create=True) as directory_fd:
+        descriptor = open_regular_file_at(directory_fd, relative_path.name, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+    return os.fdopen(descriptor, "a", encoding="utf-8")
+
+
 def _call_transcript_roots(
     *,
     agent_name: str,
@@ -52,11 +67,8 @@ def _call_transcript_roots(
         execution_identity=execution_identity,
         create=True,
     )
-    if config.resolve_entity(agent_name).memory_backend == "file":
+    if agent_memory_backend(config, agent_name) == "file":
         workspace = agent_runtime.workspace
-        if workspace is None:
-            msg = f"File-memory agent '{agent_name}' has no resolved workspace"
-            raise ValueError(msg)
         return workspace.root / _TRANSCRIPT_DIRNAME, workspace.root
     if agent_runtime.execution.is_private:
         return agent_runtime.state_root / _TRANSCRIPT_DIRNAME, agent_runtime.state_root
@@ -75,10 +87,13 @@ class CallTranscript:
     started_at: datetime
     reference_root: Path
     execution_identity: ToolExecutionIdentity | None
-    _turns: int = field(default=0, init=False)
+    _started_monotonic: float = field(default_factory=time.monotonic, init=False)
+    #: Spoken items in arrival order: speaker, text, seconds from the call start, and whether it continued a turn.
+    _spoken: list[tuple[str, str, float, bool]] = field(default_factory=list, init=False)
     _write_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     _pending: list[str] = field(default_factory=list, init=False)
     _header_written: bool = field(default=False, init=False)
+    _open_speaker: str | None = field(default=None, init=False)
     _flush_task: asyncio.Task[None] | None = field(default=None, init=False)
 
     @classmethod
@@ -111,23 +126,68 @@ class CallTranscript:
             execution_identity=execution_identity,
         )
 
-    def record(self, speaker: str, text: str) -> None:
-        """Record one finalized conversation turn (safe from sync callbacks)."""
-        text = text.strip()
+    def record(self, speaker: str, text: str, spoken_at: float) -> None:
+        """Record one finalized item whose speech started at Unix time ``spoken_at`` (safe from sync callbacks).
+
+        Consecutive items from the same speaker extend one turn, and its line stays open in the file until the turn ends.
+        An item's start is held between the call's start and now.
+        """
+        text = " ".join(text.split())
         if not text:
             return
-        self._turns += 1
-        stamp = datetime.now(tz=UTC).strftime("%H:%M:%S")
-        self._pending.append(f"- `{stamp}` **{speaker}**: {text}\n")
+        continues = self._open_speaker == speaker
+        since_start = max(0.0, spoken_at - self.started_at.timestamp())
+        self._spoken.append((speaker, text, min(since_start, self.elapsed_seconds()), continues))
+        if continues:
+            self._pending.append(spoken_continuation(text))
+        else:
+            self._end_open_line()
+            stamp = datetime.now(tz=UTC).strftime("%H:%M:%S")
+            self._pending.append(f"- `{stamp}` **{speaker}**: {text}")
+            self._open_speaker = speaker
         self._schedule_flush()
+
+    @property
+    def spoken_turns(self) -> tuple[tuple[str, str, int], ...]:
+        """Return the finalized spoken turns so far in spoken order, each with its start in whole seconds.
+
+        Items are ordered by start first, so an item that continued its speaker's turn on arrival joins it only if
+        nobody else started speaking in between.
+        """
+        turns: list[tuple[str, str, int]] = []
+        for speaker, text, since_start, continues in sorted(self._spoken, key=lambda item: item[2]):
+            if continues and turns and turns[-1][0] == speaker:
+                turns[-1] = (speaker, turns[-1][1] + spoken_continuation(text), turns[-1][2])
+            else:
+                turns.append((speaker, text, math.floor(since_start)))
+        return tuple(turns)
+
+    def mark_call_active(self) -> None:
+        """Start the call's clock now, when the agent can hear the caller, so joining time is not part of the call.
+
+        Turns recorded before this were spoken before the clock started, so they stay at 0.
+        """
+        self.started_at = datetime.now(tz=UTC)
+        self._started_monotonic = time.monotonic()
+        self._spoken = [(speaker, text, 0.0, continues) for speaker, text, _, continues in self._spoken]
+
+    def elapsed_seconds(self) -> float:
+        """Return the seconds since the call started, on a clock that never goes back."""
+        return time.monotonic() - self._started_monotonic
 
     def record_tool_use(self, tool_names: list[str]) -> None:
         """Record one realtime tool-execution round without counting it as speech."""
         if not tool_names:
             return
+        self._end_open_line()
         stamp = datetime.now(tz=UTC).strftime("%H:%M:%S")
         self._pending.append(f"- `{stamp}` _tools used: {', '.join(tool_names)}_\n")
         self._schedule_flush()
+
+    def _end_open_line(self) -> None:
+        if self._open_speaker is not None:
+            self._pending.append("\n")
+            self._open_speaker = None
 
     def _schedule_flush(self) -> None:
         if self._flush_task is not None and not self._flush_task.done():
@@ -169,8 +229,7 @@ class CallTranscript:
         lines = list(self._pending)
         if not lines:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
+        with _open_transcript_for_append(self.reference_root, self.path.relative_to(self.reference_root)) as handle:
             if not self._header_written:
                 started = self.started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
                 handle.write(
@@ -183,8 +242,8 @@ class CallTranscript:
 
     async def finalize(self, *, config: Config, runtime_paths: RuntimePaths) -> None:
         """Flush remaining turns and store a memory reference for the call."""
-        ended_at = datetime.now(tz=UTC)
-        duration_minutes = max(1, round((ended_at - self.started_at).total_seconds() / 60))
+        duration_minutes = max(1, round(self.elapsed_seconds() / 60))
+        self._end_open_line()
         try:
             await self._flush()
         except OSError as error:
@@ -195,26 +254,30 @@ class CallTranscript:
                 error=str(error),
             )
             return
-        if self._turns == 0:
+        if not self._spoken:
             return
-        memory_backend = config.resolve_entity(self.agent_name).memory_backend
+        memory_backend = agent_memory_backend(config, self.agent_name)
         if memory_backend == "none":
             return
         transcript_path = self.path.relative_to(self.reference_root).as_posix()
         summary = (
             f"Joined a voice call in {self.room_display_name} ({self.room_id}): "
-            f"{self._turns} spoken turns over ~{duration_minutes} min. "
+            f"{len(self.spoken_turns)} spoken turns over ~{duration_minutes} min. "
             f"Transcript: {transcript_path}"
         )
         try:
             memory_content = summary
             if memory_backend == "mem0":
-                transcript = await asyncio.to_thread(self.path.read_text, encoding="utf-8")
-                memory_content = f"{summary}\n\n{transcript}"
+                transcript = await asyncio.to_thread(
+                    read_regular_file_within_root,
+                    self.reference_root,
+                    self.path.relative_to(self.reference_root),
+                    truncate=True,
+                )
+                memory_content = f"{summary}\n\n{redact_memory_text(transcript.decode('utf-8', errors='replace'))}"
             await add_agent_memory(
                 memory_content,
                 self.agent_name,
-                runtime_paths.storage_root,
                 config,
                 runtime_paths,
                 metadata={"source": "matrix_rtc_call", "transcript_path": transcript_path},

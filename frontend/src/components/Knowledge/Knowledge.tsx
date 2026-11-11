@@ -13,11 +13,13 @@ import {
   getCoreRowModel,
   useReactTable,
 } from "@tanstack/react-table";
-import { apiErrorMessageFromPayload, API_ENDPOINTS } from "@/lib/api";
+import { apiErrorMessageFromResponse, API_ENDPOINTS } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { useConfigStore } from "@/store/configStore";
+import { useConfigStore, type SaveConfigResult } from "@/store/configStore";
+import { SchemaSection } from "@/components/SchemaForm";
 import type { KnowledgeBaseConfig, KnowledgeGitConfig } from "@/types/config";
 import { useToast } from "@/components/ui/use-toast";
+import { useUnsavedDraft } from "@/hooks/useUnsavedDraft";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +31,7 @@ import {
 } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { ParsedInput, ParsedTextarea } from "@/components/shared/ParsedInput";
 import { Textarea } from "@/components/ui/textarea";
 import {
   FolderOpen,
@@ -109,6 +112,25 @@ const DEFAULT_GIT_SETTINGS: KnowledgeGitConfig = {
 };
 const REDACTED_CREDENTIALS_SENTINEL = "***";
 
+/** The "Create Knowledge Base" form. */
+interface NewBaseForm {
+  name: string;
+  description: string;
+  sourceType: KnowledgeSourceType;
+  mode: KnowledgeAccessMode;
+  path: string;
+  git: KnowledgeGitConfig;
+}
+
+const EMPTY_NEW_BASE: NewBaseForm = {
+  name: "",
+  description: "",
+  sourceType: "local",
+  mode: "semantic",
+  path: "",
+  git: DEFAULT_GIT_SETTINGS,
+};
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -164,6 +186,13 @@ function sourceTypeForBase(config?: KnowledgeBaseConfig): KnowledgeSourceType {
   return config?.git ? "git" : "local";
 }
 
+const branchOrMain = (text: string) => text.trim() || "main";
+
+function secondsAtLeastFive(text: string): number {
+  const seconds = Number.parseInt(text, 10);
+  return Number.isNaN(seconds) || seconds < 5 ? 5 : seconds;
+}
+
 function defaultGitSettings(
   gitConfig?: KnowledgeGitConfig,
 ): KnowledgeGitConfig {
@@ -195,13 +224,13 @@ function normalizeGitConfig(gitConfig: KnowledgeGitConfig): KnowledgeGitConfig {
   const repoUrl = gitConfig.repo_url.trim();
   return {
     repo_url: repoUrl,
-    branch: gitConfig.branch?.trim() || "main",
+    branch: gitConfig.branch,
     poll_interval_seconds:
       typeof gitConfig.poll_interval_seconds === "number" &&
       gitConfig.poll_interval_seconds >= 5
         ? gitConfig.poll_interval_seconds
         : DEFAULT_GIT_SETTINGS.poll_interval_seconds,
-    credentials_service: gitConfig.credentials_service?.trim() || undefined,
+    credentials_service: gitConfig.credentials_service,
     lfs: gitConfig.lfs ?? DEFAULT_GIT_SETTINGS.lfs,
     sync_timeout_seconds:
       typeof gitConfig.sync_timeout_seconds === "number" &&
@@ -218,6 +247,16 @@ function normalizeGitConfig(gitConfig: KnowledgeGitConfig): KnowledgeGitConfig {
         ? gitConfig.exclude_patterns
         : undefined,
   };
+}
+
+function gitBackedFileActionError(mode: KnowledgeAccessMode): string {
+  return `Git-backed knowledge bases sync from the repository. Update the repository and ${mode === "files" ? "sync" : "reindex"} instead.`;
+}
+
+function saveFailureMessage(result: SaveConfigResult): string {
+  return result.status === "error"
+    ? result.message
+    : "Save was superseded by newer draft edits";
 }
 
 function parsePatternsFromTextarea(value: string): string[] | undefined {
@@ -245,22 +284,32 @@ function validateBaseName(baseName: string): string | null {
 async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
   if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const payload = await response.json();
-      detail = apiErrorMessageFromPayload(payload, detail);
-    } catch {
-      // Keep fallback detail
-    }
-    throw new Error(detail || `Request failed (${response.status})`);
+    throw new Error(
+      await apiErrorMessageFromResponse(
+        response,
+        response.statusText || `Request failed (${response.status})`,
+      ),
+    );
   }
   return response.json() as Promise<T>;
 }
+
+/** KnowledgeBaseConfig keys this editor renders by hand; More settings shows the rest. */
+const KNOWLEDGE_BASE_EDITOR_FIELDS = [
+  "mode",
+  "description",
+  "path",
+  "watch",
+  "chunk_size",
+  "chunk_overlap",
+  "git",
+] as const;
 
 export function Knowledge() {
   const {
     config,
     updateKnowledgeBase,
+    updateConfigValue,
     deleteKnowledgeBase,
     saveConfig,
     isDirty,
@@ -268,20 +317,10 @@ export function Knowledge() {
   const { toast } = useToast();
 
   const [selectedBase, setSelectedBase] = useState<string>("");
-  const [newBaseName, setNewBaseName] = useState("");
-  const [newBaseDescription, setNewBaseDescription] = useState("");
-  const [newBaseSourceType, setNewBaseSourceType] =
-    useState<KnowledgeSourceType>("local");
-  const [newBaseMode, setNewBaseMode] =
-    useState<KnowledgeAccessMode>("semantic");
-  const [newBasePath, setNewBasePath] = useState("");
-  const [newBaseGitSettings, setNewBaseGitSettings] =
-    useState<KnowledgeGitConfig>(() => defaultGitSettings());
+  const [newBase, setNewBase] = useState<NewBaseForm>(EMPTY_NEW_BASE);
+  useUnsavedDraft(JSON.stringify(newBase) !== JSON.stringify(EMPTY_NEW_BASE));
   const [files, setFiles] = useState<KnowledgeFile[]>([]);
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
-  const [settings, setSettings] = useState<KnowledgeBaseConfig>(
-    DEFAULT_BASE_SETTINGS,
-  );
   const [gitRepoUrlReplacement, setGitRepoUrlReplacement] = useState("");
   const [totalSize, setTotalSize] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -297,6 +336,14 @@ export function Knowledge() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const loadRequestIdRef = useRef(0);
 
+  const reportFailure = useCallback(
+    (title: string, message: string) => {
+      setError(message);
+      toast({ title, description: message, variant: "destructive" });
+    },
+    [toast],
+  );
+
   const knowledgeBases = useMemo(
     () => config?.knowledge_bases ?? {},
     [config?.knowledge_bases],
@@ -304,9 +351,29 @@ export function Knowledge() {
   const selectedBaseConfig = selectedBase
     ? knowledgeBases[selectedBase]
     : undefined;
-  const selectedBaseIsGitBacked = Boolean(selectedBaseConfig?.git);
-  const selectedBaseMode: KnowledgeAccessMode =
-    selectedBaseConfig?.mode ?? "semantic";
+  const settings = useMemo<KnowledgeBaseConfig>(
+    () =>
+      selectedBaseConfig
+        ? {
+            description: selectedBaseConfig.description ?? "",
+            mode: selectedBaseConfig.mode ?? "semantic",
+            path: selectedBaseConfig.path,
+            watch: selectedBaseConfig.watch,
+            ...normalizeChunking(
+              selectedBaseConfig.chunk_size,
+              selectedBaseConfig.chunk_overlap,
+            ),
+            git: selectedBaseConfig.git
+              ? defaultGitSettings(selectedBaseConfig.git)
+              : undefined,
+          }
+        : DEFAULT_BASE_SETTINGS,
+    [selectedBaseConfig],
+  );
+  const settingsSourceType: KnowledgeSourceType = settings.git
+    ? "git"
+    : "local";
+  const settingsMode: KnowledgeAccessMode = settings.mode ?? "semantic";
   const baseNames = useMemo(
     () => Object.keys(knowledgeBases).sort(),
     [knowledgeBases],
@@ -324,34 +391,6 @@ export function Knowledge() {
       setSelectedBase(baseNames.length === 1 ? baseNames[0] : "");
     }
   }, [baseNames, selectedBase]);
-
-  useEffect(() => {
-    if (!selectedBase) {
-      setSettings(DEFAULT_BASE_SETTINGS);
-      return;
-    }
-
-    const selectedConfig = knowledgeBases[selectedBase];
-    if (!selectedConfig) {
-      setSettings(DEFAULT_BASE_SETTINGS);
-      return;
-    }
-
-    const chunking = normalizeChunking(
-      selectedConfig.chunk_size,
-      selectedConfig.chunk_overlap,
-    );
-    setSettings({
-      description: selectedConfig.description ?? "",
-      mode: selectedConfig.mode ?? "semantic",
-      path: selectedConfig.path,
-      watch: selectedConfig.watch,
-      ...chunking,
-      git: selectedConfig.git
-        ? defaultGitSettings(selectedConfig.git)
-        : undefined,
-    });
-  }, [knowledgeBases, selectedBase]);
 
   const loadData = useCallback(async (baseId: string | null) => {
     const requestId = loadRequestIdRef.current + 1;
@@ -419,19 +458,16 @@ export function Knowledge() {
         return;
       }
 
-      setSettings((previous) => {
-        const next = { ...previous, ...updates };
-        updateKnowledgeBase(selectedBase, next);
-        return next;
+      const next = { ...settings, ...updates };
+      // The draft holds the chunking the fields show, so any save sends a valid pair.
+      updateKnowledgeBase(selectedBase, {
+        ...next,
+        ...normalizeChunking(next.chunk_size, next.chunk_overlap),
       });
     },
-    [selectedBase, updateKnowledgeBase],
+    [selectedBase, settings, updateKnowledgeBase],
   );
 
-  const settingsSourceType: KnowledgeSourceType = settings.git
-    ? "git"
-    : "local";
-  const settingsMode: KnowledgeAccessMode = settings.mode ?? "semantic";
   const hasGitRepoUrlReplacement =
     settingsSourceType === "git" && gitRepoUrlReplacement.trim().length > 0;
   const canSaveSettings = isDirty || hasGitRepoUrlReplacement;
@@ -455,11 +491,15 @@ export function Knowledge() {
     [settings.git, updateSettings],
   );
 
+  const updateNewBase = useCallback((updates: Partial<NewBaseForm>) => {
+    setNewBase((previous) => ({ ...previous, ...updates }));
+  }, []);
+
   const updateNewBaseGitSettings = useCallback(
     (updates: Partial<KnowledgeGitConfig>) => {
-      setNewBaseGitSettings((previous) => ({
+      setNewBase((previous) => ({
         ...previous,
-        ...updates,
+        git: { ...previous.git, ...updates },
       }));
     },
     [],
@@ -490,27 +530,13 @@ export function Knowledge() {
       return;
     }
 
-    const settingsMode = settings.mode ?? "semantic";
     if (settingsMode === "files" && !settings.path.trim()) {
       setError("Folder path is required for files-only knowledge bases");
       return;
     }
 
-    const normalizedChunking = normalizeChunking(
-      settings.chunk_size,
-      settings.chunk_overlap,
-    );
     const baseSettings: KnowledgeBaseConfig =
-      settingsMode === "semantic"
-        ? {
-            ...settings,
-            ...normalizedChunking,
-          }
-        : {
-            ...settings,
-            watch: false,
-            ...normalizedChunking,
-          };
+      settingsMode === "semantic" ? settings : { ...settings, watch: false };
     const nextSettings: KnowledgeBaseConfig = gitSettings
       ? {
           ...baseSettings,
@@ -518,7 +544,6 @@ export function Knowledge() {
         }
       : baseSettings;
 
-    setSettings(nextSettings);
     updateKnowledgeBase(selectedBase, nextSettings);
 
     setSavingSettings(true);
@@ -526,16 +551,7 @@ export function Knowledge() {
     try {
       const result = await saveConfig();
       if (result.status !== "saved") {
-        const message =
-          result.status === "error"
-            ? result.message
-            : "Save was superseded by newer draft edits";
-        setError(message);
-        toast({
-          title: "Save failed",
-          description: message,
-          variant: "destructive",
-        });
+        reportFailure("Save failed", saveFailureMessage(result));
         return;
       }
       await loadData(selectedBase);
@@ -545,31 +561,29 @@ export function Knowledge() {
         description: "Configuration has been updated.",
       });
     } catch (err) {
-      const message =
+      reportFailure(
+        "Save failed",
         err instanceof Error
           ? err.message
-          : "Failed to save knowledge settings";
-      setError(message);
-      toast({
-        title: "Save failed",
-        description: message,
-        variant: "destructive",
-      });
+          : "Failed to save knowledge settings",
+      );
     } finally {
       setSavingSettings(false);
     }
   }, [
     loadData,
+    reportFailure,
     saveConfig,
     selectedBase,
     settings,
+    settingsMode,
     gitRepoUrlReplacement,
     toast,
     updateKnowledgeBase,
   ]);
 
   const handleCreateBase = useCallback(async () => {
-    const baseName = newBaseName.trim();
+    const baseName = newBase.name.trim();
     const validationError = validateBaseName(baseName);
     if (validationError) {
       setError(validationError);
@@ -585,14 +599,14 @@ export function Knowledge() {
     setError(null);
 
     try {
-      if (newBaseSourceType === "git" && !newBaseGitSettings.repo_url.trim()) {
+      if (newBase.sourceType === "git" && !newBase.git.repo_url.trim()) {
         setError("Repository URL is required for Git-based knowledge bases");
         return;
       }
 
       const basePath =
-        newBaseMode === "files"
-          ? newBasePath.trim()
+        newBase.mode === "files"
+          ? newBase.path.trim()
           : defaultPathForBase(baseName);
       if (!basePath) {
         setError("Folder path is required for files-only knowledge bases");
@@ -600,59 +614,41 @@ export function Knowledge() {
       }
 
       const nextBaseConfig: KnowledgeBaseConfig = {
-        description: newBaseDescription.trim(),
-        mode: newBaseMode,
+        description: newBase.description.trim(),
+        mode: newBase.mode,
         path: basePath,
-        watch: newBaseMode === "semantic",
+        watch: newBase.mode === "semantic",
         chunk_size: DEFAULT_CHUNK_SIZE,
         chunk_overlap: DEFAULT_CHUNK_OVERLAP,
       };
 
-      if (newBaseSourceType === "git") {
-        nextBaseConfig.git = normalizeGitConfig(newBaseGitSettings);
+      if (newBase.sourceType === "git") {
+        nextBaseConfig.git = normalizeGitConfig(newBase.git);
       }
 
       updateKnowledgeBase(baseName, nextBaseConfig);
       const result = await saveConfig();
       if (result.status !== "saved") {
-        const message =
-          result.status === "error"
-            ? result.message
-            : "Save was superseded by newer draft edits";
-        setError(message);
-        toast({
-          title: "Create failed",
-          description: message,
-          variant: "destructive",
-        });
+        reportFailure("Create failed", saveFailureMessage(result));
         return;
       }
       setSelectedBase(baseName);
-      setNewBaseName("");
-      setNewBaseDescription("");
-      setNewBaseSourceType("local");
-      setNewBaseMode("semantic");
-      setNewBasePath("");
-      setNewBaseGitSettings(defaultGitSettings());
+      setNewBase(EMPTY_NEW_BASE);
       await loadData(baseName);
       toast({
         title: "Knowledge base created",
         description:
-          newBaseSourceType === "git"
+          newBase.sourceType === "git"
             ? `Git base '${baseName}' is ready to sync.`
-            : newBaseMode === "files"
+            : newBase.mode === "files"
               ? `Base '${baseName}' is ready for direct file access.`
               : `Base '${baseName}' is ready for uploads.`,
       });
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to create knowledge base";
-      setError(message);
-      toast({
-        title: "Create failed",
-        description: message,
-        variant: "destructive",
-      });
+      reportFailure(
+        "Create failed",
+        err instanceof Error ? err.message : "Failed to create knowledge base",
+      );
     } finally {
       setCreatingBase(false);
     }
@@ -660,12 +656,8 @@ export function Knowledge() {
     baseNames,
     updateKnowledgeBase,
     loadData,
-    newBaseName,
-    newBaseMode,
-    newBasePath,
-    newBaseSourceType,
-    newBaseGitSettings,
-    newBaseDescription,
+    newBase,
+    reportFailure,
     saveConfig,
     toast,
   ]);
@@ -689,16 +681,7 @@ export function Knowledge() {
       deleteKnowledgeBase(selectedBase);
       const result = await saveConfig();
       if (result.status !== "saved") {
-        const message =
-          result.status === "error"
-            ? result.message
-            : "Save was superseded by newer draft edits";
-        setError(message);
-        toast({
-          title: "Delete failed",
-          description: message,
-          variant: "destructive",
-        });
+        reportFailure("Delete failed", saveFailureMessage(result));
         return;
       }
       setSelectedBase(nextBase || "");
@@ -708,14 +691,10 @@ export function Knowledge() {
         description: `Deleted '${selectedBase}'.`,
       });
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to delete knowledge base";
-      setError(message);
-      toast({
-        title: "Delete failed",
-        description: message,
-        variant: "destructive",
-      });
+      reportFailure(
+        "Delete failed",
+        err instanceof Error ? err.message : "Failed to delete knowledge base",
+      );
     } finally {
       setDeletingBase(false);
     }
@@ -723,6 +702,7 @@ export function Knowledge() {
     baseNames,
     deleteKnowledgeBase,
     loadData,
+    reportFailure,
     saveConfig,
     selectedBase,
     toast,
@@ -737,11 +717,8 @@ export function Knowledge() {
         setDragActive(false);
         return;
       }
-      if (selectedBaseIsGitBacked) {
-        const refreshVerb = selectedBaseMode === "files" ? "sync" : "reindex";
-        setError(
-          `Git-backed knowledge bases sync from the repository. Update the repository and ${refreshVerb} instead.`,
-        );
+      if (settingsSourceType === "git") {
+        setError(gitBackedFileActionError(settingsMode));
         return;
       }
 
@@ -769,14 +746,10 @@ export function Knowledge() {
           } to '${selectedBase}'.`,
         });
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to upload files";
-        setError(message);
-        toast({
-          title: "Upload failed",
-          description: message,
-          variant: "destructive",
-        });
+        reportFailure(
+          "Upload failed",
+          err instanceof Error ? err.message : "Failed to upload files",
+        );
       } finally {
         setUploading(false);
       }
@@ -785,8 +758,9 @@ export function Knowledge() {
       isDirty,
       loadData,
       selectedBase,
-      selectedBaseIsGitBacked,
-      selectedBaseMode,
+      reportFailure,
+      settingsSourceType,
+      settingsMode,
       toast,
     ],
   );
@@ -796,11 +770,8 @@ export function Knowledge() {
       if (!selectedBase) {
         return;
       }
-      if (selectedBaseIsGitBacked) {
-        const refreshVerb = selectedBaseMode === "files" ? "sync" : "reindex";
-        setError(
-          `Git-backed knowledge bases sync from the repository. Update the repository and ${refreshVerb} instead.`,
-        );
+      if (settingsSourceType === "git") {
+        setError(gitBackedFileActionError(settingsMode));
         return;
       }
 
@@ -824,19 +795,15 @@ export function Knowledge() {
         );
         await loadData(selectedBase);
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Failed to delete file";
-        setError(message);
-        toast({
-          title: "Delete failed",
-          description: message,
-          variant: "destructive",
-        });
+        reportFailure(
+          "Delete failed",
+          err instanceof Error ? err.message : "Failed to delete file",
+        );
       } finally {
         setDeletingPath(null);
       }
     },
-    [loadData, selectedBase, selectedBaseIsGitBacked, selectedBaseMode, toast],
+    [loadData, reportFailure, selectedBase, settingsMode, settingsSourceType],
   );
 
   const handleReindex = useCallback(async () => {
@@ -844,6 +811,7 @@ export function Knowledge() {
       return;
     }
 
+    const actionName = settingsMode === "files" ? "Sync" : "Reindex";
     setReindexing(true);
     setError(null);
 
@@ -855,32 +823,26 @@ export function Knowledge() {
         },
       );
       await loadData(selectedBase);
-      const actionName = selectedBaseMode === "files" ? "Sync" : "Reindex";
       toast({
         title: `${actionName} complete`,
         description:
-          selectedBaseMode === "files"
+          settingsMode === "files"
             ? `Knowledge base '${selectedBase}' synced successfully.`
             : `Knowledge base '${selectedBase}' rebuilt successfully.`,
       });
     } catch (err) {
-      const message =
+      reportFailure(
+        `${actionName} failed`,
         err instanceof Error
           ? err.message
-          : selectedBaseMode === "files"
+          : settingsMode === "files"
             ? "Failed to sync knowledge files"
-            : "Failed to reindex knowledge files";
-      const actionName = selectedBaseMode === "files" ? "Sync" : "Reindex";
-      setError(message);
-      toast({
-        title: `${actionName} failed`,
-        description: message,
-        variant: "destructive",
-      });
+            : "Failed to reindex knowledge files",
+      );
     } finally {
       setReindexing(false);
     }
-  }, [loadData, selectedBase, selectedBaseMode, toast]);
+  }, [loadData, reportFailure, selectedBase, settingsMode, toast]);
 
   const columns: ColumnDef<KnowledgeFile>[] = useMemo(() => {
     const baseColumns: ColumnDef<KnowledgeFile>[] = [
@@ -913,7 +875,7 @@ export function Knowledge() {
       },
     ];
 
-    if (selectedBaseIsGitBacked) {
+    if (settingsSourceType === "git") {
       return baseColumns;
     }
 
@@ -938,7 +900,7 @@ export function Knowledge() {
         ),
       },
     ];
-  }, [deletingPath, handleDeleteFile, isDirty, selectedBaseIsGitBacked]);
+  }, [deletingPath, handleDeleteFile, isDirty, settingsSourceType]);
 
   const table = useReactTable({
     data: files,
@@ -964,7 +926,7 @@ export function Knowledge() {
     void uploadFiles(droppedFiles);
   };
 
-  const createBaseNamePreview = newBaseName.trim() || "new_base_name";
+  const createBaseNamePreview = newBase.name.trim() || "new_base_name";
   const createBasePathPreview = defaultPathForBase(createBaseNamePreview);
   const createFileModePathPlaceholder = fileModePathPlaceholder(
     createBaseNamePreview,
@@ -1022,7 +984,7 @@ export function Knowledge() {
                             "rounded-md border p-3 text-left transition-colors",
                             isActive
                               ? "border-primary bg-primary/5"
-                              : "border-border hover:border-primary/40 hover:bg-muted/40",
+                              : "border-border hover:bg-secondary",
                           )}
                           aria-pressed={isActive}
                         >
@@ -1114,8 +1076,10 @@ export function Knowledge() {
                 </label>
                 <Input
                   id="new-base-name"
-                  value={newBaseName}
-                  onChange={(event) => setNewBaseName(event.target.value)}
+                  value={newBase.name}
+                  onChange={(event) =>
+                    updateNewBase({ name: event.target.value })
+                  }
                   placeholder="new_base_name"
                 />
               </div>
@@ -1129,9 +1093,9 @@ export function Knowledge() {
                 </label>
                 <Textarea
                   id="new-base-description"
-                  value={newBaseDescription}
+                  value={newBase.description}
                   onChange={(event) =>
-                    setNewBaseDescription(event.target.value)
+                    updateNewBase({ description: event.target.value })
                   }
                   placeholder="Product docs, support notes, and operating procedures"
                   rows={3}
@@ -1144,10 +1108,10 @@ export function Knowledge() {
                   <Button
                     type="button"
                     variant={
-                      newBaseSourceType === "local" ? "default" : "outline"
+                      newBase.sourceType === "local" ? "default" : "outline"
                     }
                     aria-label="Create local source"
-                    onClick={() => setNewBaseSourceType("local")}
+                    onClick={() => updateNewBase({ sourceType: "local" })}
                     disabled={creatingBase || isDirty}
                     className="justify-start"
                   >
@@ -1157,10 +1121,10 @@ export function Knowledge() {
                   <Button
                     type="button"
                     variant={
-                      newBaseSourceType === "git" ? "default" : "outline"
+                      newBase.sourceType === "git" ? "default" : "outline"
                     }
                     aria-label="Create git source"
-                    onClick={() => setNewBaseSourceType("git")}
+                    onClick={() => updateNewBase({ sourceType: "git" })}
                     disabled={creatingBase || isDirty}
                     className="justify-start"
                   >
@@ -1175,9 +1139,11 @@ export function Knowledge() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <Button
                     type="button"
-                    variant={newBaseMode === "semantic" ? "default" : "outline"}
+                    variant={
+                      newBase.mode === "semantic" ? "default" : "outline"
+                    }
                     aria-label="Create semantic search access"
-                    onClick={() => setNewBaseMode("semantic")}
+                    onClick={() => updateNewBase({ mode: "semantic" })}
                     disabled={creatingBase || isDirty}
                     className="justify-start"
                   >
@@ -1186,9 +1152,9 @@ export function Knowledge() {
                   </Button>
                   <Button
                     type="button"
-                    variant={newBaseMode === "files" ? "default" : "outline"}
+                    variant={newBase.mode === "files" ? "default" : "outline"}
                     aria-label="Create files-only access"
-                    onClick={() => setNewBaseMode("files")}
+                    onClick={() => updateNewBase({ mode: "files" })}
                     disabled={creatingBase || isDirty}
                     className="justify-start"
                   >
@@ -1198,7 +1164,7 @@ export function Knowledge() {
                 </div>
               </div>
 
-              {newBaseMode === "files" ? (
+              {newBase.mode === "files" ? (
                 <div className="space-y-2">
                   <label
                     className="text-sm font-medium"
@@ -1208,8 +1174,10 @@ export function Knowledge() {
                   </label>
                   <Input
                     id="new-base-path"
-                    value={newBasePath}
-                    onChange={(event) => setNewBasePath(event.target.value)}
+                    value={newBase.path}
+                    onChange={(event) =>
+                      updateNewBase({ path: event.target.value })
+                    }
                     placeholder={createFileModePathPlaceholder}
                   />
                   <p className="text-xs text-muted-foreground">
@@ -1219,7 +1187,7 @@ export function Knowledge() {
                 </div>
               ) : null}
 
-              {newBaseSourceType === "git" ? (
+              {newBase.sourceType === "git" ? (
                 <div className="space-y-3 rounded-md border p-3">
                   <div className="space-y-2">
                     <label
@@ -1230,7 +1198,7 @@ export function Knowledge() {
                     </label>
                     <Input
                       id="new-base-git-repo-url"
-                      value={newBaseGitSettings.repo_url}
+                      value={newBase.git.repo_url}
                       onChange={(event) =>
                         updateNewBaseGitSettings({
                           repo_url: event.target.value,
@@ -1246,19 +1214,19 @@ export function Knowledge() {
                     >
                       Branch
                     </label>
-                    <Input
+                    <ParsedInput
                       id="new-base-git-branch"
-                      value={newBaseGitSettings.branch ?? "main"}
-                      onChange={(event) =>
-                        updateNewBaseGitSettings({
-                          branch: event.target.value || "main",
-                        })
+                      value={newBase.git.branch ?? "main"}
+                      format={(branch) => branch}
+                      parse={branchOrMain}
+                      onChange={(branch) =>
+                        updateNewBaseGitSettings({ branch })
                       }
                       placeholder="main"
                     />
                   </div>
                 </div>
-              ) : newBaseMode === "semantic" ? (
+              ) : newBase.mode === "semantic" ? (
                 <p className="text-xs text-muted-foreground">
                   Local base folder path: <code>{createBasePathPreview}</code>
                 </p>
@@ -1273,7 +1241,7 @@ export function Knowledge() {
                   <Plus className="h-4 w-4 mr-2" />
                   {creatingBase
                     ? "Creating..."
-                    : newBaseSourceType === "git"
+                    : newBase.sourceType === "git"
                       ? "Create Git Base"
                       : "Add Base"}
                 </Button>
@@ -1318,6 +1286,7 @@ export function Knowledge() {
                       onClick={() =>
                         updateSettings({
                           git: defaultGitSettings(settings.git),
+                          poll_interval_seconds: undefined,
                         })
                       }
                       disabled={savingSettings}
@@ -1344,10 +1313,6 @@ export function Knowledge() {
                           path:
                             settings.path.trim() ||
                             defaultPathForBase(selectedBase),
-                          ...normalizeChunking(
-                            settings.chunk_size,
-                            settings.chunk_overlap,
-                          ),
                         })
                       }
                       disabled={savingSettings}
@@ -1369,6 +1334,7 @@ export function Knowledge() {
                               ? ""
                               : settings.path,
                           watch: false,
+                          poll_interval_seconds: undefined,
                         })
                       }
                       disabled={savingSettings}
@@ -1453,24 +1419,22 @@ export function Knowledge() {
                       >
                         Chunk Size (characters)
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-chunk-size"
                         type="number"
+                        format={String}
                         min={MIN_CHUNK_SIZE}
                         value={settings.chunk_size ?? DEFAULT_CHUNK_SIZE}
-                        onChange={(event) => {
-                          const parsedValue = Number.parseInt(
-                            event.target.value,
-                            10,
-                          );
-                          updateSettings({
-                            chunk_size:
-                              Number.isNaN(parsedValue) ||
-                              parsedValue < MIN_CHUNK_SIZE
-                                ? MIN_CHUNK_SIZE
-                                : parsedValue,
-                          });
+                        parse={(text) => {
+                          const parsedValue = Number.parseInt(text, 10);
+                          return Number.isNaN(parsedValue) ||
+                            parsedValue < MIN_CHUNK_SIZE
+                            ? MIN_CHUNK_SIZE
+                            : parsedValue;
                         }}
+                        onChange={(chunk_size) =>
+                          updateSettings({ chunk_size })
+                        }
                       />
                       <p className="text-xs text-muted-foreground">
                         Larger chunks reduce requests but increase per-request
@@ -1485,28 +1449,26 @@ export function Knowledge() {
                       >
                         Chunk Overlap (characters)
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-chunk-overlap"
                         type="number"
+                        format={String}
                         min={0}
                         value={settings.chunk_overlap ?? DEFAULT_CHUNK_OVERLAP}
-                        onChange={(event) => {
-                          const parsedValue = Number.parseInt(
-                            event.target.value,
-                            10,
-                          );
+                        parse={(text) => {
+                          const parsedValue = Number.parseInt(text, 10);
                           const nextChunkSize =
                             settings.chunk_size ?? DEFAULT_CHUNK_SIZE;
-                          const normalizedValue = Number.isNaN(parsedValue)
+                          return Number.isNaN(parsedValue)
                             ? 0
                             : Math.max(
                                 0,
                                 Math.min(parsedValue, nextChunkSize - 1),
                               );
-                          updateSettings({
-                            chunk_overlap: normalizedValue,
-                          });
                         }}
+                        onChange={(chunk_overlap) =>
+                          updateSettings({ chunk_overlap })
+                        }
                       />
                       <p className="text-xs text-muted-foreground">
                         Must stay lower than chunk size.
@@ -1556,14 +1518,12 @@ export function Knowledge() {
                       >
                         Branch
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-git-branch"
                         value={settings.git.branch ?? "main"}
-                        onChange={(event) =>
-                          updateGitSettings({
-                            branch: event.target.value || "main",
-                          })
-                        }
+                        format={(branch) => branch}
+                        parse={branchOrMain}
+                        onChange={(branch) => updateGitSettings({ branch })}
                         placeholder="main"
                       />
                     </div>
@@ -1575,23 +1535,16 @@ export function Knowledge() {
                       >
                         Poll Interval (seconds)
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-git-poll-interval-seconds"
                         type="number"
                         min={5}
                         value={settings.git.poll_interval_seconds ?? 300}
-                        onChange={(event) => {
-                          const nextValue = Number.parseInt(
-                            event.target.value,
-                            10,
-                          );
-                          updateGitSettings({
-                            poll_interval_seconds:
-                              Number.isNaN(nextValue) || nextValue < 5
-                                ? 5
-                                : nextValue,
-                          });
-                        }}
+                        format={String}
+                        parse={secondsAtLeastFive}
+                        onChange={(poll_interval_seconds) =>
+                          updateGitSettings({ poll_interval_seconds })
+                        }
                       />
                       <p className="text-xs text-muted-foreground">
                         Minimum snapshot age before checking for Git updates on
@@ -1606,14 +1559,13 @@ export function Knowledge() {
                       >
                         Credentials Service (optional)
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-git-credentials-service"
-                        value={settings.git.credentials_service ?? ""}
-                        onChange={(event) =>
-                          updateGitSettings({
-                            credentials_service:
-                              event.target.value || undefined,
-                          })
+                        value={settings.git.credentials_service}
+                        format={(service) => service ?? ""}
+                        parse={(text) => text.trim() || undefined}
+                        onChange={(credentials_service) =>
+                          updateGitSettings({ credentials_service })
                         }
                         placeholder="github-pat"
                       />
@@ -1629,23 +1581,16 @@ export function Knowledge() {
                       >
                         Sync Timeout (seconds)
                       </label>
-                      <Input
+                      <ParsedInput
                         id="knowledge-git-sync-timeout-seconds"
                         type="number"
                         min={5}
                         value={settings.git.sync_timeout_seconds ?? 3600}
-                        onChange={(event) => {
-                          const nextValue = Number.parseInt(
-                            event.target.value,
-                            10,
-                          );
-                          updateGitSettings({
-                            sync_timeout_seconds:
-                              Number.isNaN(nextValue) || nextValue < 5
-                                ? 5
-                                : nextValue,
-                          });
-                        }}
+                        format={String}
+                        parse={secondsAtLeastFive}
+                        onChange={(sync_timeout_seconds) =>
+                          updateGitSettings({ sync_timeout_seconds })
+                        }
                       />
                       <p className="text-xs text-muted-foreground">
                         Abort a hung Git command after this many seconds.
@@ -1692,17 +1637,13 @@ export function Knowledge() {
                       >
                         Include Patterns (optional)
                       </label>
-                      <Textarea
+                      <ParsedTextarea
                         id="knowledge-git-include-patterns"
-                        value={formatPatternsForTextarea(
-                          settings.git.include_patterns,
-                        )}
-                        onChange={(event) =>
-                          updateGitSettings({
-                            include_patterns: parsePatternsFromTextarea(
-                              event.target.value,
-                            ),
-                          })
+                        value={settings.git.include_patterns}
+                        format={formatPatternsForTextarea}
+                        parse={parsePatternsFromTextarea}
+                        onChange={(include_patterns) =>
+                          updateGitSettings({ include_patterns })
                         }
                         placeholder="docs/**"
                         className="min-h-[96px]"
@@ -1720,17 +1661,13 @@ export function Knowledge() {
                       >
                         Exclude Patterns (optional)
                       </label>
-                      <Textarea
+                      <ParsedTextarea
                         id="knowledge-git-exclude-patterns"
-                        value={formatPatternsForTextarea(
-                          settings.git.exclude_patterns,
-                        )}
-                        onChange={(event) =>
-                          updateGitSettings({
-                            exclude_patterns: parsePatternsFromTextarea(
-                              event.target.value,
-                            ),
-                          })
+                        value={settings.git.exclude_patterns}
+                        format={formatPatternsForTextarea}
+                        parse={parsePatternsFromTextarea}
+                        onChange={(exclude_patterns) =>
+                          updateGitSettings({ exclude_patterns })
                         }
                         placeholder="docs/private/**"
                         className="min-h-[96px]"
@@ -1749,6 +1686,22 @@ export function Knowledge() {
                     </p>
                   </div>
                 ) : null}
+
+                {selectedBaseConfig && (
+                  <SchemaSection
+                    title="More settings"
+                    definition="KnowledgeBaseConfig"
+                    value={selectedBaseConfig}
+                    path={["knowledge_bases", selectedBase]}
+                    exclude={KNOWLEDGE_BASE_EDITOR_FIELDS}
+                    onFieldChange={(key, next) =>
+                      updateConfigValue(
+                        ["knowledge_bases", selectedBase, key],
+                        next,
+                      )
+                    }
+                  />
+                )}
 
                 <div className="flex justify-end">
                   <Button
@@ -1889,7 +1842,7 @@ export function Knowledge() {
 
         {selectedBase && (
           <>
-            {selectedBaseIsGitBacked ? (
+            {settingsSourceType === "git" ? (
               <Card>
                 <CardContent className="py-6">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1897,7 +1850,7 @@ export function Knowledge() {
                       <p className="font-medium">Repository-managed files</p>
                       <p className="text-sm text-muted-foreground">
                         Update the configured repository, then{" "}
-                        {selectedBaseMode === "files" ? "sync" : "reindex"} to
+                        {settingsMode === "files" ? "sync" : "reindex"} to
                         refresh this base.
                       </p>
                     </div>
@@ -1913,10 +1866,10 @@ export function Knowledge() {
                         )}
                       />
                       {reindexing
-                        ? selectedBaseMode === "files"
+                        ? settingsMode === "files"
                           ? "Syncing..."
                           : "Reindexing..."
-                        : selectedBaseMode === "files"
+                        : settingsMode === "files"
                           ? "Sync"
                           : "Reindex"}
                     </Button>
@@ -1952,7 +1905,7 @@ export function Knowledge() {
                         Drop files here or upload manually
                       </p>
                       <p className="text-sm text-muted-foreground">
-                        {selectedBaseMode === "files"
+                        {settingsMode === "files"
                           ? "Agents can inspect these files from their workspace knowledge path."
                           : "Supported formats are auto-detected by agno readers."}
                       </p>
@@ -1973,7 +1926,7 @@ export function Knowledge() {
                         <Upload className="h-4 w-4 mr-2" />
                         {uploading ? "Uploading..." : "Upload"}
                       </Button>
-                      {selectedBaseMode === "semantic" ? (
+                      {settingsMode === "semantic" ? (
                         <Button
                           variant="outline"
                           onClick={handleReindex}
@@ -2030,7 +1983,7 @@ export function Knowledge() {
                             colSpan={columns.length}
                             className="px-4 py-8 text-center text-muted-foreground"
                           >
-                            {selectedBaseIsGitBacked
+                            {settingsSourceType === "git"
                               ? "No repository files available yet."
                               : "No files uploaded yet."}
                           </td>

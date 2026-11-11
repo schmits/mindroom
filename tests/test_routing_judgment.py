@@ -1,0 +1,392 @@
+"""Router judgments preserve candidate scope and the legacy fallback."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
+
+import httpx
+import pytest
+from pydantic import ValidationError
+from structlog.testing import capture_logs
+
+from mindroom import routing
+from mindroom.config.main import Config
+from mindroom.credentials.manager import get_runtime_shared_credentials_manager
+from mindroom.judgment.client import JudgmentClient
+from mindroom.judgment.typesafe import _PINNED_MODEL
+from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
+from mindroom.tool_system.events import ToolTraceEntry, build_tool_trace_content
+from tests.conftest import install_model_providers, test_runtime_paths
+from tests.fakes.scripted_model import Await, ScriptedModel, answer
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+    from pathlib import Path
+
+    from mindroom.constants import RuntimePaths
+    from mindroom.llm.provider import ModelRequest, StreamEvent
+
+
+def _config(judgment: dict | None = None) -> Config:
+    return Config.model_validate(
+        {
+            "models": {"default": {"provider": "openai", "id": "test"}},
+            "agents": {
+                "code": {"display_name": "code", "role": "Write Python code"},
+                "research": {"display_name": "research", "role": "Research sources"},
+                "hidden": {"display_name": "hidden", "role": "Private unrelated agent"},
+            },
+            "teams": {"crew": {"display_name": "crew", "agents": ["code", "research"], "role": "Combined work"}},
+            "router": {"judgment": judgment or {"provider": "typesafe"}},
+        },
+    )
+
+
+@dataclass
+class _FallbackRouter(ScriptedModel):
+    """The LLM router's model: it suggests ``research`` for every request and keeps each prompt."""
+
+    prompts: list[str] = field(default_factory=list)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamEvent]:
+        """Record the prompt, then answer with the fallback suggestion."""
+        self.prompts.append(request.messages[-1].get_content_string())
+        for step in answer(json.dumps({"entity_name": "research", "reasoning": "fallback"})):
+            assert not isinstance(step, Await)
+            yield step
+
+
+def _providers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Serve the LLM router from a fallback model and return the prompts it receives."""
+    router = _FallbackRouter(turns=[])
+    install_model_providers(monkeypatch, {"default": router})
+    return router.prompts
+
+
+def _paths(tmp_path: Path) -> RuntimePaths:
+    return replace(test_runtime_paths(tmp_path), process_env={"TYPESAFE_API_KEY": "synthetic"})
+
+
+def _choice_provider(monkeypatch: pytest.MonkeyPatch, choice: str | None) -> list[dict]:
+    posted = []
+
+    async def post(_self: JudgmentClient, body: bytes) -> bytes:
+        payload = json.loads(body)
+        posted.append(payload)
+        return json.dumps(
+            {
+                "model": _PINNED_MODEL,
+                "answers": {
+                    "responder_selection": {
+                        "type": "choice",
+                        "choice": choice,
+                        "confidence": 1,
+                        "probabilities": {
+                            key: int(key == choice) for key in payload["questions"]["responder_selection"]["criteria"]
+                        },
+                    },
+                },
+                "usage": {"input_tokens": 42, "output_tokens": 1},
+            },
+        ).encode()
+
+    monkeypatch.setattr(JudgmentClient, "_post", post)
+    return posted
+
+
+@pytest.mark.asyncio
+async def test_router_selects_with_openai_decisions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenAI Decisions answers the same responder choice with the shared OpenAI key."""
+    legacy = _providers(monkeypatch)
+    paths = test_runtime_paths(tmp_path)
+    get_runtime_shared_credentials_manager(paths).save_credentials("openai", {"api_key": "synthetic"})
+    posted = []
+
+    async def post(_self: JudgmentClient, body: bytes) -> bytes:
+        question = json.loads(body)["questions"][0]
+        posted.append(question)
+        values = [choice["value"] for choice in question["choices"]]
+        answer = {
+            "type": "choice",
+            "name": question["name"],
+            "choice": "candidate_2",
+            "confidence": 1,
+            "probabilities": [{"value": value, "probability": int(value == "candidate_2")} for value in values],
+        }
+        return json.dumps(
+            {"answers": [answer], "model": "gpt-6-luna", "usage": {"input_tokens": 42, "output_tokens": 0}},
+        ).encode()
+
+    monkeypatch.setattr(JudgmentClient, "_post", post)
+    result = await routing.suggest_responder(
+        "Fix my Python code",
+        ["code", "research", "crew"],
+        _config({"provider": "openai_decisions"}),
+        paths,
+    )
+
+    assert result is not None
+    assert result.entity_name == "crew"
+    assert not legacy
+    assert [question["name"] for question in posted] == ["responder_selection"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "expected", "fallback"),
+    [
+        ("candidate_0", "code", False),
+        ("candidate_2", "crew", False),
+        ("no_fit", None, False),
+        ("multiple", "research", True),
+        (None, "research", True),
+        ("hidden", "research", True),
+    ],
+)
+async def test_router_maps_choice_and_only_falls_back_when_needed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str | None,
+    expected: str | None,
+    fallback: bool,
+) -> None:
+    """Router maps choice and only falls back when needed."""
+    legacy = _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, decision)
+    result = await routing.suggest_responder(
+        "Fix my Python code",
+        ["code", "research", "crew"],
+        _config(),
+        _paths(tmp_path),
+    )
+    assert result is not None
+    assert result.entity_name == expected
+    assert bool(legacy) is fallback
+    assert len(posted) == 1
+    payload = posted[0]
+    assert set(payload["questions"]["responder_selection"]["criteria"]) == {
+        "candidate_0",
+        "candidate_1",
+        "candidate_2",
+        "no_fit",
+        "multiple",
+    }
+    assert "Private unrelated agent" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_router_judge_sees_complete_recent_text_and_aliased_speakers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Router judge sees complete recent text and aliased speakers."""
+    _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, "candidate_0")
+    history = [
+        ResolvedVisibleMessage.synthetic(sender="@person:example.org", body=body, event_id=f"$msg{i}")
+        for i, body in enumerate(["oldest", "context " * 30, "second", "third"])
+    ]
+    result = await routing.suggest_responder(
+        "Current question",
+        ["code", "research"],
+        _config(),
+        _paths(tmp_path),
+        history,
+    )
+    assert result is not None
+    assert result.entity_name == "code"
+    payload = posted[0]
+    state = json.dumps(payload["state"])
+    assert "oldest" not in state
+    assert "context " * 30 in state
+    assert "Current question" in state
+    assert "@person:example.org" not in state
+    assert "speaker_1" in state
+
+
+@pytest.mark.asyncio
+async def test_router_judge_clips_long_recent_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A long recent reply, such as one with many tool calls, is clipped like other judges' context."""
+    _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, "candidate_0")
+    history = [ResolvedVisibleMessage.synthetic(sender="@person:example.org", body="word " * 4000, event_id="$long")]
+    result = await routing.suggest_responder(
+        "Current question",
+        ["code", "research"],
+        _config(),
+        _paths(tmp_path),
+        history,
+    )
+    assert result is not None
+    assert result.entity_name == "code"
+    assert "characters omitted" in json.dumps(posted[0]["state"])
+
+
+@pytest.mark.asyncio
+async def test_router_judge_sees_tool_calls_as_tags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An earlier agent reply reaches the router judge with its tool calls, not display markers."""
+    _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, "candidate_0")
+    trace = [
+        ToolTraceEntry(type="tool_call_completed", tool_name="shell", args_preview="cmd=ls", result_preview="a.py"),
+    ]
+    history = [
+        ResolvedVisibleMessage.synthetic(
+            sender="@mindroom_code:localhost",
+            body="Listing.\n\n🔧 `shell` [1]",
+            event_id="$reply",
+            content={"msgtype": "m.text", **(build_tool_trace_content(trace) or {})},
+        ),
+    ]
+    await routing.suggest_responder("Current question", ["code", "research"], _config(), _paths(tmp_path), history)
+    state = json.dumps(posted[0]["state"])
+    assert "🔧" not in state
+    assert '<tool name=\\"shell\\"' in state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["token=sk-secret", "x" * 16000], ids=["secret", "oversized"])
+async def test_unsafe_judgment_context_uses_existing_router_without_judge_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    """Unsafe judgment context uses existing router without judge call."""
+    legacy = _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, "candidate_0")
+    with capture_logs() as logs:
+        result = await routing.suggest_responder(message, ["code", "research"], _config(), _paths(tmp_path))
+    failures = [entry for entry in logs if entry.get("failure") == "incomplete_state"]
+    assert len(failures) == 1
+    assert failures[0]["incomplete_reason"] == (
+        "essential_input_redacted" if message.startswith("token=") else "essential_input_too_large"
+    )
+    assert message not in json.dumps(failures)
+    assert result is not None
+    assert result.entity_name == "research"
+    assert len(legacy) == 1
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_judgment_keeps_existing_router(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disabled judgment keeps existing router."""
+    legacy = _providers(monkeypatch)
+    posted = _choice_provider(monkeypatch, "candidate_0")
+    config = _config()
+    config.router.judgment = None
+    result = await routing.suggest_responder("Help", ["code", "research"], config, test_runtime_paths(tmp_path))
+    assert result is not None
+    assert result.entity_name == "research"
+    assert len(legacy) == 1
+    assert posted == []
+
+
+@pytest.mark.parametrize("alias", ["default", "missing"])
+def test_router_rejects_duplicate_llm_judgment_configuration(alias: str) -> None:
+    """LLM routing has one configuration entry point: router.model."""
+    with pytest.raises(ValidationError, match="typesafe"):
+        _config({"provider": "llm", "model": alias})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    ["select", "missing_key", "timeout", "drift", "low_confidence", "tie", "malformed"],
+)
+async def test_typesafe_routing_uses_shared_client_and_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """Provider selection, credentials, thresholds and decoder failures reach the correct routing path."""
+    legacy = _providers(monkeypatch)
+    posted = []
+
+    async def post(_self: JudgmentClient, body: bytes) -> bytes:
+        posted.append(json.loads(body))
+        if scenario == "timeout":
+            error = "unavailable"
+            raise httpx.ReadTimeout(error)
+        return (
+            json.dumps(
+                {
+                    "model": "wrong" if scenario == "drift" else _PINNED_MODEL,
+                    "answers": {
+                        "responder_selection": {
+                            "type": "choice",
+                            "choice": "candidate_0",
+                            "confidence": 0.1 if scenario == "low_confidence" else 0.95,
+                            "probabilities": {"candidate_0": 0.5, "candidate_1": 0.5, "no_fit": 0, "multiple": 0}
+                            if scenario == "tie"
+                            else {"candidate_0": 0.9, "candidate_1": 0.1, "no_fit": 0, "multiple": 0},
+                        },
+                    },
+                    "usage": {"input_tokens": 42, "output_tokens": 1},
+                },
+            ).encode()
+            if scenario != "malformed"
+            else b"bad json"
+        )
+
+    monkeypatch.setattr(JudgmentClient, "_post", post)
+    paths = replace(
+        _paths(tmp_path),
+        process_env={"TYPESAFE_API_KEY": "" if scenario == "missing_key" else "synthetic"},
+    )
+    config = _config({"provider": "typesafe", "threshold": 0.0 if scenario == "tie" else 0.8})
+    result = await routing.suggest_responder("Help with Python", ["code", "research"], config, paths)
+    assert result is not None
+    assert result.entity_name == ("code" if scenario == "select" else "research")
+    assert bool(legacy) is (scenario != "select")
+    assert len(posted) == (0 if scenario == "missing_key" else 1)
+    if posted:
+        assert posted[0]["questions"]["responder_selection"]["type"] == "choice"
+
+
+@pytest.mark.asyncio
+async def test_default_and_jev_fallback_use_same_llm_router(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Opting into JEV retains the configured LLM prompt and model on fallback."""
+    prompts = _providers(monkeypatch)
+    aliases = []
+
+    router = _FallbackRouter(turns=[], prompts=prompts)
+
+    def load(_config: Config, _paths: RuntimePaths, alias: str) -> _FallbackRouter:
+        aliases.append(alias)
+        return router
+
+    monkeypatch.setattr("mindroom.providers.registry.build_model_provider", load)
+    config = _config()
+    config.models["cheap_router"] = config.models["default"]
+    config.router.model = "cheap_router"
+    paths = replace(test_runtime_paths(tmp_path), process_env={"TYPESAFE_API_KEY": ""})
+    fallback = await routing.suggest_responder("Help", ["code", "research"], config, paths)
+    config.router.judgment = None
+    ordinary = await routing.suggest_responder("Help", ["code", "research"], config, paths)
+    assert fallback == ordinary == routing.ResponderSelection("research")
+    assert len(prompts) == 2
+    assert prompts[0] == prompts[1]
+    assert aliases == ["cheap_router", "cheap_router"]
+
+
+@pytest.mark.asyncio
+async def test_llm_router_context_drops_tool_markers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The LLM router reads an agent reply's text without its display markers."""
+    prompts = _providers(monkeypatch)
+    config = _config()
+    config.router.judgment = None
+    trace = [ToolTraceEntry(type="tool_call_completed", tool_name="shell", args_preview="cmd=ls")]
+    history = [
+        ResolvedVisibleMessage.synthetic(
+            sender="@mindroom_code:localhost",
+            body="Listing.\n\n🔧 `shell` [1]",
+            event_id="$reply",
+            content={"msgtype": "m.text", **(build_tool_trace_content(trace) or {})},
+        ),
+    ]
+    await routing.suggest_responder("Help", ["code", "research"], config, _paths(tmp_path), history)
+    assert "Listing." in prompts[0]
+    assert "🔧" not in prompts[0]

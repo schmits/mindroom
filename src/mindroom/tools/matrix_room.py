@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,16 +13,16 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="matrix_room",
+    file_access=ToolFileAccess.NONE,
     display_name="Matrix Room",
-    description="View Matrix room details, members, and conversation threads",
+    description="Discover available agents and view Matrix room details, members, and conversation threads",
     category=ToolCategory.COMMUNICATION,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     requires_room_context=True,
     icon="LayoutList",
     icon_color="text-blue-500",
-    dependencies=["agno"],
-    docs_url="https://github.com/mindroom-ai/mindroom",
+    docs_url="https://docs.mindroom.chat/tools/matrix-and-attachments/#matrix_room",
     function_names=("matrix_room",),
 )
 def matrix_room_tools() -> type[MatrixRoomTools]:

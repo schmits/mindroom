@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="zep",
+    file_access=ToolFileAccess.NONE,
+    requires_primary_runtime=True,
     display_name="Zep Memory",
     description="Memory system for storing, retrieving, and searching conversational data",
     category=ToolCategory.PRODUCTIVITY,
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
         ),
         ConfigField(
             name="api_key",
+            env=("ZEP_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -78,13 +81,6 @@ if TYPE_CHECKING:
             default=None,
         ),
         ConfigField(
-            name="add_instructions",
-            label="Add Instructions",
-            type="boolean",
-            required=False,
-            default=False,
-        ),
-        ConfigField(
             name="all",
             label="All",
             type="boolean",
@@ -93,7 +89,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["zep-cloud"],
-    docs_url="https://docs.agno.com/tools/toolkits/database/zep",
+    docs_url="https://docs.mindroom.chat/tools/memory-and-storage/#zep",
     function_names=("add_zep_message", "get_zep_memory", "search_zep_memory"),
 )
 def zep_tools() -> type[ZepTools]:

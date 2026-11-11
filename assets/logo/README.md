@@ -19,9 +19,10 @@ If your checkout contains pointer files, fetch the images with `git lfs pull` fi
 
 The script declares its own pinned rendering dependencies; they are separate from the application dependencies.
 It writes the static `logo.svg`, `logo-transparent.svg`, and `preview.png`, plus `logo-animated.svg` and `logo-animated-transparent.svg`.
-Each SVG also has a losslessly compressed `.svgz` copy.
+Each SVG except `logo-mark-movable-cube.svg` also has a losslessly compressed `.svgz` copy.
 It also writes `logo-transparent.png` as a raster preview of the complete M with a transparent background.
 The `logo-mark.svg` and `logo-mark-animated.svg` exports tightly frame the static and animated M for small icons and the README.
+The `logo-mark-movable-cube.svg` export is the static framed mark with an opening in the frame under the central cube, for animations that move the cube.
 
 | File | Purpose |
 | --- | --- |
@@ -32,6 +33,12 @@ The `logo-mark.svg` and `logo-mark-animated.svg` exports tightly frame the stati
 | `animation.py` | Cube pulse, curved electrical filaments, and their shared timing. |
 | `optimize.py` | Lossless sharing of identical gradients and stops, unused-paint removal, and compact XML. |
 | `publication.py` | Frames the unchanged M and derives the app, documentation, favicon, desktop, and Matrix avatar exports. |
+| `app_icons.py` | Composes dark-glass and light-porcelain app icon treatments around the shared vector M. |
+| `app-glass-material.svg` | Editable refraction filter, glowing panes, and glass tile lighting for the dark app icon. |
+| `social-preview.png` | AI-rendered ivory social card with a centered glass M and lowercase wordmark. |
+| `social-preview.prompt.md` | Sunburst model and prompts used for the social artwork. |
+| `menu-bar.svg` | Optional monochrome outline variant of the M. |
+| [`blender/`](blender/README.md) | 3D Blender model rebuilt from the same vertices, rendered as crystal around a glowing tesseract, with a still and animated effects. |
 | `preview.html` | Browser preview with a pause/play control. |
 | `reference.png` | Cleaned raster design used as the lighting reference. |
 | `test_geometry.py` | Regression checks for closed junctions and angled terminal cuts. |
@@ -95,10 +102,40 @@ The compact `logo-mark.svg` and `logo-mark-animated.svg` change only the viewpor
 Both use the same 720-pixel square viewport with a small border, so the M fills more of its displayed area without jumping when the motion preference changes.
 Their regression tests check that the crop removes no painted pixels and that restoring the original viewport reproduces the exact RGBA image.
 
+The frame is one filled polygon that also covers the area under the central cube, so a cube turned edge-on by an animation would reveal a navy slab.
+`logo-mark-movable-cube.svg` cuts the cube's outline out of the frame with an even-odd fill, inset 2% toward the cube's center so the cube still overlaps the frame's edge.
+MindRoom Chat's thinking marker turns the cube and copies this file verbatim.
+At rest the cube covers the opening, but a few antialiased pixels along the cube's thin inner seams show the page instead of the frame.
+The published icons keep the closed frame, so they are unaffected.
+
 Regeneration also updates the dashboard and documentation SVGs, portal branding, PNG fallbacks, both web favicons, the macOS app icon source, and the bundled Matrix root-space avatar.
+The macOS appearance variants use `app-icon-light.svg` and `app-icon-dark.svg`, rendered to `macos/MindRoom/Resources/MindRoom.icon/Assets/` as 1024-pixel PNGs.
+These full-bleed images receive their final system mask from Icon Composer, which supplies appearance variants on macOS 26 or newer and a static light icon on older systems.
+The material treatments were inspired by AI-generated concepts; their geometry, backgrounds, edge lighting, and shadows are rendered deterministically from SVG.
+The dark icon takes inspiration from [Kube's liquid-glass article](https://kube.io/blog/liquid-glass-css-svg/): a blurred pane silhouette approximates a rounded surface, whose horizontal and vertical derivatives drive an SVG displacement filter.
+Directional specular highlights and broad cyan glows give the panes depth, while an inset illuminated rim defines the dark glass tile.
+This is a static approximation baked into the exported PNG, with no browser backdrop filter, embedded bitmap, or runtime effect.
+The native macOS app bundles the mark SVG and its matching PNG; AppKit uses the PNG to preserve the SVG's masked shading.
+Its menu bar icon uses dedicated 20- and 40-pixel renders of the full-color mark, preserving the original blue-and-gold shading without AppKit template tinting.
 The portal's public logo aliases resolve within its own public directory so container builds retain them.
-Application assets use the static version; animation remains optional.
+Application assets use the static version except for the connections page, which imports the existing `assets/logo/logo-mark-animated.svgz` directly.
+The frontend build bundles that compressed asset, and the backend and Vite servers send it with SVG and gzip response headers.
 The generated root-space avatar is a default asset; existing uploaded or custom Matrix avatars follow the existing avatar management behavior.
+
+## GitHub social images
+
+These PNGs are ready to upload:
+
+| File | Size | Use |
+| --- | --- | --- |
+| [social-preview.png](social-preview.png) | 1280 × 640 | Repository Settings → Social preview → Upload an image. |
+| [Dark app icon](../../macos/MindRoom/Resources/MindRoom.icon/Assets/dark.png) | 1024 × 1024 | Organization profile picture, reusing the dark glass M. |
+
+Both PNGs have opaque backgrounds and stay below GitHub's 1 MB social preview limit.
+The social card follows [GitHub's recommended dimensions](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/customizing-your-repositorys-social-media-preview).
+The social card is AI-rendered artwork created with `gpt-image-2.5-sunburst`; its model, prompts, and export details are recorded in [social-preview.prompt.md](social-preview.prompt.md).
+It is a committed raster asset, and `generate.py` leaves it unchanged.
+The app icons remain editable SVG, and the organization avatar reuses the macOS dark PNG without a duplicate export.
 
 ## Animated version
 
@@ -141,4 +178,4 @@ For visual review, rasterize the complete SVG at the desired resolution before c
 Inspect enlarged junctions as well as the full logo, because a whole-image pixel error can hide local edge defects.
 
 The repository README selects the tightly framed `logo-mark-animated.svg` when motion is allowed, with `logo-mark.svg` as its reduced-motion and compatibility fallback.
-Application headers use the static framed transparent mark.
+The connections header uses the animated framed transparent mark, whose embedded CSS honors reduced-motion preferences; other application headers use the static mark.

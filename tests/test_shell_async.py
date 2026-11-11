@@ -1,4 +1,4 @@
-"""Tests for async shell tool with timeout-to-handle support."""
+"""Tests for async shell execution and timeout termination."""
 
 from __future__ import annotations
 
@@ -13,11 +13,16 @@ from unittest.mock import patch
 
 import pytest
 
+from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, workspace_home_identity_env
-from mindroom.shell_execution import _MAX_OUTPUT_BYTES
+from mindroom.shell.execution import _MAX_OUTPUT_BYTES, _OutputBuffer, _OutputProgress, _progress_lines
+from mindroom.tool_jobs.control import JobControl, job_control_context
+from mindroom.tool_system.agno_toolkits import toolkit_function
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.progress import shown_progress, tool_progress_reporter
+from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.tool_environment import ToolEnvironment
 from mindroom.tools.shell import (
-    _process_registry,
     _shell_subprocess_env,
     _workspace_home_contract_env_from_process_env,
     shell_tools,
@@ -26,10 +31,9 @@ from mindroom.tools.shell import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from agno.tools.function import Function
-    from agno.tools.toolkit import Toolkit
-
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
+    from mindroom.tool_system.tool_function import ToolFunction
 
 
 def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = None) -> RuntimePaths:
@@ -46,9 +50,58 @@ def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = 
     )
 
 
-def _get_toolkit(tmp_path: Path) -> Toolkit:
+def _get_toolkit(tmp_path: Path) -> AnyToolkit:
     runtime_paths = _make_runtime_paths(tmp_path)
-    return get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
+    return get_tool_by_name(
+        "shell",
+        runtime_paths,
+        runs_in_worker=False,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+
+
+def _shell_for_config(tmp_path: Path, defaults: dict[str, object]) -> AnyToolkit:
+    """Build the shell for a config with these ``defaults``, placed where the sandbox settings place it."""
+    runtime_paths = _make_runtime_paths(tmp_path)
+    config = Config.validate_with_runtime({"defaults": defaults}, runtime_paths)
+    return get_tool_by_name(
+        "shell",
+        runtime_paths,
+        runtime_config=config,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("real_shell_refusal")
+@pytest.mark.parametrize("defaults", [{}, {"allow_shell_without_worker": False}], ids=["unset", "off"])
+async def test_shell_without_a_worker_refuses_each_command(tmp_path: Path, defaults: dict[str, object]) -> None:
+    """Without a worker, and without the setting that allows it, a command never runs in MindRoom's process."""
+    marker = tmp_path / "ran"
+    tool = _shell_for_config(tmp_path, defaults)
+
+    result = await tool.functions["run_shell_command"](["touch", str(marker)])
+
+    assert result == (
+        "Error: Shell commands run only in a worker, and this agent's shell runs in MindRoom's own process. "
+        "Route `shell` to a worker, or set `defaults.allow_shell_without_worker: true` in config.yaml to run them here."
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("real_shell_refusal")
+async def test_shell_without_a_worker_runs_commands_when_the_config_allows_it(tmp_path: Path) -> None:
+    """`defaults.allow_shell_without_worker: true` lets the shell run commands in MindRoom's process."""
+    marker = tmp_path / "ran"
+    tool = _shell_for_config(tmp_path, {"allow_shell_without_worker": True})
+
+    result = await tool.functions["run_shell_command"](f"touch {marker} && echo ran-here")
+
+    assert result == "ran-here"
+    assert marker.exists()
 
 
 def _fork_child_holding_stdio_script(*, parent_stderr: str = "", parent_exit_code: int = 0) -> str:
@@ -112,8 +165,10 @@ async def _stop_recorded_child(pid: int, stop_file: Path) -> None:
     raise AssertionError(message)
 
 
-def _get_run_shell_command_function(tool: Toolkit) -> Function:
-    return tool.async_functions["run_shell_command"]
+def _get_run_shell_command_function(tool: AnyToolkit) -> ToolFunction:
+    function = toolkit_function(tool, "run_shell_command")
+    assert function is not None
+    return function
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +180,7 @@ def _get_run_shell_command_function(tool: Toolkit) -> Function:
 async def test_run_shell_command_returns_output(tmp_path: Path) -> None:
     """Fast command should return stdout directly."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["echo", "hello world"])
     assert result == "hello world"
@@ -136,8 +190,7 @@ async def test_run_shell_command_returns_output(tmp_path: Path) -> None:
 async def test_run_shell_command_bash_echo_returns_output(tmp_path: Path) -> None:
     """Normal shell output should still be returned."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["bash", "-lc", "echo hello"])
     assert result == "hello"
@@ -147,8 +200,7 @@ async def test_run_shell_command_bash_echo_returns_output(tmp_path: Path) -> Non
 async def test_run_shell_command_accepts_shell_command_string(tmp_path: Path) -> None:
     """Natural shell command strings should execute through bash."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint("echo $HOME")
     assert result
@@ -166,8 +218,7 @@ async def test_run_shell_command_accepts_shell_command_string(tmp_path: Path) ->
 async def test_implicit_shell_does_not_run_login_startup(tmp_path: Path, command: str | list[str]) -> None:
     """Ordinary commands must not pay for or acquire side effects from login profiles."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
     assert await entrypoint(command) == "plain"
 
 
@@ -175,8 +226,7 @@ async def test_implicit_shell_does_not_run_login_startup(tmp_path: Path, command
 async def test_explicit_login_shell_remains_available(tmp_path: Path) -> None:
     """Callers opting into login initialization still get it."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
     assert await entrypoint(["bash", "-lc", "shopt -q login_shell && echo login"]) == "login"
 
 
@@ -195,8 +245,7 @@ async def test_run_shell_command_accepts_bracketed_shell_command_strings(
 ) -> None:
     """Shell grammar that starts with JSON-like characters should still execute through bash."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(command)
     assert result == expected
@@ -206,8 +255,7 @@ async def test_run_shell_command_accepts_bracketed_shell_command_strings(
 async def test_run_shell_command_accepts_single_item_shell_command_line(tmp_path: Path) -> None:
     """LLMs often send one shell command line inside the argv array."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["printf '%s' ok"])
     assert result == "ok"
@@ -228,8 +276,7 @@ def test_run_shell_command_schema_accepts_string_or_string_array(tmp_path: Path)
 async def test_run_shell_command_parses_json_string_args(tmp_path: Path) -> None:
     """JSON-stringified args should be parsed into a shell argv list."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint('["echo", "hello world"]')
     assert result == "hello world"
@@ -239,8 +286,7 @@ async def test_run_shell_command_parses_json_string_args(tmp_path: Path) -> None
 async def test_run_shell_command_parses_single_item_json_args(tmp_path: Path) -> None:
     """A single command item in JSON string form should execute normally."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint('["ls"]')
     assert result
@@ -254,16 +300,16 @@ async def test_run_shell_command_parses_single_item_json_args(tmp_path: Path) ->
         '["echo",',
         '{"cmd": "ls"}',
         "",
+        "   ",
         '["echo", 42]',
         '["bash", ["-c", "ls"]]',
         '["echo", {"x": 1}]',
     ],
 )
 async def test_run_shell_command_rejects_invalid_stringified_args(tmp_path: Path, args: str) -> None:
-    """Malformed or non-flat stringified args should fail validation."""
+    """Malformed, blank, or non-flat stringified args return a validation error instead of raising."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(args)
     assert result.startswith("Error:")
@@ -274,36 +320,42 @@ async def test_run_shell_command_rejects_invalid_stringified_args(tmp_path: Path
 async def test_run_shell_command_empty_json_list_uses_existing_empty_behavior(tmp_path: Path) -> None:
     """An empty JSON list should fall through to the existing subprocess error path."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint("[]")
     assert result.startswith("Error:")
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("args", ["", "   "])
-async def test_run_shell_command_entrypoint_returns_error_for_empty_string_args(tmp_path: Path, args: str) -> None:
-    """Direct entrypoint calls should return validation errors instead of raising."""
+async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -> None:
+    """Non-zero exit should return its exit code and stderr."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
-    result = await entrypoint(args)
-    assert result.startswith("Error:")
-    assert "'args' must be a shell command string or a flat list of strings" in result
+    result = await entrypoint(["bash", "-c", "echo oops >&2; exit 1"])
+    assert result == "Exit code 1\nStderr:\noops"
 
 
 @pytest.mark.asyncio
-async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -> None:
-    """Non-zero exit should return stderr."""
+async def test_run_shell_command_preserves_stdout_receipt_on_nonzero_exit(tmp_path: Path) -> None:
+    """A nonterminal CLI receipt on stdout must retain its continuation handle."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
-    result = await entrypoint(["bash", "-c", "echo oops >&2; exit 1"])
-    assert result.startswith("Error:")
-    assert "oops" in result
+    result = await entrypoint(["bash", "-c", 'printf \'{"status":"queued","call_id":"call-1"}\'; exit 3'])
+
+    assert result == 'Exit code 3\nOutput:\n{"status":"queued","call_id":"call-1"}'
+
+
+@pytest.mark.asyncio
+async def test_run_shell_command_preserves_both_failure_streams(tmp_path: Path) -> None:
+    """Useful stdout must not displace the existing stderr failure detail."""
+    tool = _get_toolkit(tmp_path)
+    entrypoint = tool.functions["run_shell_command"]
+
+    result = await entrypoint(["bash", "-c", "printf receipt; printf warning >&2; exit 3"])
+
+    assert result == "Exit code 3\nOutput:\nreceipt\nStderr:\nwarning"
 
 
 @pytest.mark.asyncio
@@ -311,8 +363,7 @@ async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -
 async def test_run_shell_command_returns_after_foreground_exit_with_inherited_pipe_child(tmp_path: Path) -> None:
     """Regression: tmux/auth helpers/watchers/daemons can inherit pipes after foreground exit."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     pid_file = tmp_path / "child.pid"
     stop_file = tmp_path / "child.stopped"
@@ -342,8 +393,7 @@ async def test_run_shell_command_returns_after_foreground_exit_with_inherited_pi
 async def test_run_shell_command_nonzero_foreground_exit_with_inherited_pipe_child(tmp_path: Path) -> None:
     """Nonzero foreground exit should return buffered stderr without waiting for descendant EOF."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     pid_file = tmp_path / "child-error.pid"
     stop_file = tmp_path / "child-error.stopped"
@@ -371,15 +421,14 @@ async def test_run_shell_command_nonzero_foreground_exit_with_inherited_pipe_chi
 
     elapsed = time.perf_counter() - started
     assert elapsed < 2
-    assert result == "Error: foreground failed"
+    assert result == "Exit code 7\nStderr:\nforeground failed"
 
 
 @pytest.mark.asyncio
 async def test_run_shell_command_tail_parameter(tmp_path: Path) -> None:
     """Only the last N lines should be returned."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["bash", "-c", "for i in $(seq 1 20); do echo line$i; done"], tail=3)
     lines = result.strip().split("\n")
@@ -390,8 +439,7 @@ async def test_run_shell_command_tail_parameter(tmp_path: Path) -> None:
 async def test_run_shell_command_truncates_large_output_by_bytes(tmp_path: Path) -> None:
     """A small line count with very large lines should not return an unbounded result."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     script = "for i in range(120): print(f'{i:03d}:' + 'x' * 1000)"
     result = await entrypoint([sys.executable, "-c", script], tail=120)
@@ -406,13 +454,12 @@ async def test_run_shell_command_truncates_large_output_by_bytes(tmp_path: Path)
 async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path) -> None:
     """Large stderr from failed commands should be byte-capped too."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     script = "import sys\nfor i in range(120): print(f'{i:03d}:' + 'x' * 1000, file=sys.stderr)\nsys.exit(1)\n"
     result = await entrypoint([sys.executable, "-c", script])
 
-    assert result.startswith("Error: [Output truncated to the last")
+    assert result.startswith("Exit code 1\nStderr:\n[Output truncated to the last")
     assert "119:" in result
     assert "000:" not in result
     assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
@@ -422,8 +469,7 @@ async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path)
 async def test_run_shell_command_truncates_many_short_lines_by_rendered_bytes(tmp_path: Path) -> None:
     """Rendered newline separators should be included in the output byte cap."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     script = "for _ in range(10000): print('xxxxxx')"
     result = await entrypoint([sys.executable, "-c", script], tail=10000)
@@ -436,8 +482,7 @@ async def test_run_shell_command_truncates_many_short_lines_by_rendered_bytes(tm
 async def test_run_shell_command_truncates_oversized_single_stdout_line(tmp_path: Path) -> None:
     """Output without newlines should still be retained and byte-capped."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint([sys.executable, "-c", "import sys; sys.stdout.write('A' * 100000)"])
 
@@ -450,55 +495,22 @@ async def test_run_shell_command_truncates_oversized_single_stdout_line(tmp_path
 async def test_run_shell_command_truncates_oversized_single_stderr_line(tmp_path: Path) -> None:
     """Oversized stderr lines should be surfaced instead of skipped."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(
         [sys.executable, "-c", "import sys; sys.stderr.write('B' * 100000); sys.exit(1)"],
     )
 
-    assert result.startswith("Error: [Output truncated to the last")
+    assert result.startswith("Exit code 1\nStderr:\n[Output truncated to the last")
     assert "B" * 100 in result
     assert len(result.encode("utf-8")) <= _MAX_OUTPUT_BYTES + 200
-
-
-@pytest.mark.asyncio
-async def test_run_shell_command_returns_handle_on_timeout(tmp_path: Path) -> None:
-    """A workspace-prefixed timeout result should expose a usable handle identifier."""
-    runtime_paths = _make_runtime_paths(tmp_path)
-    tool = get_tool_by_name(
-        "shell",
-        runtime_paths,
-        disable_sandbox_proxy=True,
-        worker_target=None,
-        tool_init_overrides={"base_dir": str(tmp_path)},
-    )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert entrypoint is not None
-    assert check_fn is not None
-
-    result = await entrypoint(["sleep", "300"], timeout=1)
-
-    assert result.startswith(f"[cwd: {tmp_path}]\n")
-    assert "timed out" in result.lower()
-    assert "Handle: shell:" in result
-    assert "check_shell_command" in result
-
-    # Extract handle and clean up
-    handle = result.split("Handle: ")[1].split("\n")[0]
-    assert "RUNNING" in check_fn(handle)
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    kill_fn(handle, force=True)
-    await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
 async def test_run_shell_command_error_on_bad_command(tmp_path: Path) -> None:
     """Non-existent command should return an error."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["__nonexistent_command_xyz__"])
     assert result.startswith("Error:")
@@ -511,199 +523,15 @@ async def test_run_shell_command_respects_base_dir(tmp_path: Path) -> None:
     tool = get_tool_by_name(
         "shell",
         runtime_paths,
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
         tool_init_overrides={"base_dir": str(tmp_path)},
+        tools=builtin_tool_registry(),
     )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["pwd"])
     assert result.splitlines() == [f"[cwd: {tmp_path}]", str(tmp_path)]
-
-
-# ---------------------------------------------------------------------------
-# check_shell_command
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_check_shell_command_running(tmp_path: Path) -> None:
-    """Checking a running process should show RUNNING status."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert check_fn is not None
-
-    result = await run_fn(["sleep", "300"], timeout=0)
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    status = check_fn(handle)
-    assert "RUNNING" in status
-
-    # Clean up
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    kill_fn(handle, force=True)
-    await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
-async def test_check_shell_command_finished(tmp_path: Path) -> None:
-    """Checking a finished process should show FINISHED status and output."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert check_fn is not None
-
-    # Force backgrounding immediately, but let the command live long enough for
-    # the monitor path to observe its output and final status.
-    result = await run_fn(["bash", "-c", "echo done-output; sleep 0.05"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    # Wait for the process to finish
-    for _ in range(50):
-        status = check_fn(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.02)
-    assert "FINISHED" in status
-    assert "done-output" in status
-
-
-@pytest.mark.asyncio
-async def test_check_shell_command_unknown_handle(tmp_path: Path) -> None:
-    """Checking an unknown handle should return an error."""
-    tool = _get_toolkit(tmp_path)
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert check_fn is not None
-
-    result = check_fn("shell:nonexistent")
-    assert "Error:" in result
-    assert "Unknown handle" in result
-
-
-@pytest.mark.asyncio
-async def test_check_shell_command_partial_output(tmp_path: Path) -> None:
-    """Checking a running process should show partial output."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert check_fn is not None
-
-    result = await run_fn(
-        ["bash", "-c", "for i in 1 2 3; do echo partial-line-$i; done; sleep 300"],
-        timeout=0,
-    )
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    for _ in range(50):
-        status = check_fn(handle)
-        if "partial-line" in status:
-            break
-        await asyncio.sleep(0.02)
-    assert "RUNNING" in status
-    assert "lines buffered" in status
-    assert "lines so far" not in status
-    assert "partial-line" in status
-
-    # Clean up
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    kill_fn(handle, force=True)
-    await asyncio.sleep(0.1)
-
-
-# ---------------------------------------------------------------------------
-# kill_shell_command
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_kill_shell_command(tmp_path: Path) -> None:
-    """Killing a running process should succeed."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert kill_fn is not None
-    assert check_fn is not None
-
-    result = await run_fn(["sleep", "300"], timeout=0)
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    kill_result = kill_fn(handle)
-    assert "Terminated" in kill_result or "SIGTERM" in kill_result
-
-    # Wait for process to actually exit
-    for _ in range(30):
-        status = check_fn(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.02)
-
-    assert "FINISHED" in status
-
-
-@pytest.mark.asyncio
-async def test_kill_shell_command_force(tmp_path: Path) -> None:
-    """Force-killing should send SIGKILL."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    assert run_fn is not None
-    assert kill_fn is not None
-
-    result = await run_fn(["sleep", "300"], timeout=0)
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    kill_result = kill_fn(handle, force=True)
-    assert "Force-killed" in kill_result or "SIGKILL" in kill_result
-    await asyncio.sleep(0.1)
-
-
-@pytest.mark.asyncio
-async def test_kill_shell_command_already_finished(tmp_path: Path) -> None:
-    """Killing an already-finished process should say so."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert kill_fn is not None
-    assert check_fn is not None
-
-    # Force backgrounding: command finishes in ~0.2s but timeout is very short
-    result = await run_fn(["bash", "-c", "echo fast; sleep 0.2"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    # Wait for it to finish
-    for _ in range(30):
-        status = check_fn(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.1)
-    assert "FINISHED" in status
-
-    kill_result = kill_fn(handle)
-    assert "already finished" in kill_result.lower()
-
-
-@pytest.mark.asyncio
-async def test_kill_shell_command_unknown_handle(tmp_path: Path) -> None:
-    """Killing an unknown handle should return error."""
-    tool = _get_toolkit(tmp_path)
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    assert kill_fn is not None
-
-    result = kill_fn("shell:nonexistent")
-    assert "Error:" in result
-    assert "Unknown handle" in result
 
 
 # ---------------------------------------------------------------------------
@@ -711,13 +539,11 @@ async def test_kill_shell_command_unknown_handle(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shell_registers_three_tools(tmp_path: Path) -> None:
-    """Shell toolkit should register run, check, and kill functions."""
+def test_shell_registers_only_run_shell_command(tmp_path: Path) -> None:
+    """A job is how a long command runs in the background, so the shell has no handle functions."""
     tool = _get_toolkit(tmp_path)
 
-    assert "run_shell_command" in tool.async_functions
-    assert "check_shell_command" in tool.functions
-    assert "kill_shell_command" in tool.functions
+    assert list(tool.functions) == ["run_shell_command"]
 
 
 def test_shell_disabled_registers_no_tools(tmp_path: Path) -> None:
@@ -726,51 +552,7 @@ def test_shell_disabled_registers_no_tools(tmp_path: Path) -> None:
 
     cls = shell_tools()
     toolkit = cls(enable_run_shell_command=False, runtime_paths=runtime_paths)
-    assert len(toolkit.functions) == 0
-    assert len(toolkit.async_functions) == 0
-
-
-# ---------------------------------------------------------------------------
-# Stale record cleanup
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_sweep_stale_records(tmp_path: Path) -> None:
-    """Stale finished records should be cleaned up based on finished_at."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert check_fn is not None
-
-    # Force backgrounding with timeout=0, command finishes quickly
-    result = await run_fn(["bash", "-c", "echo quick; sleep 0.2"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    # Wait for process to finish
-    for _ in range(30):
-        status = check_fn(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.1)
-    assert "FINISHED" in status
-
-    # Record should still exist — aging started_at should NOT cause sweep
-    # because sweep now uses finished_at
-    record = _process_registry.get(handle)
-    assert record is not None
-    record.started_at = time.monotonic() - 700  # 700 seconds ago
-
-    # Trigger sweep — record should survive because finished_at is recent
-    await run_fn(["echo", "trigger-sweep"])
-    assert handle in _process_registry
-
-    # Now age finished_at — record should be swept
-    record.finished_at = time.monotonic() - 700
-    await run_fn(["echo", "trigger-sweep-2"])
-    assert handle not in _process_registry
+    assert toolkit.functions == {}
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +596,12 @@ def test_shell_subprocess_env_exports_workspace_from_base_dir_without_home_contr
     """Local execution keeps the host HOME but still exports the workspace env var."""
     workspace = tmp_path / "workspace"
 
-    env = _shell_subprocess_env({}, base_process_env={"HOME": "/home/host-user"}, workspace_dir=workspace)
+    env = _shell_subprocess_env(
+        {},
+        call_environment=ToolEnvironment(),
+        base_process_env={"HOME": "/home/host-user"},
+        workspace_dir=workspace,
+    )
 
     assert env["MINDROOM_AGENT_WORKSPACE"] == str(workspace.resolve())
     assert env["HOME"] == "/home/host-user"
@@ -831,6 +618,7 @@ def test_shell_subprocess_env_replaces_incomplete_workspace_contract(tmp_path: P
 
     env = _shell_subprocess_env(
         {"MINDROOM_AGENT_WORKSPACE": str(stale_workspace)},
+        call_environment=ToolEnvironment(),
         base_process_env=base_env,
         workspace_dir=workspace,
     )
@@ -851,7 +639,12 @@ def test_shell_subprocess_env_prefers_worker_home_contract_over_base_dir(tmp_pat
         "VIRTUAL_ENV": str(tmp_path / "venv"),
     }
 
-    env = _shell_subprocess_env({}, base_process_env=base_env, workspace_dir=tmp_path / "other-base-dir")
+    env = _shell_subprocess_env(
+        {},
+        call_environment=ToolEnvironment(),
+        base_process_env=base_env,
+        workspace_dir=tmp_path / "other-base-dir",
+    )
 
     assert env["MINDROOM_AGENT_WORKSPACE"] == str(contract_workspace)
     assert env["HOME"] == str(contract_workspace)
@@ -872,12 +665,12 @@ async def test_local_shell_replaces_stale_agent_workspace_env(tmp_path: Path) ->
     tool = get_tool_by_name(
         "shell",
         runtime_paths,
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
         tool_init_overrides={"base_dir": str(workspace)},
+        tools=builtin_tool_registry(),
     )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint('printf %s "$MINDROOM_AGENT_WORKSPACE"')
     assert result.splitlines() == [f"[cwd: {workspace}]", str(workspace.resolve())]
@@ -890,17 +683,19 @@ def test_run_shell_command_description_uses_portable_workspace_paths(tmp_path: P
     tool = get_tool_by_name(
         "shell",
         runtime_paths,
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         worker_target=None,
         tool_init_overrides={"base_dir": str(workspace)},
+        tools=builtin_tool_registry(),
     )
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "Always use relative paths" in description
     assert "$MINDROOM_AGENT_WORKSPACE" in description
     assert "worker-routed execution maps `~` to the workspace" in description
     assert "local execution maps it to the host home" in description
+    assert description.count("Working method:") == 1
 
 
 def test_proxied_run_shell_command_description_does_not_claim_host_home(tmp_path: Path) -> None:
@@ -918,21 +713,23 @@ def test_proxied_run_shell_command_description_does_not_claim_host_home(tmp_path
         runtime_paths,
         worker_target=None,
         tool_init_overrides={"base_dir": str(workspace)},
+        tools=builtin_tool_registry(),
     )
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "worker-routed execution maps `~` to the workspace" in description
     assert "`~` and `$HOME` point at the host home" not in description
 
 
 def test_run_shell_command_description_has_no_workspace_note_without_base_dir(tmp_path: Path) -> None:
-    """Without a workspace there is no cwd contract to describe."""
+    """Without a workspace there is no cwd contract to describe, but the working method still applies."""
     tool = _get_toolkit(tmp_path)
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "[cwd:" not in description
+    assert description.count("Working method:") == 1
 
 
 @pytest.mark.asyncio
@@ -949,9 +746,14 @@ async def test_env_passthrough_preserved(tmp_path: Path) -> None:
         storage_path=tmp_path / "storage",
         process_env={},
     )
-    tool = get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    tool = get_tool_by_name(
+        "shell",
+        runtime_paths,
+        runs_in_worker=False,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint(["bash", "-lc", "printf '%s' \"$MY_TEST_VAR\""])
     assert result == "async-shell-works"
@@ -984,191 +786,161 @@ async def test_login_bash_preserves_runtime_path_after_profile_reset(tmp_path: P
         storage_path=tmp_path / "storage",
         process_env={"PATH": "/worker-env/bin:/usr/bin:/bin"},
     )
-    tool = get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    tool = get_tool_by_name(
+        "shell",
+        runtime_paths,
+        runs_in_worker=False,
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+    entrypoint = tool.functions["run_shell_command"]
 
     result = await entrypoint([str(fake_bash), "-lc", "printf '%s' \"$PATH\""])
 
     assert result == "/worker-env/bin:/usr/bin:/bin"
 
 
-# ---------------------------------------------------------------------------
-# Handle persistence across toolkit instances (sandbox runner path)
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_run_shell_command_stops_a_command_past_its_timeout(tmp_path: Path) -> None:
+    """A command past its timeout is stopped, and the call returns its output so far without a handle."""
+    runtime_paths = _make_runtime_paths(tmp_path)
+    tool = get_tool_by_name(
+        "shell",
+        runtime_paths,
+        runs_in_worker=False,
+        worker_target=None,
+        tool_init_overrides={"base_dir": str(tmp_path)},
+        tools=builtin_tool_registry(),
+    )
+    entrypoint = tool.functions["run_shell_command"]
+
+    result = await entrypoint(["bash", "-c", "echo started; sleep 300"], timeout=1)
+
+    assert result == f"[cwd: {tmp_path}]\nStopped after 1s.\nOutput:\nstarted"
 
 
 @pytest.mark.asyncio
-async def test_handle_persists_across_toolkit_instances(tmp_path: Path) -> None:
-    """Handles created by one toolkit instance should be visible to a new one.
+async def test_only_a_job_command_runs_past_the_default_time_limit(tmp_path: Path) -> None:
+    """Without a timeout, a call that runs as a background job has no limit and any other call has the default."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    command = ["bash", "-c", "sleep 0.6; echo done"]
 
-    This simulates the sandbox runner path where _resolve_entrypoint creates
-    a fresh MindRoomShellTools per request.
-    """
-    tool1 = _get_toolkit(tmp_path)
-    run_fn = tool1.async_functions["run_shell_command"].entrypoint
-    assert run_fn is not None
+    with patch("mindroom.shell.execution._DEFAULT_RUN_TIMEOUT_SECONDS", 0.2):
+        stopped = await entrypoint(command)
+        with job_control_context(JobControl()):
+            finished = await entrypoint(command)
 
-    result = await run_fn(["sleep", "300"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
-
-    # Create a second toolkit instance (simulates sandbox runner re-creation)
-    tool2 = _get_toolkit(tmp_path)
-    check_fn = tool2.functions["check_shell_command"].entrypoint
-    assert check_fn is not None
-
-    status = check_fn(handle)
-    assert "RUNNING" in status
-
-    # Kill via the second instance too
-    kill_fn = tool2.functions["kill_shell_command"].entrypoint
-    assert kill_fn is not None
-    kill_result = kill_fn(handle, force=True)
-    assert "Force-killed" in kill_result or "already exited" in kill_result.lower()
-    await asyncio.sleep(0.1)
+    assert stopped == "Stopped after 0.2s."
+    assert finished == "done"
 
 
 @pytest.mark.asyncio
-async def test_handle_check_then_kill_across_instances(tmp_path: Path) -> None:
-    """Full run→check→kill lifecycle across separate toolkit instances."""
-    tool_run = _get_toolkit(tmp_path)
-    run_fn = tool_run.async_functions["run_shell_command"].entrypoint
-    assert run_fn is not None
+async def test_a_shell_call_reports_its_output_as_its_progress(tmp_path: Path) -> None:
+    """A shell call's output tail reaches whoever owns the call, such as its job, while the command runs."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    reports: list[str] = []
 
-    result = await run_fn(["bash", "-c", "for i in 1 2 3; do echo line-$i; done; sleep 300"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
+    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+        result = await entrypoint(["bash", "-c", "echo building; sleep 0.5; echo built"])
 
-    # Check from a fresh instance
-    tool_check = _get_toolkit(tmp_path)
-    check_fn = tool_check.functions["check_shell_command"].entrypoint
-    assert check_fn is not None
-    for _ in range(50):
-        status = check_fn(handle)
-        if "line-" in status:
-            break
-        await asyncio.sleep(0.02)
-    assert "RUNNING" in status
-    assert "line-" in status
-
-    # Kill from yet another fresh instance
-    tool_kill = _get_toolkit(tmp_path)
-    kill_fn = tool_kill.functions["kill_shell_command"].entrypoint
-    assert kill_fn is not None
-    kill_fn(handle, force=True)
-
-    for _ in range(30):
-        tool_final = _get_toolkit(tmp_path)
-        final_check = tool_final.functions["check_shell_command"].entrypoint
-        assert final_check is not None
-        status = final_check(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.02)
-
-    assert "FINISHED" in status
+    assert result == "building\nbuilt"
+    assert reports[0] == "building"
 
 
 @pytest.mark.asyncio
-async def test_handle_isolation_blocks_cross_runtime_access(tmp_path: Path) -> None:
-    """A handle from one runtime should not be visible to a different runtime root."""
-    runtime_a = tmp_path / "runtime-a"
-    runtime_b = tmp_path / "runtime-b"
-    runtime_a.mkdir()
-    runtime_b.mkdir()
+async def test_a_progress_meter_reports_only_its_latest_state(tmp_path: Path) -> None:
+    """A line a command redraws with carriage returns, such as a download meter, reports only what it shows last."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    reports: list[str] = []
+    command = "printf 'fetching\\n10%%\\r50%%\\r100%%'; timeout 0.5 tail -f /dev/null; echo"
 
-    tool_a = _get_toolkit(runtime_a)
-    tool_b = _get_toolkit(runtime_b)
-    run_a = tool_a.async_functions["run_shell_command"].entrypoint
-    check_b = tool_b.functions["check_shell_command"].entrypoint
-    kill_b = tool_b.functions["kill_shell_command"].entrypoint
-    kill_a = tool_a.functions["kill_shell_command"].entrypoint
-    assert run_a is not None
-    assert check_b is not None
-    assert kill_b is not None
-    assert kill_a is not None
+    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+        await entrypoint(["bash", "-c", command])
 
-    result = await run_a(["sleep", "300"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
+    assert reports[0] == "fetching\n100%"
 
+
+@pytest.mark.asyncio
+async def test_a_running_commands_output_is_reported_whole(tmp_path: Path) -> None:
+    """A private key longer than the shown output is reported from its first line, so the shown output masks it."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    reports: list[str] = []
+    key_lines = " ".join(f"'MIIE{index:02d}{'A' * 56}'" for index in range(25))
+    command = (
+        f"printf '%s\\n' provisioning '-----BEGIN PRIVATE KEY-----' {key_lines} '-----END PRIVATE KEY-----' waiting; "
+        "timeout 0.5 tail -f /dev/null; echo done"
+    )
+
+    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0.1), tool_progress_reporter(reports.append):
+        await entrypoint(["bash", "-c", command])
+
+    assert reports[0].startswith("provisioning\n-----BEGIN PRIVATE KEY-----")
+    assert reports[0].endswith("waiting")
+    assert "A" * 56 not in shown_progress(reports[0])
+
+
+def test_the_stream_that_printed_last_ends_the_report() -> None:
+    """Warnings on stderr do not hide a build's newer progress on stdout, which the live view shows as the tail."""
+    reports: list[str] = []
+    stdout, stderr = _OutputBuffer(), _OutputBuffer()
+
+    with patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0):
+        progress = _OutputProgress(reports.append, stdout, stderr)
+        stderr.append("".join(f"warning: unused variable {index}\n" for index in range(80)))
+        stdout.append("step 1/2\n")
+        progress.poll()
+        stderr.append("error: link failed\n")
+        progress.poll()
+
+    assert reports[0].endswith("step 1/2")
+    assert reports[0].startswith("Stderr:\nwarning: unused variable 0")
+    assert reports[1].endswith("error: link failed")
+
+
+def test_a_quiet_commands_unchanged_output_is_not_read_again() -> None:
+    """A command that prints nothing new, such as a dev server waiting for requests, costs its progress checks nothing."""
+    reports: list[str] = []
+    stdout, stderr = _OutputBuffer(), _OutputBuffer()
+    stdout.append("listening on :8000\n")
+
+    with (
+        patch("mindroom.shell.execution._PROGRESS_INTERVAL_SECONDS", 0),
+        patch("mindroom.shell.execution._progress_lines", wraps=_progress_lines) as read,
+    ):
+        progress = _OutputProgress(reports.append, stdout, stderr)
+        for _ in range(5):
+            progress.poll()
+
+    assert reports == ["listening on :8000"]
+    assert read.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_command_never_reads_the_terminal_mindroom_runs_in(tmp_path: Path) -> None:
+    """A command that reads stdin sees end of input instead of waiting on the primary's own stdin."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    # A silent pipe stands in for the terminal a foreground `mindroom run` reads from.
+    read_end, write_end = os.pipe()
+    saved_stdin = os.dup(0)
+    os.dup2(read_end, 0)
     try:
-        check_result = check_b(handle)
-        assert "Unknown handle" in check_result
-
-        kill_result = kill_b(handle, force=True)
-        assert "Unknown handle" in kill_result
+        result = await entrypoint("read -r line; echo read:$?", timeout=5)
     finally:
-        kill_a(handle, force=True)
-        await asyncio.sleep(0.1)
+        os.dup2(saved_stdin, 0)
+        for fd in (saved_stdin, read_end, write_end):
+            os.close(fd)
 
-
-# ---------------------------------------------------------------------------
-# _MAX_BACKGROUNDED limit
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_max_backgrounded_limit(tmp_path: Path) -> None:
-    """Exceeding _MAX_BACKGROUNDED should return an error and kill the excess process."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    assert run_fn is not None
-
-    handles: list[str] = []
-
-    # Patch to a small limit
-    with patch("mindroom.shell_execution._MAX_BACKGROUNDED", 2):
-        # Fill up to the limit
-        for _ in range(2):
-            result = await run_fn(["sleep", "300"], timeout=0)
-            assert "Handle:" in result
-            handles.append(result.split("Handle: ")[1].split("\n")[0])
-
-        # Third one should fail
-        result = await run_fn(["sleep", "300"], timeout=0)
-        assert "Too many backgrounded processes" in result
-
-    # Clean up
-    kill_fn = tool.functions["kill_shell_command"].entrypoint
-    for h in handles:
-        kill_fn(h, force=True)
-    await asyncio.sleep(0.1)
-
-
-# ---------------------------------------------------------------------------
-# Long-running command retention (finished_at not started_at)
-# ---------------------------------------------------------------------------
+    assert result == "read:1"
 
 
 @pytest.mark.asyncio
-async def test_long_running_command_not_swept_on_finish(tmp_path: Path) -> None:
-    """A command that ran for >10min should not be swept immediately on finish."""
-    tool = _get_toolkit(tmp_path)
-    run_fn = tool.async_functions["run_shell_command"].entrypoint
-    check_fn = tool.functions["check_shell_command"].entrypoint
-    assert run_fn is not None
-    assert check_fn is not None
+@pytest.mark.parametrize("seconds", [0, -5])
+async def test_a_timeout_that_is_not_positive_is_rejected_before_the_command_runs(tmp_path: Path, seconds: int) -> None:
+    """A zero or negative timeout would stop the command at once, so the call explains the argument instead."""
+    entrypoint = _get_run_shell_command_function(_get_toolkit(tmp_path)).entrypoint
+    marker = tmp_path / "ran"
 
-    # Force backgrounding with timeout=0
-    result = await run_fn(["bash", "-c", "echo long-output; sleep 0.2"], timeout=0)
-    assert "Handle:" in result
-    handle = result.split("Handle: ")[1].split("\n")[0]
+    result = await entrypoint(["touch", str(marker)], timeout=seconds)
 
-    # Wait for finish
-    for _ in range(30):
-        status = check_fn(handle)
-        if "FINISHED" in status:
-            break
-        await asyncio.sleep(0.1)
-    assert "FINISHED" in status
-
-    # Simulate a process that started 15 minutes ago (longer than _STALE_RECORD_SECONDS)
-    record = _process_registry[handle]
-    record.started_at = time.monotonic() - 900
-
-    # Trigger sweep — record should survive because finished_at is recent
-    await run_fn(["echo", "trigger"])
-    assert handle in _process_registry
-    assert "long-output" in check_fn(handle)
+    assert result == "Error: timeout must be a positive number of seconds; omit it for the default limit."
+    assert not marker.exists()

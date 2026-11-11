@@ -11,11 +11,14 @@ from typing import TYPE_CHECKING, cast
 
 from mindroom.logging_config import get_logger
 from mindroom.timing import elapsed_ms_since
+from mindroom.tool_system.tool_environment import ToolEnvironment
 
 from .context import (
     AgentLifecycleContext,
     BeforeResponseContext,
+    CallHookContext,
     CompactionHookContext,
+    ContactBeforeSendContext,
     CustomEventContext,
     FinalResponseDraft,
     FinalResponseTransformContext,
@@ -31,13 +34,18 @@ from .context import (
     SystemEnrichContext,
     ToolAfterCallContext,
     ToolBeforeCallContext,
+    ToolEnvironmentContext,
     message_envelope_for_hook_context,
 )
-from .types import EVENT_MESSAGE_RECEIVED, EnrichmentItem, RegisteredHook, default_timeout_ms_for_event
+from .types import (
+    EVENT_MESSAGE_RECEIVED,
+    EVENT_TOOL_ENVIRONMENT,
+    EnrichmentItem,
+    RegisteredHook,
+    default_timeout_ms_for_event,
+)
 
 if TYPE_CHECKING:
-    from agno.models.message import Message
-
     from .registry import HookRegistry
 
 logger = get_logger(__name__)
@@ -46,7 +54,6 @@ _COLLECT_CONCURRENCY_LIMIT = 10
 _MAX_EMIT_DEPTH = 3
 _EMIT_DEPTH: ContextVar[int] = ContextVar("mindroom_hook_emit_depth", default=0)
 
-type _HookExecutionContext = HookContext | ToolBeforeCallContext | ToolAfterCallContext
 type _TransformContext = BeforeResponseContext | FinalResponseTransformContext
 type _TransformDraft = ResponseDraft | FinalResponseDraft
 
@@ -57,16 +64,14 @@ class _HookInvocationResult:
     value: object | None = None
 
 
-def _scope_agent_name(context: _HookExecutionContext) -> str | None:
+def _scope_agent_name(context: HookContext) -> str | None:
     agent_name: str | None = None
-    if isinstance(context, ToolBeforeCallContext | ToolAfterCallContext):
+    if isinstance(context, CallHookContext):
         agent_name = context.agent_name
     else:
         envelope = message_envelope_for_hook_context(context)
         if envelope is not None:
             agent_name = envelope.agent_name
-        elif isinstance(context, MessageEnrichContext | SystemEnrichContext):
-            agent_name = context.target_entity_name
         elif isinstance(context, AgentLifecycleContext):
             agent_name = context.entity_name
         elif isinstance(
@@ -77,29 +82,30 @@ def _scope_agent_name(context: _HookExecutionContext) -> str | None:
     return agent_name
 
 
-def _scope_room_ids(context: _HookExecutionContext) -> tuple[str, ...]:  # noqa: PLR0911
-    if isinstance(context, ToolBeforeCallContext | ToolAfterCallContext):
+def _scope_room_ids(context: HookContext) -> tuple[str, ...]:
+    if isinstance(context, CallHookContext):
         return (context.room_id,) if context.room_id else ()
     envelope = message_envelope_for_hook_context(context)
     if envelope is not None:
         return (envelope.room_id,)
     if isinstance(
         context,
-        ScheduleFiredContext | ReactionReceivedContext | RoomMemberJoinedContext | RoomMemberLeftContext,
+        ScheduleFiredContext
+        | ReactionReceivedContext
+        | RoomMemberJoinedContext
+        | RoomMemberLeftContext
+        | CompactionHookContext
+        | SessionHookContext,
     ):
         return (context.room_id,)
     if isinstance(context, AgentLifecycleContext):
         return context.rooms
-    if isinstance(context, CompactionHookContext):
-        return (context.room_id,)
-    if isinstance(context, SessionHookContext):
-        return (context.room_id,)
     if isinstance(context, CustomEventContext) and context.room_id:
         return (context.room_id,)
     return ()
 
 
-def _hook_in_scope(hook: RegisteredHook, context: _HookExecutionContext) -> bool:
+def _hook_in_scope(hook: RegisteredHook, context: HookContext) -> bool:
     if hook.agents is not None:
         agent_name = _scope_agent_name(context)
         if agent_name is None or agent_name not in hook.agents:
@@ -142,52 +148,31 @@ def _snapshot_tool_observer_error(error: BaseException | None) -> BaseException 
     return copied if isinstance(copied, BaseException) else Exception(str(error))
 
 
-def _snapshot_compaction_messages(messages: list[Message]) -> list[Message] | None:
-    """Return one best-effort isolated snapshot of compaction messages."""
-    try:
-        return deepcopy(messages)
-    except Exception as deepcopy_error:
-        try:
-            return [message.model_copy(deep=True) for message in messages]
-        except Exception as model_copy_error:
-            logger.warning(
-                "Skipping compaction hooks after snapshot copy failures",
-                deepcopy_error=repr(deepcopy_error),
-                model_copy_error=repr(model_copy_error),
-                message_count=len(messages),
-            )
-            return None
-
-
 def _bind_hook_context(
     registry: HookRegistry,
     hook: RegisteredHook,
-    context: _HookExecutionContext,
-) -> _HookExecutionContext | None:
+    context: HookContext,
+) -> HookContext:
+    """Return the copy of ``context`` one hook receives, under that hook's plugin name, settings, and logger."""
     replacement_kwargs: dict[str, object] = {
         "plugin_name": hook.plugin_name,
-        "settings": dict(hook.settings),
+        "settings": deepcopy(hook.settings),
         "logger": _context_logger(hook),
         "_hook_registry_snapshot": registry,
     }
-    if isinstance(context, ToolBeforeCallContext | ToolAfterCallContext):
+    if isinstance(context, ToolBeforeCallContext | ToolAfterCallContext | ToolEnvironmentContext):
         replacement_kwargs["arguments"] = deepcopy(context.arguments)
     if isinstance(context, ToolAfterCallContext):
         replacement_kwargs["result"] = _snapshot_tool_observer_value(context.result)
         replacement_kwargs["error"] = _snapshot_tool_observer_error(context.error)
-    if isinstance(context, CompactionHookContext):
-        messages_snapshot = _snapshot_compaction_messages(context.messages)
-        if messages_snapshot is None:
-            return None
-        replacement_kwargs["messages"] = messages_snapshot
     if isinstance(context, MessageEnrichContext | SystemEnrichContext):
         replacement_kwargs["_items"] = []
     return replace(context, **replacement_kwargs)
 
 
 def _merge_observer_context_changes(
-    context: _HookExecutionContext,
-    hook_context: _HookExecutionContext,
+    context: HookContext,
+    hook_context: HookContext,
 ) -> None:
     """Propagate mutable observer fields back to the caller-visible context."""
     if isinstance(context, ToolBeforeCallContext) and isinstance(hook_context, ToolBeforeCallContext):
@@ -204,7 +189,7 @@ def _effective_timeout_ms(hook: RegisteredHook) -> int:
     return hook.timeout_ms if hook.timeout_ms is not None else default_timeout_ms_for_event(hook.event_name)
 
 
-async def _invoke_hook(hook: RegisteredHook, context: _HookExecutionContext) -> _HookInvocationResult:
+async def _invoke_hook(hook: RegisteredHook, context: HookContext) -> _HookInvocationResult:
     timeout_seconds = _effective_timeout_ms(hook) / 1000
     started_at = time.monotonic()
     try:
@@ -237,7 +222,7 @@ async def _invoke_hook(hook: RegisteredHook, context: _HookExecutionContext) -> 
 def _eligible_hooks(
     registry: HookRegistry,
     event_name: str,
-    context: _HookExecutionContext,
+    context: HookContext,
 ) -> tuple[RegisteredHook, ...]:
     hooks = registry.hooks_for(event_name)
     if not hooks:
@@ -260,7 +245,7 @@ def _eligible_hooks(
 async def emit(
     registry: HookRegistry,
     event_name: str,
-    context: _HookExecutionContext,
+    context: HookContext,
     *,
     continue_on_cancelled: bool = False,
 ) -> None:
@@ -279,8 +264,6 @@ async def emit(
     try:
         for hook in _eligible_hooks(registry, event_name, context):
             hook_context = _bind_hook_context(registry, hook, context)
-            if hook_context is None:
-                return
             try:
                 await _invoke_hook(hook, hook_context)
             except asyncio.CancelledError:
@@ -319,14 +302,54 @@ async def emit_gate(
                 "ToolBeforeCallContext",
                 _bind_hook_context(registry, hook, context),
             )
-            if hook_context is None:
-                return
             invocation = await _invoke_hook(hook, hook_context)
             if not invocation.succeeded:
                 continue
             context.declined = hook_context.declined
             context.decline_reason = hook_context.decline_reason
             if context.declined:
+                return
+    finally:
+        _EMIT_DEPTH.reset(token)
+
+
+async def emit_policy(
+    registry: HookRegistry,
+    event_name: str,
+    context: ContactBeforeSendContext,
+) -> None:
+    """Run policy hooks serially in priority order, failing closed.
+
+    After each hook ``context`` takes its ``text``, ``verdict``, and ``feedback``, and the first verdict other than
+    ``send`` stops the chain.
+    A hook that fails or times out denies the send, as does a policy run nested too deeply.
+    """
+    depth = _EMIT_DEPTH.get()
+    if depth >= _MAX_EMIT_DEPTH:
+        logger.warning(
+            "Denying contact policy emission after recursion limit",
+            event_name=event_name,
+            correlation_id=context.correlation_id,
+            max_depth=_MAX_EMIT_DEPTH,
+        )
+        context.deny("Contact policy hooks nested too deeply.")
+        return
+
+    token = _EMIT_DEPTH.set(depth + 1)
+    try:
+        for hook in _eligible_hooks(registry, event_name, context):
+            hook_context = cast(
+                "ContactBeforeSendContext",
+                _bind_hook_context(registry, hook, context),
+            )
+            invocation = await _invoke_hook(hook, hook_context)
+            if not invocation.succeeded:
+                context.deny("A contact policy hook failed.")
+                return
+            context.text = hook_context.text
+            context.verdict = hook_context.verdict
+            context.feedback = hook_context.feedback
+            if context.verdict != "send":
                 return
     finally:
         _EMIT_DEPTH.reset(token)
@@ -345,32 +368,52 @@ def _normalize_collector_result(
     return items
 
 
-async def emit_collect(
+async def _collect[C: HookContext](
     registry: HookRegistry,
     event_name: str,
-    context: MessageEnrichContext | SystemEnrichContext,
-) -> list[EnrichmentItem]:
-    """Run collector hooks concurrently and return merged enrichment items."""
+    context: C,
+) -> list[tuple[C, object | None]]:
+    """Run collector hooks concurrently; return each finished hook's own context and return value, in hook order."""
     hooks = _eligible_hooks(registry, event_name, context)
     if not hooks:
         return []
 
     semaphore = asyncio.Semaphore(_COLLECT_CONCURRENCY_LIMIT)
 
-    async def run_hook(hook: RegisteredHook) -> list[EnrichmentItem]:
+    async def run_hook(hook: RegisteredHook) -> tuple[C, object | None] | None:
         async with semaphore:
-            hook_context = cast(
-                "MessageEnrichContext | SystemEnrichContext",
-                _bind_hook_context(registry, hook, context),
-            )
+            hook_context = cast("C", _bind_hook_context(registry, hook, context))
             invocation = await _invoke_hook(hook, hook_context)
-            return _normalize_collector_result(invocation.value, hook_context)
+            return (hook_context, invocation.value) if invocation.succeeded else None
 
     results = await asyncio.gather(*(run_hook(hook) for hook in hooks))
-    merged: list[EnrichmentItem] = []
-    for hook_items in results:
-        merged.extend(hook_items)
-    return merged
+    return [result for result in results if result is not None]
+
+
+async def emit_collect(
+    registry: HookRegistry,
+    event_name: str,
+    context: MessageEnrichContext | SystemEnrichContext,
+) -> list[EnrichmentItem]:
+    """Run collector hooks concurrently and return merged enrichment items."""
+    return [
+        item
+        for hook_context, result in await _collect(registry, event_name, context)
+        for item in _normalize_collector_result(result, hook_context)
+    ]
+
+
+async def emit_collect_environment(registry: HookRegistry, context: ToolEnvironmentContext) -> ToolEnvironment:
+    """Run tool:environment hooks concurrently and return their changes, a later hook's over an earlier one's.
+
+    The first hook in hook order that declines the call marks ``context`` declined with its reason.
+    """
+    environment = ToolEnvironment()
+    for hook_context, _result in await _collect(registry, EVENT_TOOL_ENVIRONMENT, context):
+        environment = environment.then(hook_context._environment)
+        if hook_context.declined and not context.declined:
+            context.decline(hook_context.decline_reason)
+    return environment
 
 
 async def emit_transform(
@@ -411,14 +454,6 @@ async def emit_final_response_transform(
     )
 
 
-def _copy_transform_draft(draft: _TransformDraft) -> _TransformDraft:
-    return deepcopy(draft)
-
-
-def _transform_context_with_draft(context: _TransformContext, draft: _TransformDraft) -> _TransformContext:
-    return replace(context, draft=draft)
-
-
 def _next_transform_draft(
     current_draft: _TransformDraft,
     hook_context: _TransformContext,
@@ -444,15 +479,8 @@ async def _emit_serial_transform(
 ) -> _TransformDraft:
     current_draft = context.draft
     for hook in _eligible_hooks(registry, event_name, context):
-        hook_draft = _copy_transform_draft(current_draft) if copy_on_write else current_draft
-        bound_context = _bind_hook_context(
-            registry,
-            hook,
-            _transform_context_with_draft(context, hook_draft),
-        )
-        if bound_context is None:
-            return current_draft
-        hook_context = cast("_TransformContext", bound_context)
+        hook_draft = deepcopy(current_draft) if copy_on_write else current_draft
+        hook_context = cast("_TransformContext", _bind_hook_context(registry, hook, replace(context, draft=hook_draft)))
         try:
             invocation = await _invoke_hook(hook, hook_context)
         except asyncio.CancelledError:

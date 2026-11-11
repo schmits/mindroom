@@ -12,14 +12,16 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import nio
 import pytest
 from nio.crypto.attachments import encrypt_attachment
 
 from mindroom.config.main import Config
-from mindroom.event_journal import DepartureSource, EventClass, EventKind
+from mindroom.constants import STREAM_STATUS_COMPLETED, STREAM_STATUS_KEY, STREAM_STATUS_PENDING
+from mindroom.event_journal import DepartureSource, EventClass, EventKind, HydrationPolicy
+from mindroom.event_journal.identity import journal_principal_id
 from mindroom.matrix.conversation_hydration import (
     _MAX_FETCHED_EVENTS,
     _MAX_MESSAGES_REQUESTS,
@@ -28,16 +30,21 @@ from mindroom.matrix.conversation_hydration import (
 )
 from mindroom.matrix.conversation_reads import ConversationReader
 from mindroom.matrix.journal_ingress import _inbound_event, _projected_event
+from mindroom.thread_export import projected_history
 from mindroom.thread_export.projected_history import (
     ProjectedThreadReader,
     ThreadExportIncompleteError,
     export_conversation_reader,
     fetch_projected_thread_history,
 )
+from mindroom.tool_system.events import ToolTraceEntry, build_tool_trace_content
+from tests.conftest import TEST_ACCESS_TOKEN, FakeMediaResponse, make_matrix_client_mock, serve_media_download
 from tests.journal_membership_helpers import admit_room_membership
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable
+
+    from nio.api import RelationshipType
 
     from mindroom.event_journal import EventJournalStore, PrincipalStore
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
@@ -48,7 +55,8 @@ ROOM = "!room:example.org"
 ROOT = "$root:example.org"
 ALICE = "@alice:example.org"
 ROUTER = "@mindroom_router:example.org"
-PRINCIPAL = f"router@{ROUTER}"
+HELPER = "@mindroom_helper:example.org"
+PRINCIPAL = journal_principal_id("router", ROUTER)
 SIDECAR_URL = "mxc://example.org/whole-message"
 SIDECAR_TEXT = "the whole long message, all of it, well past any preview"
 THREAD_SUMMARY_KEY = "io.mindroom.thread_summary"
@@ -126,6 +134,9 @@ class FakeHomeserver:
     relation_calls: int = 0
     messages_calls: int = 0
     download_calls: int = 0
+    access_token: str = TEST_ACCESS_TOKEN
+    # No decryption keys: an encrypted event reaches the hydrator unreadable.
+    olm: object | None = None
 
     @property
     def history_calls(self) -> int:
@@ -156,6 +167,7 @@ class FakeHomeserver:
         *,
         room_id: str,
         event_id: str,
+        rel_type: RelationshipType | None = None,
         direction: nio.MessageDirection = nio.MessageDirection.back,
         recurse: bool = False,
         minimum_recursion_depth: int | None = None,
@@ -163,12 +175,18 @@ class FakeHomeserver:
         """Yield one event's relations in the order the caller asked for.
 
         Newest first is what the bounded walk rests on, so the fake honours the
-        direction rather than accepting and ignoring it.
+        direction rather than accepting and ignoring it. A relation type asks
+        for the event's direct relations of that type only.
         """
         del room_id, recurse, minimum_recursion_depth
         self.relation_calls += 1
+        direct = None if rel_type is None else {"rel_type": rel_type.value, "event_id": event_id}
         sources = sorted(
-            self.relations.get(event_id, []),
+            (
+                source
+                for source in self.relations.get(event_id, [])
+                if direct is None or source["content"].get("m.relates_to") == direct
+            ),
             key=lambda source: (source["origin_server_ts"], source["event_id"]),
             reverse=direction is nio.MessageDirection.back,
         )
@@ -188,6 +206,10 @@ class FakeHomeserver:
         if payload is None:
             return nio.DownloadError("M_NOT_FOUND")
         return nio.DownloadResponse(payload.encode(), "application/json", None)
+
+    async def send(self, _method: str, path: str, *_args: object, **_kwargs: object) -> FakeMediaResponse:
+        """Serve the streamed media requests sidecar resolution sends."""
+        return await serve_media_download(self.download, path)
 
 
 @pytest.fixture
@@ -296,9 +318,10 @@ async def test_a_cold_thread_hydrates_once_and_then_costs_no_history_calls(
     cold = await export(reader)
 
     assert bodies(cold) == ["root", "first", "second"]
-    # One fetch of the root and one walk of its relation tree: no `/messages`
-    # scan of the room, and no per-message refetch.
-    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 1)
+    # One fetch of the root, one walk of its relation tree, and one request
+    # asking how deep a walk holding no edit went: no `/messages` scan of the
+    # room, and no per-message refetch.
+    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 2)
     assert (homeserver.messages_calls, homeserver.download_calls) == (0, 0)
 
     homeserver.reset_counts()
@@ -346,7 +369,7 @@ async def test_live_sync_rows_alone_do_not_count_as_a_built_conversation(
 
     await export(reader)
 
-    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 1)
+    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 2)
 
     homeserver.reset_counts()
     await export(reader)
@@ -376,7 +399,7 @@ async def test_a_thread_longer_than_one_page_exports_in_order_with_one_root(
     assert event_ids(messages)[0] == ROOT
     # Paging must not re-hydrate: the walk happens once for the conversation,
     # not once per page.
-    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 1)
+    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 2)
 
 
 async def test_an_edited_message_exports_its_current_revision(router: PrincipalStore) -> None:
@@ -401,6 +424,71 @@ async def test_an_edited_message_exports_its_current_revision(router: PrincipalS
     # The ordering key stays the original's; the edit's own time is separate.
     assert edited.timestamp == 200
     assert edited.edited_timestamp == 500
+
+
+def streamed_reply(event_id: str, *, ts: int) -> dict[str, Any]:
+    """Return an agent reply still showing its streaming placeholder."""
+    return raw(
+        event_id,
+        "Thinking...",
+        ts=ts,
+        sender=HELPER,
+        thread_id=ROOT,
+        extra_content={STREAM_STATUS_KEY: STREAM_STATUS_PENDING},
+    )
+
+
+def stream_ending(event_id: str, *, replaces: str, ts: int) -> dict[str, Any]:
+    """Return the edit that ends a streamed reply, its status in the new content."""
+    ending = raw(event_id, "the whole answer", ts=ts, sender=HELPER, replaces=replaces)
+    ending["content"]["m.new_content"][STREAM_STATUS_KEY] = STREAM_STATUS_COMPLETED
+    return ending
+
+
+async def test_a_reply_ending_the_thread_walk_missed_is_exported(router: PrincipalStore) -> None:
+    """A recursive walk that left out how a reply ended still exports the ending, not its placeholder."""
+    homeserver = FakeHomeserver()
+    serve_thread(homeserver, raw(ROOT, "root", ts=100), [streamed_reply("$a:example.org", ts=200)])
+    homeserver.relations["$a:example.org"] = [stream_ending("$a-end:example.org", replaces="$a:example.org", ts=300)]
+
+    messages = await export(reader_for(router, homeserver))
+
+    assert bodies(messages) == ["root", "the whole answer"]
+
+
+async def test_a_thread_an_older_walk_left_mid_stream_exports_the_ending(
+    journal_store: EventJournalStore,
+    router: PrincipalStore,
+) -> None:
+    """A thread an older walk marked whole with a reply at its placeholder is walked again before it is exported.
+
+    Export rewrites a thread's file whenever its bytes change, so the next pass
+    after this read replaces a placeholder already written to disk.
+    """
+    root = raw(ROOT, "root", ts=100)
+    reply = streamed_reply("$a:example.org", ts=200)
+    await router.install_hydrated_conversation(
+        room_id=ROOM,
+        thread_id=ROOT,
+        events=tuple(
+            projected
+            for source in (root, reply)
+            if (projected := _projected_event(ROOM, parse(source), EventKind.MESSAGE, self_sender=ROUTER)) is not None
+        ),
+        complete=True,
+        attempted_policy_rank=HydrationPolicy.EXPORT,
+        expected_membership_epoch=await router.membership_epoch(ROOM),
+    )
+    await journal_store.backend.write(
+        lambda transaction: transaction.execute("UPDATE conversation_hydration SET walk_version = walk_version - 1"),
+    )
+    homeserver = FakeHomeserver()
+    serve_thread(homeserver, root, [reply])
+    homeserver.relations["$a:example.org"] = [stream_ending("$a-end:example.org", replaces="$a:example.org", ts=300)]
+
+    messages = await export(reader_for(router, homeserver))
+
+    assert bodies(messages) == ["root", "the whole answer"]
 
 
 async def test_a_replacement_from_another_sender_is_not_an_edit(router: PrincipalStore) -> None:
@@ -529,7 +617,7 @@ async def test_legacy_file_edit_exports_the_entire_sidecar(
         for source in reversed(homeserver.relations.get(event_id, [])):
             yield nio.Event.parse_event(source)
 
-    client = AsyncMock(spec=nio.AsyncClient)
+    client = make_matrix_client_mock()
     client.room_get_event.side_effect = homeserver.room_get_event
     client.room_get_event_relations = Mock(side_effect=relations)
     client.download.side_effect = homeserver.download
@@ -554,10 +642,10 @@ async def test_legacy_file_edit_exports_the_entire_sidecar(
     client.download.assert_not_awaited()
 
 
-async def test_an_unreadable_sidecar_fails_the_thread_instead_of_exporting_the_preview(
+async def test_an_unreadable_sidecar_exports_its_preview_marked_incomplete(
     router: PrincipalStore,
 ) -> None:
-    """A file that cannot be read leaves the debt owed, and the caller is told."""
+    """A file that cannot be read exports the preview with a notice rather than failing the thread."""
     homeserver = FakeHomeserver()
     serve_thread(
         homeserver,
@@ -573,14 +661,15 @@ async def test_an_unreadable_sidecar_fails_the_thread_instead_of_exporting_the_p
         ],
     )
 
-    with pytest.raises(RuntimeError, match="awaiting a server refetch"):
-        await export(reader_for(router, homeserver))
+    messages = await export(reader_for(router, homeserver))
+
+    assert bodies(messages) == ["root", "the whole long mes…\n\n[The rest of this message could not be loaded.]"]
 
 
 async def test_a_thread_summary_notice_keeps_its_metadata_through_the_export(
     router: PrincipalStore,
 ) -> None:
-    """The summary lives in message content, and the projection round-trips it whole."""
+    """The summary lives in message content, and the export keeps what picks the current summary and nothing else."""
     homeserver = FakeHomeserver()
     serve_thread(
         homeserver,
@@ -594,7 +683,16 @@ async def test_a_thread_summary_notice_keeps_its_metadata_through_the_export(
                 thread_id=ROOT,
                 extra_content={
                     "msgtype": "m.notice",
-                    THREAD_SUMMARY_KEY: {"version": 1, "summary": "Deploy pipeline fix"},
+                    "m.relates_to": {"rel_type": "m.thread", "event_id": ROOT, "m.in_reply_to": {"event_id": ROOT}},
+                    THREAD_SUMMARY_KEY: {
+                        "version": 1,
+                        "summary": "Deploy pipeline fix",
+                        "message_count": 4,
+                        "generated_at": "2026-01-01T00:00:00+00:00",
+                        "model": "manual",
+                        "pinned": True,
+                    },
+                    "formatted_body": "<p>Deploy pipeline fix</p>",
                 },
             ),
         ],
@@ -602,7 +700,70 @@ async def test_a_thread_summary_notice_keeps_its_metadata_through_the_export(
 
     messages = await export(reader_for(router, homeserver))
 
-    assert messages[1].content[THREAD_SUMMARY_KEY] == {"version": 1, "summary": "Deploy pipeline fix"}
+    assert messages[1].content == {
+        "msgtype": "m.notice",
+        "m.relates_to": {"m.in_reply_to": {"event_id": ROOT}},
+        THREAD_SUMMARY_KEY: {
+            "version": 1,
+            "summary": "Deploy pipeline fix",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+            "model": "manual",
+            "pinned": True,
+        },
+    }
+    assert messages[1].reply_to_event_id == ROOT
+
+
+async def test_an_agent_reply_exports_without_tool_display_markers(router: PrincipalStore) -> None:
+    """Agents grep exports with file tools, so a reply keeps its text and loses its display markers."""
+    homeserver = FakeHomeserver()
+    body = "Checked.\n\n🔧 `shell` [1]\n\nAll good."
+    serve_thread(
+        homeserver,
+        raw(ROOT, "root", ts=100),
+        [
+            raw(
+                "$reply:example.org",
+                body,
+                ts=200,
+                sender=ROUTER,
+                thread_id=ROOT,
+                extra_content=build_tool_trace_content([ToolTraceEntry(type="tool_call_completed", tool_name="shell")]),
+            ),
+        ],
+    )
+
+    messages = await export(reader_for(router, homeserver))
+
+    assert "🔧" not in messages[1].body
+    assert messages[1].body.endswith("All good.")
+
+
+@pytest.mark.parametrize("character", ["x", "€"])
+async def test_a_thread_fails_as_too_large_once_it_holds_twice_the_read_cap(
+    router: PrincipalStore,
+    monkeypatch: pytest.MonkeyPatch,
+    character: str,
+) -> None:
+    """Pages of three messages each fit, and a thread past the read cap exports until its UTF-8 content passes twice that."""
+    homeserver = FakeHomeserver()
+    serve_thread(
+        homeserver,
+        raw(ROOT, "root", ts=1_000),
+        [
+            raw(f"$reply-{index:02d}:example.org", character * 1_000, ts=1_000 + index, thread_id=ROOT)
+            for index in range(1, 12)
+        ],
+    )
+    reader = reader_for(router, homeserver)
+    messages = await export(reader, page_messages=3)
+    held = sum(len(json.dumps(message.to_dict(), ensure_ascii=False).encode()) for message in messages)
+
+    monkeypatch.setattr(projected_history, "MAX_READ_BYTES", held * 2 // 3)
+    assert len(await export(reader, page_messages=3)) == 12
+    monkeypatch.setattr(projected_history, "MAX_READ_BYTES", held // 3)
+    with pytest.raises(ThreadExportIncompleteError, match="too large to export"):
+        await export(reader, page_messages=3)
 
 
 async def test_rejoining_the_room_forces_one_fresh_hydration(router: PrincipalStore) -> None:
@@ -625,7 +786,7 @@ async def test_rejoining_the_room_forces_one_fresh_hydration(router: PrincipalSt
     ]
     messages = await export(reader)
 
-    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 1)
+    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 2)
     assert bodies(messages) == ["root", "first", "second"]
 
 
@@ -657,7 +818,7 @@ async def test_one_principals_warm_projection_does_not_serve_another(
     other = journal_store.principal("general@@mindroom_general:example.org")
     await export(reader_for(other, homeserver))
 
-    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 1)
+    assert (homeserver.get_event_calls, homeserver.relation_calls) == (1, 2)
 
 
 async def test_a_thread_hydration_could_not_finish_fails_rather_than_exporting_a_suffix(

@@ -1,0 +1,121 @@
+"""Create an attempt's tool catalog, and bind the response's CLI owner and grant to it once prepared."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import replace
+from typing import TYPE_CHECKING
+
+from mindroom.agent_cli.session import MAX_CLI_GRANT_LIFETIME_NS, cli_turn_owner
+from mindroom.agent_cli.shell_access import agent_cli_shell_env, minimal_shell_problems
+from mindroom.agent_cli.turn import LiveTurnTools
+from mindroom.approval.tool_owners import authorize_prepared_tool_call, check_prepared_catalog_authority
+from mindroom.tool_jobs.execution import agent_tool_middleware
+from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from mindroom.agent_cli.lifetime import CliTurnLifetime
+    from mindroom.agent_loop.build import AgentBuild
+    from mindroom.agent_loop.spec import RunContext
+    from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
+    from mindroom.llm.runs import RunRecord
+    from mindroom.response_turn import ResponseTurnContext
+    from mindroom.run_storage import RunStorage
+    from mindroom.tool_system.agent_tool_calls import PreparedAgentToolBinding
+    from mindroom.tool_system.output_files import ToolOutputFilePolicy
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_access import ToolKey
+
+__all__ = ["bind_response_owner", "tool_catalog"]
+
+
+def tool_catalog(
+    build: AgentBuild,
+    *,
+    run: RunContext,
+    runtime: ToolRuntimeContext,
+    storage: RunStorage,
+    record: RunRecord | None = None,
+) -> PreparedAgentToolCatalog:
+    """Return an empty catalog for ``build``'s tools in run ``run``, under the build's tool-call policy and call limit.
+
+    ``record`` is the stored run an approval recovery continues.
+    In minimal mode the batch checkpoint sets it for a live turn.
+    ``runtime`` must be the build's agent's, since the catalog's generated functions run under it.
+    """
+    if runtime.agent_name != build.spec.id:
+        msg = f"A tool catalog for agent {build.spec.id!r} needs its runtime context, not {runtime.agent_name!r}'s"
+        raise ValueError(msg)
+    return PreparedAgentToolCatalog(
+        run=run,
+        runtime_context=runtime,
+        store=storage.store,
+        middleware=agent_tool_middleware(build),
+        max_tool_calls_per_turn=build.spec.max_tool_calls_per_turn,
+        record=record,
+    )
+
+
+def bind_response_owner(
+    catalog: PreparedAgentToolCatalog,
+    *,
+    lifetime: CliTurnLifetime,
+    response_context: ResponseTurnContext,
+    context_documents: Mapping[str, str],
+    output_file_policy: ToolOutputFilePolicy,
+    delegation_depth: int,
+    refresh_scheduler: KnowledgeRefreshScheduler | None,
+    failure_message: Callable[[str], str],
+) -> LiveTurnTools:
+    """Register the response's owner and grant on its first attempt, or rebind its catalog after a rebuild.
+
+    The owner runs as the catalog's tool runtime, for the catalog's run.
+    """
+    runtime = catalog.runtime_context
+    assert runtime.orchestrator is not None
+    owner = lifetime.owner
+    if owner is not None:
+        owner.bind_catalog(catalog, context=context_documents)
+        return owner
+    # Check that Bash can reach MindRoom before any grant exists.
+    if problems := minimal_shell_problems(runtime.config, runtime.runtime_paths, runtime.agent_name):
+        raise RuntimeError(" ".join(problems))
+    expected_target = runtime.resolve_worker_target()
+    bindings: dict[tuple[int, ToolKey], PreparedAgentToolBinding] = {}
+
+    async def authorize(key: ToolKey, _arguments: dict[str, object]) -> None:
+        current = new_owner.catalog
+        # Before binding, so a refused catalog builds no deferred toolkit; dispatch checks again after the bind's awaits.
+        try:
+            check_prepared_catalog_authority(current.runtime_context)
+        except PermissionError as exc:
+            raise PermissionError(failure_message(str(exc))) from exc
+        cache_key = (id(current), key)
+        binding = bindings.get(cache_key)
+        if binding is None:
+            binding = await current.bind(key)
+            bindings[cache_key] = binding
+        await authorize_prepared_tool_call(binding, expected_worker_target=expected_target)
+
+    new_owner = LiveTurnTools(
+        cli_turn_owner(runtime, replace(response_context, run_id=catalog.run.run_id)),
+        catalog=catalog,
+        authorize=authorize,
+        context=context_documents,
+        output_file_policy=output_file_policy,
+        delegation_depth=delegation_depth,
+        refresh_scheduler=refresh_scheduler,
+    )
+    lifetime.register(new_owner, runtime.orchestrator.agent_cli_registry)
+    now = time.time_ns()
+    lifetime.grant_expires_at_ns = now + MAX_CLI_GRANT_LIFETIME_NS
+    grant = new_owner.issue(now_ns=now, expires_at_ns=lifetime.grant_expires_at_ns)
+    new_owner.shell_env = agent_cli_shell_env(
+        runtime.config,
+        runtime.runtime_paths,
+        runtime.agent_name,
+        grant.raw_token,
+    )
+    return new_owner

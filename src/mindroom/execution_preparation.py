@@ -2,71 +2,97 @@
 
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from agno.models.message import Message
-
-from mindroom import ai_runtime
-from mindroom.attachments import attachment_records_for_visible_message, format_attachment_annotation
+from mindroom.agent_loop.tools import PreparedTools
+from mindroom.attachments.storage import attachment_records_for_visible_message, format_attachment_annotation
+from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
+from mindroom.config.resolution import entity_timezone
 from mindroom.constants import (
     COMPACTION_NOTICE_CONTENT_KEY,
     ORIGINAL_SENDER_KEY,
+    SKILL_REVIEW_NOTICE_CONTENT_KEY,
+    SOURCE_KIND_KEY,
     STREAM_STATUS_CANCELLED,
     STREAM_STATUS_COMPLETED,
     STREAM_STATUS_ERROR,
     STREAM_STATUS_INTERRUPTED,
     STREAM_STATUS_PENDING,
     STREAM_STATUS_STREAMING,
-    TOOL_TRACE_CONTENT_KEY,
+    THREAD_SUMMARY_CONTENT_KEY,
+    UI_ACTION_CONTENT_KEY,
     RuntimePaths,
 )
-from mindroom.entity_resolution import entity_identity_registry
-from mindroom.history.policy import context_budget_after_reserve
-from mindroom.history.prompt_tokens import agent_static_token_estimator, team_static_token_estimator
+from mindroom.dispatch_source import hook_source_from_content
+from mindroom.entity_resolution import current_internal_sender_ids, entity_identity_registry
+from mindroom.history.conversation_text import thread_context_note
+from mindroom.history.request_messages import TurnMessages, with_media
+from mindroom.history.request_size import RequestFrame, request_sizer
 from mindroom.history.runtime import (
     PreparedScopeHistory,
-    ScopeSessionContext,
-    apply_replay_plan,
     finalize_history_preparation,
-    prepare_bound_scope_history,
     prepare_scope_history,
-    resolve_agent_preparation_inputs,
+    resolve_entity_preparation_inputs,
 )
 from mindroom.history.storage import read_scope_seen_event_ids
 from mindroom.history.types import ResolvedReplayPlan
+from mindroom.llm.messages import Message
+from mindroom.llm.provider import ModelRequest
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_visible_messages import replace_visible_message
+from mindroom.media_inputs import MediaInputs
 from mindroom.prompt_message_tags import render_msg_tag
-from mindroom.streaming import clean_partial_reply_text, is_interrupted_partial_reply, strip_visible_tool_markers
+from mindroom.streaming import (
+    PROGRESS_PLACEHOLDER,
+    TEAM_PROGRESS_PLACEHOLDER,
+    clean_partial_reply_text,
+    is_interrupted_partial_reply,
+)
 from mindroom.timestamp_formatting import format_timestamp_ms
 from mindroom.timing import timed
+from mindroom.tool_jobs.execution import offered_definitions
+from mindroom.tool_system.events import has_tool_trace, strip_visible_tool_markers
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+    from collections.abc import Callable, Collection, Mapping, Sequence
     from pathlib import Path
 
-    from agno.agent import Agent
-    from agno.team import Team
-
-    from mindroom.attachments import AttachmentRecord
-    from mindroom.config.main import Config, ResolvedRuntimeModel
-    from mindroom.history.types import CompactionLifecycle, PreparedHistoryState
+    from mindroom.agent_loop.build import AgentBuild
+    from mindroom.attachments.storage import AttachmentRecord
+    from mindroom.config.main import Config
+    from mindroom.history.request_size import RequestSizer
+    from mindroom.history.runtime import HistoryPreparationInputs
+    from mindroom.history.session_context import ScopeSessionContext
+    from mindroom.history.types import CompactionLifecycle, PreparedHistoryState, ResolvedHistorySettings
+    from mindroom.llm.provider import ModelProvider, ToolSpec
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
     from mindroom.response_turn import ResponseTurnContext
     from mindroom.timing import DispatchPipelineTiming
+    from mindroom.turn_model import TurnModel
 
 logger = get_logger(__name__)
 
 _NO_MEMBER_DISPLAY_NAMES: Mapping[str, str] = MappingProxyType({})
 
-_PARTIAL_REPLY_SENDER_LABELS = {
-    "interrupted": "You (interrupted reply draft)",
-    "in_progress": "You (reply still streaming)",
-}
-_PARTIAL_REPLY_GUIDANCE_LABELS = frozenset({*_PARTIAL_REPLY_SENDER_LABELS.values(), "You (partial reply)"})
+_IN_PROGRESS_REPLY_LABEL = "You (reply still streaming)"
+_HOOK_OUTPUT_LABEL = "[posted automatically by hook {hook_source}, not written by you or any agent]"
+# Claims about who wrote a message; only MindRoom's own accounts may make them.
+_AUTHORSHIP_CLAIM_KEYS = (ORIGINAL_SENDER_KEY, SOURCE_KIND_KEY)
+# Notices that are not turns: lifecycle notices describe the runtime, a Chat UI request is a tool
+# call's fallback text for other clients (answers and error reports name the canvas themselves),
+# and a thread summary is the thread's title.
+_NON_TURN_NOTICE_CONTENT_KEYS = (
+    COMPACTION_NOTICE_CONTENT_KEY,
+    SKILL_REVIEW_NOTICE_CONTENT_KEY,
+    UI_ACTION_CONTENT_KEY,
+    THREAD_SUMMARY_CONTENT_KEY,
+)
 
 
 class _PartialReplyKind(str, Enum):
@@ -80,19 +106,9 @@ class _PartialReplyKind(str, Enum):
 class _PreparedExecutionContext:
     """Final request-scoped input planning result."""
 
-    messages: tuple[Message, ...]
+    turn: TurnMessages
     unseen_event_ids: list[str]
     prepared_history: PreparedHistoryState
-
-    @property
-    def final_prompt(self) -> str:
-        """Return the prompt-visible text derived from the canonical message input."""
-        return render_prepared_messages_text(self.messages)
-
-    @property
-    def context_messages(self) -> tuple[Message, ...]:
-        """Return replayed context messages without the current user turn."""
-        return tuple(message for message in self.messages[:-1] if message.add_to_agent_memory)
 
     @property
     def replay_plan(self) -> ResolvedReplayPlan | None:
@@ -120,41 +136,13 @@ class _ThreadAttachmentContext:
         return attachment_records_for_visible_message(self.storage_path, message, room_id=self.room_id)
 
 
-def _build_matrix_prompt_with_history(
-    prompt: str,
-    history_messages: list[tuple[str, str]],
-    *,
-    header: str,
-    prompt_intro: str,
-    current_sender: str | None,
-    current_ts: str | None = None,
-    current_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
-    current_display_name: str | None = None,
-) -> str:
-    if current_sender is not None and not current_prompt_is_structured:
-        current_block = render_msg_tag(
-            sender=current_sender,
-            body=prompt,
-            event_id=current_event_id,
-            ts=current_ts,
-            display_name=current_display_name,
-        )
-    else:
-        current_block = prompt
-    standalone_prompt = f"{prompt_intro}{current_block}" if current_sender is not None else prompt
-    if not history_messages:
-        return standalone_prompt
-    rendered_history = "\n".join(render_msg_tag(sender=sender, body=body) for sender, body in history_messages)
-    return f"{header}\n<conversation>\n{rendered_history}\n</conversation>\n\n{prompt_intro}{current_block}"
-
-
 def _classify_partial_reply(
     msg: ResolvedVisibleMessage,
     *,
     active_event_ids: Collection[str],
 ) -> _PartialReplyKind | None:
     """Classify a self-authored partial reply from persisted stream metadata first."""
+    # LEGACY_COMPAT: Body-only terminal suffixes when structured stream status is absent.
     # Legacy format: mindroom.legacy_streaming owns body-only terminal suffix parsing without stream_status.
     # Last legacy release: v2026.3.121; replacement: v2026.3.122 wrote structured stream status.
     # Handling: Structured status wins; consult body markers only when status is absent or unrecognized.
@@ -162,54 +150,51 @@ def _classify_partial_reply(
     status = msg.stream_status
     if status == STREAM_STATUS_COMPLETED:
         return None
-
-    partial_kind: _PartialReplyKind | None = None
     if status in {STREAM_STATUS_CANCELLED, STREAM_STATUS_ERROR, STREAM_STATUS_INTERRUPTED}:
-        partial_kind = _PartialReplyKind.INTERRUPTED
-    elif status in {STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING}:
-        event_id = msg.event_id
-        if isinstance(event_id, str):
-            return _PartialReplyKind.IN_PROGRESS if event_id in active_event_ids else _PartialReplyKind.INTERRUPTED
-        partial_kind = _PartialReplyKind.IN_PROGRESS
-    else:
-        body = msg.body
-        if is_interrupted_partial_reply(body):
-            partial_kind = _PartialReplyKind.INTERRUPTED
-
-    return partial_kind
+        return _PartialReplyKind.INTERRUPTED
+    if status in {STREAM_STATUS_PENDING, STREAM_STATUS_STREAMING}:
+        return _PartialReplyKind.IN_PROGRESS if msg.event_id in active_event_ids else _PartialReplyKind.INTERRUPTED
+    return _PartialReplyKind.INTERRUPTED if is_interrupted_partial_reply(msg.body) else None
 
 
-def _clean_partial_reply_body(body: str) -> str:
-    """Strip live status notes before the canonical interrupted replay marker is added."""
-    return clean_partial_reply_text(body)
+def _has_authorship_claim(message: ResolvedVisibleMessage) -> bool:
+    return any(key in message.content for key in _AUTHORSHIP_CLAIM_KEYS)
 
 
-def _message_speaker_label(message: ResolvedVisibleMessage) -> str:
-    """Return the speaker label that should be shown for one visible Matrix message."""
+def _without_untrusted_authorship_claims(
+    thread_history: Sequence[ResolvedVisibleMessage] | None,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> Sequence[ResolvedVisibleMessage] | None:
+    """Drop relay or hook claims that a sender outside MindRoom wrote, so the prompt names each message's real author."""
+    if not thread_history or not any(_has_authorship_claim(message) for message in thread_history):
+        return thread_history
+    internal_sender_ids = current_internal_sender_ids(config, runtime_paths)
+    return [
+        message
+        if message.sender in internal_sender_ids or not _has_authorship_claim(message)
+        else replace(message, content={k: v for k, v in message.content.items() if k not in _AUTHORSHIP_CLAIM_KEYS})
+        for message in thread_history
+    ]
+
+
+def _relayed_sender(message: ResolvedVisibleMessage) -> str | None:
+    """Return the user whose message an internal Matrix sender relayed, or None for a message its sender wrote."""
     original_sender = message.content.get(ORIGINAL_SENDER_KEY)
-    if isinstance(original_sender, str) and original_sender:
-        return original_sender
-    return message.sender
+    return original_sender if isinstance(original_sender, str) and original_sender else None
 
 
-def _is_relayed_user_message(message: ResolvedVisibleMessage) -> bool:
-    """Return whether an internal Matrix sender is relaying a user-authored message."""
-    original_sender = message.content.get(ORIGINAL_SENDER_KEY)
-    return isinstance(original_sender, str) and bool(original_sender)
+def _is_own_reply(message: ResolvedVisibleMessage, response_sender_id: str | None) -> bool:
+    """Return whether this agent wrote one visible message.
 
-
-def _should_strip_visible_tool_markers(
-    message: ResolvedVisibleMessage,
-    *,
-    response_sender_id: str | None,
-) -> bool:
-    """Return whether visible marker lines are known MindRoom display chrome."""
-    if isinstance(message.content.get(TOOL_TRACE_CONTENT_KEY), dict):
-        return True
+    Relayed user messages and hook output also arrive from the agent's account, but the agent wrote neither.
+    Replaying hook progress as assistant turns taught the model to write fake progress lines itself.
+    """
     return (
-        response_sender_id is not None
+        bool(response_sender_id)
         and message.sender == response_sender_id
-        and not _is_relayed_user_message(message)
+        and _relayed_sender(message) is None
+        and hook_source_from_content(message.content) is None
     )
 
 
@@ -218,8 +203,11 @@ def _context_body_from_visible_message(
     *,
     response_sender_id: str | None,
 ) -> str:
-    """Return the model-facing body for one visible Matrix message."""
-    if _should_strip_visible_tool_markers(message, response_sender_id=response_sender_id):
+    """Return the model-facing body for one visible Matrix message, without marker lines known to be display chrome."""
+    # Matrix bodies include human-facing tool markers like "🔧 `tool` [1]".
+    # Those markers are display chrome, not conversation content; if we replay
+    # them to the model it can continue the pattern as plain text with no trace.
+    if has_tool_trace(message.content) or _is_own_reply(message, response_sender_id):
         return strip_visible_tool_markers(message.body)
     return message.body
 
@@ -233,41 +221,18 @@ def _cap_visible_message_body(body: str, max_length: int | None) -> str:
     return f"{body[: max_length - 1]}…"
 
 
-def _build_unseen_messages_header(
-    partial_reply_kinds: set[_PartialReplyKind],
-    *,
-    config: Config,
-) -> str:
-    """Choose the unseen-context guidance for the partial-reply mix present."""
-    if not partial_reply_kinds:
-        return config.get_prompt("DEFAULT_UNSEEN_MESSAGES_HEADER")
-    if partial_reply_kinds == {_PartialReplyKind.INTERRUPTED}:
-        return config.get_prompt("INTERRUPTED_PARTIAL_REPLY_HEADER")
-    if partial_reply_kinds == {_PartialReplyKind.IN_PROGRESS}:
-        return config.get_prompt("IN_PROGRESS_PARTIAL_REPLY_HEADER")
-    return config.get_prompt("MIXED_PARTIAL_REPLY_HEADER")
-
-
 def _context_message_from_visible_message(
     message: ResolvedVisibleMessage,
     *,
     response_sender_id: str | None,
-    missing_sender_label: str | None = None,
-    body: str | None = None,
-    attachment_records: Sequence[AttachmentRecord] = (),
-    member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
+    missing_sender_label: str | None,
+    body: str,
+    attachment_records: Sequence[AttachmentRecord],
+    member_display_names: Mapping[str, str],
 ) -> Message:
-    """Convert one visible Matrix message into a structured Agno message."""
-    # Matrix bodies include human-facing tool markers like "🔧 `tool` [1]".
-    # Those markers are display chrome, not conversation content; if we replay
-    # them to the model it can continue the pattern as plain text with no trace.
-    body = _context_body_from_visible_message(message, response_sender_id=response_sender_id) if body is None else body
+    """Convert one visible Matrix message, whose prompt text is ``body``, into a structured prompt message."""
     annotation = format_attachment_annotation(list(attachment_records))
-    if (
-        response_sender_id is not None
-        and message.sender == response_sender_id
-        and not _is_relayed_user_message(message)
-    ):
+    if _is_own_reply(message, response_sender_id):
         if message.content.get("msgtype") == "m.audio":
             body = f"[audio message: {body}]"
         if annotation:
@@ -278,24 +243,23 @@ def _context_message_from_visible_message(
         return Message(role="assistant", content=f"\n\n{body}")
     if annotation:
         body = f"{body}\n{annotation}" if body else annotation
+    hook_source = hook_source_from_content(message.content)
+    if hook_source is not None:
+        body = f"{_HOOK_OUTPUT_LABEL.format(hook_source=hook_source)}\n{body}"
     event_id = message.event_id or None
-    speaker_label = _message_speaker_label(message)
-    if not speaker_label:
-        speaker_label = missing_sender_label
-    if speaker_label in _PARTIAL_REPLY_GUIDANCE_LABELS and response_sender_id is not None:
-        content = render_msg_tag(
-            sender=response_sender_id,
-            body=f"{speaker_label}: {body}",
-            event_id=event_id,
+    speaker_label = _relayed_sender(message) or message.sender or missing_sender_label
+    if speaker_label == _IN_PROGRESS_REPLY_LABEL and response_sender_id is not None:
+        # The turn still writing this reply stores it, so this copy is context, not the agent's words.
+        return thread_context_note(
+            render_msg_tag(sender=response_sender_id, body=f"{speaker_label}: {body}", event_id=event_id),
         )
-    else:
-        sender = speaker_label or ""
-        content = render_msg_tag(
-            sender=sender,
-            body=body,
-            event_id=event_id,
-            display_name=member_display_names.get(sender),
-        )
+    sender = speaker_label or ""
+    content = render_msg_tag(
+        sender=sender,
+        body=body,
+        event_id=event_id,
+        display_name=member_display_names.get(sender),
+    )
     return Message(role="user", content=content)
 
 
@@ -317,18 +281,12 @@ def _context_messages_from_visible_messages(
         # model-context budget or leave marker-only turns behind.
         body = _context_body_from_visible_message(message, response_sender_id=response_sender_id)
         attachment_records = attachment_context.records_for(message) if attachment_context is not None else []
-        if not body and not attachment_records:
+        capped_body = _cap_visible_message_body(body, max_message_length)
+        if not capped_body and not attachment_records:
             continue
-        capped_body = body
-        capped_message = replace_visible_message(message, body=capped_body)
-        if max_message_length is not None:
-            capped_body = _cap_visible_message_body(body, max_message_length)
-            if not capped_body and not attachment_records:
-                continue
-            capped_message = replace_visible_message(message, body=capped_body)
         context_messages.append(
             _context_message_from_visible_message(
-                capped_message,
+                replace_visible_message(message, body=capped_body),
                 response_sender_id=response_sender_id,
                 missing_sender_label=missing_sender_label,
                 body=capped_body,
@@ -340,63 +298,40 @@ def _context_messages_from_visible_messages(
 
 
 def _messages_with_capped_context(
-    prompt: str,
-    *,
+    with_context: Callable[[Sequence[Message]], TurnMessages],
     context_messages: Sequence[Message],
-    transient_context_messages: Sequence[Message] = (),
-    current_sender_id: str | None,
-    member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
-    current_timestamp_ms: float | None = None,
-    current_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
+    *,
     config: Config,
     static_token_budget: int,
-    estimate_static_tokens_fn: Callable[[str], int],
-    render_messages_text_fn: Callable[[Sequence[Message]], str],
-) -> tuple[Message, ...]:
-    """Return the newest context-message suffix that fits the total static token budget."""
-    selected_context: list[Message] = []
-    current_only_messages = _messages_with_current_prompt(
-        prompt,
-        transient_context_messages=transient_context_messages,
-        current_sender_id=current_sender_id,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        member_display_names=member_display_names,
-    )
-    current_only_tokens = estimate_static_tokens_fn(render_messages_text_fn(current_only_messages))
-    if current_only_tokens > static_token_budget:
-        return current_only_messages
+    turn_tokens: Callable[[TurnMessages], int],
+) -> TurnMessages:
+    """Return the turn ``with_context`` builds around the newest context-message suffix that fits the static budget.
 
-    for context_message in reversed(context_messages):
-        candidate_context = [context_message, *selected_context]
-        candidate_messages = _messages_with_current_prompt(
-            prompt,
-            context_messages=candidate_context,
-            transient_context_messages=transient_context_messages,
-            current_sender_id=current_sender_id,
-            current_timestamp_ms=current_timestamp_ms,
-            current_event_id=current_event_id,
-            current_prompt_is_structured=current_prompt_is_structured,
-            config=config,
-            member_display_names=member_display_names,
-        )
-        if estimate_static_tokens_fn(render_messages_text_fn(candidate_messages)) > static_token_budget:
-            break
-        selected_context = candidate_context
-    return _messages_with_current_prompt(
-        prompt,
-        context_messages=selected_context,
-        transient_context_messages=transient_context_messages,
-        current_sender_id=current_sender_id,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        member_display_names=member_display_names,
-    )
+    ``turn_tokens`` sizes a request holding a turn and no history.
+    """
+
+    def fits(turn: TurnMessages) -> bool:
+        return turn_tokens(turn) <= static_token_budget
+
+    def newest_from(start: int) -> TurnMessages:
+        # Tell the agent older messages were dropped; the marker counts against the same budget.
+        marker = config.render_prompt("THREAD_HISTORY_OMITTED_MARKER_TEMPLATE", omitted_count=start)
+        return with_context([thread_context_note(marker), *context_messages[start:]])
+
+    full_messages = with_context(context_messages)
+    if fits(full_messages):
+        return full_messages
+    if not fits(newest_from(len(context_messages))):
+        return with_context(())
+    # Binary search the oldest start that fits; every start ``high`` takes was measured to fit.
+    low, high = 1, len(context_messages)
+    while low < high:
+        middle = (low + high) // 2
+        if fits(newest_from(middle)):
+            high = middle
+        else:
+            low = middle + 1
+    return newest_from(high)
 
 
 def _messages_with_current_prompt(
@@ -409,67 +344,58 @@ def _messages_with_current_prompt(
     current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
+    timezone: str,
     member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
-) -> tuple[Message, ...]:
-    """Return canonical live request messages with the current user turn last."""
-    messages = [message.model_copy(deep=True) for message in context_messages]
-    current_ts = format_timestamp_ms(current_timestamp_ms, timezone=config.timezone)
-    current_prompt = (
-        _build_matrix_prompt_with_history(
-            prompt,
-            [],
-            header=config.get_prompt("PREVIOUS_CONVERSATION_THREAD_HEADER"),
-            prompt_intro=config.get_prompt("CURRENT_MESSAGE_PROMPT_INTRO"),
-            current_sender=current_sender_id,
-            current_ts=current_ts,
-            current_event_id=current_event_id,
-            current_prompt_is_structured=current_prompt_is_structured,
-            current_display_name=member_display_names.get(current_sender_id),
+) -> TurnMessages:
+    """Return the canonical live turn: its context messages, the current user prompt, and its transient context."""
+    current_prompt = prompt
+    if current_sender_id is not None:
+        current_block = (
+            prompt
+            if current_prompt_is_structured
+            else render_msg_tag(
+                sender=current_sender_id,
+                body=prompt,
+                event_id=current_event_id,
+                ts=format_timestamp_ms(current_timestamp_ms, timezone=timezone),
+                display_name=member_display_names.get(current_sender_id),
+            )
         )
-        if current_sender_id is not None
-        else prompt
+        current_prompt = f"{config.get_prompt('CURRENT_MESSAGE_PROMPT_INTRO')}{current_block}"
+    return TurnMessages(
+        prompt=Message(role="user", content=current_prompt),
+        context=tuple(deepcopy(message) for message in context_messages),
+        transient=tuple(deepcopy(message) for message in transient_context_messages),
     )
-    messages.extend(message.model_copy(deep=True) for message in transient_context_messages)
-    messages.append(Message(role="user", content=current_prompt))
-    return tuple(messages)
 
 
 def render_prepared_messages_text(messages: Sequence[Message]) -> str:
-    """Render canonical request messages to text for logs and rough token estimates."""
+    """Render canonical request messages to text for logs and prompt previews."""
     return "\n\n".join(str(message.content) for message in messages if message.content)
-
-
-def render_prepared_team_messages_text(messages: Sequence[Message]) -> str:
-    """Render prepared team messages into the exact string form passed to Agno teams."""
-    rendered_chunks: list[str] = []
-    for message in messages:
-        if not message.content:
-            continue
-        content = str(message.content)
-        rendered_chunks.append(f"assistant: {content}" if message.role == "assistant" else content)
-    return "\n\n".join(rendered_chunks)
 
 
 def _build_unseen_context_messages(
     prompt: str,
     thread_history: Sequence[ResolvedVisibleMessage],
     *,
-    transient_context_messages: Sequence[Message] = (),
+    transient_context_messages: Sequence[Message],
     seen_event_ids: set[str],
     current_event_id: str,
     active_event_ids: Collection[str],
     response_sender_id: str | None,
-    current_sender_id: str | None = None,
-    member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
-    current_timestamp_ms: float | None = None,
-    prompt_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
+    current_sender_id: str | None,
+    member_display_names: Mapping[str, str],
+    current_timestamp_ms: float | None,
+    prompt_event_id: str | None,
+    current_prompt_is_structured: bool,
     config: Config,
-    attachment_context: _ThreadAttachmentContext | None = None,
-) -> tuple[tuple[Message, ...], list[str]]:
-    """Return canonical request messages for unseen thread context plus the current turn."""
-    unseen_messages, partial_reply_kinds, in_progress_event_ids = _get_unseen_messages_for_sender(
-        thread_history,
+    timezone: str,
+    attachment_context: _ThreadAttachmentContext | None,
+) -> tuple[TurnMessages, list[str]]:
+    """Return the canonical turn for unseen thread context plus the current prompt, and the unseen event ids."""
+    history_before_current = _thread_history_before_current_event(thread_history, current_event_id)
+    unseen_messages, in_progress_event_ids = _get_unseen_messages_for_sender(
+        history_before_current or (),
         sender_id=response_sender_id,
         seen_event_ids=seen_event_ids,
         current_event_id=current_event_id,
@@ -481,9 +407,10 @@ def _build_unseen_context_messages(
         attachment_context=attachment_context,
         member_display_names=member_display_names,
     )
-    if partial_reply_kinds:
+    # Unseen context keeps only in-progress drafts of this sender, so only their header can apply.
+    if in_progress_event_ids:
         context_messages = (
-            Message(role="user", content=_build_unseen_messages_header(partial_reply_kinds, config=config)),
+            thread_context_note(config.get_prompt("IN_PROGRESS_PARTIAL_REPLY_HEADER")),
             *context_messages,
         )
     return (
@@ -496,6 +423,7 @@ def _build_unseen_context_messages(
             current_event_id=prompt_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
+            timezone=timezone,
             member_display_names=member_display_names,
         ),
         _get_unseen_event_ids_for_metadata(
@@ -509,34 +437,40 @@ def _build_thread_history_messages(
     prompt: str,
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     *,
-    transient_context_messages: Sequence[Message] = (),
+    transient_context_messages: Sequence[Message],
     response_sender_id: str | None,
-    current_sender_id: str | None = None,
-    member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
-    current_timestamp_ms: float | None = None,
-    current_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
+    current_sender_id: str | None,
+    member_display_names: Mapping[str, str],
+    current_timestamp_ms: float | None,
+    current_event_id: str | None,
+    current_prompt_is_structured: bool,
     config: Config,
-    max_messages: int | None = None,
-    max_message_length: int | None = None,
-    missing_sender_label: str | None = None,
-    static_token_budget: int | None = None,
-    estimate_static_tokens_fn: Callable[[str], int] | None = None,
-    render_messages_text_fn: Callable[[Sequence[Message]], str] | None = None,
-    attachment_context: _ThreadAttachmentContext | None = None,
-) -> tuple[Message, ...]:
-    """Return canonical request messages for fallback full-thread replay."""
-    if not thread_history:
+    timezone: str,
+    max_messages: int | None,
+    max_message_length: int | None,
+    missing_sender_label: str | None,
+    static_token_budget: int | None,
+    turn_tokens: Callable[[TurnMessages], int],
+    attachment_context: _ThreadAttachmentContext | None,
+) -> TurnMessages:
+    """Return the canonical turn for fallback full-thread replay."""
+
+    def with_context(context_messages: Sequence[Message] = ()) -> TurnMessages:
         return _messages_with_current_prompt(
             prompt,
+            context_messages=context_messages,
             transient_context_messages=transient_context_messages,
             current_sender_id=current_sender_id,
             current_timestamp_ms=current_timestamp_ms,
             current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
+            timezone=timezone,
             member_display_names=member_display_names,
         )
+
+    if not thread_history:
+        return with_context()
     context_messages = _context_messages_from_visible_messages(
         thread_history,
         response_sender_id=response_sender_id,
@@ -546,43 +480,15 @@ def _build_thread_history_messages(
         attachment_context=attachment_context,
         member_display_names=member_display_names,
     )
-    if (
-        static_token_budget is not None
-        and estimate_static_tokens_fn is not None
-        and render_messages_text_fn is not None
-    ):
+    if static_token_budget is not None:
         return _messages_with_capped_context(
-            prompt,
-            context_messages=context_messages,
-            transient_context_messages=transient_context_messages,
-            current_sender_id=current_sender_id,
-            current_timestamp_ms=current_timestamp_ms,
-            current_event_id=current_event_id,
-            current_prompt_is_structured=current_prompt_is_structured,
+            with_context,
+            context_messages,
             config=config,
             static_token_budget=static_token_budget,
-            estimate_static_tokens_fn=estimate_static_tokens_fn,
-            render_messages_text_fn=render_messages_text_fn,
-            member_display_names=member_display_names,
+            turn_tokens=turn_tokens,
         )
-    return _messages_with_current_prompt(
-        prompt,
-        context_messages=context_messages,
-        transient_context_messages=transient_context_messages,
-        current_sender_id=current_sender_id,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        member_display_names=member_display_names,
-    )
-
-
-def _fallback_static_token_budget(*, context_window: int | None, reserve_tokens: int) -> int | None:
-    """Return the total static-token budget available to Matrix-thread fallback prompts."""
-    if context_window is None or context_window <= 0:
-        return None
-    return context_budget_after_reserve(context_window, reserve_tokens)
+    return with_context(context_messages)
 
 
 def _thread_history_before_current_event(
@@ -611,16 +517,22 @@ def _thread_history_with_scheduled_budget(
     if not thread_history:
         return thread_history
 
+    history_through_current: list[ResolvedVisibleMessage] = []
+    for message in thread_history:
+        history_through_current.append(message)
+        if current_event_id is not None and message.event_id == current_event_id:
+            break
+
     prompt_event_ids = {source_event_id}
     if current_event_id is not None:
         prompt_event_ids.add(current_event_id)
     history_indices = [
-        index for index, message in enumerate(thread_history) if message.event_id not in prompt_event_ids
+        index for index, message in enumerate(history_through_current) if message.event_id not in prompt_event_ids
     ]
     selected_indices = set(history_indices[-history_limit:]) if history_limit > 0 else set()
     return tuple(
         message
-        for index, message in enumerate(thread_history)
+        for index, message in enumerate(history_through_current)
         if index in selected_indices or message.event_id == current_event_id
     )
 
@@ -632,7 +544,7 @@ def _sanitize_thread_history_for_replay(
     active_event_ids: Collection[str],
 ) -> tuple[ResolvedVisibleMessage, ...]:
     """Apply unseen-context sanitization before fallback full-thread replay."""
-    sanitized, _, _ = _get_unseen_messages_for_sender(
+    sanitized, _ = _get_unseen_messages_for_sender(
         thread_history,
         sender_id=response_sender_id,
         seen_event_ids=set(),
@@ -659,6 +571,18 @@ def _get_unseen_event_ids_for_metadata(
     return event_ids
 
 
+def _has_nothing_to_read(msg: ResolvedVisibleMessage) -> bool:
+    """Return whether one message is a notice rather than a turn, or a streamed reply showing only its placeholder.
+
+    MindRoom redacts a placeholder whose answer is suppressed, so recording one as consumed would let that tidy-up
+    remove the history of whoever read it.
+    """
+    content = msg.content
+    if isinstance(content, dict) and any(key in content for key in _NON_TURN_NOTICE_CONTENT_KEYS):
+        return True
+    return msg.stream_status is not None and msg.body.strip() in {PROGRESS_PLACEHOLDER, TEAM_PROGRESS_PLACEHOLDER}
+
+
 def _get_unseen_messages_for_sender(
     thread_history: Sequence[ResolvedVisibleMessage],
     *,
@@ -666,52 +590,42 @@ def _get_unseen_messages_for_sender(
     seen_event_ids: set[str],
     current_event_id: str | None,
     active_event_ids: Collection[str],
-) -> tuple[list[ResolvedVisibleMessage], set[_PartialReplyKind], set[str]]:
-    """Filter thread_history to unseen messages for one Matrix sender."""
+) -> tuple[list[ResolvedVisibleMessage], set[str]]:
+    """Return one sender's unseen messages, without its interrupted drafts, and the ids of its in-progress drafts."""
     unseen: list[ResolvedVisibleMessage] = []
-    partial_reply_kinds: set[_PartialReplyKind] = set()
     in_progress_event_ids: set[str] = set()
     for msg in thread_history:
         event_id = msg.event_id
-        sender = msg.sender
-        content = msg.content
         if event_id and event_id in seen_event_ids:
             continue
         if current_event_id and event_id == current_event_id:
             continue
-        if isinstance(content, dict) and COMPACTION_NOTICE_CONTENT_KEY in content:
+        if _has_nothing_to_read(msg):
             continue
-        if sender_id and sender == sender_id and not _is_relayed_user_message(msg):
+        if _is_own_reply(msg, sender_id):
             partial_kind = _classify_partial_reply(
                 msg,
                 active_event_ids=active_event_ids,
             )
             if partial_kind is _PartialReplyKind.INTERRUPTED:
                 continue
-            if partial_kind is not None:
-                cleaned_body = _clean_partial_reply_body(msg.body)
+            if partial_kind is _PartialReplyKind.IN_PROGRESS:
+                # Strip live status notes before the canonical interrupted replay marker is added.
+                cleaned_body = clean_partial_reply_text(msg.body)
                 if not cleaned_body:
                     continue
-                partial_reply_kinds.add(partial_kind)
-                if partial_kind is _PartialReplyKind.IN_PROGRESS and event_id is not None:
-                    in_progress_event_ids.add(event_id)
-                unseen.append(
-                    replace_visible_message(
-                        msg,
-                        sender=_PARTIAL_REPLY_SENDER_LABELS.get(partial_kind.value, "You (partial reply)"),
-                        body=cleaned_body,
-                    ),
-                )
+                in_progress_event_ids.add(event_id)
+                unseen.append(replace_visible_message(msg, sender=_IN_PROGRESS_REPLY_LABEL, body=cleaned_body))
                 continue
         unseen.append(msg)
-    return unseen, partial_reply_kinds, in_progress_event_ids
+    return unseen, in_progress_event_ids
 
 
 def _scope_seen_event_ids(scope_context: ScopeSessionContext | None) -> set[str]:
     """Return currently persisted seen IDs for one open prepared scope."""
     if scope_context is None or scope_context.session is None:
         return set()
-    return read_scope_seen_event_ids(scope_context.session, scope_context.scope)
+    return read_scope_seen_event_ids(scope_context.storage, scope_context.session)
 
 
 def _prepared_history_with_scheduled_limit(
@@ -726,7 +640,7 @@ def _prepared_history_with_scheduled_limit(
             replays_persisted_history=False,
         )
     plan = prepared_history.replay_plan
-    if plan is None or not plan.add_history_to_context:
+    if plan is None or not plan.add_history_to_context or plan.mode == "disabled":
         return prepared_history
     if plan.num_history_messages is not None and plan.num_history_messages <= max_persisted_messages:
         return prepared_history
@@ -741,19 +655,55 @@ def _prepared_history_with_scheduled_limit(
 
 
 @timed("system_prompt_assembly.history_prepare.finalize")
-def _finalize_prepared_history(
+async def _finalize_prepared_history(
     *,
     prepared_scope_history: PreparedScopeHistory,
-    config: Config,
-    static_prompt_tokens: int,
+    frame: RequestFrame,
     pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> PreparedHistoryState:
-    return finalize_history_preparation(
-        prepared_scope_history=prepared_scope_history,
-        config=config,
-        static_prompt_tokens=static_prompt_tokens,
-        pipeline_timing=pipeline_timing,
+    # Planning reads the caller's live session in a worker; drain it before cancellation lets the caller change it.
+    return await run_coroutine_until_complete(
+        asyncio.to_thread(
+            finalize_history_preparation,
+            prepared_scope_history=prepared_scope_history,
+            frame=frame,
+            pipeline_timing=pipeline_timing,
+        ),
     )
+
+
+def _frame_holding_attachments(
+    model: ModelProvider,
+    frame: Callable[[TurnMessages], RequestFrame],
+    media: MediaInputs,
+    turn: TurnMessages,
+    limit: int | None,
+    scope_context: ScopeSessionContext | None,
+) -> Callable[[TurnMessages], RequestFrame]:
+    """Return ``frame`` with ``media`` on the prompt when a request holding them, ``turn``, and the summary fits ``limit``.
+
+    ``turn`` is what the reply cannot trim, and ``scope_context`` the scope whose summary it replays: the whole turn
+    and the scope for a reply that replays stored history, and the turn without its thread and no scope for one whose
+    thread stands in for that history. Attachments estimated past ``limit`` beside them are left to the media fallback,
+    which drops them if the provider refuses, so an estimate that runs high trims the history but never fails the reply
+    or drops history it would keep.
+    """
+    if not media.has_any():
+        return frame
+
+    def media_frame(sent: TurnMessages) -> RequestFrame:
+        return frame(with_media(sent, media))
+
+    session = scope_context.session if scope_context is not None else None
+    summary = session.summary if session is not None else None
+    if limit is None or model.request_tokens(media_frame(turn).request(summary=summary)) <= limit:
+        return media_frame
+    return frame
+
+
+def _turn_tokens(model: ModelProvider, frame: Callable[[TurnMessages], RequestFrame], turn: TurnMessages) -> int:
+    """Return the size of a request that holds ``turn`` and no history."""
+    return model.request_tokens(frame(turn).request())
 
 
 async def _prepare_execution_context_common(
@@ -770,44 +720,56 @@ async def _prepare_execution_context_common(
     current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
     config: Config,
-    prepare_scope_history_fn: Callable[[str], Awaitable[PreparedScopeHistory]],
-    estimate_static_tokens_fn: Callable[[str], int],
-    render_messages_text_fn: Callable[[Sequence[Message]], str],
+    runtime_paths: RuntimePaths,
+    timezone: str,
+    resolved_inputs: HistoryPreparationInputs,
+    compaction_lifecycle: CompactionLifecycle | None,
+    frame: Callable[[TurnMessages], RequestFrame],
+    sizer: RequestSizer,
     thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
-    fallback_static_token_budget: int | None = None,
     attachment_context: _ThreadAttachmentContext | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> _PreparedExecutionContext:
-    """Prepare one request-scoped prompt/replay plan after unseen-thread handling."""
-    reply_to_event_id = ctx.reply_to_event_id
+    """Prepare one request-scoped prompt/replay plan after unseen-thread handling.
+
+    ``timezone`` is the zone the current message's time is written in. ``frame`` holds what the run's requests hold
+    around the scope's history for a turn, and ``sizer`` sizes them; each size holds the media ``ctx`` puts on the
+    prompt when they fit beside what the reply cannot trim (``_frame_holding_attachments``). A fallback thread replay
+    stands in for persisted replay, so ``resolved_inputs``' request limit bounds it too.
+    """
+    history_boundary_event_id = ctx.history_boundary_event_id or ctx.reply_to_event_id
     active_event_ids = ctx.active_event_ids
-    seen_event_ids = _scope_seen_event_ids(scope_context)
+    # Compacted history's seen ids are read from the summary rows; keep that SQLite read off the loop.
+    seen_event_ids = await run_blocking_until_complete(_scope_seen_event_ids, scope_context)
     scheduled_history_budget = ctx.scheduled_history_budget
     if scheduled_history_budget is not None:
         thread_history = _thread_history_with_scheduled_budget(
             thread_history,
-            current_event_id=reply_to_event_id,
+            current_event_id=history_boundary_event_id,
             source_event_id=scheduled_history_budget.source_event_id,
             history_limit=scheduled_history_budget.limit,
         )
 
-    provisional_messages = _messages_with_current_prompt(
-        prompt,
-        transient_context_messages=transient_context_messages,
-        current_sender_id=current_sender_id,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        member_display_names=member_display_names,
-    )
-    if reply_to_event_id and thread_history:
-        provisional_messages, _ = _build_unseen_context_messages(
+    def turn_messages(seen_event_ids: set[str]) -> tuple[TurnMessages, list[str]]:
+        """Return the turn, with the thread's unseen context when it has a history boundary, and the unseen ids."""
+        if not (history_boundary_event_id and thread_history):
+            return _messages_with_current_prompt(
+                prompt,
+                transient_context_messages=transient_context_messages,
+                current_sender_id=current_sender_id,
+                current_timestamp_ms=current_timestamp_ms,
+                current_event_id=current_event_id,
+                current_prompt_is_structured=current_prompt_is_structured,
+                config=config,
+                timezone=timezone,
+                member_display_names=member_display_names,
+            ), []
+        return _build_unseen_context_messages(
             prompt,
             thread_history,
             transient_context_messages=transient_context_messages,
             seen_event_ids=seen_event_ids,
-            current_event_id=reply_to_event_id,
+            current_event_id=history_boundary_event_id,
             active_event_ids=active_event_ids,
             response_sender_id=response_sender_id,
             current_sender_id=current_sender_id,
@@ -815,66 +777,75 @@ async def _prepare_execution_context_common(
             prompt_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
+            timezone=timezone,
             attachment_context=attachment_context,
             member_display_names=member_display_names,
         )
 
-    prepared_scope_history = await prepare_scope_history_fn(render_messages_text_fn(provisional_messages))
-
-    final_messages = _messages_with_current_prompt(
-        prompt,
-        transient_context_messages=transient_context_messages,
-        current_sender_id=current_sender_id,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        member_display_names=member_display_names,
+    provisional_messages, _ = turn_messages(seen_event_ids)
+    media = ctx.media or MediaInputs()
+    limit = resolved_inputs.execution_plan.limit_tokens
+    replay_frame = await asyncio.to_thread(
+        _frame_holding_attachments,
+        sizer.model,
+        frame,
+        media,
+        provisional_messages,
+        limit,
+        scope_context,
     )
-    if reply_to_event_id and thread_history:
-        final_messages, unseen_event_ids = _build_unseen_context_messages(
-            prompt,
-            thread_history,
-            transient_context_messages=transient_context_messages,
-            seen_event_ids=_scope_seen_event_ids(scope_context),
-            current_event_id=reply_to_event_id,
-            active_event_ids=active_event_ids,
-            response_sender_id=response_sender_id,
-            current_sender_id=current_sender_id,
-            current_timestamp_ms=current_timestamp_ms,
-            prompt_event_id=current_event_id,
-            current_prompt_is_structured=current_prompt_is_structured,
-            config=config,
-            attachment_context=attachment_context,
-            member_display_names=member_display_names,
-        )
-    else:
-        unseen_event_ids = []
-
-    final_static_tokens = estimate_static_tokens_fn(render_messages_text_fn(final_messages))
-    prepared_history = _finalize_prepared_history(
-        prepared_scope_history=prepared_scope_history,
+    prepared_scope_history = await prepare_scope_history(
+        sizer=sizer,
+        frame=replay_frame(provisional_messages),
+        resolved_inputs=resolved_inputs,
+        runtime_paths=runtime_paths,
         config=config,
-        static_prompt_tokens=final_static_tokens,
+        scope_context=scope_context,
+        compaction_lifecycle=compaction_lifecycle,
+        pipeline_timing=pipeline_timing,
+        allow_native_compaction=ctx.scheduled_history_budget is None,
+    )
+    final_messages, unseen_event_ids = turn_messages(
+        await run_blocking_until_complete(_scope_seen_event_ids, scope_context)
+        if history_boundary_event_id and thread_history
+        else set(),
+    )
+
+    prepared_history = await _finalize_prepared_history(
+        prepared_scope_history=prepared_scope_history,
+        frame=replay_frame(final_messages),
         pipeline_timing=pipeline_timing,
     )
     if scheduled_history_budget is not None:
-        inline_history_messages = sum(message.add_to_agent_memory for message in final_messages[:-1])
         prepared_history = _prepared_history_with_scheduled_limit(
             prepared_history,
-            max(0, scheduled_history_budget.limit - inline_history_messages),
+            max(0, scheduled_history_budget.limit - len(final_messages.context)),
         )
     if pipeline_timing is not None:
         pipeline_timing.mark("prompt_assembly_start")
     if not prepared_history.replays_persisted_history and thread_history:
-        fallback_thread_history = _thread_history_before_current_event(thread_history, reply_to_event_id)
+        fallback_thread_history = _thread_history_before_current_event(thread_history, history_boundary_event_id)
         if fallback_thread_history is not None:
             fallback_thread_history = _sanitize_thread_history_for_replay(
                 fallback_thread_history,
                 response_sender_id=response_sender_id,
                 active_event_ids=active_event_ids,
             )
-        replay_fallback_messages = _build_thread_history_messages(
+        render_limits = thread_history_render_limits or ThreadHistoryRenderLimits()
+        # The thread is fitted beside what the reply cannot trim without it, and the reply replays no summary.
+        fallback_frame = await asyncio.to_thread(
+            _frame_holding_attachments,
+            sizer.model,
+            frame,
+            media,
+            replace(final_messages, context=()),
+            limit,
+            None,
+        )
+        turn_tokens = partial(_turn_tokens, sizer.model, fallback_frame)
+        # Fitting the thread to the budget counts it repeatedly, so it runs in a worker thread.
+        final_messages = await asyncio.to_thread(
+            _build_thread_history_messages,
             prompt,
             fallback_thread_history,
             transient_context_messages=transient_context_messages,
@@ -884,21 +855,16 @@ async def _prepare_execution_context_common(
             current_event_id=current_event_id,
             current_prompt_is_structured=current_prompt_is_structured,
             config=config,
-            max_messages=thread_history_render_limits.max_messages if thread_history_render_limits else None,
-            max_message_length=(
-                thread_history_render_limits.max_message_length if thread_history_render_limits else None
-            ),
-            missing_sender_label=(
-                thread_history_render_limits.missing_sender_label if thread_history_render_limits else None
-            ),
-            static_token_budget=fallback_static_token_budget,
-            estimate_static_tokens_fn=estimate_static_tokens_fn,
-            render_messages_text_fn=render_messages_text_fn,
+            timezone=timezone,
+            max_messages=render_limits.max_messages,
+            max_message_length=render_limits.max_message_length,
+            missing_sender_label=render_limits.missing_sender_label,
+            static_token_budget=limit,
+            turn_tokens=turn_tokens,
             attachment_context=attachment_context,
             member_display_names=member_display_names,
         )
-        final_messages = replay_fallback_messages
-        fallback_context_tokens = estimate_static_tokens_fn(render_messages_text_fn(final_messages))
+        fallback_context_tokens = await asyncio.to_thread(turn_tokens, final_messages)
         if prepared_history.replay_plan is not None:
             fallback_context_tokens += prepared_history.replay_plan.estimated_tokens
         prepared_history = replace(prepared_history, prepared_context_tokens=fallback_context_tokens)
@@ -906,7 +872,7 @@ async def _prepare_execution_context_common(
         pipeline_timing.mark("prompt_assembly_ready")
 
     return _PreparedExecutionContext(
-        messages=final_messages,
+        turn=final_messages,
         unseen_event_ids=unseen_event_ids,
         prepared_history=prepared_history,
     )
@@ -917,69 +883,42 @@ async def prepare_agent_execution_context(
     ctx: ResponseTurnContext,
     *,
     scope_context: ScopeSessionContext | None,
-    agent: Agent,
+    build: AgentBuild,
+    system_messages: Sequence[Message],
     prompt: str,
-    transient_context_messages: Sequence[Message] = (),
+    transient_context_messages: Sequence[Message],
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     runtime_paths: RuntimePaths,
     config: Config,
-    resolved_runtime_model: ResolvedRuntimeModel | None = None,
-    compaction_lifecycle: CompactionLifecycle | None = None,
-    current_sender_id: str | None = None,
-    current_timestamp_ms: float | None = None,
-    current_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
-    include_openai_compat_guidance: bool = False,
-    pipeline_timing: DispatchPipelineTiming | None = None,
+    resolved_runtime_model: TurnModel,
+    compaction_lifecycle: CompactionLifecycle | None,
+    current_sender_id: str | None,
+    current_timestamp_ms: float | None,
+    current_event_id: str | None,
+    current_prompt_is_structured: bool,
+    include_openai_compat_guidance: bool,
+    pipeline_timing: DispatchPipelineTiming | None,
 ) -> _PreparedExecutionContext:
-    """Prepare one agent's final prompt and replay plan for the current call."""
+    """Prepare one agent's final prompt and replay plan for the current call.
+
+    ``system_messages`` are the turn's rendered system messages, which size the static part of every request, and
+    ``resolved_runtime_model`` the model the turn runs on, whose window bounds its history.
+    """
     agent_name = ctx.entity_label
     response_sender = None
     if not include_openai_compat_guidance:
         response_sender_id = entity_identity_registry(config, runtime_paths).current_ids.get(agent_name)
         response_sender = response_sender_id.full_id if response_sender_id is not None else None
-    runtime_model = resolved_runtime_model or config.resolve_runtime_model(
-        entity_name=agent_name,
-        room_id=ctx.room_id,
-        thread_id=ctx.thread_id,
-        runtime_paths=runtime_paths,
-    )
-    static_token_estimator = agent_static_token_estimator(agent)
-
-    async def _prepare_agent_scope_history(
-        prepared_prompt: str,
-    ) -> PreparedScopeHistory:
-        resolved_inputs = resolve_agent_preparation_inputs(
-            agent=agent,
-            agent_name=agent_name,
-            full_prompt=prepared_prompt,
-            config=config,
-            active_model_name=runtime_model.model_name,
-            active_context_window=runtime_model.context_window,
-            static_prompt_tokens=static_token_estimator.estimate(prepared_prompt),
-        )
-        return await prepare_scope_history(
-            agent=agent,
-            agent_name=agent_name,
-            resolved_inputs=resolved_inputs,
-            runtime_paths=runtime_paths,
-            config=config,
-            scope_context=scope_context,
-            compaction_lifecycle=compaction_lifecycle,
-            pipeline_timing=pipeline_timing,
-        )
-
-    def _estimate_agent_static_tokens(
-        prepared_prompt: str,
-    ) -> int:
-        return static_token_estimator.estimate(prepared_prompt)
-
+    offered = PreparedTools(functions=build.spec.functions).specs()
+    tools = offered_definitions(build.tool_jobs, offered) if build.tool_jobs is not None else offered
+    frame = partial(RequestFrame, replace(build.request_template, tools=tools), tuple(system_messages))
+    sizer = request_sizer(build.spec.model, config, resolved_runtime_model.model_name)
     return await _prepare_execution_context_common(
         ctx,
         scope_context=scope_context,
         prompt=prompt,
         transient_context_messages=transient_context_messages,
-        thread_history=thread_history,
+        thread_history=_without_untrusted_authorship_claims(thread_history, config, runtime_paths),
         response_sender_id=response_sender,
         current_sender_id=current_sender_id,
         member_display_names=ctx.member_display_names,
@@ -987,14 +926,18 @@ async def prepare_agent_execution_context(
         current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
         config=config,
-        prepare_scope_history_fn=_prepare_agent_scope_history,
-        estimate_static_tokens_fn=_estimate_agent_static_tokens,
-        render_messages_text_fn=render_prepared_messages_text,
-        thread_history_render_limits=None,
-        fallback_static_token_budget=_fallback_static_token_budget(
-            context_window=runtime_model.context_window,
-            reserve_tokens=config.resolve_entity(agent_name).compaction_config.reserve_tokens,
+        runtime_paths=runtime_paths,
+        timezone=entity_timezone(config, agent_name),
+        resolved_inputs=resolve_entity_preparation_inputs(
+            config=config,
+            runtime_paths=runtime_paths,
+            history_settings=build.history_settings,
+            active_model_name=resolved_runtime_model.model_name,
+            active_context_window=resolved_runtime_model.context_window,
         ),
+        compaction_lifecycle=compaction_lifecycle,
+        frame=frame,
+        sizer=sizer,
         attachment_context=_ThreadAttachmentContext(
             storage_path=runtime_paths.storage_root,
             room_id=ctx.room_id,
@@ -1003,23 +946,25 @@ async def prepare_agent_execution_context(
     )
 
 
-async def _prepare_bound_team_execution_context(
+@timed("system_prompt_assembly.history_prepare")
+async def prepare_bound_team_run_context(
     ctx: ResponseTurnContext,
     *,
-    scope_context: ScopeSessionContext | None,
-    agents: list[Agent],
-    team: Team,
+    scope_context: ScopeSessionContext,
+    leader_system_messages: Sequence[Message],
+    leader_tools: Sequence[ToolSpec],
+    model: ModelProvider,
     prompt: str,
     transient_context_messages: Sequence[Message] = (),
     thread_history: Sequence[ResolvedVisibleMessage] | None,
     runtime_paths: RuntimePaths,
     config: Config,
-    team_name: str | None,
-    active_model_name: str | None,
+    timezone: str,
+    history_settings: ResolvedHistorySettings,
+    active_model_name: str,
     active_context_window: int | None,
     response_sender_id: str | None = None,
     current_sender_id: str | None = None,
-    member_display_names: Mapping[str, str] = _NO_MEMBER_DISPLAY_NAMES,
     current_timestamp_ms: float | None = None,
     current_event_id: str | None = None,
     current_prompt_is_structured: bool = False,
@@ -1027,128 +972,43 @@ async def _prepare_bound_team_execution_context(
     thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
     pipeline_timing: DispatchPipelineTiming | None = None,
 ) -> _PreparedExecutionContext:
-    """Prepare one bound team scope for the current call."""
-    static_token_estimator = team_static_token_estimator(team)
+    """Prepare one bound team scope for the current call.
 
-    async def _prepare_team_scope_history(
-        prepared_prompt: str,
-    ) -> PreparedScopeHistory:
-        return await prepare_bound_scope_history(
-            agents=agents,
-            team=team,
-            full_prompt=prepared_prompt,
-            runtime_paths=runtime_paths,
-            config=config,
-            scope_context=scope_context,
-            team_name=team_name,
-            active_model_name=active_model_name,
-            active_context_window=active_context_window,
-            static_prompt_tokens=static_token_estimator.estimate(prepared_prompt),
-            compaction_lifecycle=compaction_lifecycle,
-            pipeline_timing=pipeline_timing,
-        )
-
-    def _estimate_team_static_tokens(
-        prepared_prompt: str,
-    ) -> int:
-        return static_token_estimator.estimate(prepared_prompt)
-
+    ``leader_system_messages`` and ``leader_tools`` size the static part of every leader request; the delegation tool
+    the run adds is among them. ``history_settings`` are the built team's, whose replay policy and compaction config
+    the scope follows.
+    """
+    frame = partial(RequestFrame, ModelRequest(messages=(), tools=tuple(leader_tools)), tuple(leader_system_messages))
+    sizer = request_sizer(model, config, active_model_name)
     return await _prepare_execution_context_common(
         ctx,
         scope_context=scope_context,
         prompt=prompt,
         transient_context_messages=transient_context_messages,
-        thread_history=thread_history,
-        response_sender_id=response_sender_id,
-        current_sender_id=current_sender_id,
-        member_display_names=member_display_names,
-        current_timestamp_ms=current_timestamp_ms,
-        current_event_id=current_event_id,
-        current_prompt_is_structured=current_prompt_is_structured,
-        config=config,
-        prepare_scope_history_fn=_prepare_team_scope_history,
-        estimate_static_tokens_fn=_estimate_team_static_tokens,
-        render_messages_text_fn=render_prepared_team_messages_text,
-        thread_history_render_limits=thread_history_render_limits,
-        attachment_context=_ThreadAttachmentContext(
-            storage_path=runtime_paths.storage_root,
-            room_id=ctx.room_id,
-        ),
-        fallback_static_token_budget=_fallback_static_token_budget(
-            context_window=active_context_window,
-            reserve_tokens=config.resolve_entity(
-                team_name if team_name is not None and team_name in config.teams else None,
-            ).compaction_config.reserve_tokens,
-        ),
-        pipeline_timing=pipeline_timing,
-    )
-
-
-def _scrub_bound_team_scope_context(
-    *,
-    scope_context: ScopeSessionContext | None,
-    team: Team,
-    entity_name: str | None,
-) -> None:
-    """Recover prior queued-message notices before preparing a bound team run."""
-    ai_runtime.scrub_queued_notice_session_context(
-        scope_context=scope_context,
-        entity_name=entity_name or str(team.name or "Team"),
-    )
-
-
-async def prepare_bound_team_run_context(
-    ctx: ResponseTurnContext,
-    *,
-    scope_context: ScopeSessionContext | None,
-    agents: list[Agent],
-    team: Team,
-    prompt: str,
-    transient_context_messages: Sequence[Message] = (),
-    thread_history: Sequence[ResolvedVisibleMessage] | None,
-    runtime_paths: RuntimePaths,
-    config: Config,
-    entity_name: str | None,
-    active_model_name: str | None,
-    active_context_window: int | None,
-    response_sender_id: str | None = None,
-    current_sender_id: str | None = None,
-    current_timestamp_ms: float | None = None,
-    current_event_id: str | None = None,
-    current_prompt_is_structured: bool = False,
-    compaction_lifecycle: CompactionLifecycle | None = None,
-    thread_history_render_limits: ThreadHistoryRenderLimits | None = None,
-    pipeline_timing: DispatchPipelineTiming | None = None,
-) -> _PreparedExecutionContext:
-    """Prepare a team run with queued-notice scrubbing and replay application."""
-    _scrub_bound_team_scope_context(
-        scope_context=scope_context,
-        team=team,
-        entity_name=entity_name,
-    )
-    prepared_execution = await _prepare_bound_team_execution_context(
-        ctx,
-        scope_context=scope_context,
-        agents=agents,
-        team=team,
-        prompt=prompt,
-        transient_context_messages=transient_context_messages,
-        thread_history=thread_history,
-        runtime_paths=runtime_paths,
-        config=config,
-        team_name=entity_name,
-        active_model_name=active_model_name,
-        active_context_window=active_context_window,
+        thread_history=_without_untrusted_authorship_claims(thread_history, config, runtime_paths),
         response_sender_id=response_sender_id,
         current_sender_id=current_sender_id,
         member_display_names=ctx.member_display_names,
         current_timestamp_ms=current_timestamp_ms,
         current_event_id=current_event_id,
         current_prompt_is_structured=current_prompt_is_structured,
+        config=config,
+        runtime_paths=runtime_paths,
+        timezone=timezone,
+        resolved_inputs=resolve_entity_preparation_inputs(
+            config=config,
+            runtime_paths=runtime_paths,
+            history_settings=history_settings,
+            active_model_name=active_model_name,
+            active_context_window=active_context_window,
+        ),
         compaction_lifecycle=compaction_lifecycle,
+        frame=frame,
+        sizer=sizer,
         thread_history_render_limits=thread_history_render_limits,
+        attachment_context=_ThreadAttachmentContext(
+            storage_path=runtime_paths.storage_root,
+            room_id=ctx.room_id,
+        ),
         pipeline_timing=pipeline_timing,
     )
-    if prepared_execution.replay_plan is not None:
-        apply_replay_plan(target=team, replay_plan=prepared_execution.replay_plan)
-    return prepared_execution

@@ -9,13 +9,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from .identity import decode_thread_id, encode_thread_id
+from .identity import agent_of_principal, decode_thread_id, encode_thread_id
 from .membership_state import claim_membership_epoch
 from .models import (
     ConversationCursor,
     ConversationPage,
     HydrationCoverage,
     RefreshRequest,
+    RoomPage,
     VisibleMessage,
 )
 from .projection import decode_content
@@ -27,6 +28,49 @@ _PAGE_COLUMNS = """
     logical_event_id, room_id, thread_id, sender, created_ts,
     revision_event_id, revision_ts, content_json, refresh_token, membership_epoch
 """
+# Order and stored size only, so a page is sized before any content is loaded.
+# Both backends read a text value's byte length without loading the value;
+# SQLite before 3.43 has no ``octet_length``, and the backend supplies one.
+_PAGE_SIZE_COLUMNS = "logical_event_id, created_ts, octet_length(content_json) AS content_bytes"
+
+# How much stored content one page loads, newest message first. A resolved
+# long-text sidecar can be megabytes, and anyone who can post can make every
+# message in a thread name one, so a row limit alone does not bound a read.
+PAGE_CONTENT_BUDGET_BYTES = 16 * 1024 * 1024
+
+# The version of hydration walk whose markers stand, kept per kind of
+# conversation because the thread walk and the room walk change separately, and
+# a new thread walk is no reason to walk every room again.
+#
+# Thread walk 1 looks up the edits of every message a thread walk left
+# mid-stream, which a recursive relations walk can miss. Thread walk 2 also
+# looks up every reply's edits after a walk that stopped above them, and moving
+# to it walks every thread once more on its next read. That gives a thread
+# walked before the Tuwunel fork served recursive relations whole and in order
+# (v1.9.4-mindroom.17) back the ordinary edits that older paging dropped.
+#
+# The room walk has been version 1 since walks had versions.
+_THREAD_WALK_VERSION = 2
+_ROOM_WALK_VERSION = 1
+
+# What the loaded rows of one page may decode to, estimated before decoding.
+# Prose decodes to about its stored size, but every JSON value becomes a Python
+# object: a string or number of a few bytes takes 35 to 55 bytes once decoded,
+# an array about 70 and an object about 190, so a list of short values decodes
+# to about 10 times its size and nested empty containers to over 40. Weighing
+# every structural array, object and separator keeps such shapes near their
+# estimate. Measured worst: a dict just past a hash table resize with
+# one-character non-ASCII keys and values holds about 1.25 times it, and a page
+# of those peaks near 1.35 times this bound; a list of one-character non-ASCII
+# strings holds about 1.05 times it. Meanwhile 16 MiB of prose and tool traces,
+# including spaced JSON text inside their strings as tool previews write it,
+# stays under this bound. Strings holding a character outside the Basic
+# Multilingual Plane decode at 4 bytes per character, so a page of them can
+# reach about twice this bound before the byte budget stops it.
+_PAGE_DECODED_BUDGET_BYTES = 64 * 1024 * 1024
+_DECODED_BYTES_PER_ARRAY = 96
+_DECODED_BYTES_PER_OBJECT = 192
+_DECODED_BYTES_PER_SEPARATOR = 56
 
 # Everything older than one page's last row, spelled as a row value.
 #
@@ -54,6 +98,8 @@ _PAGE_COLUMNS = """
 # could go on proving that a seek is possible while this drifted back to a
 # spelling that does not use one.
 _CONVERSATION_CURSOR_CLAUSE = " AND (created_ts, logical_event_id) < (?, ?)"
+_ROOM_CURSOR_CLAUSE = " AND (created_ts, logical_event_id) > (?, ?)"
+_ROOM_UNTIL_CLAUSE = " AND created_ts <= ?"
 
 
 def read_conversation(
@@ -72,11 +118,18 @@ def read_conversation(
     returns it: the row's body was cleared in the same transaction that
     admitted the redaction, so no caller can serve deleted content, whether or
     not it is willing to wait for the refetch.
+
+    A page also ends before ``limit`` once its stored content passes a fixed
+    budget, and then carries a cursor exactly as a full page does. Its rows are
+    sized first and only the ones that fit are loaded.
+
+    Both queries read one snapshot, the read transaction's, so the content
+    loaded is exactly what the page was sized on.
     """
     if limit <= 0:
         msg = "A conversation read requires a positive limit"
         raise ValueError(msg)
-    rows = _page_rows(
+    sizes = _page_rows(
         transaction,
         principal_id,
         room_id=room_id,
@@ -84,6 +137,11 @@ def read_conversation(
         limit=limit,
         before=before,
     )
+    kept = _rows_within_content_budget(sizes)
+    rows = _load_rows(transaction, principal_id, room_id=room_id, sized=sizes[:kept])
+    decoded = _rows_within_decoded_budget(rows)
+    trimmed = decoded < len(rows)
+    rows = rows[:decoded]
     messages: list[VisibleMessage] = []
     refresh_pending: list[RefreshRequest] = []
     for row in rows:
@@ -96,7 +154,7 @@ def read_conversation(
             created_ts=int(rows[-1]["created_ts"]),
             logical_event_id=rows[-1]["logical_event_id"],
         )
-        if len(rows) == limit
+        if rows and (trimmed or kept < len(sizes) or len(sizes) == limit)
         else None
     )
     return ConversationPage(
@@ -104,6 +162,96 @@ def read_conversation(
         refresh_pending=tuple(refresh_pending),
         next_cursor=next_cursor,
     )
+
+
+def read_room_after(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    after: ConversationCursor | None,
+    limit: int,
+    until_ts: int | None = None,
+) -> RoomPage:
+    """Return what a room holds after a cursor, every thread and the room level together, oldest first.
+
+    ``after`` is exclusive, and ``None`` starts at the room's first message.
+    ``until_ts`` leaves out messages stamped later, such as one whose sender's
+    clock runs ahead; ``None`` reads up to the room's newest. ``more`` says
+    whether messages follow the page's rows, past its limit or its budgets.
+    The page is bounded by ``limit`` and by the same content budgets as
+    ``read_conversation``, so a caller continues from ``last_cursor``. A thread
+    root has no thread relation of its own and is stored at the room level, so
+    it appears once.
+
+    The page stops at the first message whose visible revision awaits a
+    refetch, so ``last_cursor`` never passes a message that is not in
+    ``messages``; once the refetch resolves, a read from the same cursor
+    returns it. ``refresh_pending`` names the refetches the page's rows owe.
+    When the first row after ``after`` is one of them, ``messages`` is empty
+    and ``last_cursor`` is ``None``, which means no progress: keep your cursor,
+    never start over.
+    """
+    if limit <= 0:
+        msg = "A room read requires a positive limit"
+        raise ValueError(msg)
+    cursor_clause = "" if after is None else _ROOM_CURSOR_CLAUSE
+    cursor_params: tuple[object, ...] = () if after is None else (after.created_ts, after.logical_event_id)
+    if until_ts is not None:
+        cursor_clause += _ROOM_UNTIL_CLAUSE
+        cursor_params = (*cursor_params, until_ts)
+    # One row past the limit says whether more follow.
+    sizes = tuple(
+        transaction.fetchall(
+            f"""
+            SELECT {_PAGE_SIZE_COLUMNS} FROM visible_messages
+            WHERE principal_id = ? AND room_id = ?{cursor_clause}
+            ORDER BY created_ts, logical_event_id
+            LIMIT ?
+            """,  # noqa: S608 - a fixed column list and a fixed clause, not input
+            (principal_id, room_id, *cursor_params, limit + 1),
+        ),
+    )
+    kept = _rows_within_content_budget(sizes[:limit])
+    rows = _load_rows(transaction, principal_id, room_id=room_id, sized=sizes[:kept])
+    rows = rows[: _rows_within_decoded_budget(rows)]
+    pending = tuple(_refresh_request(row) for row in rows if row["content_json"] is None)
+    first_pending = next((index for index, row in enumerate(rows) if row["content_json"] is None), len(rows))
+    messages = tuple(_visible_message(row) for row in rows[:first_pending])
+    return RoomPage(
+        messages=messages,
+        refresh_pending=pending,
+        more=len(rows) < len(sizes),
+        last_cursor=(
+            ConversationCursor(created_ts=messages[-1].created_ts, logical_event_id=messages[-1].logical_event_id)
+            if messages
+            else None
+        ),
+        stopped_at=(
+            ConversationCursor(
+                created_ts=int(rows[first_pending]["created_ts"]),
+                logical_event_id=rows[first_pending]["logical_event_id"],
+            )
+            if first_pending < len(rows)
+            else None
+        ),
+    )
+
+
+def latest_room_cursor(transaction: Transaction, principal_id: str, *, room_id: str) -> ConversationCursor | None:
+    """Return the position of a room's newest visible message, or nothing if it has none."""
+    row = transaction.fetchone(
+        """
+        SELECT created_ts, logical_event_id FROM visible_messages
+        WHERE principal_id = ? AND room_id = ?
+        ORDER BY created_ts DESC, logical_event_id DESC
+        LIMIT 1
+        """,
+        (principal_id, room_id),
+    )
+    if row is None:
+        return None
+    return ConversationCursor(created_ts=int(row["created_ts"]), logical_event_id=row["logical_event_id"])
 
 
 def _page_rows(
@@ -115,7 +263,7 @@ def _page_rows(
     limit: int,
     before: ConversationCursor | None,
 ) -> tuple[Row, ...]:
-    """Return one page's rows, newest first.
+    """Return the order and stored size of one page's rows, newest first.
 
     A thread's root message carries no thread relation of its own — it becomes
     a root only when someone replies to it — so it is stored in the room
@@ -127,7 +275,7 @@ def _page_rows(
     rows = list(
         transaction.fetchall(
             f"""
-            SELECT {_PAGE_COLUMNS} FROM visible_messages
+            SELECT {_PAGE_SIZE_COLUMNS} FROM visible_messages
             WHERE principal_id = ? AND room_id = ? AND thread_id = ?{cursor_clause}
             ORDER BY created_ts DESC, logical_event_id DESC
             LIMIT ?
@@ -138,7 +286,7 @@ def _page_rows(
     if thread_id is not None:
         root = transaction.fetchone(
             f"""
-            SELECT {_PAGE_COLUMNS} FROM visible_messages
+            SELECT {_PAGE_SIZE_COLUMNS} FROM visible_messages
             WHERE principal_id = ? AND room_id = ? AND logical_event_id = ?{cursor_clause}
             """,  # noqa: S608 - a fixed column list and a fixed clause, not input
             (principal_id, room_id, thread_id, *cursor_params),
@@ -148,6 +296,108 @@ def _page_rows(
             rows.sort(key=lambda row: (int(row["created_ts"]), row["logical_event_id"]), reverse=True)
             del rows[limit:]
     return tuple(rows)
+
+
+def _load_rows(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    sized: tuple[Row, ...],
+) -> tuple[Row, ...]:
+    """Return the full rows a page was sized on, in the same order, by primary key."""
+    if not sized:
+        return ()
+    placeholders = ", ".join("?" for _ in sized)
+    loaded = {
+        row["logical_event_id"]: row
+        for row in transaction.fetchall(
+            f"""
+            SELECT {_PAGE_COLUMNS} FROM visible_messages
+            WHERE principal_id = ? AND room_id = ? AND logical_event_id IN ({placeholders})
+            """,  # noqa: S608 - a fixed column list and generated placeholders, not input
+            (principal_id, room_id, *(row["logical_event_id"] for row in sized)),
+        )
+    }
+    return tuple(loaded[row["logical_event_id"]] for row in sized)
+
+
+def _rows_within_content_budget(rows: tuple[Row, ...]) -> int:
+    """Return how many of one page's newest rows fit its content budget, never fewer than one.
+
+    A row owing a refetch holds no content and costs nothing, so resolving it
+    can only shorten the next read of the same page, never lengthen it.
+    """
+    total = 0
+    for index, row in enumerate(rows):
+        total += int(row["content_bytes"] or 0)
+        if total > PAGE_CONTENT_BUDGET_BYTES:
+            return max(index, 1)
+    return len(rows)
+
+
+def _rows_within_decoded_budget(rows: tuple[Row, ...]) -> int:
+    """Return how many of one page's loaded rows fit what it may decode to, never fewer than one."""
+    total = 0
+    for index, row in enumerate(rows):
+        content_json = row["content_json"] or ""
+        total += (
+            len(content_json)
+            # Stored content is compact JSON: a structural object opens with an unescaped quote or closes at
+            # once, and a structural separator is never followed by a space, so JSON text inside strings is free.
+            + _DECODED_BYTES_PER_ARRAY * (content_json.count("[") - content_json.count('[\\"'))
+            + _DECODED_BYTES_PER_OBJECT * (content_json.count('{"') + content_json.count("{}"))
+            + _DECODED_BYTES_PER_SEPARATOR
+            * (content_json.count(",") - content_json.count(", ") + content_json.count(":") - content_json.count(": "))
+        )
+        if total > _PAGE_DECODED_BUDGET_BYTES:
+            return max(index, 1)
+    return len(rows)
+
+
+def later_message_exists(
+    transaction: Transaction,
+    principal_id: str,
+    *,
+    room_id: str,
+    thread_id: str | None,
+    source_event_ids: tuple[str, ...],
+    excluded_senders: frozenset[str],
+    whole_room: bool = False,
+) -> bool:
+    """Return whether a message from someone outside ``excluded_senders`` came after these sources in one conversation.
+
+    A source no longer visible counts as nothing coming after it. With
+    ``whole_room``, the room is one conversation, so a message in any of its
+    threads counts.
+    """
+    placeholders = ", ".join("?" for _ in source_event_ids)
+    excluded = ", ".join("?" for _ in excluded_senders) or "NULL"
+    thread_clause = "" if whole_room else "AND later.thread_id = ?"
+    thread_params = () if whole_room else (encode_thread_id(thread_id),)
+    row = transaction.fetchone(
+        f"""
+        SELECT 1 AS present FROM visible_messages AS later
+        WHERE later.principal_id = ? AND later.room_id = ? {thread_clause}
+          AND later.logical_event_id NOT IN ({placeholders})
+          AND later.sender NOT IN ({excluded})
+          AND later.created_ts > (
+            SELECT MAX(source.created_ts) FROM visible_messages AS source
+            WHERE source.principal_id = later.principal_id AND source.room_id = later.room_id
+              AND source.logical_event_id IN ({placeholders})
+          )
+        LIMIT 1
+        """,  # noqa: S608 - generated placeholders, values still bound
+        (
+            principal_id,
+            room_id,
+            *thread_params,
+            *source_event_ids,
+            *excluded_senders,
+            *source_event_ids,
+        ),
+    )
+    return row is not None
 
 
 def latest_visible_event_id(
@@ -173,16 +423,16 @@ def latest_visible_event_id(
     A withheld body is not enough to tell those apart. A message whose text
     lives in a sidecar is stored exactly the same way -- no body, refresh owed
     -- and its revision is a perfectly good event that was never redacted. Only
-    the tombstone distinguishes them, so only the tombstone is consulted.
+    the recorded redaction distinguishes them, so only it is consulted.
     """
     row = transaction.fetchone(
         """
         SELECT CASE
                    WHEN EXISTS (
-                       SELECT 1 FROM redaction_tombstones AS tombstone
-                       WHERE tombstone.principal_id = visible.principal_id
-                         AND tombstone.room_id = visible.room_id
-                         AND tombstone.redacted_event_id = visible.revision_event_id
+                       SELECT 1 FROM event_redactions AS redaction
+                       WHERE redaction.agent_name = ?
+                         AND redaction.room_id = visible.room_id
+                         AND redaction.event_id = visible.revision_event_id
                    )
                    THEN visible.logical_event_id
                    ELSE visible.revision_event_id
@@ -192,9 +442,14 @@ def latest_visible_event_id(
         ORDER BY visible.created_ts DESC, visible.logical_event_id DESC
         LIMIT 1
         """,
-        (principal_id, room_id, encode_thread_id(thread_id)),
+        (agent_of_principal(principal_id), principal_id, room_id, encode_thread_id(thread_id)),
     )
     return None if row is None else str(row["reply_target"])
+
+
+def _walk_version(thread_id: str | None) -> int:
+    """Return the walk version whose marker stands for one conversation."""
+    return _ROOM_WALK_VERSION if thread_id is None else _THREAD_WALK_VERSION
 
 
 def _current_hydration(
@@ -208,13 +463,15 @@ def _current_hydration(
 
     A repairable recovery obligation withholds every marker in the room so the
     next read enters the repair path. A truncated obligation leaves its bounded
-    context readable, but cannot certify completeness.
+    context readable, but cannot certify completeness. A marker an older walk
+    version earned speaks for nothing, so the next read walks again.
     """
     row = transaction.fetchone(
         """
         SELECT hydration.membership_epoch AS hydrated_epoch,
                hydration.complete AS complete,
                hydration.attempted_policy_rank AS attempted_policy_rank,
+               hydration.walk_version AS walk_version,
                COALESCE(membership.membership_epoch, 0) AS current_epoch,
                recovery.state AS recovery_state
         FROM conversation_hydration AS hydration
@@ -230,6 +487,8 @@ def _current_hydration(
         (principal_id, room_id, encode_thread_id(thread_id)),
     )
     if row is None or int(row["hydrated_epoch"]) != int(row["current_epoch"]):
+        return None
+    if int(row["walk_version"]) != _walk_version(thread_id):
         return None
     if row["recovery_state"] == "repairable":
         return None
@@ -349,10 +608,12 @@ def mark_conversation_hydrated(
     once more before publishing coverage, so a fence between any two commits
     deletes the earlier rows and makes every later step refuse the stale epoch.
 
-    Coverage only ever grows within one membership epoch. Two hydrators can
-    finish in either order, and a narrower walk finishing last cannot overwrite
-    the wider walk's proof that it reached the end or attempted a stronger
-    policy. A later membership is a different view and clears both facts.
+    Coverage only ever grows within one membership epoch and walk version. Two
+    hydrators can finish in either order, and a narrower walk finishing last
+    cannot overwrite the wider walk's proof that it reached the end or
+    attempted a stronger policy. A later membership is a different view and
+    clears both facts, and so does a newer walk version, because an older
+    walk's proof is the thing that version stopped trusting.
     """
     if not claim_membership_epoch(
         transaction,
@@ -387,23 +648,26 @@ def publish_conversation_hydration(
     transaction.execute(
         """
         INSERT INTO conversation_hydration (
-            principal_id, room_id, thread_id, membership_epoch, complete, attempted_policy_rank
+            principal_id, room_id, thread_id, membership_epoch, complete, attempted_policy_rank, walk_version
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (principal_id, room_id, thread_id) DO UPDATE SET
             membership_epoch = excluded.membership_epoch,
             complete = CASE
                 WHEN conversation_hydration.membership_epoch = excluded.membership_epoch
+                     AND conversation_hydration.walk_version = excluded.walk_version
                      AND conversation_hydration.complete <> 0
                 THEN conversation_hydration.complete
                 ELSE excluded.complete
             END,
             attempted_policy_rank = CASE
                 WHEN conversation_hydration.membership_epoch = excluded.membership_epoch
+                     AND conversation_hydration.walk_version = excluded.walk_version
                      AND conversation_hydration.attempted_policy_rank > excluded.attempted_policy_rank
                 THEN conversation_hydration.attempted_policy_rank
                 ELSE excluded.attempted_policy_rank
-            END
+            END,
+            walk_version = excluded.walk_version
         """,
         (
             principal_id,
@@ -412,7 +676,16 @@ def publish_conversation_hydration(
             membership_epoch,
             int(complete),
             attempted_policy_rank,
+            _walk_version(thread_id),
         ),
+    )
+
+
+def revoke_room_hydration(transaction: Transaction, principal_id: str, *, room_id: str) -> None:
+    """Drop every conversation marker in one room so each is walked again on its next read."""
+    transaction.execute(
+        "DELETE FROM conversation_hydration WHERE principal_id = ? AND room_id = ?",
+        (principal_id, room_id),
     )
 
 

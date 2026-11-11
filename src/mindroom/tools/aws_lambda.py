@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="aws_lambda",
+    file_access=ToolFileAccess.NONE,
     display_name="AWS Lambda",
     description="Serverless function management and execution",
     category=ToolCategory.DEVELOPMENT,
@@ -51,7 +52,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["boto3"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/aws_lambda",
+    docs_url="https://docs.mindroom.chat/tools/automation-and-platforms/#aws_lambda",
     function_names=("invoke_function", "list_functions"),
 )
 def aws_lambda_tools() -> type[AWSLambdaTools]:

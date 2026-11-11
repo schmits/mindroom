@@ -8,15 +8,19 @@ revision, because the store never returns it to anyone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
+import aiohttp
+
+from mindroom.entity_resolution import entity_identity_registry
 from mindroom.logging_config import get_logger
 from mindroom.matrix.agent_message_snapshot import AgentMessageSnapshot
-from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
+from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage, replace_visible_message
+from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES, ConversationReadError
 from mindroom.matrix.thread_diagnostics import (
     THREAD_HISTORY_DEGRADED_DIAGNOSTIC,
     THREAD_HISTORY_SOURCE_DEGRADED,
@@ -25,9 +29,11 @@ from mindroom.matrix.thread_diagnostics import (
 from mindroom.matrix.thread_history_result import ThreadHistoryResult, thread_history_result
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Iterator, Sequence
 
-    from mindroom.event_journal import ConversationCursor, ConversationPage, ConversationReadView
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+    from mindroom.event_journal import ConversationCursor, ConversationPage, ConversationReadView, RoomPage
     from mindroom.matrix.conversation_hydration import ConversationHydrator
 
 logger = get_logger(__name__)
@@ -53,8 +59,8 @@ class ThreadReadMode(Enum):
     STRICT = auto()
 
 
-def projected_visible_messages(page: ConversationPage) -> list[ResolvedVisibleMessage]:
-    """Render one projected page as the visible messages every consumer reads.
+def projected_visible_messages(page: ConversationPage | RoomPage) -> list[ResolvedVisibleMessage]:
+    """Render one projected page, of a conversation or a whole room, as the visible messages every consumer reads.
 
     The single conversion from a projection row to the shape the rest of
     MindRoom renders, so a prompt and an exported thread cannot disagree about
@@ -102,6 +108,10 @@ def projected_thread_history(
         if source_degraded
         else None
     )
+    if page.refresh_pending:
+        # A withheld revision is repairable. Dispatch must resolve it before
+        # counting participants, even when the rest of the source is current.
+        diagnostics = {**(diagnostics or {}), THREAD_HISTORY_DEGRADED_DIAGNOSTIC: True}
     return thread_history_result(
         messages,
         # A page with more behind it is not the whole conversation, however
@@ -163,11 +173,7 @@ def with_delivered_response(
     patched = list(messages)
     for index, message in enumerate(patched):
         if message.event_id == delivered_response.event_id:
-            patched[index] = replace(
-                message,
-                body=delivered_response.body,
-                content={**message.content, "body": delivered_response.body},
-            )
+            patched[index] = replace_visible_message(message, body=delivered_response.body)
             return patched
     patched.append(
         ResolvedVisibleMessage.synthetic(
@@ -184,8 +190,16 @@ def with_delivered_response(
     return patched
 
 
-class _StaleConversationError(RuntimeError):
-    """A strict read could not obtain the server-authoritative content."""
+@contextmanager
+def _homeserver_failure_fails_the_read(room_id: str, thread_id: str | None) -> Iterator[None]:
+    """Fail a strict read whose request to the homeserver broke off, as nio raises rather than answers it."""
+    try:
+        yield
+    except aiohttp.ClientError as error:
+        msg = (
+            f"Conversation {room_id}/{thread_id} could not be read from the homeserver: {type(error).__name__}: {error}"
+        )
+        raise ConversationReadError(msg) from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,10 +208,6 @@ class ConversationReader:
 
     store: ConversationReadView
     hydrator: ConversationHydrator
-
-    async def is_event_redacted(self, *, room_id: str, event_id: str) -> bool:
-        """Distinguish proven physical deletion from an unavailable projection row."""
-        return await self.store.is_event_redacted(room_id=room_id, event_id=event_id)
 
     async def may_have_unread_history(self, *, room_id: str, thread_id: str | None) -> bool:
         """Return whether local absence cannot prove this conversation is fresh.
@@ -279,6 +289,24 @@ class ConversationReader:
             before=before,
         )
 
+    async def read_room_after(
+        self,
+        room_id: str,
+        after: ConversationCursor | None,
+        limit: int,
+        until_ts: int,
+    ) -> RoomPage:
+        """Return up to ``limit`` visible messages of a whole room after a cursor, oldest first, stamped by ``until_ts``.
+
+        Every thread and the room level are read together, without waiting for
+        a hydration or a refetch: a message owing one is left out.
+        """
+        return await self.store.read_room_after(room_id=room_id, after=after, limit=limit, until_ts=until_ts)
+
+    async def latest_room_cursor(self, room_id: str) -> ConversationCursor | None:
+        """Return the position of a room's newest visible message, in any thread, or nothing when it has none."""
+        return await self.store.latest_room_cursor(room_id=room_id)
+
     async def read_strict(
         self,
         *,
@@ -289,21 +317,22 @@ class ConversationReader:
     ) -> ConversationPage:
         """Return a complete bounded page, hydrating and refetching as needed.
 
-        Raises rather than returning a page with content missing. A caller
-        building a prompt cannot tell an omitted message from a conversation
-        that never had one, so silently dropping it would change what the model
-        is answering.
+        Raises ``ConversationReadError`` rather than returning a page with
+        content missing. A caller building a prompt cannot tell an omitted
+        message from a conversation that never had one, so silently dropping it
+        would change what the model is answering.
         """
-        await self.hydrator.ensure_hydrated(room_id=room_id, thread_id=thread_id)
-        page = await self.store.read_conversation(
-            room_id=room_id,
-            thread_id=thread_id,
-            limit=limit,
-            before=before,
-        )
-        if not page.refresh_pending:
-            return page
-        await self.hydrator.resolve_refreshes(page.refresh_pending)
+        with _homeserver_failure_fails_the_read(room_id, thread_id):
+            await self.hydrator.ensure_hydrated(room_id=room_id, thread_id=thread_id)
+            page = await self.store.read_conversation(
+                room_id=room_id,
+                thread_id=thread_id,
+                limit=limit,
+                before=before,
+            )
+            if not page.refresh_pending:
+                return page
+            await self.hydrator.resolve_refreshes(page.refresh_pending)
         page = await self.store.read_conversation(
             room_id=room_id,
             thread_id=thread_id,
@@ -315,7 +344,7 @@ class ConversationReader:
                 f"Conversation {room_id}/{thread_id} has "
                 f"{len(page.refresh_pending)} message(s) awaiting a server refetch"
             )
-            raise _StaleConversationError(msg)
+            raise ConversationReadError(msg)
         return page
 
 
@@ -352,12 +381,42 @@ async def latest_agent_message_snapshot(
     return None
 
 
+async def consecutive_agent_messages(
+    reader: ConversationReader,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    *,
+    room_id: str,
+    thread_id: str | None,
+    limit: int,
+    agent_ids: frozenset[str] = frozenset(),
+) -> int:
+    """Count the newest messages in one conversation that agents or teams wrote, looking back at most ``limit``.
+
+    ``agent_ids`` are agents this deployment does not run that count too. Any other sender, the router included, ends
+    the run: it writes only for a person.
+    """
+    page = await reader.read(room_id=room_id, thread_id=thread_id, limit=limit)
+    registry = entity_identity_registry(config, runtime_paths)
+    count = 0
+    for message in reversed(page.messages):
+        if (
+            message.sender not in agent_ids
+            and registry.current_entity_name_for_user_id(message.sender, include_router=False) is None
+        ):
+            break
+        count += 1
+    return count
+
+
 async def complete_thread_history(
     reader: ConversationReader,
     room_id: str,
     thread_id: str,
 ) -> ThreadHistoryResult:
-    """Return one thread's complete history for a caller outside the turn path.
+    """Return one thread's history, strictly read and bounded, for a caller outside the turn path.
+
+    ``is_full_history`` says whether the page is the whole thread.
 
     Summaries, schedulers, and Matrix tools all want the same thing the prompt
     path wants -- a conversation with nothing missing from it -- without also
@@ -372,3 +431,36 @@ async def complete_thread_history(
     # populated the conversation reached the beginning of it.
     truncated = await reader.hydration_was_truncated(room_id=room_id, thread_id=thread_id)
     return projected_thread_history(page, complete=not truncated)
+
+
+async def refetched_thread_history(
+    reader: ConversationReader,
+    room_id: str,
+    thread_id: str,
+    *,
+    edits_of: Collection[str] = (),
+    unreadable_is_missing: bool,
+) -> ThreadHistoryResult:
+    """Return one thread's history after walking it on the server again.
+
+    For the caller that must observe a write another runtime just made, which
+    the projection only learns about when sync delivers it, or that must prove
+    a thread has no reply. The result is full history only when this walk
+    itself read the whole thread, so such a caller can tell a fresh view from
+    an old marker's.
+    ``edits_of`` names messages whose newest revision the caller must see, and
+    ``unreadable_is_missing`` whether an event the walk could not decrypt keeps
+    the history short of full; see `ConversationHydrator.rewalk`.
+    """
+    with _homeserver_failure_fails_the_read(room_id, thread_id):
+        walk_complete = await reader.hydrator.rewalk(
+            room_id=room_id,
+            thread_id=thread_id,
+            edits_of=edits_of,
+            unreadable_is_missing=unreadable_is_missing,
+        )
+    page = await reader.read_strict(room_id=room_id, thread_id=thread_id, limit=HYDRATED_PROMPT_WINDOW_MESSAGES)
+    # Whole only as far as this walk of this thread vouches. A room-wide
+    # recovery that stopped short concerns the room timeline, which a thread's
+    # own relation walk does not read through.
+    return projected_thread_history(page, complete=walk_complete)

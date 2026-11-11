@@ -12,12 +12,14 @@ const securityHeaders = [
       "object-src 'none'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      "script-src 'self' 'unsafe-inline'",
+      // Plausible analytics; its events post to the same host, which connect-src already allows.
+      "script-src 'self' 'unsafe-inline' https://plausible.nijho.lt",
       "style-src 'self' 'unsafe-inline'",
       "connect-src 'self' https: wss:",
       "frame-src 'self' https://js.stripe.com https://hooks.stripe.com",
       "form-action 'self'",
-      "media-src 'self'",
+      // The landing page's product film is a GitHub attachment, which redirects to GitHub's asset bucket.
+      "media-src 'self' https://github.com https://github-production-user-asset-6210df.s3.amazonaws.com",
       "worker-src 'self' blob:",
       'upgrade-insecure-requests',
       'report-uri /api/csp-report',

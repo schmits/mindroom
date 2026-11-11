@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import atexit
+import contextvars
 import logging
 import logging.config
+import logging.handlers
 import os
+import queue
 import sys
+import traceback
 from datetime import UTC, datetime
 from io import StringIO
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import structlog
 
@@ -18,11 +24,25 @@ if TYPE_CHECKING:
     from contextlib import AbstractContextManager
     from typing import TextIO
 
-    from structlog.typing import ExceptionRenderer, ExcInfo
+    from structlog.typing import ExceptionRenderer, ExcInfo, Processor
 
     from mindroom.constants import RuntimePaths
 
-__all__ = ["bound_log_context", "get_logger", "setup_logging"]
+__all__ = [
+    "bound_log_context",
+    "configure_default_logging",
+    "current_log_file",
+    "exception_frames",
+    "get_logger",
+    "setup_logging",
+    "setup_subprocess_logging",
+    "subprocess_logging_env",
+    "uses_default_logging",
+]
+
+_LOG_LEVEL_ENV = "LOG_LEVEL"
+_LOG_FORMAT_ENV = "MINDROOM_LOG_FORMAT"
+_LOGGER_LEVELS_ENV = "MINDROOM_LOGGER_LEVELS"
 
 
 _DEFAULT_LOGGER_LEVELS = {
@@ -59,6 +79,58 @@ class _NioValidationFilter(logging.Filter):
         return True
 
 
+class _Mem0KeywordSearchFilter(logging.Filter):
+    """Drop Mem0's advice to leave Chroma, which it logs for every memory MindRoom builds."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return False for Mem0's Chroma keyword-search warning and True for every other record.
+
+        Chroma is the only vector store MindRoom configures, so the advice to switch to another one cannot be
+        followed, and MindRoom builds a Mem0 memory for every memory operation.
+        """
+        return not (
+            record.name == "mem0.memory.main"
+            and record.getMessage().startswith("The 'chroma' vector store does not support keyword search.")
+        )
+
+
+def _scrub_request_record(record: logging.LogRecord) -> bool:
+    """Keep the query, headers, and frame contents of uvicorn's requests out of its records, since they can carry secrets.
+
+    Returns False for each raw WebSocket traffic record, whether or not it carries such data, and True for every other
+    record, its query cut.
+    """
+    message = record.msg if isinstance(record.msg, str) else ""
+    # The websockets library logs each raw handshake line, header, and frame on uvicorn's error logger at DEBUG.
+    if message.startswith(("< ", "> ")):
+        return False
+    # Uvicorn logs each HTTP request's target, its path with query, as the third argument of an access line,
+    # and each WebSocket handshake's as the second argument of a `WebSocket` line on its error logger.
+    if record.name == "uvicorn.access":
+        target = 2
+    elif message.startswith('%s - "WebSocket %s"'):
+        target = 1
+    else:
+        return True
+    if isinstance(record.args, tuple) and len(record.args) > target:
+        args = list(record.args)
+        args[target] = str(args[target]).partition("?")[0]
+        record.args = tuple(args)
+    return True
+
+
+class _AgnoLevelFilter(logging.Filter):
+    """Drop records below the level MindRoom resolved for one Agno logger."""
+
+    def __init__(self, level: str) -> None:
+        super().__init__()
+        self.levelno = logging.getLevelNamesMapping()[level]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Keep only records at or above the resolved level."""
+        return record.levelno >= self.levelno
+
+
 class _RedactingExceptionFormatter:
     """Render exceptions normally, then redact credential-bearing text."""
 
@@ -89,6 +161,35 @@ def _redact_log_event_preserving_exc_info(
     redacted = redact_log_event(logger, method_name, redacted_input)
     redacted["exc_info"] = exc_info
     return redacted
+
+
+# structlog's builtin console renderer prints Rich tracebacks with every frame's
+# locals: resolved config, credentials, subprocess environments. Processes that
+# never call `setup_logging`, such as subprocess entrypoints and the sandbox
+# runner, log through these processors instead.
+_DEFAULT_PROCESSORS: list[Processor] = [
+    structlog.contextvars.merge_contextvars,
+    structlog.processors.add_log_level,
+    structlog.processors.StackInfoRenderer(),
+    structlog.dev.set_exc_info,
+    structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+    cast("Processor", _redact_log_event_preserving_exc_info),
+    structlog.dev.ConsoleRenderer(
+        colors=False,
+        exception_formatter=_RedactingExceptionFormatter(structlog.dev.plain_traceback),
+    ),
+]
+
+
+def configure_default_logging() -> None:
+    """Restore the logging a process uses until it calls `setup_logging`."""
+    structlog.reset_defaults()
+    structlog.configure(processors=_DEFAULT_PROCESSORS)
+
+
+def uses_default_logging() -> bool:
+    """Return whether the processors are still the ones `configure_default_logging` installed."""
+    return structlog.get_config()["processors"] is _DEFAULT_PROCESSORS
 
 
 def _normalize_log_level(level: str) -> str:
@@ -124,6 +225,7 @@ def _build_logger_levels(
     *,
     global_level: str,
     override_config: str | None,
+    handler_names: list[str],
 ) -> tuple[str, dict[str, dict[str, object]]]:
     """Build logger config and the handler threshold needed to emit it."""
     level_numbers = logging.getLevelNamesMapping()
@@ -135,13 +237,94 @@ def _build_logger_levels(
     handler_level = min((root_level, *logger_levels.values()), key=level_numbers.__getitem__)
     loggers: dict[str, dict[str, object]] = {
         "": {  # Root logger
-            "handlers": ["console", "file"],
+            "handlers": handler_names,
             "level": root_level,
             "propagate": False,
         },
     }
     loggers.update({logger_name: {"level": logger_level} for logger_name, logger_level in logger_levels.items()})
     return handler_level, loggers
+
+
+# Several minutes of busy logging at tens of records a second, in a few tens of megabytes at most.
+_MAX_QUEUED_LOG_FILE_RECORDS = 10_000
+
+
+class _LogFile(logging.FileHandler):
+    """A log file whose failed reopen is reported like a failed write, so it cannot end the writer thread."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Append the record, reopening the file first if it was closed."""
+        try:
+            super().emit(record)
+        except Exception:
+            self.handleError(record)
+
+
+class _QueuedFileHandler(logging.handlers.QueueHandler):
+    """Format records on the logging thread and append them to the log file from a writer thread.
+
+    A log directory on a network file system can stall writes for minutes, and a write on the event loop would stall
+    every agent with it. Formatting stays on the logging thread, so records keep their bound context and timestamps.
+    The queue is capped so a long stall cannot grow memory without limit: from the cap until the writer has caught up,
+    records skip the file only, stderr still gets them, and a note in the file says how many it skipped.
+    """
+
+    def __init__(self, filename: str, mode: str, encoding: str) -> None:
+        # Unlike `queue.Queue`, `SimpleQueue` is reentrant, so a finalizer that logs during a put cannot deadlock it.
+        super().__init__(queue.SimpleQueue())
+        self._file = _LogFile(filename, mode=mode, encoding=encoding)
+        self._dropped_records = 0
+        # A later `dictConfig`, such as uvicorn's, drops this handler from the list `logging.shutdown` closes at exit.
+        atexit.register(self.close)
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        """Queue the formatted record, or count it as dropped from the cap until the writer has caught up."""
+        queued_records = cast("queue.SimpleQueue[logging.LogRecord]", self.queue).qsize()
+        if queued_records >= _MAX_QUEUED_LOG_FILE_RECORDS or (self._dropped_records and queued_records):
+            self._dropped_records += 1
+            return
+        if self.listener is None:
+            # Any `dictConfig` closes every handler, even one it leaves on the root logger, and a closed `FileHandler`
+            # reopens on its next record; this writer starts again the same way.
+            listener = logging.handlers.QueueListener(self.queue, self._file)
+            listener.start()
+            self.listener = listener
+        self._queue_dropped_records_note()
+        self.queue.put_nowait(record)
+
+    def _queue_dropped_records_note(self) -> None:
+        """Queue a note where the file skipped records, if it skipped any since the last note."""
+        if not self._dropped_records:
+            return
+        note = logging.makeLogRecord(
+            {
+                "name": __name__,
+                "levelno": logging.WARNING,
+                "levelname": "WARNING",
+                "msg": "Log file dropped records while its writes were stalled",
+                "dropped_records": self._dropped_records,
+            },
+        )
+        self._dropped_records = 0
+        # An empty context keeps the bound fields of whichever task logged next off the note.
+        self.queue.put_nowait(contextvars.Context().run(self.prepare, note))
+
+    def close(self) -> None:
+        """Write every queued record, then close the file."""
+        self.acquire()
+        try:
+            if self.listener is not None:
+                self._queue_dropped_records_note()
+                self.listener.stop()
+                self.listener = None
+            self._file.close()
+        finally:
+            self.release()
+        super().close()
+
+
+_current_log_file: Path | None = None
 
 
 def setup_logging(
@@ -164,6 +347,41 @@ def setup_logging(
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     log_file = logs_dir / f"mindroom_{timestamp}.log"
 
+    renderer_name = _configure_logging(level=level, log_file=log_file)
+    global _current_log_file
+    _current_log_file = log_file
+
+    # Log startup message
+    logger = get_logger(__name__)
+    logger.info("Logging initialized", log_file=str(log_file), level=level, log_format=renderer_name)
+
+
+def subprocess_logging_env() -> dict[str, str]:
+    """Return the environment that makes `setup_subprocess_logging` in a child log like this process."""
+    # The root level also reflects `mindroom run --log-level`, which never reaches the environment.
+    return {
+        _LOG_LEVEL_ENV: logging.getLevelName(logging.getLogger().level),
+        _LOG_FORMAT_ENV: os.getenv(_LOG_FORMAT_ENV, ""),
+        _LOGGER_LEVELS_ENV: os.getenv(_LOGGER_LEVELS_ENV, ""),
+    }
+
+
+def current_log_file() -> Path | None:
+    """Return the log file `setup_logging` opened in this process, if any."""
+    return _current_log_file
+
+
+def setup_subprocess_logging(log_file: Path | None = None) -> None:
+    """Configure a child process to log to stderr like the parent that built its `subprocess_logging_env`.
+
+    The child writes no log file of its own, so each run does not leave a new file behind.
+    A long-lived child can pass the parent's `current_log_file()` to append its records there too.
+    """
+    _configure_logging(level=os.getenv(_LOG_LEVEL_ENV, "INFO"), log_file=log_file)
+
+
+def _configure_logging(*, level: str, log_file: Path | None) -> str:
+    """Route structlog, stdlib, and Agno records to stderr and an optional file; return the renderer name."""
     # Shared processors that don't affect output format
     timestamper = structlog.processors.TimeStamper(fmt="iso")
     pre_chain = [
@@ -174,11 +392,13 @@ def setup_logging(
         timestamper,
         _redact_log_event_preserving_exc_info,
     ]
-    log_format = os.getenv("MINDROOM_LOG_FORMAT", "text").strip().lower()
-    renderer_name = "json" if log_format == "json" else ("colored" if sys.stderr.isatty() else "text")
+    log_format = os.getenv(_LOG_FORMAT_ENV, "text").strip().lower()
+    use_colors = sys.stderr.isatty() and not os.getenv("NO_COLOR")
+    renderer_name = "json" if log_format == "json" else ("colored" if use_colors else "text")
     handler_level, loggers = _build_logger_levels(
         global_level=level,
-        override_config=os.getenv("MINDROOM_LOGGER_LEVELS"),
+        override_config=os.getenv(_LOGGER_LEVELS_ENV),
+        handler_names=["console", "file"] if log_file is not None else ["console"],
     )
 
     text_processors = [
@@ -209,7 +429,26 @@ def setup_logging(
         structlog.processors.JSONRenderer(),
     ]
 
-    # Configure logging with both console and file handlers
+    handlers: dict[str, dict[str, object]] = {
+        "console": {
+            "level": handler_level,
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": renderer_name,
+            "filters": ["nio_validation", "mem0_keyword_search"],
+        },
+    }
+    if log_file is not None:
+        handlers["file"] = {
+            "level": handler_level,
+            "()": _QueuedFileHandler,
+            "filename": str(log_file),
+            "mode": "a",
+            "encoding": "utf-8",
+            "formatter": "json" if renderer_name == "json" else "text",
+            "filters": ["nio_validation", "mem0_keyword_search"],
+        }
+
     logging.config.dictConfig(
         {
             "version": 1,
@@ -235,25 +474,11 @@ def setup_logging(
                 "nio_validation": {
                     "()": _NioValidationFilter,
                 },
-            },
-            "handlers": {
-                "console": {
-                    "level": handler_level,
-                    "class": "logging.StreamHandler",
-                    "stream": "ext://sys.stderr",
-                    "formatter": renderer_name,
-                    "filters": ["nio_validation"],
-                },
-                "file": {
-                    "level": handler_level,
-                    "class": "logging.FileHandler",
-                    "filename": str(log_file),
-                    "mode": "a",
-                    "encoding": "utf-8",
-                    "formatter": "json" if renderer_name == "json" else "text",
-                    "filters": ["nio_validation"],
+                "mem0_keyword_search": {
+                    "()": _Mem0KeywordSearchFilter,
                 },
             },
+            "handlers": handlers,
             "loggers": loggers,
         },
     )
@@ -276,10 +501,47 @@ def setup_logging(
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+    _route_agno_loggers_to_root(loggers)
+    return renderer_name
 
-    # Log startup message
-    logger = get_logger(__name__)
-    logger.info("Logging initialized", log_file=str(log_file), level=level, log_format=renderer_name)
+
+def _route_agno_loggers_to_root(loggers: dict[str, dict[str, object]]) -> None:
+    """Send Agno records through the configured handlers, so they share their format, level, and stream."""
+    # AGNO_COMPAT: Agno library loggers bypass the host's logging configuration.
+    # Reason: Importing agno.utils.log gives the agno, agno-team, and agno-workflow loggers their own
+    # stdout handler at INFO with propagation disabled, so their records ignore the configured level,
+    # skip the JSON renderer and redaction, and leave the knowledge refresh child as plain stderr lines.
+    # The loggers keep the INFO level Agno sets on them, and propagated records skip the root level, so a
+    # logger filter enforces the resolved level instead.
+    # Upstream issue: https://github.com/agno-agi/agno/issues/4097, closed after Agno 2.0 added
+    # `configure_agno_logging`, which swaps module globals but leaves the default handlers on the
+    # loggers that modules imported directly.
+    # Upstream PR: none identified.
+    # Remove when: Agno's library loggers propagate to the host's handlers without installing their own
+    # handlers or setting their own levels.
+    # Coverage: tests/test_logging_config.py::test_agno_records_follow_configured_format_and_level;
+    # tests/test_logging_config.py::test_agno_records_keep_the_resolved_level_after_agno_resets_it;
+    # tests/test_logging_config.py::test_subprocess_logging_matches_parent_format_and_level.
+    from agno.utils import log as agno_log  # noqa: PLC0415 - keeps agno out of the config layer's imports.
+
+    for agno_logger in (agno_log.agent_logger, agno_log.team_logger, agno_log.workflow_logger):
+        for handler in list(agno_logger.handlers):
+            agno_logger.removeHandler(handler)
+        agno_logger.propagate = True
+        for log_filter in list(agno_logger.filters):
+            if isinstance(log_filter, _AgnoLevelFilter):
+                agno_logger.removeFilter(log_filter)
+        # No Agno logger name has a parent below the root, so only an exact override or the root level applies.
+        level = cast("str", loggers.get(agno_logger.name, loggers[""])["level"])
+        agno_logger.addFilter(_AgnoLevelFilter(level))
+
+
+def exception_frames(error: BaseException) -> list[str]:
+    """Return an exception's stack locations without its message, source lines, or locals."""
+    return [
+        f"{Path(frame.filename).name}:{frame.lineno} ({frame.name})"
+        for frame in traceback.extract_tb(error.__traceback__)
+    ]
 
 
 def get_logger(name: str = __name__) -> structlog.stdlib.BoundLogger:
@@ -298,3 +560,11 @@ def get_logger(name: str = __name__) -> structlog.stdlib.BoundLogger:
 def bound_log_context(**context: object) -> AbstractContextManager[None]:
     """Temporarily bind structured log fields for the current async/task scope."""
     return structlog.contextvars.bound_contextvars(**context)
+
+
+if not structlog.is_configured():
+    configure_default_logging()
+# A logger's filters outlast every later `dictConfig`, such as the one each uvicorn server runs as it starts,
+# so every server in a process that imports this module keeps these.
+logging.getLogger("uvicorn.access").addFilter(_scrub_request_record)
+logging.getLogger("uvicorn.error").addFilter(_scrub_request_record)

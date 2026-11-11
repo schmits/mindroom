@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from mindroom.model_defaults import CARTESIA_TTS
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -14,9 +14,11 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="cartesia",
+    file_access=ToolFileAccess.NONE,
+    worker_inert_agent_functions=("text_to_speech",),
     display_name="Cartesia",
     description="Voice AI services including text-to-speech and voice localization",
-    category=ToolCategory.DEVELOPMENT,  # others/ → DEVELOPMENT according to mapping
+    category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,  # requires API key
     setup_type=SetupType.API_KEY,  # API key authentication
     icon="VolumeX",  # Voice/sound related icon
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("CARTESIA_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -73,7 +76,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["cartesia"],
-    docs_url="https://docs.agno.com/tools/toolkits/others/cartesia",
+    docs_url="https://docs.mindroom.chat/tools/ai-and-generation/#cartesia",
     function_names=("list_voices", "localize_voice", "text_to_speech"),
 )
 def cartesia_tools() -> type[CartesiaTools]:

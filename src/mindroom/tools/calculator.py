@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
-    from agno.tools.calculator import CalculatorTools
+    from mindroom.custom_tools.calculator import CalculatorTools
 
 
 @register_tool_with_metadata(
     name="calculator",
+    file_access=ToolFileAccess.NONE,
     display_name="Calculator",
     description="Mathematical calculator with basic and advanced operations",
     category=ToolCategory.DEVELOPMENT,  # Local tool
@@ -21,12 +22,11 @@ if TYPE_CHECKING:
     icon="Calculator",  # React icon name
     icon_color="text-blue-500",  # Tailwind color class
     config_fields=[],
-    dependencies=["agno"],  # From agno requirements
-    docs_url="https://docs.agno.com/tools/toolkits/local/calculator",
+    docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#calculator",
     function_names=("add", "divide", "exponentiate", "factorial", "is_prime", "multiply", "square_root", "subtract"),
 )
 def calculator_tools() -> type[CalculatorTools]:
     """Return calculator tools for mathematical operations."""
-    from agno.tools.calculator import CalculatorTools
+    from mindroom.custom_tools.calculator import CalculatorTools
 
     return CalculatorTools

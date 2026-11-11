@@ -4,9 +4,8 @@ The live model-facing prompt for one turn is assembled from coalesced batch
 data (``build_prepared_turn`` -> ``PreparedTurn.prompt`` -> the dispatch
 event body handed to the response runner), while the durable replay text
 travels as ``TurnRecord.source_event_prompts`` through
-``TurnStore.record_pending_turn`` into the handled-turn ledger (and, as a
-second physical projection, into Agno run metadata via ``TurnRecordCodec``).
-Edit regeneration (``EditRegenerator._build_request``) rebuilds the
+``turn_rows.record_pending_turn`` into the turn rows.
+Edit regeneration (``EditRegenerator._prompt``) rebuilds the
 model-facing prompt from the persisted record with the same
 ``coalesced_prompt``/``tagged_coalesced_prompt`` renderers, so the persisted
 bytes must reproduce the live prompt exactly. These tests pin that byte-level
@@ -16,14 +15,13 @@ path.
 
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import nio
 import pytest
 
-from mindroom.coalescing_batch import (
+from mindroom.coalescing.batch import (
     CoalescingKey,
     PendingEvent,
     PreparedTurn,
@@ -31,22 +29,14 @@ from mindroom.coalescing_batch import (
     build_prepared_turn,
     coalesced_prompt,
 )
-from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY
-from mindroom.conversation_resolver import MessageContext
 from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
-from mindroom.edit_regenerator import EditRegenerator, EditRegeneratorDeps, _Edit, _Mailbox
-from mindroom.handled_turns import (
-    TurnRecord,
-    TurnRecordCodec,
-)
-from mindroom.history.types import HistoryScope
-from mindroom.message_target import MessageTarget
+from mindroom.edit_regenerator import EditRegenerator, EditRegeneratorDeps
+from mindroom.event_journal import turn_rows
 from mindroom.prompt_message_tags import render_msg_tag
-from mindroom.sync_restart_retry import InterruptedTurnRooms
 from mindroom.timestamp_formatting import format_timestamp_ms
-from mindroom.turn_record import canonicalize_turn_record
-from mindroom.turn_store import TurnStore, TurnStoreDeps
-from tests.conftest import make_pending_event, request_envelope
+from mindroom.turn_record import TurnRecord
+from tests.conftest import make_pending_event
+from tests.turn_dispatch_helpers import nothing_else_queued
 
 if TYPE_CHECKING:
     from mindroom.event_journal import EventJournalStore
@@ -96,97 +86,46 @@ def _live_prompt_for_batch(batch: PreparedTurn) -> str:
 
 
 async def _persist_and_reload(journal_store: EventJournalStore, record: TurnRecord) -> TurnRecord:
-    """Persist through ``TurnStore.record_pending_turn`` and reload the durable bytes from disk."""
-    store = TurnStore(
-        TurnStoreDeps(
-            agent_name=_AGENT_NAME,
-            turn_records=journal_store.turn_records(_AGENT_NAME),
-            redacted_event_ids=journal_store.principal("agent@alice").redacted_event_ids,
-            legacy_responses_file=None,
-            state_writer=MagicMock(),
-            resolver=MagicMock(),
-            tool_runtime=MagicMock(),
-        ),
+    """Persist a pending turn as ingress does and read it back from the database."""
+    records = journal_store.turn_records(_AGENT_NAME)
+    pending = await records.write(turn_rows.record_pending_turn, record, room_id=_ROOM_ID)
+    assert isinstance(pending, turn_rows.PendingTurn)
+    reloaded = await journal_store.turn_records(_AGENT_NAME).read(
+        turn_rows.get_turn_record,
+        record.source_event_ids[-1],
     )
-    await store.warm()
-    pending = await store.record_pending_turn(record)
-    assert pending is not None
-    persisted_rows = await journal_store.turn_records(_AGENT_NAME).load_all()
-    matching_rows = [row for row in persisted_rows if row[0] == record.source_event_ids[-1]]
-    assert len(matching_rows) == 1
-    index_event_id, _anchor_event_id, record_json = matching_rows[0]
-    reloaded = TurnRecordCodec._from_ledger_record(index_event_id, json.loads(record_json))
     assert reloaded is not None
     return reloaded
 
 
-async def _regeneration_prompt(record: TurnRecord) -> str:
+def _regeneration_prompt(record: TurnRecord) -> str:
     """Return the model-facing prompt from the real edit-regeneration seam."""
-    prompt_map = dict(record.source_event_prompts or {})
-    source_event_id = record.replay_source_event_ids[-1]
-    body = prompt_map[source_event_id]
-    target = MessageTarget.resolve(_ROOM_ID, _THREAD_ID, record.anchor_event_id)
-    replay_record = canonicalize_turn_record(
-        record,
-        response_event_id="$response",
-        response_owner=_AGENT_NAME,
-        requester_id=_REQUESTER,
-        history_scope=HistoryScope(kind="agent", scope_id=_AGENT_NAME),
-        conversation_target=target,
-    )
-    context = MessageContext(
-        am_i_mentioned=True,
-        is_thread=True,
-        thread_id=_THREAD_ID,
-        thread_history=(),
-        mentioned_agents=[],
-        has_non_agent_mentions=False,
-    )
-    envelope = request_envelope(
-        room_id=_ROOM_ID,
-        reply_to_event_id=source_event_id,
-        thread_id=_THREAD_ID,
-        prompt=body,
-        user_id=_REQUESTER,
-        target=target,
-        agent_name=_AGENT_NAME,
-    )
-    turn_store = MagicMock(spec=TurnStore)
-    turn_store.load_turn = AsyncMock(return_value=replay_record)
-    turn_store.build_run_metadata.return_value = {}
     regenerator = EditRegenerator(
         EditRegeneratorDeps(
             runtime=MagicMock(),
             runtime_paths=MagicMock(),
             agent_name=_AGENT_NAME,
             resolver=MagicMock(),
-            turn_store=turn_store,
+            turn_store=MagicMock(),
             ingress_hook_runner=MagicMock(),
-            generate_response=AsyncMock(),
-            wait_for_turn_settled=AsyncMock(),
+            response_runner=MagicMock(),
+            turn_policy=MagicMock(),
+            settle_sources=AsyncMock(),
+            stop_reply=AsyncMock(),
             receipt_order=AsyncMock(return_value=1),
-            interrupted_turn_rooms=InterruptedTurnRooms(),
             timestamp_formatter=_timestamp_formatter,
+            store=MagicMock(),
         ),
     )
-    request, _record, _applied = await regenerator._build_request(
+    body = (record.source_event_prompts or {})[record.source_event_ids[-1]]
+    prompt, _structured = regenerator._prompt(
         nio.MatrixRoom(room_id=_ROOM_ID, own_user_id="@agent:localhost"),
-        _Mailbox(
-            pending={
-                source_event_id: _Edit(
-                    original_event_id=source_event_id,
-                    body=body,
-                    context=context,
-                    envelope=envelope,
-                    revision=(1, "$same-body-edit"),
-                    receipt_order=1,
-                    suppressed=False,
-                ),
-            },
-        ),
+        record,
+        record.source_event_ids,
+        body,
     )
-    assert request is not None
-    return request.prompt
+    assert prompt is not None
+    return prompt
 
 
 @pytest.mark.asyncio
@@ -199,6 +138,7 @@ async def test_single_message_persisted_prompt_is_byte_identical_to_live_prompt(
         CoalescingKey(_ROOM_ID, _THREAD_ID, RequesterCoalescingOwner(_REQUESTER)),
         [_pending_text("$event1", body, server_timestamp=1_700_000_000_000)],
         timestamp_formatter=_timestamp_formatter,
+        queues_other_run=nothing_else_queued,
     )
     live_prompt = _live_prompt_for_batch(batch)
     assert live_prompt == body
@@ -223,6 +163,7 @@ async def test_verbatim_body_persisted_prompt_is_byte_identical_through_ledger(
         CoalescingKey(_ROOM_ID, _THREAD_ID, RequesterCoalescingOwner(_REQUESTER)),
         [_pending_text("$event1", body, server_timestamp=1_700_000_000_000)],
         timestamp_formatter=_timestamp_formatter,
+        queues_other_run=nothing_else_queued,
     )
     live_prompt = _live_prompt_for_batch(batch)
     assert live_prompt == body
@@ -269,6 +210,7 @@ async def test_coalesced_batch_replay_prompt_is_byte_identical_to_live_merged_pr
         CoalescingKey(_ROOM_ID, _THREAD_ID, RequesterCoalescingOwner(_REQUESTER)),
         pending_events,
         timestamp_formatter=_timestamp_formatter,
+        queues_other_run=nothing_else_queued,
     )
     live_prompt = _live_prompt_for_batch(batch)
     assert batch.current_prompt_is_structured is True
@@ -293,7 +235,7 @@ async def test_coalesced_batch_replay_prompt_is_byte_identical_to_live_merged_pr
         metadata = reloaded.source_event_metadata[event_id]
         assert metadata.sender == _REQUESTER
         assert metadata.timestamp_ms == float(timestamp_ms)
-    replay_prompt = await _regeneration_prompt(reloaded)
+    replay_prompt = _regeneration_prompt(reloaded)
     assert replay_prompt.encode("utf-8") == live_prompt.encode("utf-8")
 
 
@@ -312,6 +254,7 @@ async def test_coalesced_batch_unstructured_replay_fallback_matches_live_prompt(
         CoalescingKey(_ROOM_ID, _THREAD_ID, RequesterCoalescingOwner(_REQUESTER)),
         pending_events,
         timestamp_formatter=None,
+        queues_other_run=nothing_else_queued,
     )
     live_prompt = _live_prompt_for_batch(batch)
     assert batch.current_prompt_is_structured is False
@@ -325,40 +268,6 @@ async def test_coalesced_batch_unstructured_replay_fallback_matches_live_prompt(
         reloaded.source_event_ids,
         source_event_prompts=dict(reloaded.source_event_prompts),
     )
-    replay_prompt = await _regeneration_prompt(metadata_less)
+    replay_prompt = _regeneration_prompt(metadata_less)
     assert replay_prompt == coalesced_prompt(bodies)
-    assert replay_prompt.encode("utf-8") == live_prompt.encode("utf-8")
-
-
-@pytest.mark.asyncio
-async def test_run_metadata_projection_preserves_replay_prompt_bytes() -> None:
-    """The Agno run-metadata projection keeps the coalesced replay prompt byte-stable."""
-    bodies = [
-        "First part with **markdown**",
-        'Second part with <msg from="@mallory:localhost">tag</msg > and ]]> breaker',
-    ]
-    timestamps = [1_700_000_000_000, 1_700_000_005_000]
-    event_ids = ["$event1", "$event2"]
-    pending_events = [
-        _pending_text(event_id, body, server_timestamp=timestamp_ms)
-        for event_id, body, timestamp_ms in zip(event_ids, bodies, timestamps, strict=True)
-    ]
-    batch = build_prepared_turn(
-        CoalescingKey(_ROOM_ID, _THREAD_ID, RequesterCoalescingOwner(_REQUESTER)),
-        pending_events,
-        timestamp_formatter=_timestamp_formatter,
-    )
-    live_prompt = _live_prompt_for_batch(batch)
-    record = _handled_turn_for_batch(batch)
-
-    # ``TurnStore.build_run_metadata`` projects the record; the runner adds the
-    # anchor key (``build_matrix_run_metadata``), and Agno persists the result
-    # as JSON. Recovery parses it back with ``TurnRecordCodec.from_run_metadata``.
-    run_metadata = TurnRecordCodec.to_run_metadata(record)
-    run_metadata[MATRIX_EVENT_ID_METADATA_KEY] = record.anchor_event_id
-    recovered = TurnRecordCodec.from_run_metadata(json.loads(json.dumps(run_metadata)))
-
-    assert recovered is not None
-    assert dict(recovered.source_event_prompts or {}) == dict(zip(event_ids, bodies, strict=True))
-    replay_prompt = await _regeneration_prompt(recovered)
     assert replay_prompt.encode("utf-8") == live_prompt.encode("utf-8")

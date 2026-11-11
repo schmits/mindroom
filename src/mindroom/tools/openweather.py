@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,9 +13,10 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="openweather",
+    file_access=ToolFileAccess.NONE,
     display_name="OpenWeather",
     description="Weather data services from OpenWeatherMap API",
-    category=ToolCategory.DEVELOPMENT,  # Based on agno docs structure: /tools/toolkits/others/
+    category=ToolCategory.DEVELOPMENT,
     status=ToolStatus.REQUIRES_CONFIG,  # Requires API key
     setup_type=SetupType.API_KEY,  # Uses api_key parameter
     icon="WiDaySunny",  # Weather icon
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("OPENWEATHER_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -78,8 +80,8 @@ if TYPE_CHECKING:
             default=30,
         ),
     ],
-    dependencies=["requests"],  # From agno requirements
-    docs_url="https://docs.agno.com/tools/toolkits/others/openweather",  # URL without .md extension
+    dependencies=["requests"],
+    docs_url="https://docs.mindroom.chat/tools/location-commerce-and-home/#openweather",
     function_names=("geocode_location", "get_air_pollution", "get_current_weather", "get_forecast"),
 )
 def openweather_tools() -> type[OpenWeatherTools]:

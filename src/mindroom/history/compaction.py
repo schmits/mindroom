@@ -3,139 +3,280 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
-from html import escape
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from agno.run.agent import RunOutput
-from agno.run.team import TeamRunOutput
-from agno.session.summary import SessionSummary
-from agno.utils.message import filter_tool_calls
-from pydantic import BaseModel
-
-from mindroom.claude_prompt_cache import as_anthropic_claude
-from mindroom.constants import (
-    AI_RUN_METADATA_KEY,
-    MINDROOM_COMPACTION_METADATA_KEY,
-    MINDROOM_MATRIX_HISTORY_METADATA_KEY,
-    prompt_roles_for_history_storage,
+from mindroom.background_tasks import run_blocking_until_complete, run_coroutine_until_complete
+from mindroom.failure_text import failure_text
+from mindroom.history.conversation_text import utterances
+from mindroom.history.replay import (
+    current_summary_text,
+    estimate_prompt_visible_history_tokens,
+    estimate_summary_text_tokens,
+    scope_visible_runs,
 )
-from mindroom.error_handling import is_model_safeguard_refusal
 from mindroom.history.storage import (
-    compacted_run_ids_with,
-    record_compaction_chunk,
-    remove_runs_by_id,
-    seen_event_ids_for_runs,
-    update_scope_seen_event_ids,
-    update_scope_state_on_latest,
-    write_scope_state,
+    FoldBasis,
+    append_compaction_chunk,
+    append_fold,
+    read_chunk_basis,
+    record_summary_usage,
+    set_force_compaction,
 )
-from mindroom.history.summary_call import (
-    DEFAULT_SUMMARY_RETRY_POLICY,
-    effective_summary_timeout_seconds,
-    generate_compaction_summary,
+from mindroom.history.summary_call import DEFAULT_SUMMARY_RETRY_POLICY, generate_compaction_summary
+from mindroom.history.summary_input import (
+    build_summary_input,
+    minimum_summary_input_tokens,
+    whole_run_input_tokens,
 )
 from mindroom.history.types import (
     CompactionLifecycleProgress,
     CompactionOutcome,
     HistoryScope,
     HistoryScopeState,
+    ResolvedHistoryExecutionPlan,
     ResolvedHistorySettings,
+    ScopeSummary,
+    owner_scope,
 )
-from mindroom.history_run_visibility import is_model_history_visible_run
-from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, emit
+from mindroom.hooks import EVENT_COMPACTION_AFTER, EVENT_COMPACTION_BEFORE, CompactionHookContext, TranscriptLine, emit
+from mindroom.llm.errors import ModelSafeguardRefusal
+from mindroom.llm.runs import RunRecord
 from mindroom.logging_config import get_logger
+from mindroom.native_compaction import checkpoint_summary, checkpoint_tail, replay_basis
+from mindroom.providers import registry as provider_registry
+from mindroom.providers.names import provider_route
+from mindroom.session_storage.lanes import run_session_storage_operation
+from mindroom.session_storage.store import runs_without
 from mindroom.timing import timed
-from mindroom.token_budget import (
-    CompactionEstimateKind,
-    compaction_estimate_kind,
-    estimate_compaction_input_tokens,
-    estimate_text_tokens,
-    stable_serialize,
+from mindroom.token_counting.counts import count
+from mindroom.tool_system.runtime_context import (
+    current_requester_id,
+    get_tool_runtime_context,
+    scope_hook_context_kwargs,
 )
-from mindroom.tool_system.runtime_context import get_tool_runtime_context, resolve_tool_runtime_hook_bindings
 
 if TYPE_CHECKING:
-    from agno.db.base import BaseDb
-    from agno.models.base import Model
-    from agno.models.message import Message
-    from agno.session.agent import AgentSession
-    from agno.session.team import TeamSession
+    from collections.abc import Awaitable, Callable, Sequence
 
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
     from mindroom.history.summary_call import SummaryRetryDecision
+    from mindroom.llm.provider import ModelIdentity, ModelProvider
+    from mindroom.llm.runs import AnyRunRecord
+    from mindroom.llm.usage import MessageMetrics
+    from mindroom.session_storage.store import ConversationStore
+    from mindroom.session_storage.summary_rows import Fold
+    from mindroom.session_storage.types import ConversationSession
+
 
 logger = get_logger(__name__)
 
-_WRAPPER_OVERHEAD_TOKENS = 200
-_OVERSIZED_RUN_NOTE = "Run truncated to fit compaction budget."
-_QUEUED_MESSAGE_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
-_SUMMARY_METADATA_OMIT_KEYS = frozenset(
-    {
-        AI_RUN_METADATA_KEY,
-        MINDROOM_COMPACTION_METADATA_KEY,
-        MINDROOM_MATRIX_HISTORY_METADATA_KEY,
-        "model_params",
-        "tools_schema",
-    },
-)
+
+@dataclass(frozen=True)
+class SummaryModel:
+    """One serving model and its matching identity and serialized-input budget.
+
+    A fallback switch replaces the whole value, so later chunks cannot use the previous model's budget or identity.
+    """
+
+    model: ModelProvider
+    name: str
+    input_budget_tokens: int
 
 
 @dataclass(frozen=True)
-class _ExcerptBlock:
-    open_tag: str
-    content: str
-    close_tag: str
+class Summarizer:
+    """The summary model and the request settings every summary chunk of one compaction shares."""
 
-    def render(self, *, max_chars: int | None = None) -> str | None:
-        snippet = self.content if max_chars is None else _truncate_excerpt(self.content, max_chars)
-        if not snippet:
-            return None
-        return "\n".join([self.open_tag, _escape_xml_content(snippet), self.close_tag])
+    model: SummaryModel
+    fallback: SummaryModel | None
+    prompt: str
+    timeout_seconds: float
+    history_settings: ResolvedHistorySettings
+    session_id: str
+    scope: HistoryScope
+    # Receives the usage of every summary response that reports it, including rejected ones.
+    on_usage: Callable[[ModelIdentity, MessageMetrics], Awaitable[None]] | None
+    # The input budget a failed chunk shrank to; later chunks start there unless their first run needs more.
+    shrunk_budget_tokens: int | None = None
+
+
+@timed("system_prompt_assembly.history_prepare.compaction_model_init")
+def _load_compaction_model(config: Config, runtime_paths: RuntimePaths, model_name: str) -> ModelProvider:
+    """Build the compaction model's provider with dedicated history-preparation timing."""
+    return provider_registry.build_model_provider(config, runtime_paths, model_name)
+
+
+def _compaction_fallback_is_distinct(
+    config: Config,
+    *,
+    primary_model_name: str,
+    fallback_model_name: str,
+) -> bool:
+    """Return whether the configured fallback targets a different serving model.
+
+    A fallback that names the primary alias, or a different alias resolving to
+    the same ``(provider, id)``, would resend the refused request to the same
+    model, so it is not loaded at all. Providers are compared through
+    ``provider_route``, the normalization model dispatch uses, so spelling
+    variants like ``vertexai-claude`` and ``vertexai_claude`` and aliases like
+    ``openai_codex`` and ``codex`` count as the same serving model.
+    """
+    if fallback_model_name != primary_model_name:
+        primary_config = config.models.get(primary_model_name)
+        fallback_config = config.models.get(fallback_model_name)
+        if primary_config is None or fallback_config is None:
+            return True
+        if (provider_route(primary_config.provider), primary_config.id) != (
+            provider_route(fallback_config.provider),
+            fallback_config.id,
+        ):
+            return True
+    logger.warning(
+        "Compaction fallback resolves to the primary serving model; continuing without a fallback",
+        compaction_model=primary_model_name,
+        fallback_model=fallback_model_name,
+    )
+    return False
+
+
+def load_summarizer(
+    execution_plan: ResolvedHistoryExecutionPlan,
+    history_settings: ResolvedHistorySettings,
+    *,
+    config: Config,
+    runtime_paths: RuntimePaths,
+    session_id: str,
+    scope: HistoryScope,
+    on_usage: Callable[[ModelIdentity, MessageMetrics], Awaitable[None]] | None,
+) -> Summarizer:
+    """Load the summary model and, when distinct and loadable, its safeguard fallback."""
+    assert execution_plan.summary_input_budget_tokens is not None
+    summary_model = SummaryModel(
+        model=_load_compaction_model(config, runtime_paths, execution_plan.compaction_model_name),
+        name=execution_plan.compaction_model_name,
+        input_budget_tokens=execution_plan.summary_input_budget_tokens,
+    )
+    fallback_model_name = execution_plan.compaction_fallback_model_name
+    fallback_summary_input_budget = execution_plan.compaction_fallback_summary_input_budget_tokens
+    fallback_model: SummaryModel | None = None
+    if (
+        fallback_model_name is not None
+        and fallback_summary_input_budget is not None
+        and _compaction_fallback_is_distinct(
+            config,
+            primary_model_name=execution_plan.compaction_model_name,
+            fallback_model_name=fallback_model_name,
+        )
+    ):
+        # The fallback is an optional resilience knob: when its construction
+        # fails (missing SDK, credentials, client setup), compaction still
+        # runs on the healthy primary instead of aborting before any call.
+        try:
+            fallback_model = SummaryModel(
+                model=_load_compaction_model(config, runtime_paths, fallback_model_name),
+                name=fallback_model_name,
+                input_budget_tokens=fallback_summary_input_budget,
+            )
+        except Exception:
+            logger.warning(
+                "Compaction fallback model failed to load; continuing without a fallback",
+                session_id=session_id,
+                scope=scope.key,
+                compaction_model=execution_plan.compaction_model_name,
+                fallback_model=fallback_model_name,
+                exc_info=True,
+            )
+    return Summarizer(
+        model=summary_model,
+        fallback=fallback_model,
+        prompt=config.get_prompt("COMPACTION_SUMMARY_PROMPT"),
+        timeout_seconds=execution_plan.compaction_timeout_seconds,
+        history_settings=history_settings,
+        session_id=session_id,
+        scope=scope,
+        on_usage=on_usage,
+    )
+
+
+def scope_usage_recorder(
+    storage: ConversationStore,
+    session_id: str,
+    *,
+    initial_session: ConversationSession | None = None,
+) -> Callable[[ModelIdentity, MessageMetrics], Awaitable[None]]:
+    """Record each summary response's usage under the current request's requester, first creating ``initial_session``'s row."""
+    return partial(
+        record_summary_usage,
+        storage=storage,
+        session_id=session_id,
+        requester_id=current_requester_id(),
+        initial_session=initial_session,
+    )
+
+
+@dataclass(frozen=True)
+class _SummarySource:
+    """What a summary input builds on: the previous summary and the runs after it, plus the runs it folds unread.
+
+    When the previous summary is a native checkpoint's text, the first of ``runs`` is a copy of the checkpoint's run
+    that starts at the checkpoint; the fold takes the stored run.
+    """
+
+    unread_runs: list[AnyRunRecord]
+    previous_summary: str | None
+    runs: list[AnyRunRecord]
+
+
+@dataclass(frozen=True)
+class _SummaryChunk:
+    summary: str
+    included_runs: list[AnyRunRecord]
+    # The summarizer that served this chunk, which later chunks use: once a fallback served one, it serves the rest.
+    summarizer: Summarizer
 
 
 @dataclass(frozen=True)
 class _CompactionRewriteResult:
     summary_text: str
     compacted_run_count: int
-    compacted_run_ids: tuple[str, ...]
-    compacted_messages: tuple[Message, ...]
-    # The model that actually served the final persisted summary chunk; differs
-    # from the configured primary after a safeguard-refusal fallback switch.
-    summary_model: Model
-    summary_model_name: str
+    # The model that served the final persisted chunk, the fallback after a refusal switch.
+    served_by: SummaryModel
 
 
-@dataclass(frozen=True)
-class _GeneratedSummaryChunk:
-    summary: SessionSummary
-    included_runs: list[RunOutput | TeamRunOutput]
-    # The model that actually served this chunk (fallback after a refusal switch).
-    model: Model
-    model_name: str
-    model_input_budget_tokens: int
-
-
-def _persist_cleared_force_state_if_needed(
+async def clear_manual_compaction_request(
     *,
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
+    storage: ConversationStore,
+    session: ConversationSession,
     state: HistoryScopeState,
-) -> HistoryScopeState:
-    if not state.force_compact_before_next_run:
-        return state
-    return update_scope_state_on_latest(
-        storage,
-        session,
-        scope,
-        # Only clear when the durable row still matches the state this run read;
-        # a concurrent write (for example a fresh manual request) wins otherwise.
-        lambda latest: replace(latest, force_compact_before_next_run=False) if latest == state else latest,
+) -> None:
+    """Clear the manual compaction request this run read in ``state``, if it read one.
+
+    The request is one flag, so a request written after this run read it clears with it.
+    """
+    if state.force_compact_before_next_run:
+        await run_session_storage_operation(
+            lambda: storage,
+            partial(set_force_compaction, session=session, forced=False),
+        )
+
+
+def _transcript(runs: Sequence[AnyRunRecord]) -> tuple[TranscriptLine, ...]:
+    """Return what was said in ``runs``, oldest first, as compaction hooks read it."""
+    return tuple(
+        TranscriptLine(
+            role="user" if said.kind == "said" else "assistant",
+            sender=said.sender,
+            display_name=said.display_name,
+            text=said.unredacted,
+        )
+        for run in runs
+        for said in utterances(run)
     )
 
 
@@ -143,559 +284,592 @@ async def _emit_compaction_hook(
     *,
     event_name: str,
     scope: HistoryScope,
-    messages: Sequence[Message],
+    transcript: Sequence[TranscriptLine],
     session_id: str,
     token_count_before: int,
-    token_count_after: int | None,
-    compaction_summary: str | None,
+    token_count_after: int | None = None,
+    compaction_summary: str | None = None,
 ) -> None:
     runtime_context = get_tool_runtime_context()
-    if runtime_context is None or not runtime_context.hook_registry.has_hooks(event_name):
+    if runtime_context is None or not runtime_context.hooks.registry.has_hooks(event_name):
         return
 
-    bindings = resolve_tool_runtime_hook_bindings(runtime_context)
-    correlation_id = runtime_context.correlation_id or f"{event_name}:{session_id}:{uuid4().hex}"
     context = CompactionHookContext(
-        event_name=event_name,
-        plugin_name="",
-        settings={},
-        config=runtime_context.config,
-        runtime_paths=runtime_context.runtime_paths,
-        logger=logger.bind(event_name=event_name, session_id=session_id),
-        correlation_id=correlation_id,
-        message_sender=bindings.message_sender,
-        matrix_admin=bindings.matrix_admin,
-        room_state_querier=bindings.room_state_querier,
-        room_state_putter=bindings.room_state_putter,
-        agent_name=scope.scope_id if scope.kind == "team" else runtime_context.agent_name,
-        scope=scope,
-        room_id=runtime_context.room_id,
-        thread_id=runtime_context.resolved_thread_id,
-        messages=list(messages),
-        session_id=session_id,
+        **scope_hook_context_kwargs(
+            runtime_context,
+            event_name=event_name,
+            correlation_id=runtime_context.correlation_id or f"{event_name}:{session_id}:{uuid4().hex}",
+            scope=scope,
+            session_id=session_id,
+        ),
+        transcript=tuple(transcript),
         token_count_before=token_count_before,
         token_count_after=token_count_after,
         compaction_summary=compaction_summary,
-        _hook_registry_state=runtime_context.hook_registry_state,
     )
-    await emit(runtime_context.hook_registry, event_name, context)
+    await emit(runtime_context.hooks.registry, event_name, context)
 
 
-def _should_collect_compaction_hook_messages() -> bool:
+def _compaction_hooks_registered() -> bool:
     runtime_context = get_tool_runtime_context()
-    if runtime_context is None:
-        return False
-    return runtime_context.hook_registry.has_hooks(EVENT_COMPACTION_BEFORE) or runtime_context.hook_registry.has_hooks(
-        EVENT_COMPACTION_AFTER,
+    return runtime_context is not None and any(
+        runtime_context.hooks.registry.has_hooks(event_name)
+        for event_name in (EVENT_COMPACTION_BEFORE, EVENT_COMPACTION_AFTER)
     )
 
 
 @timed("system_prompt_assembly.history_prepare.compaction")
 async def compact_scope_history(
     *,
-    storage: BaseDb,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
+    storage: ConversationStore,
+    session: ConversationSession,
     state: HistoryScopeState,
-    history_settings: ResolvedHistorySettings,
+    summarizer: Summarizer,
     available_history_budget: int | None,
-    summary_input_budget: int,
-    summary_model: Model,
-    summary_model_name: str,
+    max_summary_tokens: int | None,
+    before_tokens: int,
     replay_window_tokens: int | None,
     threshold_tokens: int | None,
-    summary_prompt: str,
-    summary_timeout_seconds: float,
-    fallback_summary_model: Model | None = None,
-    fallback_summary_model_name: str | None = None,
-    fallback_summary_input_budget: int | None = None,
-    lifecycle_notice_event_id: str | None = None,
-    progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None = None,
+    progress: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
+    complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+    model: ModelProvider,
 ) -> CompactionOutcome | None:
-    """Compact one scope by rewriting session.summary and session.runs."""
-    visible_runs = scope_visible_runs(session, scope)
-    compactable_runs = _select_compaction_candidates(
-        visible_runs=visible_runs,
-        session=session,
-        scope=scope,
-        state=state,
-        history_settings=history_settings,
-        available_history_budget=available_history_budget,
-    )
-    if not compactable_runs:
-        _persist_cleared_force_state_if_needed(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
-        )
-        return None
-    selected_run_ids = _stable_compaction_run_ids(
-        compactable_runs,
-        session_id=session.session_id,
-        scope=scope,
-    )
-    if not selected_run_ids:
-        _persist_cleared_force_state_if_needed(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
-        )
+    """Compact the scope owning ``session`` by appending summary rows that fold its oldest runs, chunk by chunk.
+
+    The caller decided the reply needs it. ``max_summary_tokens`` is the most history the reply can replay; no chunk
+    whose summary exceeds it, as ``model``'s route sizes it, is stored. ``available_history_budget`` and
+    ``before_tokens`` are the history's budget and size the notices show; ``before_tokens`` is also the size the
+    ``compaction:before`` hook receives. ``progress`` receives the progress after each stored chunk that leaves runs
+    to replay, and ``complete`` the outcome after the last stored chunk.
+    """
+    scope = owner_scope(session)
+    history_settings = summarizer.history_settings
+    visible_runs = scope_visible_runs(session)
+    if not visible_runs:
+        await clear_manual_compaction_request(storage=storage, session=session, state=state)
         return None
 
-    before_tokens = estimate_prompt_visible_history_tokens(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-    )
-    before_run_count = len(visible_runs)
+    mode = state.compaction_mode
     working_session = deepcopy(session)
-    collect_compaction_hook_messages = _should_collect_compaction_hook_messages()
+    hooks_registered = _compaction_hooks_registered()
+    compacted_transcript: list[TranscriptLine] = []
 
-    async def emit_before_persist(included_runs: Sequence[RunOutput | TeamRunOutput]) -> None:
+    async def before_persist(included_runs: Sequence[AnyRunRecord]) -> None:
         await _emit_compaction_hook(
             event_name=EVENT_COMPACTION_BEFORE,
             scope=scope,
-            messages=_messages_for_runs(included_runs, history_settings) if collect_compaction_hook_messages else (),
+            transcript=_transcript(included_runs) if hooks_registered else (),
             session_id=session.session_id,
             token_count_before=before_tokens,
-            token_count_after=None,
-            compaction_summary=None,
         )
 
-    rewrite_result = await _rewrite_working_session_for_compaction(
-        storage=storage,
-        persisted_session=session,
-        working_session=working_session,
-        summary_model=summary_model,
-        summary_model_name=summary_model_name,
-        fallback_summary_model=fallback_summary_model,
-        fallback_summary_model_name=fallback_summary_model_name,
-        fallback_summary_input_budget=fallback_summary_input_budget,
-        session_id=session.session_id,
-        scope=scope,
-        state=state,
-        history_settings=history_settings,
-        available_history_budget=available_history_budget,
-        selected_run_ids=selected_run_ids,
-        summary_input_budget=summary_input_budget,
-        before_tokens=before_tokens,
-        runs_before=before_run_count,
-        threshold_tokens=threshold_tokens,
-        summary_prompt=summary_prompt,
-        summary_timeout_seconds=summary_timeout_seconds,
-        lifecycle_notice_event_id=lifecycle_notice_event_id,
-        progress_callback=progress_callback,
-        collect_compaction_hook_messages=collect_compaction_hook_messages,
-        before_persist_callback=emit_before_persist,
-    )
-    if rewrite_result is None:
-        _persist_cleared_force_state_if_needed(
-            storage=storage,
-            session=session,
-            scope=scope,
-            state=state,
+    async def after_persist(chunk: _SummaryChunk, compacted_run_count: int, runs_remaining: int) -> None:
+        if hooks_registered:
+            compacted_transcript.extend(_transcript(chunk.included_runs))
+        if progress is None or not scope_visible_runs(working_session):
+            return
+        after_tokens = await asyncio.to_thread(
+            estimate_prompt_visible_history_tokens,
+            session=working_session,
+            history_settings=history_settings,
+            model=model,
         )
+        await progress(
+            CompactionLifecycleProgress(
+                mode=mode,
+                session_id=session.session_id,
+                scope=scope.key,
+                summary_model=chunk.summarizer.model.name,
+                before_tokens=before_tokens,
+                after_tokens=after_tokens,
+                history_budget_tokens=available_history_budget,
+                runs_before=len(visible_runs),
+                compacted_run_count=compacted_run_count,
+                runs_remaining=runs_remaining,
+                threshold_tokens=threshold_tokens,
+            ),
+        )
+
+    try:
+        rewrite_result = await _rewrite_working_session_for_compaction(
+            storage=storage,
+            persisted_session=session,
+            working_session=working_session,
+            summarizer=summarizer,
+            runs=visible_runs,
+            max_summary_tokens=max_summary_tokens,
+            model=model,
+            before_persist=before_persist,
+            after_persist=after_persist,
+        )
+    except ConversationChangedError:
+        # The reply replays what the conversation holds now; a manual request stays for the next reply.
+        await run_session_storage_operation(lambda: storage, lambda opened: opened.reload_log(session))
+        raise
+    await clear_manual_compaction_request(storage=storage, session=session, state=state)
+    if rewrite_result is None:
         return None
 
     compacted_at = _iso_utc_now()
-    new_state = HistoryScopeState(
-        last_compacted_at=compacted_at,
-        last_summary_model=_model_identifier(rewrite_result.summary_model),
-        last_compacted_run_count=rewrite_result.compacted_run_count,
-        compacted_run_ids=compacted_run_ids_with(state, rewrite_result.compacted_run_ids),
-        force_compact_before_next_run=False,
-    )
-    write_scope_state(session, scope, new_state)
-    write_scope_state(working_session, scope, new_state)
-    record_compaction_chunk(
-        storage=storage,
-        persisted_session=session,
-        working_session=working_session,
-        scope=scope,
-        compacted_run_ids=rewrite_result.compacted_run_ids,
-        sync_remaining_runs=True,
-    )
     logger.info(
         "Compaction summary generated",
         session_id=session.session_id,
         scope=scope.key,
         compacted_runs=rewrite_result.compacted_run_count,
-        model=_model_identifier(rewrite_result.summary_model),
+        model=rewrite_result.served_by.model.identity.id,
     )
 
-    after_visible_runs = scope_visible_runs(session, scope)
-    after_tokens = estimate_prompt_visible_history_tokens(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-    )
-    outcome = CompactionOutcome(
-        mode="manual" if state.force_compact_before_next_run else "auto",
-        session_id=session.session_id,
-        scope=scope.key,
-        summary=rewrite_result.summary_text,
-        summary_model=rewrite_result.summary_model_name,
-        before_tokens=before_tokens,
-        after_tokens=after_tokens,
-        window_tokens=replay_window_tokens or 0,
-        threshold_tokens=threshold_tokens or 0,
-        runs_before=before_run_count,
-        runs_after=len(after_visible_runs),
-        compacted_run_count=rewrite_result.compacted_run_count,
-        compacted_at=compacted_at,
-        history_budget_tokens=available_history_budget,
-    )
-    await _emit_compaction_hook(
-        event_name=EVENT_COMPACTION_AFTER,
-        scope=scope,
-        messages=rewrite_result.compacted_messages,
-        session_id=session.session_id,
-        token_count_before=before_tokens,
-        token_count_after=after_tokens,
-        compaction_summary=rewrite_result.summary_text,
-    )
-    return outcome
+    async def report() -> CompactionOutcome:
+        after_tokens = await asyncio.to_thread(
+            estimate_prompt_visible_history_tokens,
+            session=session,
+            history_settings=history_settings,
+            model=model,
+        )
+        outcome = CompactionOutcome(
+            mode=mode,
+            session_id=session.session_id,
+            scope=scope.key,
+            summary=rewrite_result.summary_text,
+            summary_model=rewrite_result.served_by.name,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            window_tokens=replay_window_tokens or 0,
+            threshold_tokens=threshold_tokens or 0,
+            runs_before=len(visible_runs),
+            runs_after=len(scope_visible_runs(session)),
+            compacted_run_count=rewrite_result.compacted_run_count,
+            compacted_at=compacted_at,
+            history_budget_tokens=available_history_budget,
+        )
+        return await _report_committed(
+            outcome,
+            scope=scope,
+            transcript=compacted_transcript,
+            complete=complete,
+        )
+
+    # Persistence has committed; finish reporting before releasing this request owner.
+    return await run_coroutine_until_complete(report())
 
 
 @timed("system_prompt_assembly.history_prepare.compaction.rewrite_working_session")
-async def _rewrite_working_session_for_compaction(  # noqa: C901
+async def _rewrite_working_session_for_compaction(
     *,
-    storage: BaseDb,
-    persisted_session: AgentSession | TeamSession,
-    working_session: AgentSession | TeamSession,
-    summary_model: Model,
-    summary_model_name: str,
-    session_id: str,
-    scope: HistoryScope,
-    state: HistoryScopeState,
-    history_settings: ResolvedHistorySettings,
-    available_history_budget: int | None,
-    selected_run_ids: Sequence[str],
-    summary_input_budget: int,
-    before_tokens: int,
-    runs_before: int,
-    threshold_tokens: int | None,
-    lifecycle_notice_event_id: str | None,
-    progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
-    collect_compaction_hook_messages: bool,
-    summary_prompt: str,
-    summary_timeout_seconds: float,
-    fallback_summary_model: Model | None = None,
-    fallback_summary_model_name: str | None = None,
-    fallback_summary_input_budget: int | None = None,
-    before_persist_callback: Callable[[Sequence[RunOutput | TeamRunOutput]], Awaitable[None]] | None = None,
+    storage: ConversationStore,
+    persisted_session: ConversationSession,
+    working_session: ConversationSession,
+    summarizer: Summarizer,
+    runs: Sequence[AnyRunRecord],
+    max_summary_tokens: int | None,
+    model: ModelProvider,
+    before_persist: Callable[[Sequence[AnyRunRecord]], Awaitable[None]],
+    after_persist: Callable[[_SummaryChunk, int, int], Awaitable[None]],
 ) -> _CompactionRewriteResult | None:
-    final_summary_text = _current_summary_text(working_session) or ""
-    token_estimator, estimate_kind = _compaction_sizing(summary_model)
-    total_compacted_run_count = 0
-    all_compacted_run_ids: list[str] = []
-    all_compacted_run_id_set: set[str] = set()
-    compacted_messages: list[Message] = []
-    pending_selected_run_ids = set(selected_run_ids)
+    """Fold ``runs``, oldest first, into one appended summary row per chunk.
 
-    while pending_selected_run_ids:
-        working_visible_runs = scope_visible_runs(working_session, scope)
-        compactable_runs = [
-            run
-            for run in working_visible_runs
-            if isinstance(run.run_id, str) and run.run_id in pending_selected_run_ids
-        ]
-        if not compactable_runs:
-            break
-
-        summary_input, included_runs = _build_summary_input(
-            previous_summary=_current_summary_text(working_session),
-            compacted_runs=compactable_runs,
-            history_settings=history_settings,
-            max_input_tokens=summary_input_budget,
-            token_estimator=token_estimator,
+    Stops when the conversation changes or a chunk's summary, as ``model``'s route sizes it, exceeds ``max_summary_tokens``;
+    with nothing stored yet, either stop fails the compaction.
+    """
+    scope = owner_scope(persisted_session)
+    summary_text: str | None = None
+    compacted_run_count = 0
+    remaining = list(runs)
+    while remaining:
+        previous_summary = current_summary_text(working_session)
+        basis = await run_blocking_until_complete(
+            partial(
+                read_chunk_basis,
+                storage,
+                persisted_session,
+                [run.run_id for run in remaining],
+                previous_summary=previous_summary,
+            ),
         )
-        if not included_runs:
+        if basis is None:
+            _stop_compaction(ConversationChangedError(), persisted_session.session_id, scope, compacted_run_count)
+            break
+        chunk = await _summarize_chunk(summarizer, previous_summary, remaining)
+        if chunk is None:
             logger.warning(
                 "Compaction skipped because no run fit the single-pass summary budget",
-                session_id=session_id,
+                session_id=persisted_session.session_id,
                 scope=scope.key,
-                candidate_runs=len(compactable_runs),
-                summary_input_budget_tokens=summary_input_budget,
+                candidate_runs=len(remaining),
+                summary_input_budget_tokens=summarizer.model.input_budget_tokens,
             )
-            if total_compacted_run_count == 0:
-                return None
             break
-
-        new_summary = await _generate_compaction_summary_with_retry(
-            model=summary_model,
-            model_name=summary_model_name,
-            previous_summary=_current_summary_text(working_session),
-            compactable_runs=compactable_runs,
-            initial_summary_input=summary_input,
-            initial_included_runs=included_runs,
-            summary_input_budget=summary_input_budget,
-            session_id=session_id,
-            scope=scope,
-            history_settings=history_settings,
-            summary_prompt=summary_prompt,
-            token_estimator=token_estimator,
-            estimate_kind=estimate_kind,
-            timeout_seconds=summary_timeout_seconds,
-            fallback_model=fallback_summary_model,
-            fallback_model_name=fallback_summary_model_name,
-            fallback_input_budget=fallback_summary_input_budget,
+        # Sized as replay planning sizes a saved summary, never below it while the vocabulary loads, off the event loop.
+        summary_tokens = await asyncio.to_thread(estimate_summary_text_tokens, chunk.summary, model, upper_bound=True)
+        if (error := _summary_budget_error(summary_tokens, max_summary_tokens)) is not None:
+            _stop_compaction(error, persisted_session.session_id, scope, compacted_run_count)
+            break
+        await before_persist(chunk.included_runs)
+        compacted_run_ids = tuple(run.run_id for run in chunk.included_runs)
+        appended = await run_session_storage_operation(
+            lambda: storage,
+            partial(
+                append_compaction_chunk,
+                session=persisted_session,
+                basis=basis,
+                included_run_ids=compacted_run_ids,
+                summary=chunk.summary,
+            ),
         )
-        if new_summary.model is not summary_model:
-            # A safeguard-refusal fallback served this chunk; it becomes the
-            # summary model for every later chunk, including token estimation.
-            summary_model = new_summary.model
-            summary_model_name = new_summary.model_name
-            token_estimator, estimate_kind = _compaction_sizing(summary_model)
-            summary_input_budget = new_summary.model_input_budget_tokens
-            fallback_summary_model = None
-            fallback_summary_model_name = None
-            fallback_summary_input_budget = None
-        included_runs = new_summary.included_runs
-        generated_summary = new_summary.summary
-        if before_persist_callback is not None:
-            await before_persist_callback(included_runs)
-        final_summary_text = generated_summary.summary
-        compacted_run_ids = tuple(run.run_id for run in included_runs if isinstance(run.run_id, str) and run.run_id)
-        compacted_seen_event_ids = sorted(seen_event_ids_for_runs(included_runs))
-        working_session.summary = SessionSummary(summary=generated_summary.summary, updated_at=datetime.now(UTC))
-        if compacted_seen_event_ids:
-            update_scope_seen_event_ids(working_session, scope, compacted_seen_event_ids)
-        working_session.runs = remove_runs_by_id(working_session.runs or [], compacted_run_ids)
-        total_compacted_run_count += len(included_runs)
-        for run_id in compacted_run_ids:
-            if run_id not in all_compacted_run_id_set:
-                all_compacted_run_id_set.add(run_id)
-                all_compacted_run_ids.append(run_id)
-        if collect_compaction_hook_messages:
-            compacted_messages.extend(_messages_for_runs(included_runs, history_settings))
-        pending_selected_run_ids.difference_update(compacted_run_ids)
+        if not appended:
+            _stop_compaction(ConversationChangedError(), persisted_session.session_id, scope, compacted_run_count)
+            break
+        summarizer = chunk.summarizer
+        summary_text = chunk.summary
+        working_session.summary = ScopeSummary(text=chunk.summary, updated_at=datetime.now(UTC))
+        working_session.runs = runs_without(working_session.runs, compacted_run_ids)
+        compacted_run_count += len(chunk.included_runs)
+        remaining = remaining[len(chunk.included_runs) :]
+        await after_persist(chunk, compacted_run_count, len(remaining))
 
-        record_compaction_chunk(
-            storage=storage,
-            persisted_session=persisted_session,
-            working_session=working_session,
-            scope=scope,
-            compacted_run_ids=compacted_run_ids,
-        )
-
-        await _emit_lifecycle_progress_after_persist(
-            working_session=working_session,
-            scope=scope,
-            state=state,
-            history_settings=history_settings,
-            lifecycle_notice_event_id=lifecycle_notice_event_id,
-            progress_callback=progress_callback,
-            session_id=session_id,
-            summary_model_name=summary_model_name,
-            before_tokens=before_tokens,
-            available_history_budget=available_history_budget,
-            runs_before=runs_before,
-            threshold_tokens=threshold_tokens,
-            total_compacted_run_count=total_compacted_run_count,
-            selected_runs_remaining=len(pending_selected_run_ids),
-        )
-
-    if total_compacted_run_count == 0:
+    if summary_text is None:
         return None
-    _strip_stale_anthropic_replay_fields(
-        [message for run in scope_visible_runs(working_session, scope) for message in run.messages or []],
-    )
     return _CompactionRewriteResult(
-        summary_text=final_summary_text,
-        compacted_run_count=total_compacted_run_count,
-        compacted_run_ids=tuple(all_compacted_run_ids),
-        compacted_messages=tuple(compacted_messages),
-        summary_model=summary_model,
-        summary_model_name=summary_model_name,
+        summary_text=summary_text,
+        compacted_run_count=compacted_run_count,
+        served_by=summarizer.model,
     )
 
 
-def _compaction_sizing(summary_model: Model) -> tuple[Callable[[str], int], CompactionEstimateKind]:
-    """Resolve one estimator together with the kind describing its arithmetic."""
-    conservative_fallback = as_anthropic_claude(summary_model) is not None
-    estimator = partial(
-        estimate_compaction_input_tokens,
-        model_id=summary_model.id,
-        conservative_fallback=conservative_fallback,
+def _summary_budget_error(summary_tokens: int, max_summary_tokens: int | None) -> RuntimeError | None:
+    """Return why a summary must not be stored when it exceeds ``max_summary_tokens``, the most history a reply replays.
+
+    Replay never drops a saved summary, so storing a larger one would fail a reply that can still fit raw runs.
+    """
+    if max_summary_tokens is None or summary_tokens <= max_summary_tokens:
+        return None
+    return RuntimeError(
+        f"The summary exceeds the history budget ({summary_tokens} estimated tokens; {max_summary_tokens} available).",
     )
-    kind = compaction_estimate_kind(summary_model.id, conservative_fallback=conservative_fallback)
-    return estimator, kind
 
 
-async def _emit_lifecycle_progress_after_persist(
+class ConversationChangedError(RuntimeError):
+    """Another writer changed a scope's history after compaction read it, so compaction stored nothing."""
+
+    def __init__(self) -> None:
+        super().__init__("The conversation changed during compaction.")
+
+
+def _stop_compaction(error: Exception, session_id: str, scope: HistoryScope, compacted_run_count: int) -> None:
+    """Stop compacting because of ``error``; with nothing stored yet, compaction failed with it."""
+    if compacted_run_count == 0:
+        raise error
+    # Earlier chunks stand.
+    logger.warning(
+        "Compaction stopped early",
+        reason=str(error),
+        session_id=session_id,
+        scope=scope.key,
+        compacted_runs=compacted_run_count,
+    )
+
+
+async def summarize_runs(
+    summarizer: Summarizer,
+    previous_summary: str | None,
+    runs: Sequence[AnyRunRecord],
+) -> tuple[str, Summarizer]:
+    """Summarize runs into one cumulative summary without writing anything.
+
+    Runs that do not fit one summary input are summarized in further chunks, each merged into the summary so far.
+    Returns the summary and the summarizer that served its last chunk.
+    """
+    summary = previous_summary
+    remaining = list(runs)
+    while remaining:
+        chunk = await _summarize_chunk(summarizer, summary, remaining)
+        if chunk is None:
+            msg = "No compactable content fit the summary input budget."
+            raise RuntimeError(msg)
+        summarizer = chunk.summarizer
+        summary = chunk.summary
+        remaining = remaining[len(chunk.included_runs) :]
+    assert summary is not None
+    return summary, summarizer
+
+
+async def compact_running_turn(
     *,
-    working_session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    state: HistoryScopeState,
-    history_settings: ResolvedHistorySettings,
-    lifecycle_notice_event_id: str | None,
-    progress_callback: Callable[[CompactionLifecycleProgress], Awaitable[None]] | None,
-    session_id: str,
-    summary_model_name: str,
+    storage: ConversationStore,
+    session: ConversationSession,
+    basis: FoldBasis,
+    fold: Fold,
+    snapshots: Sequence[AnyRunRecord],
+    summarizer: Summarizer,
     before_tokens: int,
-    available_history_budget: int | None,
-    runs_before: int,
+    replay_window_tokens: int | None,
     threshold_tokens: int | None,
-    total_compacted_run_count: int,
-    selected_runs_remaining: int,
-) -> None:
-    """Emit lifecycle progress after a compaction chunk has been durably persisted."""
-    remaining_runs = scope_visible_runs(working_session, scope)
-    if progress_callback is None or not remaining_runs:
-        return
-    after_tokens = estimate_prompt_visible_history_tokens(
-        session=working_session,
-        scope=scope,
-        history_settings=history_settings,
+    available_history_budget: int | None,
+    max_summary_tokens: int,
+    model: ModelProvider,
+    on_commit: Callable[[str], None],
+    rewritten_request_tokens: Callable[[], int],
+    complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+) -> CompactionOutcome:
+    """Summarize the basis's stored runs and the running turn's ``snapshots``, then append one row storing ``fold``.
+
+    Nothing is written until every chunk has been summarized. The append leaves ``session`` holding what the store
+    does; once it starts, ``on_commit`` receives the stored summary and the compaction is reported even when the turn
+    is cancelled meanwhile, so the turn's in-memory state always matches the log and a stored fold never reads as
+    failed. ``before_tokens`` sizes the request that triggered the fold, and ``rewritten_request_tokens`` sizes it
+    after ``on_commit`` rewrote it, so the report compares one request before and after. Raises, writing nothing,
+    when the summary, sized by the reply's ``model``, exceeds ``max_summary_tokens`` or the conversation
+    changed since ``basis`` was read.
+    """
+    scope = owner_scope(session)
+    runs = [*basis.runs, *snapshots]
+    summary, summarizer = await summarize_runs(summarizer, basis.summary, runs)
+    # Sized as the rewritten request is, so a stored summary keeps it within the limit; sizing stays off the loop.
+    summary_tokens = await asyncio.to_thread(estimate_summary_text_tokens, summary, model, upper_bound=True)
+    if (error := _summary_budget_error(summary_tokens, max_summary_tokens)) is not None:
+        raise error
+    # Hooks see the folded messages themselves, not the per-call units the summarizer reads, under the running turn's
+    # requester and metadata, which decide who said each message.
+    folded_run = RunRecord(
+        run_id="",
+        user_id=fold.run.user_id,
+        messages=list(fold.messages),
+        metadata=fold.run.metadata,
     )
-    await progress_callback(
-        CompactionLifecycleProgress(
-            notice_event_id=lifecycle_notice_event_id,
-            mode="manual" if state.force_compact_before_next_run else "auto",
-            session_id=session_id,
+    transcript = _transcript([*basis.runs, folded_run]) if _compaction_hooks_registered() else ()
+    # Like a compaction before a reply, hooks hear only of a summary that is about to be stored.
+    await _emit_compaction_hook(
+        event_name=EVENT_COMPACTION_BEFORE,
+        scope=scope,
+        transcript=transcript,
+        session_id=session.session_id,
+        token_count_before=before_tokens,
+    )
+
+    async def commit_and_report() -> CompactionOutcome:
+        # The append runs in the database's lane behind the session's other writes, and leaves the turn's session
+        # holding what the store does.
+        appended = await run_session_storage_operation(
+            lambda: storage,
+            partial(
+                append_fold,
+                session=session,
+                basis=basis,
+                summary=summary,
+                fold=fold,
+            ),
+        )
+        if not appended:
+            raise ConversationChangedError
+        on_commit(summary)
+        # Sizing can tokenize the whole request, so it stays off the event loop.
+        after_tokens = await asyncio.to_thread(rewritten_request_tokens)
+        outcome = CompactionOutcome(
+            mode="auto",
+            session_id=session.session_id,
             scope=scope.key,
-            summary_model=summary_model_name,
+            summary=summary,
+            summary_model=summarizer.model.name,
             before_tokens=before_tokens,
             after_tokens=after_tokens,
+            window_tokens=replay_window_tokens or 0,
+            threshold_tokens=threshold_tokens or 0,
+            # The running turn counts once beside the stored runs it folded with.
+            runs_before=len(basis.runs) + 1,
+            runs_after=1,
+            compacted_run_count=len(basis.runs) + 1,
+            compacted_at=_iso_utc_now(),
             history_budget_tokens=available_history_budget,
-            runs_before=runs_before,
-            compacted_run_count=total_compacted_run_count,
-            runs_remaining=selected_runs_remaining,
-            threshold_tokens=threshold_tokens,
-        ),
-    )
+        )
+        return await _report_committed(
+            outcome,
+            scope=scope,
+            transcript=transcript,
+            complete=complete,
+        )
+
+    # A stop that lands once the append started still lets a stored fold apply and report, so it never reads as failed.
+    return await run_coroutine_until_complete(commit_and_report())
 
 
-def _sizing_log_fields(*, kind: CompactionEstimateKind, estimate: int, budget_tokens: int) -> dict[str, object]:
-    """Return unit-explicit fields shared by compaction chunk log events."""
-    return {
-        "summary_input_estimate": estimate,
-        "summary_input_estimate_kind": kind,
-        "summary_input_budget_tokens": budget_tokens,
-    }
-
-
-async def _generate_compaction_summary_with_retry(  # noqa: PLR0915
+async def _report_committed(
+    outcome: CompactionOutcome,
     *,
-    model: Model,
-    model_name: str,
-    previous_summary: str | None,
-    compactable_runs: Sequence[RunOutput | TeamRunOutput],
-    initial_summary_input: str,
-    initial_included_runs: list[RunOutput | TeamRunOutput],
-    summary_input_budget: int,
-    session_id: str,
     scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-    summary_prompt: str,
-    token_estimator: Callable[[str], int],
-    estimate_kind: CompactionEstimateKind,
-    timeout_seconds: float,
-    fallback_model: Model | None = None,
-    fallback_model_name: str | None = None,
-    fallback_input_budget: int | None = None,
-) -> _GeneratedSummaryChunk:
-    """Generate one summary chunk, retrying the same or smaller input when safe.
+    transcript: Sequence[TranscriptLine],
+    complete: Callable[[CompactionOutcome], Awaitable[CompactionOutcome]],
+) -> CompactionOutcome:
+    """Tell compaction:after hooks, then the reply's lifecycle, about a stored compaction."""
+    await _emit_compaction_hook(
+        event_name=EVENT_COMPACTION_AFTER,
+        scope=scope,
+        transcript=transcript,
+        session_id=outcome.session_id,
+        token_count_before=outcome.before_tokens,
+        token_count_after=outcome.after_tokens,
+        compaction_summary=outcome.summary,
+    )
+    return await complete(outcome)
 
-    A safeguard refusal from the primary model switches once to
-    ``fallback_model``. The input remains unchanged when it fits the fallback
-    model, otherwise it is rebuilt under that model's own budget. A refusal or
-    failure from the fallback propagates. The switch shares the retry policy's
-    attempt bound, so a
-    refusal after an earlier shrink or transient retry propagates without a
-    fallback call. All other failures keep the existing shrink and transient
-    same-input retry behavior.
+
+def _summary_input_tokens(summary_model: ModelProvider) -> Callable[[str], int]:
+    """Return the summary model's count of summary input text, an upper bound: an input that undercounts fails."""
+    return partial(count, summary_model.token_counter, upper_bound=True)
+
+
+def _after_native_checkpoint(previous_summary: str | None, runs: Sequence[AnyRunRecord]) -> _SummarySource | None:
+    """Split off what the latest readable native checkpoint summarizes, with its text as the summary.
+
+    A provider checkpoint summarizes everything its request replayed before it, including the previous summary,
+    whichever model wrote it, and its own run's prompt and work before it. It stands in only while that is still
+    ``previous_summary`` and the runs before its run: a run that waited for approval sorts after the turns it waited
+    for, and retiring a summary keeps its runs. Its own run stays in the input from the checkpoint on, as native replay
+    sends it, so the summary built on the text always folds that run, and an edit or redaction of it removes the
+    summary too.
     """
-    summary_input = initial_summary_input
-    included_runs = initial_included_runs
-    budget = summary_input_budget
+    for index in range(len(runs) - 1, -1, -1):
+        basis = replay_basis(previous_summary, runs[:index])
+        messages = runs[index].messages
+        for position in range(len(messages) - 1, -1, -1):
+            if (summary := checkpoint_summary(messages[position], basis)) is not None:
+                tail = replace(runs[index], messages=checkpoint_tail(messages, position))
+                return _SummarySource(list(runs[:index]), summary, [tail, *runs[index + 1 :]])
+    return None
+
+
+async def _summarize_chunk(  # noqa: C901, PLR0915
+    summarizer: Summarizer,
+    previous_summary: str | None,
+    runs: Sequence[AnyRunRecord],
+) -> _SummaryChunk | None:
+    """Summarize the longest prefix of ``runs`` that fits one summary input; None when not even one run fits.
+
+    The runs and messages before the latest readable native checkpoint fold without being read, since its text
+    summarizes them.
+
+    A failed attempt retries the same or a smaller input when safe, and a shrunk size carries to later chunks. A
+    safeguard refusal from the primary model switches once to the fallback model, rebuilding the input only when it
+    exceeds the fallback's own budget; a refusal or failure from the fallback propagates. The switch counts against the
+    retry policy's attempt bound, so a refusal after an earlier shrink or transient retry propagates without a
+    fallback call.
+    """
+    summary_model = summarizer.model
+    fallback_model = summarizer.fallback
+    shrunk_budget = summarizer.shrunk_budget_tokens
+    token_estimator = _summary_input_tokens(summary_model.model)
+    original = _SummarySource([], previous_summary, list(runs))
+    sources = [source for source in (_after_native_checkpoint(previous_summary, runs), original) if source is not None]
+
+    async def build(
+        max_input_tokens: int,
+        estimator: Callable[[str], int],
+    ) -> tuple[str, list[AnyRunRecord], _SummarySource]:
+        # A checkpoint too large to leave room for its own run gives way to the history it summarized.
+        for candidate in sources:
+            built_input, built_runs = await asyncio.to_thread(
+                build_summary_input,
+                previous_summary=candidate.previous_summary,
+                compacted_runs=candidate.runs,
+                history_settings=summarizer.history_settings,
+                max_input_tokens=max_input_tokens,
+                token_estimator=estimator,
+            )
+            if built_runs:
+                return built_input, built_runs, candidate
+        return "", [], original
+
+    budget = summary_model.input_budget_tokens
+    if shrunk_budget is not None:
+        whole_first_run = await asyncio.to_thread(
+            whole_run_input_tokens,
+            previous_summary=sources[0].previous_summary,
+            first_run=sources[0].runs[0],
+            history_settings=summarizer.history_settings,
+            token_estimator=token_estimator,
+        )
+        # Start where an earlier failure shrank the input, without truncating a run the full budget holds whole.
+        budget = min(budget, max(shrunk_budget, whole_first_run))
+    summary_input, included_runs, source = await build(budget, token_estimator)
+    if not included_runs:
+        return None
     retry_policy = DEFAULT_SUMMARY_RETRY_POLICY
-    minimum_progress_input_tokens = _minimum_progress_input_tokens(
-        previous_summary=previous_summary,
-        first_run=compactable_runs[0],
+    minimum_progress_input_tokens = await asyncio.to_thread(
+        minimum_summary_input_tokens,
+        previous_summary=source.previous_summary,
+        first_run=source.runs[0],
         token_estimator=token_estimator,
     )
     attempt = 1
     while True:
-        summary_input_estimate = token_estimator(summary_input)
-        effective_timeout_seconds = effective_summary_timeout_seconds(model, timeout_seconds=timeout_seconds)
+        summary_input_estimate = await asyncio.to_thread(token_estimator, summary_input)
+        attempt_fields = {
+            "session_id": summarizer.session_id,
+            "scope": summarizer.scope.key,
+            "model_name": summary_model.name,
+            "attempt": attempt,
+            "native_checkpoint": source is not original,
+            "native_checkpoint_runs": len(source.unread_runs),
+            "candidate_runs": len(source.runs),
+            "included_runs": len(included_runs),
+            "summary_input_estimate": summary_input_estimate,
+            "summary_input_budget_tokens": budget,
+            "timeout_seconds": summarizer.timeout_seconds,
+        }
         started = asyncio.get_running_loop().time()
-        logger.info(
-            "Compaction summary chunk request",
-            session_id=session_id,
-            scope=scope.key,
-            model_name=model_name,
-            attempt=attempt,
-            candidate_runs=len(compactable_runs),
-            included_runs=len(included_runs),
-            **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
-            timeout_seconds=timeout_seconds,
-            effective_timeout_seconds=effective_timeout_seconds,
-        )
+        logger.info("Compaction summary chunk request", **attempt_fields)
         try:
             summary = await generate_compaction_summary(
-                model=model,
+                model=summary_model.model,
                 summary_input=summary_input,
-                summary_prompt=summary_prompt,
-                timeout_seconds=timeout_seconds,
+                summary_prompt=summarizer.prompt,
+                timeout_seconds=summarizer.timeout_seconds,
+                on_usage=(
+                    partial(summarizer.on_usage, summary_model.model.identity)
+                    if summarizer.on_usage is not None
+                    else None
+                ),
             )
         except Exception as exc:
-            duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
             logger.warning(
                 "Compaction summary chunk failed",
-                session_id=session_id,
-                scope=scope.key,
-                model_name=model_name,
-                attempt=attempt,
-                candidate_runs=len(compactable_runs),
-                included_runs=len(included_runs),
-                **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
-                timeout_seconds=timeout_seconds,
-                effective_timeout_seconds=effective_timeout_seconds,
-                duration_ms=duration_ms,
-                error=str(exc) or type(exc).__name__,
+                **attempt_fields,
+                duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
+                error=failure_text(exc),
             )
-            # The attempt bound covers the fallback call too: a refusal after an
-            # earlier shrink or transient retry propagates instead of issuing a
-            # third provider call.
-            if fallback_model is not None and attempt < retry_policy.max_attempts and is_model_safeguard_refusal(exc):
-                assert fallback_model_name is not None
-                assert fallback_input_budget is not None
-                fallback_token_estimator, fallback_estimate_kind = _compaction_sizing(fallback_model)
-                if fallback_token_estimator(summary_input) <= fallback_input_budget:
-                    rebuilt_input, rebuilt_runs = summary_input, included_runs
-                else:
-                    rebuilt_input, rebuilt_runs = _build_summary_input(
-                        previous_summary=previous_summary,
-                        compacted_runs=compactable_runs,
-                        history_settings=history_settings,
-                        max_input_tokens=fallback_input_budget,
-                        token_estimator=fallback_token_estimator,
-                    )
+            if (
+                fallback_model is not None
+                and attempt < retry_policy.max_attempts
+                and isinstance(exc, ModelSafeguardRefusal)
+            ):
+                fallback_token_estimator = _summary_input_tokens(fallback_model.model)
+                fits_fallback = (
+                    await asyncio.to_thread(fallback_token_estimator, summary_input)
+                    <= fallback_model.input_budget_tokens
+                )
+                rebuilt_input, rebuilt_runs, rebuilt_source = (
+                    (summary_input, included_runs, source)
+                    if fits_fallback
+                    else await build(fallback_model.input_budget_tokens, fallback_token_estimator)
+                )
                 if not rebuilt_runs:
                     raise
                 logger.info(
                     "Compaction summary refused; switching to fallback model",
-                    session_id=session_id,
-                    scope=scope.key,
+                    session_id=summarizer.session_id,
+                    scope=summarizer.scope.key,
                     attempt=attempt,
-                    refused_model=model_name,
-                    fallback_model=fallback_model_name,
-                    fallback_summary_input_budget_tokens=fallback_input_budget,
+                    refused_model=summary_model.name,
+                    fallback_model=fallback_model.name,
+                    fallback_summary_input_budget_tokens=fallback_model.input_budget_tokens,
                 )
-                model = fallback_model
-                model_name = fallback_model_name
+                summary_model = fallback_model
                 summary_input = rebuilt_input
                 included_runs = rebuilt_runs
-                budget = fallback_input_budget
+                source = rebuilt_source
+                budget = fallback_model.input_budget_tokens
+                shrunk_budget = None
                 token_estimator = fallback_token_estimator
-                estimate_kind = fallback_estimate_kind
                 fallback_model = None
-                fallback_model_name = None
-                fallback_input_budget = None
                 attempt += 1
                 continue
             retry_decision: SummaryRetryDecision | None = retry_policy.retry_budget(
@@ -705,620 +879,45 @@ async def _generate_compaction_summary_with_retry(  # noqa: PLR0915
                 minimum_progress_input_tokens=minimum_progress_input_tokens,
                 error=exc,
             )
-            if retry_decision is not None:
-                if retry_decision.kind == "same-budget-transient":
-                    await asyncio.sleep(retry_policy.same_input_retry_delay_seconds)
-                    attempt += 1
-                    continue
-                rebuilt_input, rebuilt_runs = _build_summary_input(
-                    previous_summary=previous_summary,
-                    compacted_runs=compactable_runs,
-                    history_settings=history_settings,
-                    max_input_tokens=retry_decision.budget,
-                    token_estimator=token_estimator,
-                )
-                if rebuilt_runs:
-                    rebuilt_input_tokens = token_estimator(rebuilt_input)
-                    if retry_decision.kind == "shrink" and rebuilt_input_tokens >= summary_input_estimate:
-                        raise
-                    summary_input = rebuilt_input
-                    included_runs = rebuilt_runs
-                    budget = retry_decision.budget
-                    attempt += 1
-                    continue
-            raise
-        duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
+            if retry_decision is None:
+                raise
+            if retry_decision.kind == "same-budget-transient":
+                await asyncio.sleep(retry_policy.same_input_retry_delay_seconds)
+                attempt += 1
+                continue
+            rebuilt_input, rebuilt_runs, rebuilt_source = await build(retry_decision.budget, token_estimator)
+            # A shrink that does not rebuild a smaller input with some run in it cannot help.
+            if not rebuilt_runs or await asyncio.to_thread(token_estimator, rebuilt_input) >= summary_input_estimate:
+                raise
+            summary_input = rebuilt_input
+            included_runs = rebuilt_runs
+            source = rebuilt_source
+            budget = shrunk_budget = retry_decision.budget
+            attempt += 1
+            continue
         logger.info(
             "Compaction summary chunk completed",
-            session_id=session_id,
-            scope=scope.key,
-            model_name=model_name,
-            attempt=attempt,
-            candidate_runs=len(compactable_runs),
-            included_runs=len(included_runs),
-            **_sizing_log_fields(kind=estimate_kind, estimate=summary_input_estimate, budget_tokens=budget),
-            timeout_seconds=timeout_seconds,
-            effective_timeout_seconds=effective_timeout_seconds,
-            duration_ms=duration_ms,
+            **attempt_fields,
+            duration_ms=int((asyncio.get_running_loop().time() - started) * 1000),
         )
-        return _GeneratedSummaryChunk(
-            summary=summary,
-            included_runs=included_runs,
-            model=model,
-            model_name=model_name,
-            model_input_budget_tokens=budget,
-        )
-
-
-@timed("system_prompt_assembly.history_prepare.compaction.summary_input_build")
-def _build_summary_input(
-    *,
-    previous_summary: str | None,
-    compacted_runs: Sequence[RunOutput | TeamRunOutput],
-    max_input_tokens: int,
-    history_settings: ResolvedHistorySettings,
-    token_estimator: Callable[[str], int] = estimate_compaction_input_tokens,
-) -> tuple[str, list[RunOutput | TeamRunOutput]]:
-    summary_block = ""
-    if previous_summary is not None and previous_summary.strip():
-        summary_block = _previous_summary_block(previous_summary)
-
-    empty_input = _compose_summary_input(summary_block, "")
-    remaining = max_input_tokens - token_estimator(empty_input) - _WRAPPER_OVERHEAD_TOKENS
-
-    if remaining <= 0:
-        return _build_oversized_summary_input(
-            previous_summary=previous_summary,
-            compacted_runs=compacted_runs[:1],
-            history_settings=history_settings,
-            max_input_tokens=max_input_tokens,
-            token_estimator=token_estimator,
-        )
-
-    included_runs: list[RunOutput | TeamRunOutput] = []
-    serialized_runs: list[str] = []
-    for index, run in enumerate(compacted_runs):
-        serialized_run = _serialize_run(run, index, history_settings)
-        separator = "\n\n" if serialized_runs else ""
-        run_tokens = token_estimator(f"{separator}{serialized_run}")
-        if run_tokens > remaining:
-            if not included_runs:
-                return _build_oversized_summary_input(
-                    previous_summary=previous_summary,
-                    compacted_runs=[run],
-                    history_settings=history_settings,
-                    max_input_tokens=max_input_tokens,
-                    token_estimator=token_estimator,
-                )
-            break
-        included_runs.append(run)
-        serialized_runs.append(serialized_run)
-        remaining -= run_tokens
-
-    if not included_runs:
-        return summary_block, []
-
-    return _compose_summary_input(summary_block, "\n\n".join(serialized_runs)), included_runs
-
-
-def _build_oversized_summary_input(
-    *,
-    previous_summary: str | None,
-    compacted_runs: Sequence[RunOutput | TeamRunOutput],
-    history_settings: ResolvedHistorySettings,
-    max_input_tokens: int,
-    token_estimator: Callable[[str], int],
-) -> tuple[str, list[RunOutput | TeamRunOutput]]:
-    summary_block = (
-        _previous_summary_block(previous_summary) if previous_summary is not None and previous_summary.strip() else ""
-    )
-    if not compacted_runs:
-        return summary_block, []
-    first_run = compacted_runs[0]
-    oversized_excerpt = _serialize_oversized_run_excerpt(
-        first_run,
-        index=0,
-        history_settings=history_settings,
-        max_tokens=_remaining_excerpt_budget(max_input_tokens, summary_block, token_estimator),
-        token_estimator=token_estimator,
-    )
-    if oversized_excerpt is None:
-        return summary_block, []
-    return _compose_summary_input(summary_block, oversized_excerpt), [first_run]
-
-
-def _minimum_progress_input_tokens(
-    *,
-    previous_summary: str | None,
-    first_run: RunOutput | TeamRunOutput,
-    token_estimator: Callable[[str], int],
-) -> int:
-    """Return the smallest shrink budget preserving the prior summary and one run envelope.
-
-    Below this size ``_build_summary_input`` rebuilds to a run-less input
-    because the previous-summary block alone swallows the envelope, so
-    ``SummaryRetryPolicy`` clamps shrink targets here. A zero content budget
-    renders the run as its open tag, truncation note, and close tag; the
-    wrapper overhead covers the builder's own envelope accounting and
-    tokenizer boundary effects.
-    """
-    summary_block = (
-        _previous_summary_block(previous_summary) if previous_summary is not None and previous_summary.strip() else ""
-    )
-    minimal_excerpt = _serialize_run_excerpt(first_run, index=0, blocks=(), content_budget_chars=0)
-    return token_estimator(_compose_summary_input(summary_block, minimal_excerpt)) + _WRAPPER_OVERHEAD_TOKENS
-
-
-def _serialize_oversized_run_excerpt(
-    run: RunOutput | TeamRunOutput,
-    *,
-    index: int,
-    history_settings: ResolvedHistorySettings,
-    max_tokens: int,
-    token_estimator: Callable[[str], int],
-) -> str | None:
-    if max_tokens <= 0:
-        return None
-
-    full_run = _serialize_run(run, index, history_settings)
-    if token_estimator(full_run) <= max_tokens:
-        return full_run
-
-    blocks = _excerpt_blocks(run, history_settings)
-    budget_chars = max_tokens * 4
-    while budget_chars > 0:
-        excerpt = _serialize_run_excerpt(run, index=index, blocks=blocks, content_budget_chars=budget_chars)
-        if token_estimator(excerpt) <= max_tokens:
-            return excerpt
-        budget_chars //= 2
-
-    minimal_excerpt = _serialize_run_excerpt(run, index=index, blocks=blocks, content_budget_chars=0)
-    if token_estimator(minimal_excerpt) <= max_tokens:
-        return minimal_excerpt
-    return None
-
-
-def _serialize_run_excerpt(
-    run: RunOutput | TeamRunOutput,
-    *,
-    index: int,
-    blocks: Sequence[_ExcerptBlock],
-    content_budget_chars: int,
-) -> str:
-    lines = [_run_open_tag(run, index), f"<note>{_OVERSIZED_RUN_NOTE}</note>"]
-    remaining_chars = content_budget_chars
-    for block in blocks:
-        if remaining_chars <= 0:
-            break
-        rendered = block.render(max_chars=remaining_chars)
-        if rendered is None:
-            continue
-        lines.append(rendered)
-        if len(block.content) <= remaining_chars:
-            remaining_chars -= len(block.content)
-        else:
-            break
-
-    lines.append("</run>")
-    return "\n".join(lines)
-
-
-def _compaction_replay_messages(
-    run: RunOutput | TeamRunOutput,
-    history_settings: ResolvedHistorySettings,
-) -> list[Message]:
-    skip_roles = set(_history_skip_roles(history_settings))
-    messages = [deepcopy(message) for message in run.messages or [] if message.role not in skip_roles]
-    if history_settings.max_tool_calls_from_history is not None and messages:
-        filter_tool_calls(messages, history_settings.max_tool_calls_from_history)
-    _strip_stale_anthropic_replay_fields(messages)
-    return messages
-
-
-def _excerpt_blocks(run: RunOutput | TeamRunOutput, history_settings: ResolvedHistorySettings) -> list[_ExcerptBlock]:
-    blocks: list[_ExcerptBlock] = []
-    if run.metadata:
-        metadata = _metadata_for_summary(run.metadata)
-        if metadata:
-            blocks.append(_ExcerptBlock("<run_metadata>", stable_serialize(metadata), "</run_metadata>"))
-    for message in _compaction_replay_messages(run, history_settings):
-        content = _render_message_content(message)
-        if not content:
-            continue
-        blocks.append(_ExcerptBlock(_message_open_tag(message), content, "</message>"))
-    return blocks
-
-
-def _metadata_for_summary(metadata: dict[str, object]) -> dict[str, object]:
-    """Omit bulky request metadata from compaction summary inputs."""
-    return {key: value for key, value in metadata.items() if key not in _SUMMARY_METADATA_OMIT_KEYS}
-
-
-def _truncate_excerpt(text: str, max_chars: int) -> str:
-    if max_chars <= 0:
-        return ""
-    if len(text) <= max_chars:
-        return text
-    if max_chars == 1:
-        return "…"
-    return f"{text[: max_chars - 1].rstrip()}…"
-
-
-def _remaining_excerpt_budget(
-    max_input_tokens: int,
-    summary_block: str,
-    token_estimator: Callable[[str], int],
-) -> int:
-    return max_input_tokens - token_estimator(_compose_summary_input(summary_block, ""))
-
-
-def _compose_summary_input(summary_block: str, serialized_runs: str) -> str:
-    parts: list[str] = []
-    if summary_block:
-        parts.append(summary_block)
-    parts.append(f"<new_conversation>\n{serialized_runs}\n</new_conversation>")
-    return "\n\n".join(parts)
-
-
-def _previous_summary_block(summary: str) -> str:
-    return f"<previous_summary>\n{_escape_xml_content(summary)}\n</previous_summary>"
-
-
-def _messages_for_runs(
-    runs: Sequence[RunOutput | TeamRunOutput],
-    history_settings: ResolvedHistorySettings,
-) -> list[Message]:
-    messages: list[Message] = []
-    for run in runs:
-        messages.extend(_compaction_replay_messages(run, history_settings))
-    _strip_stale_anthropic_replay_fields(messages)
-    return messages
-
-
-def _serialize_run(run: RunOutput | TeamRunOutput, index: int, history_settings: ResolvedHistorySettings) -> str:
-    lines = [_run_open_tag(run, index)]
-    if run.metadata:
-        metadata = _metadata_for_summary(run.metadata)
-        if metadata:
-            lines.extend(["<run_metadata>", _escape_xml_content(stable_serialize(metadata)), "</run_metadata>"])
-    for message in _compaction_replay_messages(run, history_settings):
-        lines.extend(_serialize_message(message))
-    lines.append("</run>")
-    return "\n".join(lines)
-
-
-def _serialize_message(message: Message) -> list[str]:
-    lines = [_message_open_tag(message), _escape_xml_content(_render_message_content(message)), "</message>"]
-    if message.tool_calls:
-        lines.extend(["<tool_calls>", _escape_xml_content(stable_serialize(message.tool_calls)), "</tool_calls>"])
-    for tag, media_value in _message_media_entries(message):
-        serialized = _serialize_media_payload(media_value)
-        if not serialized:
-            continue
-        lines.extend([f"<{tag}>", _escape_xml_content(serialized), f"</{tag}>"])
-    return lines
-
-
-def _run_open_tag(run: RunOutput | TeamRunOutput, index: int) -> str:
-    attrs = [f'index="{index}"']
-    if run.run_id:
-        attrs.append(f'run_id="{escape(str(run.run_id), quote=True)}"')
-    if run.status is not None:
-        attrs.append(f'status="{escape(str(run.status), quote=True)}"')
-    return f"<run {' '.join(attrs)}>"
-
-
-def _message_open_tag(message: Message) -> str:
-    attrs = [f'role="{escape(message.role, quote=True)}"']
-    if message.name:
-        attrs.append(f'name="{escape(message.name, quote=True)}"')
-    if message.tool_call_id:
-        attrs.append(f'tool_call_id="{escape(message.tool_call_id, quote=True)}"')
-    return f"<message {' '.join(attrs)}>"
-
-
-def _message_media_entries(message: Message) -> tuple[tuple[str, object | None], ...]:
-    return (
-        ("images", message.images),
-        ("audio", message.audio),
-        ("videos", message.videos),
-        ("files", message.files),
-        ("audio_output", message.audio_output),
-        ("image_output", message.image_output),
-        ("video_output", message.video_output),
-        ("file_output", message.file_output),
-    )
-
-
-def _serialize_media_payload(media_value: object | None) -> str:
-    if media_value is None:
-        return ""
-    return stable_serialize(_media_payload_snapshot(media_value))
-
-
-def _media_payload_snapshot(media_value: object) -> object:
-    if isinstance(media_value, BaseModel):
-        payload = cast("dict[str, object]", media_value.model_dump(exclude_none=True))
-        payload.pop("content", None)
-        return payload
-    if isinstance(media_value, Sequence) and not isinstance(media_value, (str, bytes, bytearray)):
-        return [_media_payload_snapshot(item) for item in media_value]
-    return media_value
-
-
-def _render_message_content(message: Message) -> str:
-    """Render one replayable string form of a message body."""
-    content = message.compressed_content if message.compressed_content is not None else message.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(stable_serialize(part) for part in content)
-    if content is None:
-        return ""
-    return stable_serialize(content)
-
-
-def _unescape_xml_content(text: str) -> str:
-    return text.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
-
-
-def _escape_xml_content(text: str) -> str:
-    return escape(_unescape_xml_content(text), quote=False)
-
-
-def estimate_prompt_visible_history_tokens(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-) -> int:
-    """Estimate the durable summary plus visible persisted history for one run."""
-    summary_tokens = estimate_session_summary_tokens(_current_summary_text(session))
-    history_messages = _history_messages_for_estimation(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-    )
-    return summary_tokens + _estimate_history_messages_tokens(history_messages)
-
-
-def estimate_session_summary_tokens(summary_text: str | None) -> int:
-    """Estimate prompt-visible tokens contributed by one stored session summary."""
-    if summary_text is None:
-        return 0
-    normalized_summary = summary_text.strip()
-    if not normalized_summary:
-        return 0
-    wrapper = (
-        "Here is a brief summary of your previous interactions:\n\n"
-        "<summary_of_previous_interactions>\n"
-        f"{normalized_summary}\n"
-        "</summary_of_previous_interactions>\n\n"
-        "Note: this information is from previous interactions and may be outdated. "
-        "You should ALWAYS prefer information from this conversation over the past summary.\n\n"
-    )
-    return estimate_text_tokens(wrapper)
-
-
-def _estimate_history_messages_tokens(messages: list[Message]) -> int:
-    """Estimate the token count of materialized history messages."""
-    if not messages:
-        return 0
-    return sum(_estimated_message_chars(message) for message in messages) // 4
-
-
-def _strip_stale_anthropic_replay_fields(messages: list[Message]) -> int:
-    """Strip stale Anthropic thinking replay fields from completed turns."""
-    last_user_idx = -1
-    for i in range(len(messages) - 1, -1, -1):
-        provider_data = messages[i].provider_data
-        is_queued_notice = isinstance(provider_data, dict) and provider_data.get(_QUEUED_MESSAGE_NOTICE_MARKER_KEY) in (
-            True,
-            "persisted",
-        )
-        if messages[i].role == "user" and not is_queued_notice:
-            last_user_idx = i
-            break
-    if last_user_idx < 0:
-        return 0
-    modified = 0
-    for msg in messages[:last_user_idx]:
-        if msg.role != "assistant":
-            continue
-        pd = msg.provider_data
-        if not isinstance(pd, dict):
-            continue
-        has_replay_fields = "signature" in pd
-        content_blocks = pd.get("content_blocks")
-        if isinstance(content_blocks, list):
-            retained_blocks = [
-                block
-                for block in content_blocks
-                if not (
-                    isinstance(block, dict)
-                    and block.get("type") in {"thinking", "redacted_thinking", "redacted_reasoning_content"}
-                )
-            ]
-            if len(retained_blocks) != len(content_blocks):
-                pd["content_blocks"] = retained_blocks
-                has_replay_fields = True
-        if not has_replay_fields:
-            continue
-        msg.reasoning_content = None
-        msg.redacted_reasoning_content = None
-        pd.pop("signature", None)
-        modified += 1
-    return modified
-
-
-def _select_compaction_candidates(
-    *,
-    visible_runs: list[RunOutput | TeamRunOutput],
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    state: HistoryScopeState,
-    history_settings: ResolvedHistorySettings,
-    available_history_budget: int | None,
-) -> list[RunOutput | TeamRunOutput]:
-    if not visible_runs:
-        return []
-    if state.force_compact_before_next_run:
-        return visible_runs
-    if available_history_budget is None:
-        return []
-    current_tokens = estimate_prompt_visible_history_tokens(
-        session=session,
-        scope=scope,
-        history_settings=history_settings,
-    )
-    return visible_runs if current_tokens > available_history_budget else []
-
-
-def _stable_compaction_run_ids(
-    runs: Sequence[RunOutput | TeamRunOutput],
-    *,
-    session_id: str,
-    scope: HistoryScope,
-) -> tuple[str, ...]:
-    unremovable_run_count = sum(1 for run in runs if not _has_stable_run_id(run))
-    if unremovable_run_count:
-        logger.warning(
-            "Compaction skipped runs without stable run IDs",
-            session_id=session_id,
-            scope=scope.key,
-            skipped_runs=unremovable_run_count,
-        )
-    return tuple(run.run_id for run in runs if isinstance(run.run_id, str) and run.run_id)
-
-
-def _history_messages_for_estimation(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-) -> list[Message]:
-    """Return the prompt-visible history messages for token estimation only.
-
-    No deepcopy: filter_tool_calls copies any message it modifies and only the
-    list itself is mutated. Stale Anthropic replay fields are left in place
-    because the char estimate never counts them.
-    """
-    history_messages = list(
-        _session_history_messages(
-            session=session,
-            scope=scope,
-            history_settings=history_settings,
-        ),
-    )
-    if history_settings.max_tool_calls_from_history is not None and history_messages:
-        filter_tool_calls(history_messages, history_settings.max_tool_calls_from_history)
-    return history_messages
-
-
-def _session_history_messages(
-    *,
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-    history_settings: ResolvedHistorySettings,
-) -> list[Message]:
-    limit = history_settings.policy.limit
-    if scope.kind == "team":
-        return _team_session_history_messages(
-            session=cast("TeamSession", session),
-            scope_id=scope.scope_id,
-            history_settings=history_settings,
-            limit=limit,
-        )
-    return _agent_session_history_messages(
-        session=cast("AgentSession", session),
-        scope_id=scope.scope_id,
-        history_settings=history_settings,
-        limit=limit,
-    )
-
-
-def _agent_session_history_messages(
-    *,
-    session: AgentSession,
-    scope_id: str,
-    history_settings: ResolvedHistorySettings,
-    limit: int | None,
-) -> list[Message]:
-    skip_roles = _history_skip_roles(history_settings)
-    if history_settings.policy.mode == "runs":
-        return session.get_messages(agent_id=scope_id, last_n_runs=limit, skip_roles=skip_roles)
-    if history_settings.policy.mode == "messages":
-        return session.get_messages(agent_id=scope_id, limit=limit, skip_roles=skip_roles)
-    return session.get_messages(agent_id=scope_id, skip_roles=skip_roles)
-
-
-def _team_session_history_messages(
-    *,
-    session: TeamSession,
-    scope_id: str,
-    history_settings: ResolvedHistorySettings,
-    limit: int | None,
-) -> list[Message]:
-    skip_roles = _history_skip_roles(history_settings)
-    if history_settings.policy.mode == "runs":
-        return session.get_messages(team_id=scope_id, last_n_runs=limit, skip_roles=skip_roles)
-    if history_settings.policy.mode == "messages":
-        return session.get_messages(team_id=scope_id, limit=limit, skip_roles=skip_roles)
-    return session.get_messages(team_id=scope_id, skip_roles=skip_roles)
-
-
-def _history_skip_roles(history_settings: ResolvedHistorySettings) -> list[str]:
-    """Return prompt roles that should never be materialized as persisted history."""
-    return sorted(prompt_roles_for_history_storage(history_settings.system_message_role))
-
-
-def scope_visible_runs(
-    session: AgentSession | TeamSession,
-    scope: HistoryScope,
-) -> list[RunOutput | TeamRunOutput]:
-    """Return this scope's model-history-visible runs in stored order."""
-    return _runs_for_scope([run for run in session.runs or [] if is_model_history_visible_run(run)], scope)
-
-
-def _runs_for_scope(
-    runs: Sequence[RunOutput | TeamRunOutput],
-    scope: HistoryScope,
-) -> list[RunOutput | TeamRunOutput]:
-    """Filter model-history-visible runs down to one persisted history scope."""
-    if scope.kind == "team":
-        return [run for run in runs if isinstance(run, TeamRunOutput) and run.team_id == scope.scope_id]
-    return [run for run in runs if isinstance(run, RunOutput) and run.agent_id == scope.scope_id]
-
-
-def _current_summary_text(session: AgentSession | TeamSession) -> str | None:
-    if session.summary is None:
-        return None
-    return session.summary.summary.strip() or None
-
-
-def _has_stable_run_id(run: RunOutput | TeamRunOutput) -> bool:
-    return isinstance(run.run_id, str) and bool(run.run_id)
-
-
-def _estimated_message_chars(message: Message) -> int:
-    content_chars = len(_render_message_content(message))
-    tool_call_chars = len(stable_serialize(message.tool_calls)) if message.tool_calls else 0
-    return content_chars + tool_call_chars + _estimate_message_media_chars(message)
-
-
-def _estimate_message_media_chars(message: Message) -> int:
-    """Estimate serialized character cost for a message's media payloads."""
-    media_chars = 0
-    for _tag, media_value in _message_media_entries(message):
-        if media_value is None:
-            continue
-        media_chars += len(stable_serialize(_media_payload_snapshot(media_value)))
-    return media_chars
-
-
-def _model_identifier(model: Model) -> str:
-    return model.id or model.__class__.__name__
+        later = replace(summarizer, model=summary_model, fallback=fallback_model, shrunk_budget_tokens=shrunk_budget)
+        # The input may hold a checkpoint's run from the checkpoint on; the fold and its hooks take the stored runs.
+        folded = list(runs[: len(source.unread_runs) + len(included_runs)])
+        return _SummaryChunk(summary=summary, included_runs=folded, summarizer=later)
 
 
 def _iso_utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+__all__ = [
+    "ConversationChangedError",
+    "Summarizer",
+    "SummaryModel",
+    "clear_manual_compaction_request",
+    "compact_running_turn",
+    "compact_scope_history",
+    "load_summarizer",
+    "scope_usage_recorder",
+    "summarize_runs",
+]

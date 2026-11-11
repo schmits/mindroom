@@ -11,6 +11,7 @@ from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolStatus,
 )
 from mindroom.tool_system.dependencies import install_command_for_current_python
@@ -19,6 +20,7 @@ from mindroom.tool_system.registration import register_tool_with_metadata
 if TYPE_CHECKING:
     import logging
     from collections.abc import Callable
+    from pathlib import Path
 
     from agno.tools.python import PythonTools
 
@@ -64,6 +66,8 @@ def _python_tools_runtime() -> tuple[Any, Any, Any, Any]:
     display_name="Python Tools",
     description="Execute Python code, manage files, and install packages",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
@@ -79,34 +83,19 @@ def _python_tools_runtime() -> tuple[Any, Any, Any, Any]:
             default=None,
             authored_override=False,
         ),
-        ConfigField(
-            name="safe_globals",
-            label="Safe Globals",
-            type="text",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
-            name="safe_locals",
-            label="Safe Locals",
-            type="text",
-            required=False,
-            default=None,
-        ),
-        ConfigField(
-            name="restrict_to_base_dir",
-            label="Restrict To Base Dir",
-            type="boolean",
-            required=False,
-            default=True,
-        ),
     ],
-    dependencies=["agno"],
-    docs_url="https://docs.agno.com/tools/toolkits/local/python",
+    docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#python",
     function_names=(
         "list_files",
         "pip_install_package",
         "read_file",
+        "run_python_code",
+        "run_python_file_return_variable",
+        "save_to_file_and_run",
+        "uv_pip_install_package",
+    ),
+    workspace_writers=(
+        "pip_install_package",
         "run_python_code",
         "run_python_file_return_variable",
         "save_to_file_and_run",
@@ -120,6 +109,10 @@ def python_tools() -> type[PythonTools]:
     class MindRoomPythonTools(python_tools_class):
         """MindRoom wrapper around Agno's Python tool implementation."""
 
+        def __init__(self, base_dir: Path | None = None) -> None:
+            # Arbitrary code execution cannot be confined in-process, so the file helpers are not either.
+            super().__init__(base_dir=base_dir, restrict_to_base_dir=False)
+
         def pip_install_package(self, package_name: str) -> str:
             """Install a package into the current interpreter environment."""
             return _install_package_with_status(
@@ -130,12 +123,7 @@ def python_tools() -> type[PythonTools]:
             )
 
         def uv_pip_install_package(self, package_name: str) -> str:
-            """Backward-compatible alias for the shared installer path."""
-            return _install_package_with_status(
-                package_name,
-                warn=warn,
-                log_debug=log_debug,
-                agno_logger=agno_logger,
-            )
+            """Install a package into the current interpreter environment, as pip_install_package does."""
+            return self.pip_install_package(package_name)
 
     return MindRoomPythonTools

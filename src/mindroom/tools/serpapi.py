@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolStatus
+from mindroom.tool_system.declarations import ConfigField, SetupType, ToolCategory, ToolFileAccess, ToolStatus
 from mindroom.tool_system.registration import register_tool_with_metadata
 
 if TYPE_CHECKING:
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 @register_tool_with_metadata(
     name="serpapi",
+    file_access=ToolFileAccess.NONE,
     display_name="SerpApi",
     description="Google and YouTube search using SerpApi",
     category=ToolCategory.RESEARCH,
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("SERP_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -51,7 +53,7 @@ if TYPE_CHECKING:
         ),
     ],
     dependencies=["google-search-results"],
-    docs_url="https://docs.agno.com/tools/toolkits/search/serpapi",
+    docs_url="https://docs.mindroom.chat/tools/web-search/#serpapi",
     function_names=("search_google", "search_youtube"),
 )
 def serpapi_tools() -> type[SerpApiTools]:

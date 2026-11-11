@@ -2,29 +2,55 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+import secrets
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 import httpx
+from pydantic import ValidationError
 
-from mindroom.credentials import load_scoped_credentials
+from mindroom.credentials.manager import load_scoped_credentials
+from mindroom.credentials.policy import credential_service_policy
+from mindroom.logging_config import get_logger
 from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
-from mindroom.tool_system.runtime_context import get_tool_runtime_context
-from mindroom.workers.models import WorkerHandle, worker_api_endpoint
+from mindroom.tool_jobs.control import job_owns_execution
+from mindroom.tool_system.progress import report_tool_progress
+from mindroom.workers.in_flight import worker_call_in_flight
+from mindroom.workers.models import WorkerHandle, normalize_sandbox_runner_api_root, worker_api_endpoint
+from mindroom.workers.protocol import (
+    WORKER_PROTOCOL_VERSION,
+    CancelRequest,
+    ExecuteRequest,
+    ExecuteResponse,
+    FailureKind,
+    LeaseRequest,
+    LeaseResponse,
+    SaveAttachmentRequest,
+    SaveAttachmentResponse,
+    ViewFileRequest,
+    ViewFileResponse,
+    WorkerFailure,
+)
 
 if TYPE_CHECKING:
-    from mindroom.credentials import CredentialsManager
+    from mindroom.credentials.manager import CredentialsManager
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
     from mindroom.workers.backend import WorkerBackend
 
-_SANDBOX_PROXY_EXECUTE_PATH = "/api/sandbox-runner/execute"
-_SANDBOX_PROXY_LEASE_PATH = "/api/sandbox-runner/leases"
-SANDBOX_PROXY_SAVE_ATTACHMENT_PATH = "/api/sandbox-runner/save-attachment"
 _SANDBOX_PROXY_TOKEN_HEADER = "x-mindroom-sandbox-token"  # noqa: S105
+_EXECUTE_CANCEL_TIMEOUT_SECONDS = 10.0
+# The runner streams at least one line this often while a call runs; a longer silence means the runner is gone.
+EXECUTE_KEEPALIVE_SECONDS = 5.0
+
+logger = get_logger(__name__)
 
 
 class _WorkerProxyResponse(Protocol):
@@ -36,6 +62,14 @@ class _WorkerProxyResponse(Protocol):
     def json(self) -> object: ...
 
 
+class _WorkerProxyStreamedResponse(Protocol):
+    def raise_for_status(self) -> object: ...
+
+    def read(self) -> bytes: ...
+
+    def iter_bytes(self) -> Iterator[bytes]: ...
+
+
 class _WorkerProxyClient(Protocol):
     def post(
         self,
@@ -44,6 +78,16 @@ class _WorkerProxyClient(Protocol):
         json: dict[str, object],
         headers: Mapping[str, str],
     ) -> _WorkerProxyResponse: ...
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: dict[str, object],
+        headers: Mapping[str, str],
+        timeout: httpx.Timeout,
+    ) -> AbstractContextManager[_WorkerProxyStreamedResponse]: ...
 
 
 _WorkerProxyClientFactory = Callable[..., AbstractContextManager[_WorkerProxyClient]]
@@ -58,6 +102,9 @@ class WorkerProxyClientConfig:
     proxy_timeout_seconds: float
     credential_lease_ttl_seconds: int
     credential_policy: Mapping[str, tuple[str, ...]]
+    # The shared static runner has no credential store, so every call leases the tool's own saved settings.
+    # Dedicated-worker calls lease registered tools' settings too, because the primary owns tool settings.
+    lease_tool_credentials: bool
 
 
 def to_json_compatible(value: object) -> object:
@@ -79,29 +126,52 @@ def _json_object(value: object) -> dict[str, object] | None:
     return {str(key): item for key, item in value.items()}
 
 
+def _typed_failure(response: _WorkerProxyResponse) -> WorkerFailure | None:
+    """Return the worker's own account of a refused request, or None when the answer is not one."""
+    try:
+        return WorkerFailure.model_validate(response.json())
+    except (ValueError, ValidationError):
+        return None
+
+
 def _proxy_http_error_message(response: _WorkerProxyResponse) -> str:
+    failure = _typed_failure(response)
+    if failure is not None:
+        return failure.error
     try:
         payload = _json_object(response.json())
     except ValueError:
         payload = None
-    if payload is not None:
-        detail = payload.get("detail")
-        if detail:
-            return str(detail)
-        error = payload.get("error")
-        if error:
-            return str(error)
+    detail = payload.get("detail") if payload is not None else None
+    if detail:
+        return str(detail)
     body = response.text.strip()
     if body:
         return body
     return f"Sandbox proxy request failed with status {response.status_code}."
 
 
-def _request_headers_for_handle(
+class _WorkerHttpError(RuntimeError):
+    """A worker refused a request, by HTTP error or typed failure; the message is the worker's own when it gave one."""
+
+    def __init__(self, response: _WorkerProxyResponse) -> None:
+        super().__init__(_proxy_http_error_message(response))
+        self.failure = _typed_failure(response)
+
+
+def _raise_for_worker_status(response: _WorkerProxyResponse) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise _WorkerHttpError(exc.response) from exc
+
+
+def worker_request_headers(
     worker_handle: WorkerHandle | None,
     *,
     config: WorkerProxyClientConfig,
 ) -> dict[str, str]:
+    """Return the headers that authenticate a request to its worker, or to the shared runner without one."""
     token = worker_handle.auth_token if worker_handle is not None else config.proxy_token
     if token is None:
         msg = f"{SANDBOX_RUNTIME_ENV_BY_KEY['proxy_token']} must be set when sandbox proxying is enabled."
@@ -115,16 +185,26 @@ def _record_proxy_exception_for_worker(
     worker_handle: WorkerHandle | None,
     worker_manager: WorkerBackend,
 ) -> None:
-    """Classify one proxy exception as either worker-health or request-level failure."""
+    """Record one failed request against the worker unless the worker answered that the request was at fault.
+
+    A worker that refused a request says why in a typed failure, so only that failure's kind, a timeout, or a
+    connection that never got an answer decide; any other HTTP error, such as a missing route or a rejected token,
+    and a broken or malformed answer mean the worker cannot serve this primary.
+    """
     if worker_handle is None:
         return
-    if _is_request_level_proxy_http_error(exc):
-        worker_manager.touch_worker(worker_handle.worker_key)
+    if isinstance(exc, _WorkerHttpError) and exc.failure is not None:
+        record_proxy_response_failure_for_worker(
+            worker_handle=worker_handle,
+            worker_manager=worker_manager,
+            error=exc.failure.error,
+            failure_kind=exc.failure.failure_kind,
+        )
         return
     if _is_request_level_proxy_transport_error(exc):
         worker_manager.touch_worker(worker_handle.worker_key)
         return
-    worker_manager.record_failure(worker_handle.worker_key, str(exc))
+    worker_manager.record_failure(worker_handle.worker_key, str(exc), startup_count=worker_handle.startup_count)
 
 
 def _is_request_level_proxy_transport_error(exc: Exception) -> bool:
@@ -137,73 +217,85 @@ def _is_request_level_proxy_transport_error(exc: Exception) -> bool:
     return False
 
 
-def _is_request_level_proxy_http_error(exc: Exception) -> bool:
-    """Return whether one execute-route HTTP failure came from a healthy worker."""
-    if not isinstance(exc, httpx.HTTPStatusError):
-        return False
-    status_code = exc.response.status_code
-    if status_code not in {400, 404, 422}:
-        return False
-    try:
-        payload = _json_object(exc.response.json())
-    except (ValueError, json.JSONDecodeError):
-        return False
-    detail = payload.get("detail") if payload is not None else None
-    if isinstance(detail, str) and detail:
-        return status_code in {400, 422} or detail != "Not Found"
-    if status_code == 422 and isinstance(detail, list):
-        return bool(detail)
-    return False
-
-
 def record_proxy_response_failure_for_worker(
     *,
     worker_handle: WorkerHandle | None,
     worker_manager: WorkerBackend,
     error: str,
-    failure_kind: object,
+    failure_kind: FailureKind | None,
 ) -> None:
-    """Classify one structured runner failure response for worker health."""
+    """Record one failed worker answer against worker health, unless the worker reports a tool failure."""
     if worker_handle is None:
         return
     if failure_kind == "tool":
         worker_manager.touch_worker(worker_handle.worker_key)
         return
-    worker_manager.record_failure(worker_handle.worker_key, error)
+    worker_manager.record_failure(worker_handle.worker_key, error, startup_count=worker_handle.startup_count)
 
 
-def post_worker_proxy_json(
+def _checked_worker_answer[Answer: ExecuteResponse | SaveAttachmentResponse | ViewFileResponse](
+    data: object,
+    response_model: type[Answer],
     *,
-    config: WorkerProxyClientConfig,
-    payload: dict[str, object],
     worker_handle: WorkerHandle | None,
     worker_manager: WorkerBackend,
-    proxy_path: str,
-    worker_operation: Literal["execute", "save-attachment"],
-    surface_proxy_http_detail: bool = False,
+    operation: str,
+    failure: str,
+) -> Answer:
+    """Return one successful worker answer, recording a malformed or failed one against the worker.
+
+    A failed answer that blames the tool does not count against the worker.
+    """
+    try:
+        answer = response_model.model_validate(data)
+    except ValidationError as exc:
+        error = f"Sandbox {operation} returned a malformed response: {exc.error_count()} invalid field(s)."
+        record_proxy_response_failure_for_worker(
+            worker_handle=worker_handle,
+            worker_manager=worker_manager,
+            error=error,
+            failure_kind=None,
+        )
+        raise RuntimeError(error) from exc
+    if answer.ok:
+        return answer
+    error = answer.error or failure
+    record_proxy_response_failure_for_worker(
+        worker_handle=worker_handle,
+        worker_manager=worker_manager,
+        error=error,
+        failure_kind=answer.failure_kind,
+    )
+    raise RuntimeError(error)
+
+
+def post_worker_proxy_request[Answer: SaveAttachmentResponse | ViewFileResponse](
+    *,
+    config: WorkerProxyClientConfig,
+    request: SaveAttachmentRequest | ViewFileRequest,
+    response_model: type[Answer],
+    worker_handle: WorkerHandle | None,
+    worker_manager: WorkerBackend,
+    worker_operation: Literal["save-attachment", "view-file"],
+    failure: str,
     client_factory: _WorkerProxyClientFactory = httpx.Client,
-) -> object:
-    """POST one non-lease worker proxy request and return its decoded JSON payload."""
+) -> Answer:
+    """POST one worker file request and return its successful answer, recording a failed one against the worker."""
     if worker_handle is None and config.proxy_url is None:
         msg = f"{SANDBOX_RUNTIME_ENV_BY_KEY['proxy_url']} must be set when sandbox proxying is enabled."
         raise RuntimeError(msg)
 
     try:
-        headers = _request_headers_for_handle(worker_handle, config=config)
+        headers = worker_request_headers(worker_handle, config=config)
         request_url = (
             worker_api_endpoint(worker_handle, worker_operation)
             if worker_handle is not None
-            else f"{config.proxy_url}{proxy_path}"
+            else f"{normalize_sandbox_runner_api_root(config.proxy_url or '')}/{worker_operation}"
         )
         with client_factory(timeout=config.proxy_timeout_seconds) as client:
-            response = client.post(request_url, json=payload, headers=headers)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if worker_handle is None and surface_proxy_http_detail:
-                    raise RuntimeError(_proxy_http_error_message(exc.response)) from exc
-                raise
-            return response.json()
+            response = client.post(request_url, json=request.model_dump(mode="json"), headers=headers)
+            _raise_for_worker_status(response)
+            data = response.json()
     except Exception as exc:
         _record_proxy_exception_for_worker(
             exc,
@@ -211,59 +303,194 @@ def post_worker_proxy_json(
             worker_manager=worker_manager,
         )
         raise
+    return _checked_worker_answer(
+        data,
+        response_model,
+        worker_handle=worker_handle,
+        worker_manager=worker_manager,
+        operation=worker_operation,
+        failure=failure,
+    )
+
+
+class WorkerCallCancellation:
+    """Stop a worker call its caller stopped waiting for, or keep it from being dispatched."""
+
+    def __init__(self) -> None:
+        self.request_id = secrets.token_hex(16)
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self._stop: Callable[[], None] | None = None
+
+    def _arm(self, stop: Callable[[], None]) -> None:
+        """Keep the runner stop request until it is needed; refuse to dispatch an abandoned call."""
+        with self._lock:
+            if self._cancelled:
+                raise asyncio.CancelledError
+            self._stop = stop
+
+    @property
+    def cancelled(self) -> bool:
+        """Whether the caller stopped waiting for the call."""
+        with self._lock:
+            return self._cancelled
+
+    def cancel(self) -> None:
+        """Ask the runner to stop the call in the background, so the caller's cancellation stays prompt."""
+        with self._lock:
+            self._cancelled = True
+            stop = self._stop
+        if stop is not None:
+            threading.Thread(target=stop, name="mindroom-worker-cancel", daemon=True).start()
+
+
+def _post_execute_cancel(
+    client_factory: _WorkerProxyClientFactory,
+    url: str,
+    headers: dict[str, str],
+    request_id: str,
+) -> None:
+    """Ask the runner to stop one execute request the primary no longer waits for."""
+    try:
+        with client_factory(timeout=_EXECUTE_CANCEL_TIMEOUT_SECONDS) as client:
+            request = CancelRequest(protocol=WORKER_PROTOCOL_VERSION, request_id=request_id)
+            client.post(url, json=request.model_dump(mode="json"), headers=headers).raise_for_status()
+    except Exception:
+        # Best effort: the call was already abandoned, and the runner's own timeouts still apply.
+        logger.warning("worker_execute_cancel_failed", url=url, exc_info=True)
+
+
+def _ndjson_lines(chunks: Iterator[bytes]) -> Iterator[str]:
+    """Split a streamed body on newlines alone, since JSON text may hold other Unicode line separators."""
+    pending = bytearray()
+    for chunk in chunks:
+        start = 0
+        while (end := chunk.find(b"\n", start)) != -1:
+            pending += chunk[start:end]
+            yield pending.decode("utf-8")
+            pending = bytearray()
+            start = end + 1
+        pending += chunk[start:]
+    if pending:
+        yield pending.decode("utf-8")
+
+
+def _read_execute_stream(
+    response: _WorkerProxyStreamedResponse,
+    *,
+    deadline: float | None,
+    cancellation: WorkerCallCancellation | None,
+) -> dict[str, object] | None:
+    """Relay a call's progress until its result line; None when that line is not a JSON object.
+
+    Dropping the stream stops the call at the runner, so a cancelled call stops reading at its next line.
+    """
+    for line in _ndjson_lines(response.iter_bytes()):
+        if not line:
+            continue
+        frame = _json_object(json.loads(line))
+        if frame is None or ("progress" not in frame and frame.get("keepalive") is not True):
+            return frame
+        if cancellation is not None and cancellation.cancelled:
+            raise asyncio.CancelledError
+        if deadline is not None and time.monotonic() >= deadline:
+            msg = "Worker call exceeded its time limit."
+            raise httpx.ReadTimeout(msg)
+        if "progress" in frame:
+            report_tool_progress(str(frame["progress"]))
+    msg = "Sandbox proxy stream ended without a result."
+    raise RuntimeError(msg)
 
 
 def execute_worker_proxy_request(
     *,
     config: WorkerProxyClientConfig,
-    payload: dict[str, object],
+    request: ExecuteRequest,
     credentials_manager: CredentialsManager | None,
-    tool_name: str,
-    function_name: str,
     worker_target: ResolvedWorkerTarget | None,
     worker_handle: WorkerHandle | None,
     worker_manager: WorkerBackend,
     client_factory: _WorkerProxyClientFactory = httpx.Client,
+    primary_built_service: Callable[[str], bool] | None = None,
+    worker_grantable_credentials: frozenset[str] | None = None,
+    cancellation: WorkerCallCancellation | None = None,
 ) -> object:
-    """Execute one tool call through the sandbox proxy or selected dedicated worker."""
+    """Execute one tool call through the sandbox proxy or selected dedicated worker.
+
+    ``primary_built_service`` names leased services whose settings live in primary stores.
+    ``worker_grantable_credentials`` names shared services a scoped call may lease.
+    ``cancellation`` lets the caller stop the call at the runner once it stops waiting for it.
+    """
     if worker_handle is None and config.proxy_url is None:
         msg = f"{SANDBOX_RUNTIME_ENV_BY_KEY['proxy_url']} must be set when sandbox proxying is enabled."
         raise RuntimeError(msg)
 
     try:
-        headers = _request_headers_for_handle(worker_handle, config=config)
+        headers = worker_request_headers(worker_handle, config=config)
+        runner_api_root = normalize_sandbox_runner_api_root(config.proxy_url or "")
         execute_url = (
-            worker_api_endpoint(worker_handle, "execute")
-            if worker_handle is not None
-            else f"{config.proxy_url}{_SANDBOX_PROXY_EXECUTE_PATH}"
+            worker_api_endpoint(worker_handle, "execute") if worker_handle is not None else f"{runner_api_root}/execute"
         )
         lease_url = (
-            worker_api_endpoint(worker_handle, "leases")
-            if worker_handle is not None
-            else f"{config.proxy_url}{_SANDBOX_PROXY_LEASE_PATH}"
+            worker_api_endpoint(worker_handle, "leases") if worker_handle is not None else f"{runner_api_root}/leases"
         )
         with client_factory(timeout=config.proxy_timeout_seconds) as client:
+            run_as_job = job_owns_execution()
+            sent: dict[str, object] = {"run_as_job": run_as_job}
+            if cancellation is not None:
+                sent["request_id"] = cancellation.request_id
+                cancel_url = (
+                    worker_api_endpoint(worker_handle, "execute-cancel")
+                    if worker_handle is not None
+                    else f"{runner_api_root}/execute/cancel"
+                )
+                # Arm before leasing credentials, so an abandoned call leases none.
+                cancellation._arm(
+                    functools.partial(
+                        _post_execute_cancel,
+                        client_factory,
+                        cancel_url,
+                        headers,
+                        cancellation.request_id,
+                    ),
+                )
             lease_id = _create_credential_lease(
                 client,
                 config=config,
                 lease_url=lease_url,
                 headers=headers,
                 credentials_manager=credentials_manager,
-                tool_name=tool_name,
-                function_name=function_name,
+                tool_name=request.tool_name,
+                function_name=request.function_name,
                 worker_target=worker_target,
+                primary_built_service=primary_built_service,
+                worker_grantable_credentials=worker_grantable_credentials,
             )
             if lease_id is not None:
-                payload["lease_id"] = lease_id
-
-            response = client.post(execute_url, json=payload, headers=headers)
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if worker_handle is None:
-                    raise RuntimeError(_proxy_http_error_message(exc.response)) from exc
-                raise
-            data = _json_object(response.json())
+                sent["lease_id"] = lease_id
+            payload = request.model_copy(update=sent).model_dump(mode="json")
+            # A call that holds a reply keeps its time limit; a job call runs as long as its tool does.
+            deadline = None if run_as_job else time.monotonic() + config.proxy_timeout_seconds
+            # The read timeout spans worker preparation before the first line and every gap between keep-alives.
+            timeout = httpx.Timeout(
+                config.proxy_timeout_seconds,
+                read=max(config.proxy_timeout_seconds, 3 * EXECUTE_KEEPALIVE_SECONDS),
+            )
+            in_flight = (
+                worker_call_in_flight(worker_manager, worker_handle.worker_key)
+                if worker_handle is not None
+                else nullcontext()
+            )
+            with (
+                in_flight,
+                client.stream("POST", execute_url, json=payload, headers=headers, timeout=timeout) as response,
+            ):
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    response.read()
+                    raise _WorkerHttpError(exc.response) from exc
+                data = _read_execute_stream(response, deadline=deadline, cancellation=cancellation)
     except Exception as exc:
         _record_proxy_exception_for_worker(
             exc,
@@ -272,28 +499,17 @@ def execute_worker_proxy_request(
         )
         raise
 
-    if data is None:
-        msg = "Sandbox proxy returned a non-object response."
-        record_proxy_response_failure_for_worker(
-            worker_handle=worker_handle,
-            worker_manager=worker_manager,
-            error=msg,
-            failure_kind=None,
-        )
-        raise TypeError(msg)
-    if data.get("ok") is True:
-        if worker_handle is not None:
-            worker_manager.touch_worker(worker_handle.worker_key)
-        return data.get("result")
-
-    error = data.get("error") or "Sandbox execution failed."
-    record_proxy_response_failure_for_worker(
+    answer = _checked_worker_answer(
+        data,
+        ExecuteResponse,
         worker_handle=worker_handle,
         worker_manager=worker_manager,
-        error=str(error),
-        failure_kind=data.get("failure_kind"),
+        operation="execute",
+        failure="Sandbox execution failed.",
     )
-    raise RuntimeError(str(error))
+    if worker_handle is not None:
+        worker_manager.touch_worker(worker_handle.worker_key)
+    return answer.result
 
 
 def _create_credential_lease(
@@ -306,6 +522,8 @@ def _create_credential_lease(
     tool_name: str,
     function_name: str,
     worker_target: ResolvedWorkerTarget | None,
+    primary_built_service: Callable[[str], bool] | None,
+    worker_grantable_credentials: frozenset[str] | None,
 ) -> str | None:
     credential_overrides = _collect_credential_overrides(
         tool_name,
@@ -313,25 +531,29 @@ def _create_credential_lease(
         config=config,
         credentials_manager=credentials_manager,
         worker_target=worker_target,
+        primary_built_service=primary_built_service,
+        worker_grantable_credentials=worker_grantable_credentials,
     )
     if not credential_overrides:
         return None
 
-    lease_payload = {
-        "tool_name": tool_name,
-        "function_name": function_name,
-        "credential_overrides": to_json_compatible(credential_overrides),
-        "ttl_seconds": config.credential_lease_ttl_seconds,
-        "max_uses": 1,
-    }
-    response = client.post(lease_url, json=lease_payload, headers=headers)
-    response.raise_for_status()
-    lease_data = _json_object(response.json())
-    lease_id = lease_data.get("lease_id") if lease_data is not None else None
-    if not isinstance(lease_id, str):
-        msg = "Sandbox proxy lease response is missing lease_id."
-        raise TypeError(msg)
-    return lease_id
+    lease_request = LeaseRequest(
+        protocol=WORKER_PROTOCOL_VERSION,
+        tool_name=tool_name,
+        function_name=function_name,
+        credential_overrides=cast("dict[str, Any]", to_json_compatible(credential_overrides)),
+        ttl_seconds=config.credential_lease_ttl_seconds,
+    )
+    response = client.post(lease_url, json=lease_request.model_dump(mode="json"), headers=headers)
+    _raise_for_worker_status(response)
+    if _typed_failure(response) is not None:
+        # The worker refused the lease in its own words, which decide whether the worker is at fault.
+        raise _WorkerHttpError(response)
+    try:
+        return LeaseResponse.model_validate(response.json()).lease_id
+    except (ValueError, ValidationError) as exc:
+        msg = "Sandbox proxy lease response is malformed."
+        raise RuntimeError(msg) from exc
 
 
 def _collect_credential_overrides(
@@ -341,26 +563,34 @@ def _collect_credential_overrides(
     config: WorkerProxyClientConfig,
     credentials_manager: CredentialsManager | None,
     worker_target: ResolvedWorkerTarget | None,
+    primary_built_service: Callable[[str], bool] | None,
+    worker_grantable_credentials: frozenset[str] | None,
 ) -> dict[str, object]:
     if credentials_manager is None:
         return {}
-    services = _credential_services_for_call(tool_name, function_name, config=config)
+    # Scoped and unscoped calls lease the called tool's settings, which the primary owns,
+    # so dedicated workers never need the credential encryption key to read them.
+    lease_tool_settings = primary_built_service is not None and primary_built_service(tool_name)
+    services = _credential_services_for_call(
+        tool_name,
+        function_name,
+        config=config,
+        lease_tool_settings=lease_tool_settings,
+    )
     if not services:
         return {}
-    allowed_shared_services: frozenset[str] | None = None
-    if worker_target is not None and worker_target.worker_scope is not None:
-        context = get_tool_runtime_context()
-        allowed_shared_services = (
-            context.config.get_worker_grantable_credentials() if context is not None else frozenset()
-        )
 
     merged_overrides: dict[str, object] = {}
     for service in services:
+        if not credential_service_policy(service, None).leasable:
+            continue
+
         credentials = load_scoped_credentials(
             service,
             credentials_manager=credentials_manager,
             worker_target=worker_target,
-            allowed_shared_services=allowed_shared_services,
+            allowed_shared_services=worker_grantable_credentials,
+            primary_built_tool=primary_built_service is not None and primary_built_service(service),
         )
         if isinstance(credentials, Mapping):
             merged_overrides.update(_filter_internal_credential_keys(credentials))
@@ -372,9 +602,10 @@ def _credential_services_for_call(
     function_name: str,
     *,
     config: WorkerProxyClientConfig,
+    lease_tool_settings: bool,
 ) -> list[str]:
     selectors = ("*", tool_name, f"{tool_name}.{function_name}")
-    services: list[str] = []
+    services: list[str] = [tool_name] if config.lease_tool_credentials or lease_tool_settings else []
     for selector in selectors:
         for service in config.credential_policy.get(selector, ()):
             if service not in services:

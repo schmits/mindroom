@@ -23,7 +23,6 @@ from mindroom.dispatch_source import (
     content_owns_per_fire_thread_root,
     is_visible_router_voice_echo_content,
     scheduled_history_limit_from_content,
-    source_kind_allows_internal_relay_detection,
     source_kind_allows_self_authored_ingress,
     source_kind_allows_trusted_original_sender,
     source_kind_bypasses_coalescing,
@@ -120,6 +119,7 @@ def test_source_kind_allows_trusted_original_sender_rejects_plain_turns(source_k
             },
             True,
         ),
+        ({SOURCE_KIND_KEY: HOOK_DISPATCH_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: True}, True),
         ({SOURCE_KIND_KEY: HOOK_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: True}, False),
         ({SOURCE_KIND_KEY: SCHEDULED_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: False}, False),
         ({SOURCE_KIND_KEY: SCHEDULED_SOURCE_KIND, PER_FIRE_THREAD_ROOT_KEY: "$root"}, False),
@@ -133,40 +133,6 @@ def test_content_owns_per_fire_thread_root_requires_explicit_boolean_marker(
 ) -> None:
     """Only explicit automation or relayed-root metadata owns a per-fire root."""
     assert content_owns_per_fire_thread_root(content) is expected
-
-
-@pytest.mark.parametrize(
-    "source_kind",
-    [
-        "",
-        MESSAGE_SOURCE_KIND,
-        TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
-    ],
-)
-def test_source_kind_allows_internal_relay_detection_for_plain_text_handoff_candidates(
-    source_kind: str,
-) -> None:
-    """Only plain text and already-relay candidates are promoted after trusted metadata inspection."""
-    assert source_kind_allows_internal_relay_detection(source_kind)
-
-
-@pytest.mark.parametrize(
-    "source_kind",
-    [
-        HOOK_SOURCE_KIND,
-        HOOK_DISPATCH_SOURCE_KIND,
-        SCHEDULED_SOURCE_KIND,
-        VOICE_SOURCE_KIND,
-        IMAGE_SOURCE_KIND,
-        MEDIA_SOURCE_KIND,
-        None,
-    ],
-)
-def test_source_kind_allows_internal_relay_detection_rejects_specialized_turns(
-    source_kind: str | None,
-) -> None:
-    """Specialized source kinds should not be reclassified as generic trusted relays."""
-    assert not source_kind_allows_internal_relay_detection(source_kind)
 
 
 @pytest.mark.parametrize(

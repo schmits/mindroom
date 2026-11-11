@@ -13,6 +13,7 @@ import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -25,6 +26,7 @@ from nio.durable.store import DurableStore
 
 from mindroom.config.main import Config
 from mindroom.event_journal import DeliveryStage, EventClass, EventJournalStore, EventKind, InboundEvent
+from mindroom.event_journal.identity import journal_principal_id
 from mindroom.event_journal.schema import SQLITE_DIALECT, schema_statements
 from mindroom.matrix.conversation_hydration import ConversationHydrator
 from scripts.testing import fuzz_live_matrix
@@ -78,14 +80,14 @@ import json
 import shutil
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock
 
 import scripts.testing.fuzz_live_matrix as live_fuzz
 from mindroom.constants import SOURCE_KIND_KEY
-from mindroom.dispatch_source import AUTO_RESUME_MESSAGE, TRUSTED_INTERNAL_RELAY_SOURCE_KIND
-from mindroom.handled_turns import TurnRecord, TurnRecordCodec
-from mindroom.streaming import RESTART_INTERRUPTED_RESPONSE_NOTE
-from mindroom.turn_record import RevisionReplay
+from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND
+from mindroom.event_journal import turn_rows
+from mindroom.streaming import INTERRUPTED_RESPONSE_NOTE, RESTART_INTERRUPTED_RESPONSE_NOTE
+from mindroom.turn_record import RevisionReplay, TurnRecord
 from mindroom.turn_store import TurnStore, TurnStoreDeps
 from scripts.testing.fuzz_live_matrix import (
     ORIGINAL_REVISION,
@@ -104,6 +106,8 @@ from scripts.testing.fuzz_live_matrix import (
     chaos_scenario_from_seed,
     saturation_scenario,
 )
+from tests.journal_helpers import admit_room_event
+from tests.test_turn_store import _redact
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterator
@@ -305,6 +309,50 @@ class _RestartBoundaryRunner(LiveFuzzRunner):
         assert historical_event_ids == ("$restart-old-text", "$restart-old-media")
         cast("_RestartBoundaryStack", self.stack).order.append("room-read")
         return 2
+
+
+@pytest.mark.asyncio
+async def test_disposable_account_registers_with_the_homeserver_token() -> None:
+    """A homeserver created by deploy.py only admits accounts that present its registration token."""
+    payloads: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        payloads.append(payload)
+        if "session" not in payload["auth"]:
+            return httpx.Response(401, json={"session": "uia", "flows": [{"stages": ["m.login.registration_token"]}]})
+        return httpx.Response(200, json={"access_token": "token", "user_id": "@livefuzz:example"})
+
+    token = "instance-token"  # noqa: S105
+    client = LiveMatrixClient("http://matrix.invalid", "", registration_token=token)
+    await client.http.aclose()
+    client.http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        assert await client.register() == "@livefuzz:example"
+    finally:
+        await client.close()
+
+    assert [payload["auth"] for payload in payloads] == [
+        {"type": "m.login.registration_token", "token": token},
+        {"type": "m.login.registration_token", "token": token, "session": "uia"},
+    ]
+
+
+def test_instance_registration_token_comes_from_the_deploy_env_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The managed MindRoom and its test clients use the token deploy.py wrote for that instance."""
+    (tmp_path / "fuzz-instance.env").write_text(
+        "INSTANCE_ENV_FILE=x\nMATRIX_REGISTRATION_TOKEN=abc123\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tokenless.env").write_text("MATRIX_REGISTRATION_TOKEN=\n", encoding="utf-8")
+    monkeypatch.setattr(live_fuzz, "INSTANCE_ENV_DIR", tmp_path)
+
+    assert live_fuzz._instance_registration_token("fuzz-instance") == "abc123"
+    with pytest.raises(RuntimeError, match="has no MATRIX_REGISTRATION_TOKEN"):
+        live_fuzz._instance_registration_token("tokenless")
 
 
 @pytest.mark.asyncio
@@ -677,6 +725,35 @@ def test_live_scenario_is_deterministic_and_json_replayable() -> None:
             }
         ]
         assert len(reply_threads) == len(set(reply_threads))
+
+
+def test_captured_limited_sync_workload_replays_with_current_oracle() -> None:
+    """The captured concurrent backlog stays replayable after retiring the cache runner."""
+    fixture_dir = Path(__file__).parent / "fixtures" / "matrix_fuzz"
+    scenario = LiveFuzzScenario.from_json((fixture_dir / "limited_sync_concurrent_branch_replay.json").read_text())
+    original = json.loads((fixture_dir / "limited_sync_concurrent_branch.json").read_text())
+
+    assert (scenario.profile, scenario.thread_count, scenario.client_count, scenario.room_count) == (
+        "chaos",
+        12,
+        6,
+        1,
+    )
+    assert scenario.batches[0][0].kind is LiveOperationKind.STOP_MINDROOM
+    assert [batch[0].kind for batch in scenario.batches[-4:]] == [
+        LiveOperationKind.START_MINDROOM,
+        LiveOperationKind.CHECKPOINT,
+        LiveOperationKind.RESTART_MINDROOM,
+        LiveOperationKind.CHECKPOINT,
+    ]
+    replayed_batches = scenario.batches[1:-4]
+    assert len(replayed_batches) == len(original["batches"]) == 10
+    for replayed, captured in zip(replayed_batches, original["batches"], strict=True):
+        assert [(op.operation_id, op.kind, op.thread, op.client, op.target) for op in replayed] == [
+            (op["operation_id"], op["kind"], op["thread"], op["client"], op["target"].replace("root:0:", "root:"))
+            for op in captured
+        ]
+    assert LiveFuzzScenario.from_json(scenario.to_json()) == scenario
 
 
 def test_live_scenario_schedules_every_interruption_inside_unfinished_work() -> None:
@@ -1952,7 +2029,7 @@ async def test_restart_room_read_finds_history_the_answer_never_projected(
     runner = None
     try:
         stack.agent_id, stack.router_id = "@agent:example", "@router:example"
-        agent = f"general@{stack.agent_id}"
+        agent = journal_principal_id("general", stack.agent_id)
         for logical_event_id in ("$old-text", "$old-media"):
             _seed_visible_message(stack, principal=agent, room_id=room, logical_event_id=logical_event_id)
         _seed_visible_message(
@@ -2105,7 +2182,7 @@ def test_restart_regression_waits_for_projected_event_and_drained_source(debt: s
                     membership_epoch
                 ) VALUES (?, ?, ?, '', '@sender:example', 1, ?, 1, '{}', 0)
                 """,
-                (f"general@{stack.agent_id}", "!target:example", "$fresh", "$fresh"),
+                (journal_principal_id("general", stack.agent_id), "!target:example", "$fresh", "$fresh"),
             )
             fixture_database.commit()
         for name, user in (("router", "@router:example"), ("general", stack.agent_id)):
@@ -2153,7 +2230,7 @@ def test_restart_regression_reads_exact_durable_journal_state() -> None:
     try:
         stack.agent_id = "@agent:example"
         store = EventJournalStore.open_sqlite(stack.storage_path / "tracking" / "event_journal.db")
-        principal_id = f"general@{stack.agent_id}"
+        principal_id = journal_principal_id("general", stack.agent_id)
         database_path = stack.storage_path / "tracking" / "event_journal.db"
 
         async def admit() -> None:
@@ -2253,6 +2330,8 @@ def test_sustained_stream_capacity_config_uses_managed_sender_and_synthetic_resp
         }
         assert config["agents"]["general"]["model"] == "synthetic"
         assert config["agents"]["load_sender"]["rooms"] == ["lobby"]
+        # The managed sender is an agent, so every workload root counts toward the consecutive agent-reply limit.
+        assert config["defaults"]["max_consecutive_agent_replies"] > 200
         assert config["models"]["synthetic"]["extra_kwargs"] == {
             "seed": 1,
             "min_response_chars": 4800,
@@ -2346,7 +2425,7 @@ def test_recovery_debt_counts_only_exact_workload_final_rows() -> None:
     """Only attempted unacknowledged FINAL debt for general workload roots is evidence."""
     stack = ManagedTuwunelStack(profile="sustained-stream-capacity")
     stack.agent_id = "@mindroom_general:example"
-    expected_principal = f"general@{stack.agent_id}"
+    expected_principal = journal_principal_id("general", stack.agent_id)
     try:
         database_path = stack.storage_path / "tracking" / "event_journal.db"
         database_path.parent.mkdir(parents=True)
@@ -2392,7 +2471,7 @@ def test_managed_stream_reaction_state_filters_exact_principal_event_and_kind() 
             assert stack.managed_stream_reaction_state("$reaction") is None
             database.execute(
                 "INSERT INTO journal_events VALUES (?, '$reaction', 'reaction', 'settled')",
-                (f"general@{stack.agent_id}",),
+                (journal_principal_id("general", stack.agent_id),),
             )
             database.commit()
         assert stack.managed_stream_reaction_state("$reaction") == "settled"
@@ -2584,6 +2663,50 @@ def test_managed_runtime_overrides_inherited_logging(monkeypatch: pytest.MonkeyP
         stack.close()
 
 
+def test_managed_graceful_stop_delivers_one_interrupt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A non-interactive wrapper must not forward a second interrupt during drain."""
+    probe = tmp_path / "signal_probe.py"
+    probe.write_text(
+        "import signal, time\n"
+        "received = []\n"
+        "signal.signal(signal.SIGINT, lambda *_: received.append(time.monotonic()))\n"
+        "print('READY', flush=True)\n"
+        "while not received:\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(0.4)\n"
+        "print(f'SIGNALS={len(received)}', flush=True)\n"
+        f"print({ORDERLY_SHUTDOWN_MARKER!r}, flush=True)\n",
+        encoding="utf-8",
+    )
+    stack = ManagedTuwunelStack(state_root=tmp_path / "state")
+    popen = subprocess.Popen
+
+    def wait_for_probe() -> None:
+        deadline = time.monotonic() + 10
+        while "READY" not in stack.log_tail():
+            assert time.monotonic() < deadline, "signal probe did not start"
+            time.sleep(0.01)
+
+    try:
+        stack.storage_path.mkdir()
+        (stack.storage_path / "matrix_state.yaml").write_text("rooms:\n  lobby:\n    room_id: '!room:example'\n")
+        stack._log_handle = stack.log_path.open("a", encoding="utf-8")
+        stack._env = stack._mindroom_environment()
+        monkeypatch.setattr(live_fuzz, "__file__", str(probe))
+        # The probe runs under this interpreter; a real `uv run` would first sync the project environment.
+        monkeypatch.setattr(live_fuzz, "_run_command", lambda *_args, **_kwargs: sys.executable)
+        monkeypatch.setattr(subprocess, "Popen", partial(popen, stdin=subprocess.DEVNULL))
+        monkeypatch.setattr(stack, "_wait_for_runtime_attestation", wait_for_probe)
+        monkeypatch.setattr(stack, "_wait_for_url", lambda *_args, **_kwargs: None)
+
+        stack._start_mindroom(timeout=15)
+        stack._stop_mindroom(timeout=5)
+
+        assert "SIGNALS=1\n" in stack.log_path.read_text(encoding="utf-8")
+    finally:
+        stack.close()
+
+
 def test_managed_runtime_pins_child_to_python_313(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every managed MindRoom child must match the production Python runtime."""
 
@@ -2612,6 +2735,21 @@ def test_managed_runtime_pins_child_to_python_313(monkeypatch: pytest.MonkeyPatc
         def complete_url_wait(_url: str, *, timeout: float) -> None:
             assert 0 < timeout <= 7
 
+        def resolve_python(*command: str, timeout_seconds: float) -> str:
+            assert command == (
+                "uv",
+                "run",
+                "--locked",
+                "--python",
+                "3.13",
+                "python",
+                "-c",
+                "import sys; print(sys.executable)",
+            )
+            assert timeout_seconds == 7
+            return f"{sys.executable}\n"
+
+        monkeypatch.setattr(live_fuzz, "_run_command", resolve_python)
         monkeypatch.setattr(subprocess, "Popen", record_popen)
         monkeypatch.setattr(stack, "_wait_for_url", complete_url_wait)
 
@@ -2620,12 +2758,7 @@ def test_managed_runtime_pins_child_to_python_313(monkeypatch: pytest.MonkeyPatc
 
         assert commands == [
             [
-                "uv",
-                "run",
-                "--locked",
-                "--python",
-                "3.13",
-                "python",
+                sys.executable,
                 str(Path(live_fuzz.__file__).resolve()),
                 "__mindroom_runtime_child__",
                 str(stack.attestation_path),
@@ -3155,7 +3288,7 @@ def test_pending_journal_work_counts_only_unsettled_events() -> None:
         store = EventJournalStore.open_sqlite(stack.storage_path / "tracking" / "event_journal.db")
 
         async def seed() -> None:
-            principal = store.principal(f"general@{stack.agent_id}")
+            principal = store.principal(journal_principal_id("general", stack.agent_id))
             for event_id in ("$settled", "$pending"):
                 await principal.admit(
                     InboundEvent(
@@ -3590,14 +3723,10 @@ async def test_exact_reply_oracle_rejects_duplicate_canonical_replies() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exact_reply_oracle_allows_response_to_internal_restart_relay() -> None:
-    """Restart recovery may validly answer a router-authored resume relay."""
+async def test_exact_reply_oracle_rejects_response_to_router_relay_after_interruption() -> None:
+    """Replay continues an interrupted reply in place, so an answer to a router relay is a wrong reply."""
     client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    oracle = ExactReplyOracle(
-        client,
-        "@agent:example",
-        internal_relay_senders=("@router:example",),
-    )
+    oracle = ExactReplyOracle(client, "@agent:example")
     try:
         oracle.expect("root:0", "$root")
         oracle._ingest_event(
@@ -3611,11 +3740,11 @@ async def test_exact_reply_oracle_allows_response_to_internal_restart_relay() ->
         )
         oracle._ingest_event(
             {
-                "event_id": "$resume-relay",
+                "event_id": "$router-relay",
                 "sender": "@router:example",
                 "type": "m.room.message",
                 "content": {
-                    "body": AUTO_RESUME_MESSAGE,
+                    "body": "@agent continue",
                     SOURCE_KIND_KEY: TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
                     "m.relates_to": {
                         "rel_type": "m.thread",
@@ -3634,12 +3763,13 @@ async def test_exact_reply_oracle_allows_response_to_internal_restart_relay() ->
                     "m.relates_to": {
                         "rel_type": "m.thread",
                         "event_id": "$root",
-                        "m.in_reply_to": {"event_id": "$resume-relay"},
+                        "m.in_reply_to": {"event_id": "$router-relay"},
                     },
                 },
             },
         )
-        oracle._assert_no_wrong_replies()
+        with pytest.raises(AssertionError, match="unexpected"):
+            oracle._assert_no_wrong_replies()
     finally:
         await client.close()
 
@@ -3798,7 +3928,13 @@ class _ChatteringSyncClient:
             )
         events.extend(
             [
-                _resume_relay_event(event_id=relay, thread_root="$root", in_reply_to=prior_reply),
+                _threaded_reply_event(
+                    sender="@router:example",
+                    event_id=relay,
+                    thread_root="$root",
+                    in_reply_to=prior_reply,
+                    body="@agent continue",
+                ),
                 _threaded_reply_event(
                     sender="@agent:example",
                     event_id=f"{relay}-answer",
@@ -3815,17 +3951,34 @@ class _ChatteringSyncClient:
 
 
 @pytest.mark.asyncio
-async def test_wait_fails_when_the_room_never_goes_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bots looping at each other must fail the wait, not extend it forever."""
+async def test_wait_fails_at_once_when_the_agent_answers_router_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No router message continues interrupted work, so a bot loop fails the wait on its first wrong reply."""
     clock = _FakeClock()
     monkeypatch.setattr(fuzz_live_matrix, "time", clock)
     client = _ChatteringSyncClient(clock, tick=0.1)
-    oracle = ExactReplyOracle(
-        cast("LiveMatrixClient", client),
-        "@agent:example",
-        internal_relay_senders=("@router:example",),
-    )
+    oracle = ExactReplyOracle(cast("LiveMatrixClient", client), "@agent:example")
     oracle.expect("op:0", "$a")
+    budget = WaitBudget(turns=1, per_turn_seconds=0.0, settle_seconds=0.5, floor_seconds=2.0)
+
+    with pytest.raises(AssertionError, match="unexpected"):
+        await oracle.wait_until_exact(budget)
+
+    assert clock.now == pytest.approx(client.tick)
+
+
+@pytest.mark.asyncio
+async def test_wait_fails_when_the_room_never_goes_quiet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bots looping at each other must fail the wait, not extend it forever.
+
+    While a send still awaits its event ID the oracle cannot classify stray
+    replies, so only the quiet window can end the wait.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(fuzz_live_matrix, "time", clock)
+    client = _ChatteringSyncClient(clock, tick=0.1)
+    oracle = ExactReplyOracle(cast("LiveMatrixClient", client), "@agent:example")
+    oracle.expect("op:0", "$a")
+    oracle.begin_expectation_registration()
     budget = WaitBudget(turns=1, per_turn_seconds=0.0, settle_seconds=0.5, floor_seconds=2.0)
 
     with pytest.raises(AssertionError, match="never went quiet"):
@@ -4026,7 +4179,7 @@ def test_missing_reply_diagnosis_reads_the_production_journal_schema() -> None:
     stack = ManagedTuwunelStack()
     try:
         stack.agent_id = "@agent:example"
-        principal_id = f"general@{stack.agent_id}"
+        principal_id = journal_principal_id("general", stack.agent_id)
         store = EventJournalStore.open_sqlite(stack.storage_path / "tracking" / "event_journal.db")
 
         async def seed() -> None:
@@ -4594,8 +4747,6 @@ def test_startup_maintenance_wait_uses_only_current_process_generation(tmp_path:
     phases = {
         "startup_maintenance.rooms_and_memberships",
         "startup_maintenance.runtime_support",
-        "startup_maintenance.stale_stream_recovery.initial",
-        "startup_maintenance.stale_stream_recovery.joined_room_delta",
     }
     assert phases == live_fuzz._STARTUP_MAINTENANCE_PHASES
 
@@ -4632,7 +4783,7 @@ def test_startup_maintenance_wait_rejects_failed_current_phase(tmp_path: Path) -
 
     log_path = tmp_path / "mindroom.log"
     log_path.write_text(
-        "startup_phase_finished phase=startup_maintenance.stale_stream_recovery.initial status=failed\n",
+        "startup_phase_finished phase=startup_maintenance.runtime_support status=failed\n",
         encoding="utf-8",
     )
     stack = object.__new__(ManagedTuwunelStack)
@@ -4779,39 +4930,36 @@ def test_generators_never_edit_one_source_twice_per_batch() -> None:
             assert len(edited) == len(set(edited))
 
 
-@pytest.mark.asyncio
-async def test_restart_observation_attributes_auto_resumed_response_to_original_source(
-    seeded_restart_observation_stack: tuple[ManagedTuwunelStack, list[float]],
-) -> None:
-    """A completed auto-resume chain is the final response for its interrupted source."""
-    stack, stop_calls = seeded_restart_observation_stack
+def _continued_restart_reply(stack: ManagedTuwunelStack) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build an interrupted reply and the replay edit that continues it in place."""
     interrupted = _restart_response(
         "$interrupted",
         stack.agent_id,
         "$fresh",
-        body=f"partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}",
+        body="LIVE-FUZZ runtime-generation=replacement partial",
     )
-    relay = {
-        "event_id": "$relay",
-        "sender": stack.router_id,
-        "type": "m.room.message",
-        "content": {
-            SOURCE_KIND_KEY: TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
-            "body": f"@agent {AUTO_RESUME_MESSAGE}",
-            "m.relates_to": {
-                "rel_type": "m.thread",
-                "event_id": "$fresh",
-                "m.in_reply_to": {"event_id": "$interrupted"},
-            },
-        },
-    }
-    recovered = _restart_response("$recovered", stack.agent_id, "$relay")
-    recovered["content"]["m.relates_to"]["event_id"] = "$fresh"
+    continued = _agent_edit_event(
+        "$interrupted",
+        "$continued",
+        "LIVE-FUZZ runtime-generation=replacement partial\n\n"
+        f"{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\n"
+        "LIVE-FUZZ runtime-generation=recovered END call=1",
+        ts=2,
+    )
+    return interrupted, continued
+
+
+@pytest.mark.asyncio
+async def test_restart_observation_accepts_reply_continued_in_place(
+    seeded_restart_observation_stack: tuple[ManagedTuwunelStack, list[float]],
+) -> None:
+    """Replay continues an interrupted reply in its own message, which stays the source's one answer."""
+    stack, stop_calls = seeded_restart_observation_stack
 
     observation = await _collect_seeded_restart_observation(
         stack,
         log=_RESTART_OBSERVATION_LOG,
-        events=(interrupted, relay, recovered),
+        events=_continued_restart_reply(stack),
     )
 
     assert stop_calls == [0.05]
@@ -4821,24 +4969,36 @@ async def test_restart_observation_attributes_auto_resumed_response_to_original_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "fault",
-    [
-        "missing",
-        "duplicate_original",
-        "wrong_target",
-        "wrong_sender",
-        "wrong_root",
-        "wrong_room",
-        "uninterrupted",
-        "duplicate_recovered",
-    ],
-)
-async def test_restart_observation_rejects_broken_resume_chain(
+@pytest.mark.parametrize("fault", ["missing", "duplicate_original", "wrong_sender", "wrong_root", "wrong_room"])
+async def test_restart_observation_rejects_continued_reply_without_exact_provenance(
     seeded_restart_observation_stack: tuple[ManagedTuwunelStack, list[float]],
     fault: str,
 ) -> None:
-    """A relay answer cannot erase missing provenance or duplicate direct originals."""
+    """A reply continued in place cannot erase missing provenance or duplicate direct originals."""
+    stack, _stop_calls = seeded_restart_observation_stack
+    interrupted, continued = _continued_restart_reply(stack)
+    events = [interrupted, continued]
+    if fault == "missing":
+        events.remove(interrupted)
+    elif fault == "duplicate_original":
+        events.append({**interrupted, "event_id": "$duplicate"})
+    elif fault == "wrong_sender":
+        interrupted["sender"] = "@outsider:example"
+    elif fault == "wrong_root":
+        interrupted["content"]["m.relates_to"]["event_id"] = "$unrelated"
+    else:
+        interrupted["room_id"] = "!unrelated:example"
+
+    observation = await _collect_seeded_restart_observation(stack, log=_RESTART_OBSERVATION_LOG, events=tuple(events))
+
+    assert not observation.fresh_response_complete
+
+
+@pytest.mark.asyncio
+async def test_restart_observation_rejects_answer_to_router_relay(
+    seeded_restart_observation_stack: tuple[ManagedTuwunelStack, list[float]],
+) -> None:
+    """An agent answer to a router relay never completes the interrupted reply it follows."""
     stack, _stop_calls = seeded_restart_observation_stack
     interrupted = _restart_response(
         "$interrupted",
@@ -4846,29 +5006,19 @@ async def test_restart_observation_rejects_broken_resume_chain(
         "$fresh",
         body=f"partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}",
     )
-    relay = _restart_response("$relay", stack.router_id, "$interrupted", body=AUTO_RESUME_MESSAGE)
+    relay = _restart_response("$relay", stack.router_id, "$interrupted", body="@agent continue")
     relay["content"][SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
     relay["content"]["m.relates_to"]["event_id"] = "$fresh"
-    recovered = _restart_response("$recovered", stack.agent_id, "$relay")
-    recovered["content"]["m.relates_to"]["event_id"] = "$fresh"
-    events = [interrupted, relay, recovered]
-    if fault == "missing":
-        events.remove(interrupted)
-    elif fault == "duplicate_original":
-        events.append({**interrupted, "event_id": "$duplicate"})
-    elif fault == "wrong_target":
-        relay["content"]["m.relates_to"]["m.in_reply_to"]["event_id"] = "$unrelated"
-    elif fault == "wrong_sender":
-        interrupted["sender"] = "@outsider:example"
-    elif fault == "wrong_root":
-        recovered["content"]["m.relates_to"]["event_id"] = "$unrelated"
-    elif fault == "wrong_room":
-        interrupted["room_id"] = "!unrelated:example"
-    elif fault == "uninterrupted":
-        interrupted["content"]["body"] = "original completed END call=0"
-    else:
-        events.append({**recovered, "event_id": "$duplicate"})
-    observation = await _collect_seeded_restart_observation(stack, log=_RESTART_OBSERVATION_LOG, events=tuple(events))
+    answer = _restart_response("$answer", stack.agent_id, "$relay")
+    answer["content"]["m.relates_to"]["event_id"] = "$fresh"
+
+    observation = await _collect_seeded_restart_observation(
+        stack,
+        log=_RESTART_OBSERVATION_LOG,
+        events=(interrupted, relay, answer),
+    )
+
+    assert observation.fresh_agent_output_count == 1
     assert not observation.fresh_response_complete
 
 
@@ -4876,23 +5026,16 @@ async def test_restart_observation_rejects_broken_resume_chain(
 async def test_exact_reply_oracle_flags_reply_to_unrelated_router_traffic() -> None:
     """An agent reply to ordinary router traffic is unexpected, not exempt."""
     client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    oracle = ExactReplyOracle(
-        client,
-        "@agent:example",
-        internal_relay_senders=("@router:example",),
-    )
+    oracle = ExactReplyOracle(client, "@agent:example")
     try:
-        # A router greeting is not an auto-resume relay: no AUTO_RESUME_MESSAGE
-        # body, no threaded reply relation.
         oracle._ingest_event(
             {
                 "event_id": "$greeting",
                 "sender": "@router:example",
                 "type": "m.room.message",
-                "content": {"body": "not a resume"},
+                "content": {"body": "hello"},
             },
         )
-        assert "$greeting" not in oracle.internal_source_ids
         oracle._ingest_event(
             {
                 "event_id": "$response",
@@ -4907,88 +5050,6 @@ async def test_exact_reply_oracle_flags_reply_to_unrelated_router_traffic() -> N
                 },
             },
         )
-        with pytest.raises(AssertionError, match="unexpected"):
-            oracle._assert_no_wrong_replies()
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_exact_reply_oracle_rejects_router_quote_of_resume_message() -> None:
-    """Quoted resume text without the trusted source kind is ordinary traffic."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    oracle = ExactReplyOracle(
-        client,
-        "@agent:example",
-        internal_relay_senders=("@router:example",),
-    )
-    try:
-        oracle.expect("op:1", "$source")
-        interrupted = _agent_reply_event(
-            "$source",
-            "$interrupted",
-            f"LIVE-FUZZ call=1 {RESTART_INTERRUPTED_RESPONSE_NOTE}",
-        )
-        interrupted["content"]["m.relates_to"]["event_id"] = "$root"
-        oracle._ingest_event(interrupted)
-        oracle._ingest_event(
-            _threaded_reply_event(
-                sender="@router:example",
-                event_id="$quoted-resume",
-                thread_root="$root",
-                in_reply_to="$interrupted",
-                body=f"ordinary quote: {AUTO_RESUME_MESSAGE}",
-            ),
-        )
-        oracle._ingest_event(
-            _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$extra",
-                thread_root="$root",
-                in_reply_to="$quoted-resume",
-                body="LIVE-FUZZ call=2 END call=2",
-            ),
-        )
-
-        assert "$quoted-resume" not in oracle.internal_source_ids
-        with pytest.raises(AssertionError, match="unexpected"):
-            oracle._assert_no_wrong_replies()
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_exact_reply_oracle_rejects_resume_relay_after_completed_reply() -> None:
-    """A resume-shaped relay is internal only when its target is interrupted."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    oracle = ExactReplyOracle(
-        client,
-        "@agent:example",
-        internal_relay_senders=("@router:example",),
-    )
-    try:
-        oracle.expect("op:1", "$source")
-        completed = _agent_reply_event("$source", "$completed", "LIVE-FUZZ call=1 END call=1")
-        completed["content"]["m.relates_to"]["event_id"] = "$root"
-        oracle._ingest_event(completed)
-        oracle._ingest_event(
-            _resume_relay_event(
-                event_id="$false-relay",
-                thread_root="$root",
-                in_reply_to="$completed",
-            ),
-        )
-        oracle._ingest_event(
-            _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$extra",
-                thread_root="$root",
-                in_reply_to="$false-relay",
-                body="LIVE-FUZZ call=2 END call=2",
-            ),
-        )
-
-        assert "$false-relay" not in oracle.internal_source_ids
         with pytest.raises(AssertionError, match="unexpected"):
             oracle._assert_no_wrong_replies()
     finally:
@@ -5305,22 +5366,41 @@ def _threaded_reply_event(
     }
 
 
-def _resume_relay_event(
-    *,
-    event_id: str,
-    thread_root: str,
-    in_reply_to: str,
-) -> dict[str, Any]:
-    """Build the exact structured router relay production emits."""
-    event = _threaded_reply_event(
-        sender="@router:example",
-        event_id=event_id,
-        thread_root=thread_root,
-        in_reply_to=in_reply_to,
-        body=f"@agent {AUTO_RESUME_MESSAGE}",
+@pytest.mark.asyncio
+async def test_reply_to_a_redacted_threaded_parent_keeps_the_thread_the_parent_had() -> None:
+    """Redaction strips a parent's thread relation, so the audit uses the relation it had before."""
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    oracle = ExactReplyOracle(client, "@agent:example")
+    auditor = FinalStateAuditor(
+        client,
+        oracle,
+        agent_id="@agent:example",
+        expected_body_for=lambda call_id: f"LIVE-FUZZ call={call_id} END call={call_id}",
     )
-    event["content"][SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
-    return event
+    try:
+        oracle.expect("op:1", "$source")
+        parent = _agent_reply_event("$root", "$parent", "Thinking...")
+        oracle._ingest_event(parent)
+        redacted_parent = {**parent, "content": {}, "unsigned": {"redacted_because": {"event_id": "$redaction"}}}
+        source = {
+            "event_id": "$source",
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": 50,
+            "content": {"body": "plain reply", "m.relates_to": {"m.in_reply_to": {"event_id": "$parent"}}},
+        }
+        reply = _threaded_reply_event(
+            sender="@agent:example",
+            event_id="$reply",
+            thread_root="$root",
+            in_reply_to="$source",
+            body="LIVE-FUZZ call=1 END call=1",
+        )
+        events = {"$parent": redacted_parent, "$source": source, "$reply": reply}
+
+        assert auditor._canonical_agent_replies(events)["$source"] == {"$reply"}
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -5443,6 +5523,21 @@ async def test_final_state_auditor_enforces_redaction_and_reaction_semantics() -
 
         with pytest.raises(AssertionError, match="missing from /messages"):
             auditor._assert_sent_events_canonical({}, records, set())
+
+        # A homeserver may redact an edit along with the message it edits, and only then.
+        edit_content = {
+            "body": "* edited",
+            "msgtype": "m.text",
+            "m.new_content": {"body": "edited", "msgtype": "m.text"},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": "$gone"},
+        }
+        edit = _SentRecord("$edit", "!room:example", "m.room.message", content=edit_content)
+        edit_shell = {"event_id": "$edit", "type": "m.room.message", "content": {}, "_audit_room_id": "!room:example"}
+        auditor._assert_sent_events_canonical({**events, "$edit": edit_shell}, [*records, edit], {"$gone"})
+        kept_edit = {**edit_shell, "content": dict(edit_content)}
+        auditor._assert_sent_events_canonical({**events, "$edit": kept_edit}, [*records, edit], {"$gone"})
+        with pytest.raises(AssertionError, match="content diverged"):
+            auditor._assert_sent_events_canonical({**events, "$edit": edit_shell}, [*records, edit], set())
     finally:
         await client.close()
 
@@ -5662,6 +5757,13 @@ async def test_final_state_auditor_rejects_reply_outside_source_thread(
 def test_body_call_id_parses_only_canonical_prefixes() -> None:
     """Call IDs come only from exact stub-format bodies."""
     assert _body_call_id("LIVE-FUZZ call=17 segment-000 END call=17") == 17
+    # A reply continued in place after a restart belongs to its newest attempt's call.
+    continued = (
+        f"LIVE-FUZZ call=172\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nLIVE-FUZZ call=175 segment-000 END call=175"
+    )
+    assert _body_call_id(continued) == 175
+    # An attempt cut short right after its ID still names its call.
+    assert _body_call_id(f"LIVE-FUZZ call=87\n\n{INTERRUPTED_RESPONSE_NOTE}") == 87
     assert _body_call_id("[Response interrupted by service restart]") is None
     assert _body_call_id("LIVE-FUZZ call=x END") is None
 
@@ -5839,6 +5941,41 @@ async def test_exact_reply_oracle_ignores_empty_defaultdict_entries() -> None:
         await client.close()
 
 
+@pytest.mark.asyncio
+async def test_exact_reply_oracle_drops_a_reply_its_redaction_removed() -> None:
+    """A placeholder MindRoom removed, as for a replay a newer message superseded, stops being a streaming reply."""
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True)
+    auditor = FinalStateAuditor(client, oracle, agent_id="@agent:example", expected_body_for=_short_body_for)
+    try:
+        oracle.expect("op:1", "$source", thread=0)
+        oracle._ingest_event({"event_id": "$source", "sender": "@user:example", "type": "m.room.message"})
+        oracle._ingest_event(_agent_reply_event("$source", "$placeholder", "Thinking..."))
+        assert oracle.incomplete_streaming_sources() == ["$source"]
+        assert oracle.resolve_response_ref("response:op:1") == "$placeholder"
+
+        oracle._ingest_event(
+            {
+                "event_id": "$removal",
+                "sender": "@agent:example",
+                "type": "m.room.redaction",
+                "redacts": "$placeholder",
+                "content": {"redacts": "$placeholder", "reason": "Reply removed"},
+            },
+        )
+
+        assert oracle.incomplete_streaming_sources() == []
+        assert oracle.response_ids["$source"] == set()
+        assert "$placeholder" not in oracle.latest_reply_bodies
+        # A later operation that targets the response, such as a reaction, still reaches the removed event.
+        assert oracle.resolve_response_ref("response:op:1") == "$placeholder"
+        # Live supersession proofs read the same view the final audit reads from `/messages`.
+        assert auditor._canonical_agent_replies(oracle.canonical_events) == {}
+        assert oracle.canonical_events["$placeholder"]["unsigned"]["redacted_because"]["event_id"] == "$removal"
+    finally:
+        await client.close()
+
+
 def test_chaos_validation_blocks_targets_of_redacted_unsettled_responses() -> None:
     """A reply suppressed by source redaction may never be awaited as a target."""
     cross_batch = LiveFuzzScenario(
@@ -5882,19 +6019,27 @@ def test_chaos_validation_blocks_targets_of_redacted_unsettled_responses() -> No
     settled_first.validate()
 
 
-def _write_ledger(ledger_path: Path, records: dict[str, TurnRecord]) -> None:
-    """Store exact handled-turn projections in the production journal schema."""
+def _write_ledger(
+    ledger_path: Path,
+    records: dict[str, TurnRecord],
+    *,
+    redacted: Collection[str] = (),
+    room_id: str = "!room:example",
+) -> None:
+    """Store exactly these turns, each once, and the agent's redactions, in the production journal schema."""
     with closing(sqlite3.connect(ledger_path)) as database:
         for statement in schema_statements(SQLITE_DIALECT):
             database.execute(statement)
-        database.execute("DELETE FROM turn_records WHERE agent_name = 'general'")
-        database.executemany(
-            "INSERT INTO turn_records (agent_name, index_event_id, anchor_event_id, record_json) VALUES (?, ?, ?, ?)",
-            [
-                ("general", event_id, record.anchor_event_id, json.dumps(TurnRecordCodec._to_ledger_record(record)))
-                for event_id, record in records.items()
-            ],
-        )
+        for table in ("turn_revisions", "turn_aliases", "turn_sources", "turns", "event_redactions"):
+            database.execute(f"DELETE FROM {table} WHERE agent_name = 'general'")  # noqa: S608 - fixed table names
+        transaction = live_fuzz.JournalSqlTransaction(database)
+        written: list[TurnRecord] = []
+        for record in records.values():
+            if record not in written:
+                written.append(record)
+                turn_rows.insert_turn(transaction, "general", record, room_id=room_id, updated_at=1.0)
+        for event_id in redacted:
+            turn_rows.record_redaction(transaction, "general", room_id=room_id, event_id=event_id)
         database.commit()
 
 
@@ -5957,23 +6102,24 @@ async def test_unconsumed_edit_physical_tombstone_settles_checkpoint(
     journal = EventJournalStore.open_sqlite(ledger)
     store = TurnStore(
         TurnStoreDeps(
-            agent_name="general",
             turn_records=journal.turn_records("general"),
-            redacted_event_ids=journal.principal("agent@alice").redacted_event_ids,
             legacy_responses_file=None,
             state_writer=Mock(),
-            resolver=Mock(),
             tool_runtime=Mock(),
+            response_recovery_state=AsyncMock(),
+            retry_dispatch_sources=MagicMock(),
         ),
     )
     try:
         await store.warm()
         await store.record_responded_turn(
             TurnRecord.create(source_event_ids=("$root",), response_event_id="$root-reply"),
+            room_id="!room:example",
         )
-        await store.mark_source_redacted("$edit")
+        await admit_room_event(journal.principal("general@alice"), "!room:example", "$edit")
+        await _redact(journal, "$edit", "!room:example", agent_name="general")
         # Runtime exact-event invalidation establishes the expectation independently of the harness.
-        assert store.is_revision_redacted("$edit")
+        assert await store.redacted_event_ids("!room:example", ("$edit",)) == {"$edit"}
     finally:
         await journal.close()
 
@@ -5981,9 +6127,7 @@ async def test_unconsumed_edit_physical_tombstone_settles_checkpoint(
     assert records["$root"].completed
     assert records["$root"].response_event_id == "$root-reply"
     assert "$edit" not in (records["$root"].revision_replay or {})
-    assert not records["$edit"].completed
-    assert records["$edit"].redacted_source_event_ids == ("$edit",)
-    assert not records["$edit"].pending_redaction_cleanup_event_ids
+    assert "$edit" not in records
     runner._pending_source_tombstones.add("$edit")
     monkeypatch.setattr(runner.oracle, "pump", AsyncMock())
     await runner._wait_for_pending_mutation_effects(deadline_seconds=0.01, batch_index=29)
@@ -5991,73 +6135,12 @@ async def test_unconsumed_edit_physical_tombstone_settles_checkpoint(
     assert runner._qualified_cleanup_targets(LiveOperation(1, LiveOperationKind.THREAD_MESSAGE, 0, "root:0")) == (
         "$edit",
     )
-    assert live_fuzz._redaction_target_state("$edit", records, runner.source_revision_markers) == (True, False)
-
-
-@pytest.mark.parametrize(
-    ("physical", "root_revision", "context_revision", "expected"),
-    [
-        (None, None, None, (False, False)),
-        (None, None, "wrong_edit", (False, False)),
-        (None, None, "wrong_source", (False, False)),
-        (None, None, "registered", (False, False)),
-        (None, None, "clean", (True, False)),
-        (None, "clean", "pending", (True, True)),
-        (None, "clean", "registered", (True, True)),
-        ("clean", None, "pending", (True, True)),
-        ("clean", None, "registered", (True, True)),
-        ("clean", "clean", "pending", (True, True)),
-        ("clean", "clean", "clean", (True, False)),
-        ("clean", None, "wrong_source", (True, False)),
-        ("pending", "clean", "clean", (True, True)),
-        ("registered", None, None, (False, False)),
-    ],
-)
-def test_edit_tombstone_checks_every_matching_cleanup_owner(
-    tmp_path: Path,
-    physical: str | None,
-    root_revision: str | None,
-    context_revision: str | None,
-    expected: tuple[bool, bool],
-) -> None:
-    """Exact deletion evidence cannot hide another response owner's unreconciled cleanup."""
-    records = {}
-    for owner, state in (("$root", root_revision), ("$context", context_revision)):
-        replay = (
-            {
-                "$wrong" if state == "wrong_edit" else "$edit": RevisionReplay(
-                    "$wrong" if state == "wrong_source" else "$root",
-                    100,
-                    redacted=state != "registered",
-                    cleanup_pending=state == "pending",
-                ),
-            }
-            if state is not None
-            else None
-        )
-        records[owner] = TurnRecord.create(
-            source_event_ids=(owner,),
-            response_event_id=f"{owner}-reply",
-            revision_replay=replay,
-            # An original source's deletion proves nothing about its physical edit.
-            redacted_source_event_ids=(owner,) if owner == "$root" else (),
-        )
-    if physical is not None:
-        records["$edit"] = TurnRecord.create(
-            source_event_ids=("$edit",),
-            completed=physical == "registered",
-            redacted_source_event_ids=() if physical == "registered" else ("$edit",),
-            pending_redaction_cleanup_event_ids=("$edit",) if physical == "pending" else (),
-        )
-    ledger = tmp_path / "event_journal.db"
-    _write_ledger(ledger, records)
-    persisted = live_fuzz.read_ledger_records(ledger, strict=True)
-    assert live_fuzz._redaction_target_state("$edit", persisted, {"$root": {"$edit": "marker"}}) == expected
+    assert runner.oracle.source_tombstoned("$edit")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["no_response", "redacted", "missing", "incomplete"])
-@pytest.mark.parametrize("attempt", ["none", "clean", "contaminated", "pending"])
+@pytest.mark.parametrize("attempt", ["none", "clean", "contaminated"])
 @pytest.mark.parametrize("dedicated", [False, True])
 async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
     tmp_path: Path,
@@ -6072,9 +6155,9 @@ async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
     root_record = TurnRecord.create(
         source_event_ids=("$root",),
         response_event_id="$root-reply",
-        revision_replay={"$edit": RevisionReplay("$root", 100, redacted=True, cleanup_pending=True)},
+        revision_replay={"$edit": RevisionReplay("$root", 100)},
     )
-    _write_ledger(ledger, {"$root": root_record})
+    _write_ledger(ledger, {"$root": root_record}, redacted=("$edit",))
     operation = LiveOperation(
         1,
         LiveOperationKind.THREAD_MESSAGE,
@@ -6103,17 +6186,7 @@ async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
         "$root-reply": _agent_reply_event("$root", "$root-reply", _short_body_for(1)),
     }
     records = {
-        "$root": replace(
-            root_record,
-            revision_replay={
-                "$edit": RevisionReplay(
-                    "$root",
-                    100,
-                    redacted=True,
-                    cleanup_pending=attempt == "pending" or (outcome == "redacted" and attempt == "none"),
-                ),
-            },
-        ),
+        "$root": root_record,
     }
     observed = {1: frozenset({_source_marker("root:0", ORIGINAL_REVISION)})}
     if outcome != "redacted":
@@ -6123,16 +6196,12 @@ async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
         records["$anchor"] = TurnRecord.create(source_event_ids=("$anchor",), response_event_id="$anchor-reply")
         observed[3] = frozenset({_source_marker("op:2", ORIGINAL_REVISION)})
     if outcome != "missing":
-        records["$ordinary"] = TurnRecord.create(
-            source_event_ids=("$ordinary",),
-            completed=outcome == "no_response",
-            redacted_source_event_ids=("$ordinary",) if outcome == "redacted" else (),
-        )
+        records["$ordinary"] = TurnRecord.create(source_event_ids=("$ordinary",), completed=outcome == "no_response")
     if outcome == "redacted":
         runner.redacted_targets["$ordinary"] = "$delete-ordinary"
         runner.oracle.mark_source_optional("$ordinary")
     events.update(_cleanup_sent_events(runner))
-    _write_ledger(ledger, records)
+    _write_ledger(ledger, records, redacted=("$edit", "$ordinary") if outcome == "redacted" else ("$edit",))
     runner.client.paginate_room = AsyncMock(return_value=list(events.values()))
     for event in events.values():
         runner.oracle._ingest_event(event)
@@ -6147,9 +6216,7 @@ async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
     failure = {"missing": "supersession proof", "incomplete": "incomplete"}.get(outcome)
     if dedicated and failure is None:
         failure = "has no completed response"
-    failure = failure or {"pending": "pending or missing tombstone cleanup", "contaminated": "redacted history"}.get(
-        attempt,
-    )
+    failure = failure or {"contaminated": "redacted history"}.get(attempt)
     if failure is not None:
         with pytest.raises(AssertionError, match=failure):
             await runner._audit_final_state()
@@ -6161,29 +6228,23 @@ async def test_ordinary_cleanup_qualification_preserves_terminal_outcomes(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("provenance", ["wrong_source", "wrong_edit", "not_redacted"])
+@pytest.mark.parametrize("provenance", ["wrong_edit", "not_redacted"])
 async def test_cleanup_admission_rejects_inexact_incomplete_owner_tombstone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     explicit: bool,
     provenance: str,
 ) -> None:
-    """Keeping unfinished observation records must not relax exact edit provenance."""
+    """Keeping unfinished observation records must not admit cleanup of an edit the agent never recorded deleted."""
     runner = _cleanup_qualification_runner(tmp_path)
     ledger = tmp_path / "tracking/event_journal.db"
+    edit = "$wrong" if provenance == "wrong_edit" else "$edit"
     record = TurnRecord.create(
         source_event_ids=("$root",),
         completed=False,
-        revision_replay={
-            "$wrong" if provenance == "wrong_edit" else "$edit": RevisionReplay(
-                "$wrong" if provenance == "wrong_source" else "$root",
-                100,
-                redacted=provenance != "not_redacted",
-                cleanup_pending=True,
-            ),
-        },
+        revision_replay={edit: RevisionReplay("$root", 100)},
     )
-    _write_ledger(ledger, {"$root": record})
+    _write_ledger(ledger, {"$root": record}, redacted=(edit,) if provenance == "wrong_edit" else ())
     monkeypatch.setattr(runner.oracle, "pump", AsyncMock())
     operation = LiveOperation(
         1,
@@ -6215,9 +6276,9 @@ async def test_cleanup_admission_reads_incomplete_owner_edit_tombstone(
         source_event_ids=("$root",),
         completed=False,
         response_event_id="$inflight",
-        revision_replay={"$edit": RevisionReplay("$root", 100, redacted=True, cleanup_pending=True)},
+        revision_replay={"$edit": RevisionReplay("$root", 100)},
     )
-    _write_ledger(ledger, {"$root": incomplete})
+    _write_ledger(ledger, {"$root": incomplete}, redacted=("$edit",))
     monkeypatch.setattr(
         runner.oracle,
         "pump",
@@ -6503,12 +6564,14 @@ async def test_ledger_attribution_flags_missing_and_orphaned_turns(tmp_path: Pat
         assert auditor._assert_ledger_attribution(replies) == {
             "ledger_attributed_sources": 2,
             "ledger_superseded_sources": 0,
-            "ledger_recovered_sources": 0,
         }
 
         # The newest source alone with the older one absent fails: the older
         # source has no durable terminal record at all.
-        _write_ledger(ledger_path, {"$second": coalesced_record})
+        _write_ledger(
+            ledger_path,
+            {"$second": TurnRecord.create(source_event_ids=("$second",), response_event_id="$combined-reply")},
+        )
         with pytest.raises(AssertionError, match="superseded chain source"):
             auditor._assert_ledger_attribution(replies)
 
@@ -6529,7 +6592,6 @@ async def test_ledger_attribution_flags_missing_and_orphaned_turns(tmp_path: Pat
         assert auditor._assert_ledger_attribution(replies) == {
             "ledger_attributed_sources": 2,
             "ledger_superseded_sources": 0,
-            "ledger_recovered_sources": 0,
         }
 
         # A visible reply with no durable record attributing it is an orphan.
@@ -6584,7 +6646,6 @@ async def test_ledger_attribution_accepts_cross_requester_coalesced_record(
         assert auditor._assert_ledger_attribution({"$chain-b": {"$one-reply"}}) == {
             "ledger_attributed_sources": 2,
             "ledger_superseded_sources": 0,
-            "ledger_recovered_sources": 0,
         }
 
         stale = replace(coalesced, response_event_id="$stale-reply")
@@ -6641,7 +6702,7 @@ async def test_ledger_attribution_rejects_coalesced_record_across_threads(
 
 
 @pytest.mark.asyncio
-async def test_final_ledger_audit_rejects_one_malformed_projection(tmp_path: Path) -> None:
+async def test_final_ledger_audit_rejects_one_malformed_turn(tmp_path: Path) -> None:
     """One corrupt row cannot disappear and let an otherwise valid audit pass."""
     client = LiveMatrixClient("http://matrix.invalid", "!room:example")
     oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True)
@@ -6656,17 +6717,15 @@ async def test_final_ledger_audit_rejects_one_malformed_projection(tmp_path: Pat
     try:
         oracle.expect("op:1", "$source", thread=0)
         record = TurnRecord.create(source_event_ids=("$source",), response_event_id="$reply", completed=True)
-        _write_ledger(ledger_path, {"$source": record})
+        corrupt = TurnRecord.create(source_event_ids=("$corrupt",), completed=True)
+        _write_ledger(ledger_path, {"$source": record, "$corrupt": corrupt})
         with closing(sqlite3.connect(ledger_path)) as database:
-            database.execute(
-                "INSERT INTO turn_records (agent_name, index_event_id, anchor_event_id, record_json) VALUES (?, ?, ?, ?)",
-                ("general", "$corrupt", "$corrupt", json.dumps({"completed": True})),
-            )
+            database.execute("UPDATE turns SET history_scope_json = '{' WHERE anchor_event_id = '$corrupt'")
             database.commit()
 
-        # Live settlement remains tolerant while a write may be in flight.
-        assert live_fuzz.read_ledger_records(ledger_path) == {"$source": record}
-        with pytest.raises(AssertionError, match=r"ledger invalid.*\$corrupt.*invalid projection"):
+        # Live settlement remains tolerant while a write may be in flight: it waits for a readable ledger.
+        assert live_fuzz.read_ledger_records(ledger_path) == {}
+        with pytest.raises(AssertionError, match=r"ledger invalid"):
             auditor._assert_ledger_attribution({"$source": {"$reply"}})
     finally:
         await client.close()
@@ -6689,6 +6748,361 @@ def test_strict_ledger_read_rejects_incomplete_record(tmp_path: Path) -> None:
     assert live_fuzz.read_ledger_records(ledger_path) == {}
     with pytest.raises(AssertionError, match=r"\$pending.*incomplete"):
         live_fuzz.read_ledger_records(ledger_path, strict=True)
+
+
+def test_ledger_read_attributes_ai_answers_from_reply_records(tmp_path: Path) -> None:
+    """An AI turn's answer, and the edits it consumed, come from the reply records that own them."""
+    ledger_path = tmp_path / "event_journal.db"
+    _write_ledger(
+        ledger_path,
+        {
+            "$root": TurnRecord.create(
+                source_event_ids=("$root",),
+                completed=True,
+                source_event_prompts={"$root": "edited"},
+                source_event_revisions={"$root": (200, "$b")},
+                revision_replay={
+                    "$a": RevisionReplay("$root", 100),
+                    "$b": RevisionReplay("$root", 200),
+                    "$c": RevisionReplay("$root", 300),
+                },
+            ),
+            "$unanswered": TurnRecord.create(source_event_ids=("$unanswered",), completed=True),
+        },
+        redacted=("$a",),
+    )
+    with closing(sqlite3.connect(ledger_path)) as database:
+        database.executemany(
+            "INSERT INTO reply_messages (principal_id, reply_id, entity_name, room_id, membership_epoch, event_id, "
+            "state, last_span_id, presentation_json, revision, placeholder_only, reply_sequence, created_at_ns, "
+            "updated_at_ns) VALUES ('p', ?, 'general', '!room', 0, ?, ?, ?, '{}', 1, ?, 1, 1, 1)",
+            [("answer", "$reply", "completed", "regenerated", False), ("stopped", "$stopped", "gone", "early", True)],
+        )
+        database.executemany(
+            "INSERT INTO reply_spans (principal_id, span_id, reply_id, kind, delivery_id, bot_generation, "
+            "base_sequence, outcome, claimed_at_ns) VALUES ('p', ?, ?, ?, ?, 'g', 0, ?, ?)",
+            [
+                ("turn", "answer", "turn", "$root", "completed", 1),
+                ("regenerated", "answer", "regeneration", "$a", "completed", 2),
+                ("early", "stopped", "turn", "$unanswered", "cancelled", 3),
+            ],
+        )
+        database.executemany(
+            "INSERT INTO reply_span_sources (principal_id, span_id, event_id, role, ordinal) "
+            "VALUES ('p', ?, ?, 'logical', 0)",
+            [("turn", "$root"), ("regenerated", "$root"), ("early", "$unanswered")],
+        )
+        database.commit()
+
+    records = live_fuzz.read_ledger_records(ledger_path, strict=True)
+
+    assert records["$root"].response_event_id == "$reply"
+    assert {edit: revision.response_event_id for edit, revision in records["$root"].revision_replay.items()} == {
+        "$a": "$reply",
+        "$b": "$reply",
+        "$c": None,
+    }
+    assert records["$unanswered"].response_event_id is None
+
+
+@pytest.mark.asyncio
+async def test_an_edit_whose_regeneration_a_restart_cut_short_counts_as_declined(tmp_path: Path) -> None:
+    """A regeneration a restart left lost answered nothing, so MindRoom settling its edit declines that edit."""
+    ledger_path = tmp_path / "event_journal.db"
+    principal_id = journal_principal_id("general", "@agent:example")
+    _write_ledger(ledger_path, {"$root": TurnRecord.create(source_event_ids=("$root",), completed=True)})
+    with closing(sqlite3.connect(ledger_path)) as database:
+        database.execute(
+            "INSERT INTO reply_messages (principal_id, reply_id, entity_name, room_id, membership_epoch, event_id, "
+            "state, last_span_id, presentation_json, revision, placeholder_only, reply_sequence, created_at_ns, "
+            "updated_at_ns) VALUES (?, 'answer', 'general', '!room:example', 0, '$reply', 'completed', 'cut', "
+            "'{}', 1, 0, 1, 1, 1)",
+            (principal_id,),
+        )
+        database.executemany(
+            "INSERT INTO reply_spans (principal_id, span_id, reply_id, kind, delivery_id, bot_generation, "
+            "base_sequence, outcome, claimed_at_ns) VALUES (?, ?, 'answer', ?, ?, 'g', 0, ?, ?)",
+            [
+                (principal_id, "turn", "turn", "$root", "completed", 1),
+                (principal_id, "answered", "regeneration", "$answered-edit", "completed", 2),
+                (principal_id, "cut", "regeneration", "$cut-edit", "lost", 3),
+            ],
+        )
+        database.executemany(
+            "INSERT INTO journal_events (principal_id, event_id, room_id, thread_id, kind, sender, origin_server_ts, "
+            "source_json, membership_epoch, state) VALUES (?, ?, '!room:example', '', 'message', '@user:example', ?, "
+            "'{}', 0, 'settled')",
+            [(principal_id, "$answered-edit", 20), (principal_id, "$cut-edit", 30)],
+        )
+        database.commit()
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True, ledger_path=ledger_path)
+    auditor = FinalStateAuditor(
+        client,
+        oracle,
+        agent_id="@agent:example",
+        expected_body_for=_short_body_for,
+        ledger_path=ledger_path,
+        pending_edit_markers={"$root": {"$cut-edit": _source_marker("root:0", "edit:3")}},
+    )
+    try:
+        snapshot = live_fuzz._read_supersession_snapshot(ledger_path, principal_id)
+        assert snapshot.regenerated_edits == frozenset({"$answered-edit"})
+        auditor._observe_supersession({})
+        assert oracle.declined_edit_sources == frozenset({"$root"})
+
+        # Debt that also names an edit a completed regeneration answered waits for that answer instead.
+        auditor.pending_edit_markers["$root"]["$answered-edit"] = _source_marker("root:0", "edit:2")
+        auditor._observe_supersession({})
+        assert oracle.declined_edit_sources == frozenset()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("note", [INTERRUPTED_RESPONSE_NOTE, RESTART_INTERRUPTED_RESPONSE_NOTE])
+async def test_supersession_proof_reads_the_interrupted_reply_of_an_unanswered_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    note: str,
+) -> None:
+    """Only reply records name an unanswered turn's interrupted reply; a superseded replay ends it interrupted."""
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    auditor = FinalStateAuditor(
+        client,
+        ExactReplyOracle(client, "@agent:example"),
+        agent_id="@agent:example",
+        expected_body_for=_short_body_for,
+        ledger_path=tmp_path / "event_journal.db",
+    )
+    monkeypatch.setattr(auditor, "_supersession_source_pair", lambda *_args, **_kwargs: "$root")
+    monkeypatch.setattr(auditor, "_completed_supersession_anchor", lambda *_args, **_kwargs: ("$newer", "$anchor"))
+    interrupted = _agent_reply_event("$source", "$reply", f"partial\n\n{note}")
+    interrupted["content"]["io.mindroom.stream_status"] = "error"
+    snapshot = live_fuzz._SupersessionSnapshot(
+        records={"$source": TurnRecord.create(source_event_ids=("$source",), completed=False)},
+        sources={
+            "$source": live_fuzz._SettledJournalSource(
+                "$source",
+                "!room:example",
+                "$root",
+                "@user:example",
+                1,
+                "settled",
+                "message",
+            ),
+        },
+        pending_deliveries=(),
+    )
+    try:
+        proof = auditor._prove_supersession(
+            "$source",
+            "$newer",
+            snapshot,
+            {"$reply": interrupted},
+            {"$source": {"$reply"}},
+            {},
+            sent_records={},
+        )
+    finally:
+        await client.close()
+
+    assert proof is not None
+    assert proof.interrupted_response_event_id == "$reply"
+
+
+@pytest.mark.asyncio
+async def test_supersession_anchor_accepts_the_revision_mindroom_answered() -> None:
+    """A newer message answered before MindRoom declined its later edit still anchors an older message's supersession."""
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True)
+    oracle.expect("op:2", "$newer", thread=0)
+    oracle.expect("op:3", "$other", thread=0)
+    answered_edit = _source_marker("op:2", "edit:5")
+    declined_edit = _source_marker("op:2", "edit:7")
+    observed = {5: frozenset({_source_marker("op:2", ORIGINAL_REVISION)})}
+    auditor = FinalStateAuditor(
+        client,
+        oracle,
+        agent_id="@agent:example",
+        expected_body_for=_short_body_for,
+        source_current_markers={"$newer": declined_edit},
+        source_revision_markers={"$newer": {"$answered": answered_edit, "$edit": declined_edit}},
+        observed_markers_for=lambda call_id: observed.get(call_id, frozenset()),
+    )
+    anchor = _agent_reply_event("$newer", "$anchor", _short_body_for(5))
+    anchor["content"]["io.mindroom.stream_status"] = "completed"
+    records = {"$newer": TurnRecord.create(source_event_ids=("$newer",), response_event_id="$anchor", completed=True)}
+    try:
+        # Its original and an edit an answer used both anchor, as long as the call answered this message.
+        for revision in (_source_marker("op:2", ORIGINAL_REVISION), answered_edit):
+            observed[5] = frozenset({revision})
+            assert auditor._completed_supersession_anchor(
+                "$newer",
+                records,
+                {"$anchor": anchor},
+                {"$newer": {"$anchor"}},
+            ) == ("$newer", "$anchor")
+
+        # A call that answered another message anchors nothing.
+        observed[5] = frozenset({_source_marker("op:3", ORIGINAL_REVISION)})
+        assert (
+            auditor._completed_supersession_anchor("$newer", records, {"$anchor": anchor}, {"$newer": {"$anchor"}})
+            is None
+        )
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("later_ts", "seen", "noted", "status", "coalesced", "dropped"),
+    [
+        (30, "declined", True, "error", False, True),
+        (50, "declined", True, "error", False, False),
+        (None, "declined", True, "error", False, False),
+        (30, "original", True, "error", False, False),
+        (30, "answered", True, "error", False, False),
+        (30, "declined", False, "streaming", False, False),
+        (30, "declined", True, "streaming", False, False),
+        (None, "declined", True, "error", True, False),
+    ],
+    ids=[
+        "later_message_before_the_note",
+        "later_message_after_the_note",
+        "no_later_message",
+        "call_saw_the_original",
+        "call_saw_an_answered_edit",
+        "no_interrupted_note",
+        "note_in_a_write_that_is_not_final",
+        "coalesced_turn_without_a_later_message",
+    ],
+)
+async def test_regeneration_a_restart_cut_short_ends_interrupted_once_a_later_message_drops_it(
+    tmp_path: Path,
+    later_ts: int | None,
+    seen: str,
+    noted: bool,
+    status: str,
+    coalesced: bool,
+    dropped: bool,
+) -> None:
+    """After a restart MindRoom declines an edit another message followed, and the cut-short reply ends interrupted."""
+    ledger_path = tmp_path / "event_journal.db"
+    principal_id = journal_principal_id("general", "@agent:example")
+    # A coalesced turn's own later message follows its earlier source, but nothing followed the turn.
+    turn_sources = ("$root", "$sibling") if coalesced else ("$root",)
+    turn = TurnRecord.create(source_event_ids=turn_sources, completed=True)
+    _write_ledger(ledger_path, dict.fromkeys(turn_sources, turn))
+    with closing(sqlite3.connect(ledger_path)) as database:
+        database.execute(
+            "INSERT INTO reply_messages (principal_id, reply_id, entity_name, room_id, membership_epoch, event_id, "
+            "state, last_span_id, presentation_json, revision, placeholder_only, reply_sequence, created_at_ns, "
+            "updated_at_ns) VALUES (?, 'answer', 'general', '!room:example', 0, '$reply', 'failed', 'cut', "
+            "'{}', 1, 0, 1, 1, 1)",
+            (principal_id,),
+        )
+        database.executemany(
+            "INSERT INTO reply_spans (principal_id, span_id, reply_id, kind, delivery_id, bot_generation, "
+            "base_sequence, outcome, claimed_at_ns) VALUES (?, ?, 'answer', ?, ?, 'g', 0, ?, ?)",
+            [
+                (principal_id, "turn", "turn", turn.anchor_event_id, "completed", 1),
+                (principal_id, "answered", "regeneration", "$answered-edit", "completed", 2),
+                (principal_id, "cut", "regeneration", "$edit", "lost", 3),
+            ],
+        )
+        database.execute(
+            "INSERT INTO reply_span_sources (principal_id, span_id, event_id, role, ordinal) "
+            "VALUES (?, 'turn', '$root', 'logical', 0)",
+            (principal_id,),
+        )
+        database.executemany(
+            "INSERT INTO journal_events (principal_id, event_id, room_id, thread_id, kind, sender, origin_server_ts, "
+            "source_json, membership_epoch, state) VALUES (?, ?, '!room:example', '', 'message', '@user:example', ?, "
+            "'{}', 0, 'settled')",
+            [(principal_id, "$answered-edit", 15), (principal_id, "$edit", 20)],
+        )
+        database.commit()
+    answered = _source_marker("root:0", "edit:2")
+    edited = _source_marker("root:0", "edit:3")
+    call_markers = {"declined": edited, "original": _source_marker("root:0", ORIGINAL_REVISION), "answered": answered}
+    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
+    oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True, ledger_path=ledger_path)
+    oracle.expect("root:0", "$root", thread=0)
+    auditor = FinalStateAuditor(
+        client,
+        oracle,
+        agent_id="@agent:example",
+        expected_body_for=_short_body_for,
+        ledger_path=ledger_path,
+        source_current_markers={"$root": edited},
+        source_revision_markers={"$root": {"$answered-edit": answered, "$edit": edited}},
+        observed_markers_for=lambda call_id: frozenset({call_markers[seen]}) if call_id == 87 else frozenset(),
+    )
+    body = f"LIVE-FUZZ call=87\n\n{INTERRUPTED_RESPONSE_NOTE}" if noted else "LIVE-FUZZ call=87 segment-000"
+    replace_root = {"m.relates_to": {"rel_type": "m.replace", "event_id": "$root"}}
+    events: dict[str, dict[str, Any]] = {
+        "$root": {
+            "event_id": "$root",
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": 10,
+            "content": {"body": "root", "msgtype": "m.text"},
+        },
+        "$answered-edit": {
+            "event_id": "$answered-edit",
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": 15,
+            "content": replace_root,
+        },
+        "$edit": {
+            "event_id": "$edit",
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": 20,
+            "content": replace_root,
+        },
+        "$reply": _agent_reply_event("$root", "$reply", "Thinking..."),
+        "$note": _agent_edit_event("$reply", "$note", body, ts=40),
+    }
+    events["$note"]["content"]["m.new_content"]["io.mindroom.stream_status"] = status
+    later_messages = {"$later": later_ts} | ({"$sibling": 25} if coalesced else {})
+    for event_id, ts in later_messages.items():
+        if ts is None:
+            continue
+        events[event_id] = {
+            "event_id": event_id,
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": ts,
+            "content": {
+                "body": "next",
+                "msgtype": "m.text",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root", "m.in_reply_to": {"event_id": "$root"}},
+            },
+        }
+    for event in events.values():
+        event["_audit_room_id"] = "!room:example"
+    sent = [
+        _SentRecord(event_id, "!room:example", "m.room.message", sender="@user:example", content=event["content"])
+        for event_id, event in events.items()
+        if event["sender"] == "@user:example"
+    ]
+    try:
+        auditor._observe_supersession(events, sent_records=sent)
+
+        assert oracle.dropped_regenerations == (frozenset({"$reply"}) if dropped else frozenset())
+        assert oracle._reply_body_complete("$reply", body, source_event_id="$root") is dropped
+        if dropped:
+            assert auditor._assert_final_bodies_complete(events, {"$root": {"$reply"}}) == 0
+            # The cut-short attempt answered the edit, so the answer stays bound to its revision.
+            auditor._assert_model_saw_current_sources(events, sent_records=sent)
+        else:
+            with pytest.raises(AssertionError, match="non-canonical body"):
+                auditor._assert_final_bodies_complete(events, {"$root": {"$reply"}})
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -6731,35 +7145,20 @@ async def test_final_audit_reuses_one_ledger_snapshot(
 
 
 def test_strict_ledger_read_accepts_durable_redaction_tombstone(tmp_path: Path) -> None:
-    """A durable tombstone settles replay while session cleanup awaits a response."""
+    """An unfinished turn whose every source is redacted settles replay; history cleanup happens on the next read."""
     ledger_path = tmp_path / "event_journal.db"
-    tombstone = TurnRecord.create(
-        source_event_ids=("$stop-reaction",),
-        redacted_source_event_ids=("$stop-reaction",),
-        response_event_id=None,
-        completed=False,
-    )
-    _write_ledger(ledger_path, {"$stop-reaction": tombstone})
+    tombstone = TurnRecord.create(source_event_ids=("$stop-reaction",), completed=False)
+    _write_ledger(ledger_path, {"$stop-reaction": tombstone}, redacted=("$stop-reaction",))
 
-    assert live_fuzz.read_ledger_records(ledger_path, strict=True) == {
-        "$stop-reaction": tombstone,
-    }
+    records = live_fuzz.read_ledger_records(ledger_path, strict=True)
+    assert list(records) == ["$stop-reaction"]
+    assert records["$stop-reaction"].source_event_ids == ("$stop-reaction",)
+    assert not records["$stop-reaction"].completed
     oracle = ExactReplyOracle(
         AsyncMock(),
         "@agent:example",
         ledger_path=ledger_path,
     )
-    oracle.refresh_ledger_attributions(min_interval=0)
-    assert oracle.source_tombstoned("$stop-reaction")
-
-    pending_cleanup = replace(
-        tombstone,
-        pending_redaction_cleanup_event_ids=("$stop-reaction",),
-    )
-    _write_ledger(ledger_path, {"$stop-reaction": pending_cleanup})
-    assert live_fuzz.read_ledger_records(ledger_path, strict=True) == {
-        "$stop-reaction": pending_cleanup,
-    }
     oracle.refresh_ledger_attributions(min_interval=0)
     assert oracle.source_tombstoned("$stop-reaction")
 
@@ -6791,7 +7190,6 @@ async def test_visible_optional_reply_requires_durable_attribution(tmp_path: Pat
         assert auditor._assert_ledger_attribution(replies) == {
             "ledger_attributed_sources": 1,
             "ledger_superseded_sources": 0,
-            "ledger_recovered_sources": 0,
         }
 
         _write_ledger(
@@ -6810,13 +7208,8 @@ async def test_visible_optional_reply_requires_durable_attribution(tmp_path: Pat
         await client.close()
 
 
-def _recovery_auditor(client: LiveMatrixClient) -> FinalStateAuditor:
-    oracle = ExactReplyOracle(
-        client,
-        "@agent:example",
-        coalescing_threads=True,
-        internal_relay_senders=("@router:example",),
-    )
+def _final_body_auditor(client: LiveMatrixClient) -> FinalStateAuditor:
+    oracle = ExactReplyOracle(client, "@agent:example", coalescing_threads=True)
     auditor = FinalStateAuditor(
         client,
         oracle,
@@ -6838,142 +7231,31 @@ def _interrupted_reply(thread_root: str = "$root") -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_final_body_audit_rejects_resume_chain_without_durable_proof() -> None:
-    """Visible recovery relations cannot replace joined durable continuation ownership."""
+async def test_final_body_audit_rejects_interruption_note_left_visible() -> None:
+    """Replay continues an interrupted reply in place, so a visible interruption note never completes it."""
     client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
+    auditor = _final_body_auditor(client)
     try:
         events: dict[str, Any] = {"$reply": _interrupted_reply()}
         replies = {"$source": {"$reply"}}
-        # An interrupted note with no resume chain fails.
         with pytest.raises(AssertionError, match="non-canonical body"):
             auditor._assert_final_bodies_complete(events, replies)
 
-        # The relay R replies to the interrupted response I in the same thread.
-        events["$relay"] = _resume_relay_event(
+        # A router relay and a completed agent answer to it never complete the interrupted reply.
+        events["$relay"] = _threaded_reply_event(
+            sender="@router:example",
             event_id="$relay",
             thread_root="$root",
             in_reply_to="$reply",
+            body="@agent continue",
         )
-        # The completed agent response A replies to the relay R in the thread.
-        events["$resumed"] = _threaded_reply_event(
+        events["$answer"] = _threaded_reply_event(
             sender="@agent:example",
-            event_id="$resumed",
+            event_id="$answer",
             thread_root="$root",
             in_reply_to="$relay",
             body="LIVE-FUZZ call=11 END call=11",
         )
-        with pytest.raises(AssertionError, match="non-canonical body"):
-            auditor._assert_final_bodies_complete(events, replies)
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_final_body_audit_rejects_relay_for_another_interruption() -> None:
-    """A relay replying to a different interrupted response never recovers this one."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
-    try:
-        events: dict[str, Any] = {
-            "$reply": _interrupted_reply(),
-            # Relay points at some other interrupted response, not $reply.
-            "$relay": _resume_relay_event(
-                event_id="$relay",
-                thread_root="$root",
-                in_reply_to="$other-interrupted",
-            ),
-            "$resumed": _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$resumed",
-                thread_root="$root",
-                in_reply_to="$relay",
-                body="LIVE-FUZZ call=11 END call=11",
-            ),
-        }
-        replies = {"$source": {"$reply"}}
-        with pytest.raises(AssertionError, match="non-canonical body"):
-            auditor._assert_final_bodies_complete(events, replies)
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_final_body_audit_rejects_agent_reply_to_other_event() -> None:
-    """A completed agent reply to some non-relay event never recovers the note."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
-    try:
-        events: dict[str, Any] = {
-            "$reply": _interrupted_reply(),
-            "$relay": _resume_relay_event(
-                event_id="$relay",
-                thread_root="$root",
-                in_reply_to="$reply",
-            ),
-            # Agent reply targets a bystander event, not the relay.
-            "$resumed": _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$resumed",
-                thread_root="$root",
-                in_reply_to="$bystander",
-                body="LIVE-FUZZ call=11 END call=11",
-            ),
-        }
-        replies = {"$source": {"$reply"}}
-        with pytest.raises(AssertionError, match="non-canonical body"):
-            auditor._assert_final_bodies_complete(events, replies)
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_final_body_audit_rejects_resume_in_wrong_thread() -> None:
-    """A completed agent reply to the relay in another thread never recovers."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
-    try:
-        events: dict[str, Any] = {
-            "$reply": _interrupted_reply(),
-            "$relay": _resume_relay_event(
-                event_id="$relay",
-                thread_root="$root",
-                in_reply_to="$reply",
-            ),
-            # Correct reply target but a different thread root.
-            "$resumed": _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$resumed",
-                thread_root="$other-root",
-                in_reply_to="$relay",
-                body="LIVE-FUZZ call=11 END call=11",
-            ),
-        }
-        replies = {"$source": {"$reply"}}
-        with pytest.raises(AssertionError, match="non-canonical body"):
-            auditor._assert_final_bodies_complete(events, replies)
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_final_body_audit_rejects_missing_relay_event() -> None:
-    """A resume answer whose relay event is absent from the map never recovers."""
-    client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
-    try:
-        events: dict[str, Any] = {
-            "$reply": _interrupted_reply(),
-            # No $relay event in the map, even though the agent reply names it.
-            "$resumed": _threaded_reply_event(
-                sender="@agent:example",
-                event_id="$resumed",
-                thread_root="$root",
-                in_reply_to="$relay",
-                body="LIVE-FUZZ call=11 END call=11",
-            ),
-        }
-        replies = {"$source": {"$reply"}}
         with pytest.raises(AssertionError, match="non-canonical body"):
             auditor._assert_final_bodies_complete(events, replies)
     finally:
@@ -6989,7 +7271,7 @@ async def test_latest_agent_body_breaks_timestamp_ties_by_event_id() -> None:
     override event-ID ordering.
     """
     client = LiveMatrixClient("http://matrix.invalid", "!room:example")
-    auditor = _recovery_auditor(client)
+    auditor = _final_body_auditor(client)
     try:
         events: dict[str, Any] = {"$reply": _agent_reply_event("$source", "$reply", "partial")}
         # Insert the smaller-ID edit last, in the opposite order from event-ID
@@ -7068,14 +7350,27 @@ async def test_completed_streaming_reply_settles_after_edit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_note_reply_does_not_block_settlement() -> None:
-    """A by-design interrupted note is terminal; restart recovery owns its validity."""
+@pytest.mark.parametrize("superseded", [False, True], ids=["awaiting_continuation", "superseded"])
+async def test_interrupted_note_reply_settles_only_when_superseded(superseded: bool) -> None:
+    """Replay continues a reply below its restart note, so the note is terminal only after proven supersession."""
     oracle = _streaming_oracle()
     try:
         note_body = f"partial stream {RESTART_INTERRUPTED_RESPONSE_NOTE}"
         oracle._ingest_event(_agent_reply_event("$source", "$reply", note_body))
+        if superseded:
+            oracle.supersession_proofs["$source"] = live_fuzz.SupersessionProof(
+                source_event_id="$source",
+                newer_event_id="$newer",
+                anchor_source_event_id="$newer",
+                anchor_response_event_id="$anchor",
+                interrupted_response_event_id="$reply",
+                principal_id="agent@test",
+                room_id="!room:localhost",
+                thread_id="$thread",
+                requester_user_id="@user:localhost",
+            )
 
-        assert oracle.incomplete_streaming_sources() == []
+        assert oracle.incomplete_streaming_sources() == ([] if superseded else ["$source"])
     finally:
         await oracle.client.close()
 
@@ -7489,6 +7784,126 @@ async def test_model_source_audit_rejects_pre_edit_revision(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_model_source_audit_accepts_a_declined_edit_only_after_a_later_message(tmp_path: Path) -> None:
+    """An edit MindRoom declined leaves the answer on its old revision, which is right once another message followed."""
+    ledger_path = tmp_path / "event_journal.db"
+    orig = _source_marker("op:1", ORIGINAL_REVISION)
+    edited = _source_marker("op:1", "edit:5")
+    auditor = _model_source_auditor(
+        ledger_path=ledger_path,
+        expected_sources={"$a": "op:1"},
+        source_current_markers={"$a": edited},
+        observed={4: frozenset({orig})},
+    )
+    auditor.source_revision_markers = {"$a": {"$edit": edited}}
+    # MindRoom settled the edit without a regeneration span.
+    auditor.declined_edits = lambda: frozenset({"$edit"})  # type: ignore[method-assign]
+    try:
+        record = TurnRecord.create(source_event_ids=("$a",), response_event_id="$reply-a", completed=True)
+        _write_ledger(ledger_path, {"$a": record})
+        thread = {"rel_type": "m.thread", "event_id": "$a", "m.in_reply_to": {"event_id": "$a"}}
+        source = {"event_id": "$a", "sender": "@user:example", "type": "m.room.message", "origin_server_ts": 10}
+        later = {
+            "event_id": "$b",
+            "sender": "@user:example",
+            "type": "m.room.message",
+            "origin_server_ts": 20,
+            "content": {"body": "next", "msgtype": "m.text", "m.relates_to": thread},
+        }
+        events = {
+            "$a": {**source, "content": {"body": "original", "msgtype": "m.text"}},
+            "$edit": {
+                "event_id": "$edit",
+                "sender": "@user:example",
+                "type": "m.room.message",
+                "origin_server_ts": 30,
+                "content": {"m.relates_to": {"rel_type": "m.replace", "event_id": "$a"}},
+            },
+            "$reply-a": _agent_reply_event("$a", "$reply-a", _short_body_for(4)),
+        }
+        sent = [
+            _SentRecord(
+                "$a",
+                "!room:example",
+                "m.room.message",
+                sender="@user:example",
+                content=events["$a"]["content"],
+            ),
+            _SentRecord(
+                "$edit",
+                "!room:example",
+                "m.room.message",
+                sender="@user:example",
+                content=events["$edit"]["content"],
+            ),
+        ]
+        with pytest.raises(AssertionError, match="no later message followed it"):
+            auditor._assert_model_saw_current_sources(events, sent_records=sent)
+
+        auditor._assert_model_saw_current_sources(
+            {**events, "$b": later},
+            sent_records=[
+                *sent,
+                _SentRecord("$b", "!room:example", "m.room.message", sender="@user:example", content=later["content"]),
+            ],
+        )
+    finally:
+        await auditor.client.close()
+
+
+@pytest.mark.asyncio
+async def test_model_source_audit_accepts_an_edit_applied_while_its_message_was_queued(tmp_path: Path) -> None:
+    """An edit that reached its message in the coalescing queue settles like a declined one, but the turn answers it."""
+    ledger_path = tmp_path / "event_journal.db"
+    queued = _source_marker("op:1", "edit:5")
+    late = _source_marker("op:1", "edit:9")
+    auditor = _model_source_auditor(
+        ledger_path=ledger_path,
+        expected_sources={"$a": "op:1"},
+        source_current_markers={"$a": late},
+        observed={4: frozenset({queued})},
+    )
+    auditor.source_revision_markers = {"$a": {"$queued": queued, "$late": late}}
+    # Neither edit drove a regeneration: the first changed the queued message, the second came after another message.
+    auditor.declined_edits = lambda: frozenset({"$queued", "$late"})  # type: ignore[method-assign]
+    try:
+        record = TurnRecord.create(source_event_ids=("$a",), response_event_id="$reply-a", completed=True)
+        _write_ledger(ledger_path, {"$a": record})
+        thread = {"rel_type": "m.thread", "event_id": "$a", "m.in_reply_to": {"event_id": "$a"}}
+
+        def message(event_id: str, ts: int, content: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "event_id": event_id,
+                "sender": "@user:example",
+                "type": "m.room.message",
+                "origin_server_ts": ts,
+                "content": content,
+            }
+
+        replace_a = {"m.relates_to": {"rel_type": "m.replace", "event_id": "$a"}}
+        events = {
+            "$a": message("$a", 10, {"body": "original", "msgtype": "m.text"}),
+            "$queued": message("$queued", 20, replace_a),
+            "$b": message("$b", 30, {"body": "next", "msgtype": "m.text", "m.relates_to": thread}),
+            "$late": message("$late", 40, replace_a),
+            "$reply-a": _agent_reply_event("$a", "$reply-a", _short_body_for(4)),
+        }
+        sent = [
+            _SentRecord(event_id, "!room:example", "m.room.message", sender="@user:example", content=event["content"])
+            for event_id, event in events.items()
+            if event_id != "$reply-a"
+        ]
+        auditor._assert_model_saw_current_sources(events, sent_records=sent)
+
+        # Once a regeneration answered the later edit, the queued revision is stale.
+        auditor.declined_edits = lambda: frozenset({"$queued"})  # type: ignore[method-assign]
+        with pytest.raises(AssertionError, match="without current source markers"):
+            auditor._assert_model_saw_current_sources(events, sent_records=sent)
+    finally:
+        await auditor.client.close()
+
+
+@pytest.mark.asyncio
 async def test_model_source_audit_rejects_coalesced_missing_one_source(tmp_path: Path) -> None:
     """A coalesced response missing ONE current source marker fails."""
     ledger_path = tmp_path / "event_journal.db"
@@ -7559,15 +7974,10 @@ async def test_model_source_audit_uses_harness_redaction_truth(tmp_path: Path) -
         observed={4: frozenset({orig})},
     )
     try:
-        redacted = TurnRecord.create(
-            source_event_ids=("$a",),
-            redacted_source_event_ids=("$a",),
-            response_event_id="$reply-a",
-            completed=True,
-        )
-        _write_ledger(ledger_path, {"$a": redacted})
+        redacted = TurnRecord.create(source_event_ids=("$a",), response_event_id="$reply-a", completed=True)
+        _write_ledger(ledger_path, {"$a": redacted}, redacted=("$a",))
         events = {"$reply-a": _agent_reply_event("$a", "$reply-a", _short_body_for(4))}
-        with pytest.raises(AssertionError, match="claims unobserved source redactions"):
+        with pytest.raises(AssertionError, match="recorded unobserved source redactions"):
             auditor._assert_model_saw_current_sources(events)
 
         auditor._assert_model_saw_current_sources(
@@ -7587,49 +7997,16 @@ async def test_model_source_audit_uses_harness_redaction_truth(tmp_path: Path) -
 
 
 def test_ledger_redaction_audit_requires_harness_expected_tombstone() -> None:
-    """Harness-observed source redaction must exist in the durable source row."""
-    live = TurnRecord.create(
-        source_event_ids=("$source",),
-        response_event_id="$reply",
-        completed=True,
-    )
-    assert FinalStateAuditor._ledger_redaction_problems(
-        {"$source": live},
-        {"$source"},
-        {"$source"},
-    ) == ["harness-redacted source $source has no durable tombstone"]
-
-    tombstoned = TurnRecord.create(
-        source_event_ids=("$source",),
-        redacted_source_event_ids=("$source",),
-        response_event_id="$reply",
-        completed=True,
-    )
-    assert (
-        FinalStateAuditor._ledger_redaction_problems(
-            {"$source": tombstoned},
-            {"$source"},
-            {"$source"},
-        )
-        == []
-    )
+    """A harness-observed source redaction must be recorded durably for the agent."""
+    assert FinalStateAuditor._ledger_redaction_problems(set(), {"$source"}, {"$source"}) == [
+        "harness-redacted source $source has no durable tombstone",
+    ]
+    assert FinalStateAuditor._ledger_redaction_problems({"$source"}, {"$source"}, {"$source"}) == []
 
 
 def test_ledger_redaction_audit_ignores_non_harness_runtime_records() -> None:
-    """Runtime-owned stop-reaction tombstones are outside source audit authority."""
-    stop_reaction = TurnRecord.create(
-        source_event_ids=("$stop-reaction",),
-        redacted_source_event_ids=("$stop-reaction",),
-        completed=False,
-    )
-    assert (
-        FinalStateAuditor._ledger_redaction_problems(
-            {"$stop-reaction": stop_reaction},
-            set(),
-            {"$source"},
-        )
-        == []
-    )
+    """Runtime-owned stop-reaction redactions are outside source audit authority."""
+    assert FinalStateAuditor._ledger_redaction_problems({"$stop-reaction"}, set(), {"$source"}) == []
 
 
 @pytest.mark.asyncio
@@ -7647,13 +8024,8 @@ async def test_model_source_audit_requires_live_sibling_not_redacted_sibling(tmp
         observed={9: frozenset({marker_a})},
     )
     try:
-        coalesced = TurnRecord.create(
-            source_event_ids=("$a", "$b"),
-            redacted_source_event_ids=("$b",),
-            response_event_id="$combined",
-            completed=True,
-        )
-        _write_ledger(ledger_path, {"$a": coalesced, "$b": coalesced})
+        coalesced = TurnRecord.create(source_event_ids=("$a", "$b"), response_event_id="$combined", completed=True)
+        _write_ledger(ledger_path, {"$a": coalesced, "$b": coalesced}, redacted=("$b",))
         events = {"$combined": _agent_reply_event("$a", "$combined", _short_body_for(9))}
         # Live sibling $a satisfied, redacted sibling $b excluded -> passes.
         auditor._assert_model_saw_current_sources(
@@ -7810,7 +8182,6 @@ async def test_redacted_edit_preserves_completed_historical_answer(
     revision = RevisionReplay(
         "$wrong" if failure == "ledger_source" else "$root",
         100,
-        redacted=True,
         response_event_id="$wrong" if failure == "response" else "$reply",
     )
     if failure == "registered":
@@ -7832,17 +8203,12 @@ async def test_redacted_edit_preserves_completed_historical_answer(
     if failure == "pending":
         auditor.pending_edit_markers = {"$root": {"$b": _source_marker("root:0", "edit:2")}}
     records = {"$root": record}
-    if failure == "physical_tombstone":
-        records["$a"] = TurnRecord.create(
-            source_event_ids=("$a",),
-            completed=False,
-            redacted_source_event_ids=("$a",),
-        )
     try:
         if failure in {None, "runtime_before", "runtime_duplicate"}:
             auditor._assert_model_saw_current_sources(
                 events,
                 records=records,
+                ledger_redactions={"$a"},
                 redacted_targets={"$a": "$redaction"},
             )
         else:
@@ -7850,6 +8216,7 @@ async def test_redacted_edit_preserves_completed_historical_answer(
                 auditor._assert_model_saw_current_sources(
                     events,
                     records=records,
+                    ledger_redactions={"$a"},
                     redacted_targets={} if failure == "unredacted" else {"$a": "$redaction"},
                 )
     finally:
@@ -7932,7 +8299,7 @@ async def test_redacted_edit_request_records_terminal_response_after_deletion(
         response_event_id="$reply",
         source_event_revisions={"$root": (0, "$root")},
         revision_replay={
-            "$a": RevisionReplay("$root", 100, redacted=True, response_event_id="$reply" if attributed else None),
+            "$a": RevisionReplay("$root", 100, response_event_id="$reply" if attributed else None),
         },
     )
     auditor = _model_source_auditor(
@@ -8071,7 +8438,7 @@ async def test_redacted_edit_late_completion_supersedes_only_preexisting_debt(
     runner.oracle._ledger_records["$root"] = TurnRecord.create(
         source_event_ids=("$root",),
         response_event_id="$reply",
-        revision_replay={"$b": RevisionReplay("$root", 200, redacted=True, response_event_id="$reply")},
+        revision_replay={"$b": RevisionReplay("$root", 200, response_event_id="$reply")},
     )
     runner.oracle.latest_reply_bodies["$reply"] = ((0, 0, "$reply"), _short_body_for(7))
     runner._reconcile_edit_debts()
@@ -8342,7 +8709,7 @@ async def test_failure_bundle_persists_evidence_and_survives_teardown(tmp_path: 
     journal_lines = (directory / "realized_journal.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(journal_lines[0])["event_id"] == "$sent"
     assert "mindroom line" in (directory / "mindroom.log").read_text(encoding="utf-8")
-    assert (directory / "handled_turns.json").exists()
+    assert (directory / "turn_rows.json").exists()
     assert json.loads((directory / "nio_recovery.json").read_text(encoding="utf-8")) == {"stores": {}}
     observations = json.loads((directory / "model_observations.json").read_text(encoding="utf-8"))
     assert observations["3"] == [_source_marker("op:1", ORIGINAL_REVISION)]
@@ -8501,11 +8868,11 @@ def test_child_provenance_rejects_pythonpath_checkout_override(
         )
 
 
-def test_start_mindroom_uses_locked_installation_and_persists_each_pid(
+def test_start_mindroom_persists_direct_child_pid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The child uses its locked environment and persists each process identity."""
+    """The manifest owns the actual Python process that receives managed signals."""
     stack = ManagedTuwunelStack(
         state_root=tmp_path / "state",
     )
@@ -8534,12 +8901,13 @@ def test_start_mindroom_uses_locked_installation_and_persists_each_pid(
         stack._wait_for_runtime_attestation = lambda: None  # type: ignore[method-assign]
         stack._wait_for_url = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
         stack._write_manifest = lambda **kwargs: manifests.append(kwargs)  # type: ignore[method-assign]
+        monkeypatch.setattr(live_fuzz, "_run_command", lambda *_args, **_kwargs: sys.executable)
         monkeypatch.setattr("scripts.testing.fuzz_live_matrix.subprocess.Popen", popen)
 
         stack._start_mindroom()
 
         assert commands
-        assert commands[0][:5] == ["uv", "run", "--locked", "--python", "3.13"]
+        assert commands[0][0] == sys.executable
         assert "__mindroom_runtime_child__" in commands[0]
         assert manifests == [
             {"state": "starting_mindroom", "mindroom_pid": 4242},
@@ -8583,6 +8951,7 @@ async def test_run_live_closes_every_client_without_masking_primary_failure(
     monkeypatch.setattr(live_fuzz, "LiveFuzzRunner", FakeRunner)
     stack: Any = SimpleNamespace(
         homeserver="http://matrix.invalid",
+        registration_token="",
         room_ids={"lobby": "!room:example"},
         room_keys=("lobby",),
         room_id="!room:example",
@@ -8641,6 +9010,7 @@ async def test_run_live_finishes_client_cleanup_before_rethrowing_first_interrup
     monkeypatch.setattr(live_fuzz, "LiveFuzzRunner", FakeRunner)
     stack: Any = SimpleNamespace(
         homeserver="http://matrix.invalid",
+        registration_token="",
         room_ids={"lobby": "!room:example"},
         room_keys=("lobby",),
         room_id="!room:example",
@@ -8690,6 +9060,7 @@ async def test_run_live_groups_ordinary_client_cleanup_failures(
     monkeypatch.setattr(live_fuzz, "LiveFuzzRunner", FakeRunner)
     stack: Any = SimpleNamespace(
         homeserver="http://matrix.invalid",
+        registration_token="",
         room_ids={"lobby": "!room:example"},
         room_keys=("lobby",),
         room_id="!room:example",
@@ -9575,10 +9946,7 @@ async def test_chaos_checkpoint_waits_for_latest_marker_and_tombstone(monkeypatc
     async def pump(*, timeout_ms: int) -> None:
         assert timeout_ms == 250
         calls.append(f"pump:{len(calls)}")
-        runner.oracle._ledger_records["$redacted"] = TurnRecord.create(
-            source_event_ids=("$redacted",),
-            redacted_source_event_ids=("$redacted",),
-        )
+        runner.oracle._ledger_redactions = frozenset({"$redacted"})
         if len(calls) == 3:
             runner.oracle.latest_reply_bodies["$reply"] = ((1, 1, "$edit"), _short_body_for(2))
 
@@ -9608,6 +9976,113 @@ async def test_chaos_checkpoint_releases_marker_for_no_response_source(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["tombstoned", "declined"])
+async def test_chaos_checkpoint_releases_marker_for_an_edit_mindroom_cannot_apply(
+    monkeypatch: pytest.MonkeyPatch,
+    cause: str,
+) -> None:
+    """An edit of a redacted or superseded source can change no reply, so the checkpoint stops waiting for one."""
+    runner = _temporal_revision_runner()
+    runner._pending_edit_markers = {"$root": {"$edit": _source_marker("root:10", "edit:15")}}
+    if cause == "declined":
+        runner.oracle.declined_edit_sources = frozenset({"$root"})
+    else:
+        runner.oracle._ledger_redactions = frozenset({"$root"})
+    monkeypatch.setattr(runner.oracle, "pump", AsyncMock())
+    await runner._wait_for_pending_mutation_effects(deadline_seconds=1.0, batch_index=4)
+    assert runner._pending_edit_markers == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("journal_event_states", "released"),
+    [
+        ({"$redaction": "settled"}, True),
+        ({"$redaction": "pending"}, False),
+        ({"$redaction": "settled", "$root": "settled"}, False),
+    ],
+    ids=["seen_only_deleted", "redaction_unsettled", "source_admitted"],
+)
+async def test_chaos_checkpoint_releases_tombstone_for_source_mindroom_only_saw_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+    journal_event_states: dict[str, str],
+    released: bool,
+) -> None:
+    """A source redacted before MindRoom read it never starts a turn, so its settled redaction is the whole effect."""
+    runner = _temporal_revision_runner()
+    runner._pending_source_tombstones = {"$root"}
+    runner.redacted_targets = {"$root": "$redaction"}
+    runner.oracle.journal_event_states = journal_event_states
+    monkeypatch.setattr(runner.oracle, "pump", AsyncMock())
+    if released:
+        await runner._wait_for_pending_mutation_effects(deadline_seconds=1.0, batch_index=4)
+        assert runner._pending_source_tombstones == set()
+    else:
+        with pytest.raises(AssertionError, match="timed out waiting for mutation effects"):
+            await runner._wait_for_pending_mutation_effects(deadline_seconds=0.05, batch_index=4)
+
+
+def test_runner_settles_edit_debts_whenever_the_oracle_refreshes_its_ledger() -> None:
+    """A reply wait refreshes the ledger, so it must also settle edit debts that block supersession proofs."""
+    stack = ManagedTuwunelStack()
+    try:
+        client = Mock(spec=LiveMatrixClient)
+        runner = LiveFuzzRunner(
+            stack,
+            (client,),
+            live_scenario_from_seed(1, steps=4, thread_count=2),
+            reply_timeout=1.0,
+            settle_seconds=0.0,
+        )
+        assert runner.oracle.after_ledger_refresh == runner._reconcile_edit_debts
+    finally:
+        stack.close()
+
+
+def test_cold_restart_resets_only_durable_nio_stores(tmp_path: Path) -> None:
+    """An account store without durable ingestion tables has no sync cursor to reset."""
+    keys = tmp_path / "encryption_keys"
+    (keys / "agent").mkdir(parents=True)
+    (keys / "user").mkdir()
+    durable = keys / "agent" / "agent.db"
+    with closing(sqlite3.connect(durable)) as database:
+        database.executescript(
+            "CREATE TABLE NioDurableMeta (id INTEGER PRIMARY KEY, cursor TEXT);"
+            "INSERT INTO NioDurableMeta VALUES (1, 'since');"
+            "CREATE TABLE NioDurableInput (id INTEGER PRIMARY KEY);"
+            "CREATE TABLE NioDurableBatch (sequence INTEGER PRIMARY KEY);",
+        )
+    with closing(sqlite3.connect(keys / "user" / "user.db")) as database:
+        database.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY)")
+
+    assert live_fuzz._durable_store_paths(tmp_path) == (durable,)
+    live_fuzz._reset_durable_sync_cursors(tmp_path)
+    with closing(sqlite3.connect(durable)) as database:
+        assert database.execute("SELECT cursor FROM NioDurableMeta").fetchone() == (None,)
+
+
+@pytest.mark.parametrize(
+    ("journal_event_states", "seen_only_deleted"),
+    [
+        ({"$redaction": "settled"}, True),
+        ({"$redaction": "pending"}, False),
+        ({"$redaction": "settled", "$source": "settled"}, False),
+        ({}, False),
+    ],
+    ids=["settled_unadmitted", "redaction_unsettled", "source_admitted", "redaction_unseen"],
+)
+def test_oracle_knows_a_source_mindroom_only_saw_deleted(
+    journal_event_states: dict[str, str],
+    seen_only_deleted: bool,
+) -> None:
+    """Only a settled redaction of a source MindRoom never journaled proves it saw the source already deleted."""
+    oracle = ExactReplyOracle(Mock(spec=LiveMatrixClient), "@agent:example")
+    oracle.journal_event_states = journal_event_states
+
+    assert oracle.saw_only_deleted("$source", "$redaction") is seen_only_deleted
+
+
+@pytest.mark.asyncio
 async def test_chaos_checkpoint_tombstone_releases_same_source_marker(monkeypatch: pytest.MonkeyPatch) -> None:
     """A source tombstone supersedes a concurrently landed edit obligation."""
     runner = _temporal_revision_runner()
@@ -9622,8 +10097,8 @@ async def test_chaos_checkpoint_tombstone_releases_same_source_marker(monkeypatc
         runner.oracle._ledger_records["$root"] = TurnRecord.create(
             source_event_ids=("$root",),
             response_event_id="$reply",
-            redacted_source_event_ids=("$root",),
         )
+        runner.oracle._ledger_redactions = frozenset({"$root"})
 
     monkeypatch.setattr(runner.oracle, "pump", pump)
     await runner._wait_for_pending_mutation_effects(deadline_seconds=1.0, batch_index=26)
@@ -10452,7 +10927,7 @@ async def test_failure_bundle_finalizes_every_artifact_after_collector_failure(
         "artifact_errors.txt",
         "diagnostics.json",
         "exception.txt",
-        "handled_turns.json",
+        "turn_rows.json",
         "mindroom.log",
         "model_observations.json",
         "oracle_snapshot.json",
@@ -10520,7 +10995,7 @@ async def test_failure_bundle_finalizes_when_stop_mindroom_fails(tmp_path: Path)
         "cleanup_error.txt",
         "diagnostics.json",
         "exception.txt",
-        "handled_turns.json",
+        "turn_rows.json",
         "mindroom.log",
         "model_observations.json",
         "oracle_snapshot.json",
@@ -10965,7 +11440,7 @@ def test_main_cleanup_failure_retains_pre_teardown_evidence(
     assert {
         "cleanup_error.txt",
         "diagnostics.json",
-        "handled_turns.json",
+        "turn_rows.json",
         "mindroom.log",
         "model_observations.json",
         "oracle_snapshot.json",
@@ -11248,3 +11723,24 @@ def test_final_source_recheck_rejects_post_attestation_mutation(
         assert "final_source_validation" not in (stack.runtime_provenance or {})
     finally:
         stack.temp_dir.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("LIVE-FUZZ call=2 END call=2", "LIVE-FUZZ call=2 END call=2"),
+        (
+            f"LIVE-FUZZ call=1 partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nLIVE-FUZZ call=2 END call=2",
+            "LIVE-FUZZ call=2 END call=2",
+        ),
+        (
+            f"partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nmore\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}\n\nLIVE-FUZZ call=3 END call=3",
+            "LIVE-FUZZ call=3 END call=3",
+        ),
+        (f"partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}", f"partial\n\n{RESTART_INTERRUPTED_RESPONSE_NOTE}"),
+    ],
+    ids=["single_attempt", "continued_once", "continued_twice", "stopped_before_continuing"],
+)
+def test_final_attempt_body_reads_the_newest_continuation(body: str, expected: str) -> None:
+    """Only the part after the last restart note is one model call's completed stream."""
+    assert live_fuzz._final_attempt_body(body) == expected

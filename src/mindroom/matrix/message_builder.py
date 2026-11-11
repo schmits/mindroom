@@ -8,12 +8,15 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from markdown_it import MarkdownIt
+from markdown_it.rules_block import StateBlock, heading, html_block
 from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from pygments import highlight
 from pygments.formatters.html import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 from pygments.util import ClassNotFound
+
+from mindroom.matrix.event_info import UNQUOTED_REPLY_RELATION_KEY
 
 # Standard Matrix-safe HTML tags.
 _GENERAL_FORMATTED_BODY_TAGS = frozenset(
@@ -101,6 +104,9 @@ _ALLOWED_FORMATTED_BODY_ATTRIBUTES = {
 _VOID_FORMATTED_BODY_TAGS = frozenset({"br", "hr", "img"})
 _URL_ATTRIBUTES = frozenset({"href", "src"})
 _ALLOWED_URL_SCHEMES = frozenset({"", "http", "https", "mailto", "matrix", "mxc"})
+# Links also keep the app links MindRoom Chat allows by default
+# (`messageRendering.additionalAllowedUriSchemes`): Obsidian notes and Spark email backlinks.
+_ALLOWED_HREF_SCHEMES = _ALLOWED_URL_SCHEMES | {"obsidian", "readdlespark"}
 _ALLOWED_STYLE_PROPERTIES = frozenset(
     {
         "background",
@@ -117,11 +123,10 @@ _ALLOWED_STYLE_PROPERTIES = frozenset(
     },
 )
 _SAFE_STYLE_VALUE_PATTERN = re.compile(r"[#(),.%\s0-9A-Za-z-]+")
-_UNTERMINATED_HTML_FRAGMENT_PATTERN = re.compile(
-    r"<(?:(?:!--)|(?:\?)|(?:![A-Za-z])|(?:/?[A-Za-z]))[^>\r\n]*(?=$|[\r\n])",
-)
+_HTML_FRAGMENT_OPENER_PATTERN = re.compile(r"<(?:!--|\?|![A-Za-z]|/?[A-Za-z])")
+_HTML_LINE_PATTERN = re.compile(r"[^\r\n]+")
 _RAW_HTML_TAG_LINE_START_PATTERN = re.compile(
-    r"^([ ]{0,3})(</?([A-Za-z][A-Za-z0-9-]*)(?:\s+[^<>]*)?\s*/?>)",
+    r"^([ ]{0,3})(</?([A-Za-z][A-Za-z0-9-]*)(?:\s[^<>]*)?/?>)",
 )
 _SUPPORTED_BLOCK_LINE_START_PATTERN = re.compile(
     rf"^[ ]{{0,3}}</?(?:{'|'.join(sorted(_BLOCK_FORMATTED_BODY_TAGS))})\b",
@@ -229,7 +234,7 @@ def _escape_html_block_openers(text: str) -> str:
     return _transform_markdown_outside_fenced_code(text, _escape_html_block_openers_in_text)
 
 
-def _sanitize_url_attribute(value: str) -> str | None:
+def _sanitize_url_attribute(value: str, allowed_schemes: frozenset[str]) -> str | None:
     # TODO(ISSUE-084): split URL policy by tag and restrict img[src] to mxc:// only after the
     # formatted_body callers are audited for compatibility with existing content.
     candidate = unescape(value).strip()
@@ -242,7 +247,7 @@ def _sanitize_url_attribute(value: str) -> str | None:
         scheme = urlsplit(normalized).scheme.lower()
     except ValueError:
         return None
-    if scheme in _ALLOWED_URL_SCHEMES:
+    if scheme in allowed_schemes:
         return candidate
     if not scheme and ":" not in normalized:
         return candidate
@@ -298,9 +303,19 @@ def _normalize_supported_block_html_boundaries(text: str) -> str:
     return _transform_markdown_outside_fenced_code(text, _normalize_supported_block_html_boundaries_in_text)
 
 
+def _escape_unterminated_html_fragment(line_match: re.Match[str]) -> str:
+    """Escape a line from its first tag opener that no later ``>`` closes."""
+    line = line_match.group(0)
+    # Openers before the line's last ``>`` are closed by it, so search only after it.
+    opener = _HTML_FRAGMENT_OPENER_PATTERN.search(line, line.rfind(">") + 1)
+    if opener is None:
+        return line
+    return line[: opener.start()] + escape(line[opener.start() :])
+
+
 def _escape_unterminated_html_fragments(html_text: str) -> str:
     """Escape malformed tag-like fragments so HTMLParser preserves them as text."""
-    return _UNTERMINATED_HTML_FRAGMENT_PATTERN.sub(lambda match: escape(match.group(0)), html_text)
+    return _HTML_LINE_PATTERN.sub(_escape_unterminated_html_fragment, html_text)
 
 
 def _format_sanitized_attributes(tag_name: str, attrs: list[tuple[str, str | None]]) -> str:
@@ -317,7 +332,8 @@ def _format_sanitized_attributes(tag_name: str, attrs: list[tuple[str, str | Non
             continue
         sanitized_value = attr_value
         if normalized_attr_name in _URL_ATTRIBUTES:
-            sanitized_url = _sanitize_url_attribute(attr_value)
+            allowed_schemes = _ALLOWED_HREF_SCHEMES if normalized_attr_name == "href" else _ALLOWED_URL_SCHEMES
+            sanitized_url = _sanitize_url_attribute(attr_value, allowed_schemes)
             if sanitized_url is None:
                 continue
             sanitized_value = sanitized_url
@@ -433,10 +449,33 @@ def _render_preserved_math_block(
     return f"<div>{escape(content)}</div>\n"
 
 
+def _decline_line_at_end_of_input(rule: Callable[[StateBlock, int, int, bool], bool]) -> Callable[..., bool]:
+    """Return the block rule declining a line that starts at the end of the input instead of indexing past it."""
+
+    def guarded_rule(state: StateBlock, start_line: int, end_line: int, silent: bool) -> bool:
+        if state.bMarks[start_line] + state.tShift[start_line] >= len(state.src):
+            return False
+        return rule(state, start_line, end_line, silent)
+
+    return guarded_rule
+
+
 def _build_markdown_renderer() -> MarkdownIt:
     renderer = MarkdownIt("commonmark", {"breaks": True, "highlight": _highlight})
     renderer.enable("table")
     renderer.enable("strikethrough")
+    # markdown-it-py <=4.2.0 raises IndexError when a quoted table ends on a bare ">" with no newline after it,
+    # as a streamed reply often does: the table runs these rules on that empty last line and they index past the input.
+    # Upstream issue: https://github.com/executablebooks/markdown-it-py/issues/415
+    # Upstream PR (merged, unreleased): https://github.com/executablebooks/markdown-it-py/pull/416
+    # Remove when the pinned markdown-it-py release includes that PR.
+    # Replacing a rule resets the chains it may end, so they are passed again as markdown-it-py registers them.
+    for name, rule in (("html_block", html_block), ("heading", heading)):
+        renderer.block.ruler.at(
+            name,
+            _decline_line_at_end_of_input(rule),
+            {"alt": ["paragraph", "reference", "blockquote"]},
+        )
     renderer.use(
         dollarmath_plugin,
         allow_labels=False,
@@ -464,6 +503,16 @@ def markdown_to_html(text: str) -> str:
     normalized_text = _normalize_supported_block_html_boundaries(escaped_text)
     html_text: str = _MARKDOWN_RENDERER.render(normalized_text)
     return _sanitize_formatted_body_html(html_text)
+
+
+def opens_with_markdown_block(text: str) -> bool:
+    """Return whether markdown text opens with a block that only renders at the start of a line.
+
+    Tables, headings, lists, quotes, code fences, and rules qualify; a paragraph does not.
+    Only the first two lines are parsed, which keeps per-chunk streaming renders cheap and still decides a table or one-line setext heading.
+    """
+    tokens = _MARKDOWN_RENDERER.parse("\n".join(text.lstrip().split("\n", 2)[:2]))
+    return bool(tokens) and tokens[0].type != "paragraph_open"
 
 
 def build_thread_relation(
@@ -573,8 +622,7 @@ def build_message_content(
             latest_thread_event_id=latest_thread_event_id,
         )
     elif reply_to_event_id:
-        # Plain reply without thread (shouldn't happen in this bot)
-        content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to_event_id}}
+        content["m.relates_to"] = {UNQUOTED_REPLY_RELATION_KEY: {"event_id": reply_to_event_id}}
 
     if extra_content:
         content.update(extra_content)

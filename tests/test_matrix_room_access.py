@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock
 
 import nio
 import pytest
@@ -93,7 +93,7 @@ def test_room_security_helpers_use_only_effective_policy(tmp_path: Path) -> None
     )
     policy = resolve_room_policy(config, "vault")
 
-    assert matrix_rooms._managed_room_should_be_encrypted(policy) is True
+    assert policy.encrypted is True
     assert matrix_rooms._room_admin_user_ids(policy) == ["@admin:example.com", "@partner:example.com"]
 
 
@@ -107,6 +107,7 @@ def test_managed_room_initial_state_does_not_embed_admin_ownership_metadata() ->
         ["@power:example.com"],
         ["@admin:example.com"],
         encrypted=False,
+        creators=frozenset(),
     )
 
     power_levels = initial_state[0]["content"]
@@ -256,6 +257,27 @@ async def test_ensure_all_rooms_passes_resolved_policy(
 
 
 @pytest.mark.asyncio
+async def test_ensure_all_rooms_skips_unmanaged_room_references(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Room IDs and full aliases in an agent's rooms are joined as-is, never created as managed rooms."""
+    config = membership_config(tmp_path, agent_rooms=["lobby", "#lobby:localhost", "!raw:example.com"])
+    ensured_keys: list[str] = []
+
+    async def ensure_room(*, room_key: str, **_kwargs: object) -> str:
+        ensured_keys.append(room_key)
+        return f"!{room_key}:example.com"
+
+    monkeypatch.setattr(matrix_rooms, "_ensure_room_exists", ensure_room)
+
+    result = await matrix_rooms.ensure_all_rooms_exist(AsyncMock(), config, runtime_paths_for(config))
+
+    assert result == {"lobby": "!lobby:example.com"}
+    assert ensured_keys == ["lobby"]
+
+
+@pytest.mark.asyncio
 async def test_managed_room_reconciliation_has_bounded_overlap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """All configured rooms are attempted with at most four requests in flight."""
     rooms = [f"room{i}" for i in range(12)]
@@ -292,16 +314,13 @@ async def test_managed_room_reconciliation_has_bounded_overlap(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
-async def test_aliases_of_same_room_do_not_reconcile_concurrently(
+async def test_keys_recorded_for_one_room_do_not_reconcile_concurrently(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Alias duplication must not interleave policy updates to one physical room."""
+    """Keys recorded for one physical room must not interleave its policy updates."""
     config = membership_config(tmp_path, agent_rooms=["first", "second"])
     client = AsyncMock()
-    client.homeserver = "https://example.com"
-    client.rooms = {"!same:example.com": Mock()}
-    client.room_resolve_alias.return_value = nio.RoomResolveAliasResponse("#alias:example.com", "!same:example.com", [])
     active = 0
     peak = 0
 
@@ -314,9 +333,8 @@ async def test_aliases_of_same_room_do_not_reconcile_concurrently(
         finally:
             active -= 1
 
-    monkeypatch.setattr(matrix_rooms, "_add_room", Mock())
     monkeypatch.setattr(matrix_rooms, "_reconcile_joined_existing_room", reconcile)
-    result = await matrix_rooms.ensure_all_rooms_exist(client, config, runtime_paths_for(config))
+    room_ids = {"first": "!same:example.com", "second": "!same:example.com"}
     client.user_id = "@router:example.com"
     client.room_get_state.return_value = nio.RoomGetStateResponse(
         [
@@ -324,6 +342,5 @@ async def test_aliases_of_same_room_do_not_reconcile_concurrently(
         ],
         "!same:example.com",
     )
-    await matrix_rooms.reconcile_managed_rooms(client, config, runtime_paths_for(config), result)
-    assert result == {"first": "!same:example.com", "second": "!same:example.com"}
+    await matrix_rooms.reconcile_managed_rooms(client, config, runtime_paths_for(config), room_ids)
     assert peak == 1

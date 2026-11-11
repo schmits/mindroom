@@ -1,13 +1,14 @@
 """Execution-side, under-lock assembly of one response request's payload.
 
-Ingress (``TurnController`` + ``text_ingress_dispatch``) builds a complete,
+Turn dispatch (:class:`~mindroom.turns.dispatch.TurnDispatcher`) builds a complete,
 immutable :class:`ResponsePayloadPreparation` value and hands it to the
-response runner inside the :class:`~mindroom.response_runner.ResponseRequest`.
+response runner inside the :class:`~mindroom.reply_turn.request.ResponseRequest`.
 Once the runner owns the lifecycle lock and has refreshed thread history, it
-calls :meth:`ResponsePayloadPreparer.prepare` to finish assembling the request.
+calls :meth:`ResponsePayloadPreparer.prepare` to finish assembling the request,
+and :meth:`ResponsePayloadPreparer.with_system_enrichment` before any turn runs its model.
 
 Data crosses the seam as values, and the work runs here as a first-class named
-step rather than as a closure back into ingress.
+step rather than as a closure back into turn dispatch.
 """
 
 from __future__ import annotations
@@ -16,12 +17,13 @@ import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
-from mindroom.attachment_ids import merge_attachment_ids
+from mindroom.attachments.ids import merge_attachment_ids
 from mindroom.inbound_turn_normalizer import (
     BatchMediaAttachmentRequest,
     DispatchPayloadWithAttachmentsRequest,
 )
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
+from mindroom.reply_turn.request import correlation_id_for_request
 from mindroom.timing import elapsed_ms_between, emit_elapsed_timing
 
 if TYPE_CHECKING:
@@ -30,10 +32,11 @@ if TYPE_CHECKING:
     import structlog
 
     from mindroom.dispatch_handoff import MediaDispatchEvent
+    from mindroom.hooks.ingress import IngressHookRunner
     from mindroom.inbound_turn_normalizer import DispatchPayload, InboundTurnNormalizer
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-    from mindroom.response_runner import ResponseRequest
-    from mindroom.turn_policy import IngressHookRunner, PreparedDispatch
+    from mindroom.reply_turn.request import ResponseRequest
+    from mindroom.turn_policy import PreparedDispatch
 
 
 @dataclass(frozen=True)
@@ -90,7 +93,6 @@ class ResponsePayloadPreparer:
         """
         preparation = request.payload_preparation
         assert preparation is not None
-        dispatch = preparation.dispatch
         pipeline_timing = request.pipeline_timing
         if pipeline_timing is not None:
             pipeline_timing.mark("response_payload_start")
@@ -98,16 +100,11 @@ class ResponsePayloadPreparer:
         payload = await self._build_payload(preparation, thread_history=request.thread_history)
 
         prepared_payload = await self.ingress_hook_runner.apply_message_enrichment(
-            dispatch,
+            preparation.dispatch,
             payload,
             target_entity_name=self.agent_name,
             target_member_names=preparation.target_member_names,
-        )
-        system_enrichment_items = await self.ingress_hook_runner.apply_system_enrichment(
-            dispatch,
-            prepared_payload.envelope,
-            target_entity_name=self.agent_name,
-            target_member_names=preparation.target_member_names,
+            turn_id=request.turn_id,
         )
         payload_ready_monotonic = time.monotonic()
         if pipeline_timing is not None:
@@ -125,10 +122,28 @@ class ResponsePayloadPreparer:
             attachment_ids=tuple(prepared_payload.payload.attachment_ids or ()),
             response_envelope=prepared_payload.envelope,
             transient_enrichment_items=prepared_payload.transient_enrichment_items,
-            system_enrichment_items=(*system_enrichment_items, *request.system_enrichment_items),
             requires_model_history_refresh=False,
             payload_preparation=None,
         )
+
+    async def with_system_enrichment(
+        self,
+        request: ResponseRequest,
+        *,
+        target_member_names: tuple[str, ...] | None,
+    ) -> ResponseRequest:
+        """Return ``request`` with what its ``system:enrich`` hooks add, ahead of its own system enrichment.
+
+        ``target_member_names`` names a team turn's members and is None for an agent turn.
+        """
+        items = await self.ingress_hook_runner.apply_system_enrichment(
+            request.response_envelope,
+            correlation_id=correlation_id_for_request(request),
+            target_entity_name=self.agent_name,
+            target_member_names=target_member_names,
+            turn_id=request.turn_id,
+        )
+        return replace(request, system_enrichment_items=(*items, *request.system_enrichment_items))
 
     async def _build_payload(
         self,

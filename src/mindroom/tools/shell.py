@@ -1,4 +1,4 @@
-"""Shell tool configuration with async subprocess execution and timeout-to-handle support."""
+"""Shell tool configuration with async subprocess execution that stops a command at its timeout."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import json
 import os
 import re
 import shlex
+import subprocess
+from dataclasses import replace
 from pathlib import Path
-from typing import cast
-
-from agno.tools.toolkit import Toolkit
+from typing import TYPE_CHECKING, cast
 
 from mindroom.constants import (
     WORKSPACE_HOME_CONTRACT_ENV_NAMES,
@@ -18,29 +18,34 @@ from mindroom.constants import (
     subprocess_path_with_prepends,
     workspace_home_identity_env,
 )
-from mindroom.shell_execution import (
-    DEFAULT_RUN_TIMEOUT_SECONDS,
-    ProcessRecord,
-    check_command,
-    kill_command,
-    run_command,
-)
-from mindroom.shell_supervisor import (
-    SHELL_SUPERVISOR_SOCKET_ENV,
-    check_command_via_supervisor,
-    kill_command_via_supervisor,
-    run_command_via_supervisor,
-)
+from mindroom.path_confinement import resolve_path_within_root
+from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
+from mindroom.shell.execution import run_command, shell_call_timeout
+from mindroom.shell.output_capture import ShellOutputDestination
+from mindroom.shell.supervisor import SHELL_SUPERVISOR_SOCKET_ENV, run_command_via_supervisor
+from mindroom.terminal.lines import PROMPT_COMMAND
+from mindroom.terminal.session import TerminalError, TerminalLaunch
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
     ToolCategory,
     ToolExecutionTarget,
+    ToolFileAccess,
     ToolManagedInitArg,
     ToolStatus,
 )
+from mindroom.tool_system.output_files import ToolOutputFileHandled, current_tool_output_file_request
+from mindroom.tool_system.progress import report_tool_progress
 from mindroom.tool_system.registration import register_tool_with_metadata
+from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
+from mindroom.tool_system.tool_schema import closed_parameters
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from mindroom.tool_system.tool_function import ToolFunction
 
 _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS = frozenset(
     {
@@ -86,11 +91,28 @@ _WORKSPACE_CWD_NOTE = (
     "`$MINDROOM_AGENT_WORKSPACE` for workspace files instead of `~`: worker-routed execution maps `~` "
     "to the workspace, while local execution maps it to the host home."
 )
+# Working method distilled from RRSI harness-search runs on graded terminal tasks, where these habits
+# removed the most common silent failures of a shell agent (wrong field matched, merged file boundaries,
+# reserialized edits, unverified renames, truncated reads).
+_WORKING_METHOD_NOTE = (
+    "Working method: inspect inputs first, sampling large files or outputs with head, tail, grep, or wc instead "
+    "of printing everything, but compute results over the full input. Match filters against the extracted field "
+    "value, not the whole line, and check them on a few sample records. When combining the lines or words of "
+    "several text files, do not concatenate them raw: a file may lack its final newline, which merges its last "
+    "word or record with the next file's first, so process each file separately or add a separator, and test "
+    "with files that lack a trailing newline (joining split chunks of one file byte for byte is different). When "
+    "only one value must change, replace just that span and keep every other byte, including comments and "
+    "spacing. Afterwards verify the result: read outputs back, search for leftover old names after a rename, run "
+    "available tests, and recheck suspicious results such as a zero count."
+)
 
-# Module-level process registry shared across all MindRoomShellTools instances.
-# This ensures handles survive toolkit re-creation for local execution; when a
-# supervisor socket is advertised, the supervisor owns the registry instead.
-_process_registry: dict[str, ProcessRecord] = {}
+_NO_WORKER_ERROR = (
+    "Error: Shell commands run only in a worker, and this agent's shell runs in MindRoom's own process. "
+    "Route `shell` to a worker, or set `defaults.allow_shell_without_worker: true` in config.yaml to run them here."
+)
+
+# A stopped command registers no handle, so every call shares one namespace.
+_SHELL_NAMESPACE = "shell"
 
 
 def _normalize_shell_command_line(command: str) -> list[str]:
@@ -135,6 +157,15 @@ def _normalize_shell_args(args: object) -> list[str]:
     return normalized_args
 
 
+def shell_refuses_commands(runtime_paths: RuntimePaths, *, allow_without_worker: bool) -> bool:
+    """Return whether a shell built for ``runtime_paths`` refuses its commands.
+
+    A worker builds the toolkit in runner mode; anywhere else its commands would run in MindRoom's own process, which
+    ``defaults.allow_shell_without_worker`` (``allow_without_worker``) must allow.
+    """
+    return not allow_without_worker and not runtime_paths.env_flag(SANDBOX_RUNTIME_ENV_BY_KEY["runner_mode"])
+
+
 def _shell_path_prepend_entries(shell_path_prepend: str | None) -> tuple[str, ...]:
     """Parse configured shell PATH prefixes."""
     if shell_path_prepend is None:
@@ -158,15 +189,26 @@ def _workspace_home_contract_env_from_process_env(base_process_env: dict[str, st
 def _shell_subprocess_env(
     runtime_env: dict[str, str],
     *,
+    call_environment: ToolEnvironment,
     base_process_env: dict[str, str] | None = None,
     shell_path_prepend: str | None = None,
     workspace_dir: Path | None = None,
+    process_environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build the env passed to shell subprocesses."""
-    env = {key: value for key, value in os.environ.items() if key in _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS}
+    """Build the env passed to shell subprocesses.
+
+    ``call_environment`` is the call's own environment, applied over ``runtime_env``; the variables it removes stay
+    away from the command even where the base environment would give them, while the workspace variables, ``PATH``
+    entries, and telemetry settings MindRoom adds here still apply. ``process_environ`` is the environment of the
+    process the command runs from, by default this one's.
+    """
+    environ = os.environ if process_environ is None else process_environ
+    env = {key: value for key, value in environ.items() if key in _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS}
     if base_process_env is not None:
         env.update({key: value for key, value in base_process_env.items() if key in _LOCAL_SHELL_PASSTHROUGH_ENV_KEYS})
-    env.update(runtime_env)
+    env.update(call_environment.applied(runtime_env, base_process_env or {}))
+    for name in call_environment.removed:
+        env.pop(name, None)
     workspace_home_contract = (
         _workspace_home_contract_env_from_process_env(base_process_env) if base_process_env is not None else {}
     )
@@ -178,7 +220,7 @@ def _shell_subprocess_env(
 
     path_value = subprocess_path_with_prepends(
         env.get("PATH"),
-        prepend_entries=_shell_path_prepend_entries(shell_path_prepend),
+        prepend_entries=(*call_environment.path_prepend, *_shell_path_prepend_entries(shell_path_prepend)),
     )
     if path_value is None:
         env.pop("PATH", None)
@@ -186,6 +228,21 @@ def _shell_subprocess_env(
         env["PATH"] = path_value
     env.update(vendor_telemetry_env_values())
     return env
+
+
+def _terminal_cwd(base_dir: Path | None, cwd: str | None) -> str | None:
+    """Return the folder a terminal starts in: ``cwd`` inside the workspace, else the workspace itself."""
+    if base_dir is None:
+        if cwd:
+            raise TerminalError(400, "This shell has no workspace to start a terminal in.")
+        return None
+    try:
+        folder = resolve_path_within_root(base_dir, cwd or "", symlinks="internal", strict=True)
+    except (OSError, ValueError):
+        folder = None
+    if folder is None or not folder.is_dir():
+        raise TerminalError(400, "A terminal starts only in a folder inside the workspace.")
+    return str(folder)
 
 
 def _login_bash_command_index(args: list[str]) -> int | None:
@@ -241,18 +298,13 @@ def _shell_subprocess_args(args: list[str], env: dict[str, str]) -> list[str]:
     return adjusted_args
 
 
-def _handle_namespace(*, runtime_paths: RuntimePaths, base_dir: Path | None) -> str:
-    """Return the namespace that owns one shell handle registry record."""
-    storage_root = str(runtime_paths.storage_root.resolve())
-    resolved_base_dir = str(base_dir.expanduser().resolve()) if base_dir is not None else ""
-    return f"{storage_root}::{resolved_base_dir}"
-
-
 @register_tool_with_metadata(
     name="shell",
     display_name="Shell Commands",
     description="Run terminal commands and scripts in the agent workspace",
     category=ToolCategory.DEVELOPMENT,
+    file_access=ToolFileAccess.UNCONFINED,
+    executes_code=True,
     status=ToolStatus.AVAILABLE,
     setup_type=SetupType.NONE,
     default_execution_target=ToolExecutionTarget.WORKER,
@@ -326,14 +378,14 @@ def _handle_namespace(*, runtime_paths: RuntimePaths, base_dir: Path | None) -> 
     ],
     managed_init_args=(ToolManagedInitArg.RUNTIME_PATHS,),
     dependencies=[],
-    docs_url="https://docs.agno.com/tools/toolkits/local/shell",
-    function_names=("check_shell_command", "kill_shell_command", "run_shell_command"),
+    docs_url="https://docs.mindroom.chat/tools/execution-and-coding/#shell",
+    function_names=("run_shell_command",),
 )
-def shell_tools() -> type[Toolkit]:  # noqa: C901
+def shell_tools() -> type[Toolkit]:  # noqa: C901 - one toolkit class with its functions and its terminal
     """Return shell tools for command execution."""
 
     class MindRoomShellTools(Toolkit):
-        """MindRoom shell toolkit with async execution and timeout-to-handle support."""
+        """MindRoom shell toolkit with async execution that stops a command at its timeout."""
 
         def __init__(
             self,
@@ -344,21 +396,16 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
             shell_path_prepend: str | None = None,
             *,
             runtime_paths: RuntimePaths,
-            **kwargs: object,
+            allow_without_worker: bool = False,
         ) -> None:
             self.base_dir: Path | None = Path(base_dir) if isinstance(base_dir, str) else base_dir
+            self._refuse_commands = shell_refuses_commands(runtime_paths, allow_without_worker=allow_without_worker)
 
-            tools: list[object] = []
+            tools: list[Callable[..., object]] = []
             if all or enable_run_shell_command:
-                tools.extend([self.run_shell_command, self.check_shell_command, self.kill_shell_command])
+                tools.append(self.run_shell_command)
 
-            super().__init__(name="shell_tools", tools=tools, **kwargs)  # ty: ignore[invalid-argument-type]
-            run_shell_command_function = self.async_functions.get("run_shell_command")
-            if run_shell_command_function is not None:
-                effective_strict = (
-                    False if run_shell_command_function.strict is None else run_shell_command_function.strict
-                )
-                run_shell_command_function.process_entrypoint(strict=effective_strict)
+            super().__init__(name="shell_tools", tools=tools)
 
             self._runtime_env = dict(
                 shell_execution_runtime_env_values(
@@ -368,30 +415,83 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
                 ),
             )
             self._base_process_env = dict(runtime_paths.process_env)
-            if run_shell_command_function is not None and self.base_dir is not None:
-                run_shell_command_function.description = (
-                    f"{run_shell_command_function.description or ''}\n\n{_WORKSPACE_CWD_NOTE}"
-                ).strip()
-            self._handle_namespace = _handle_namespace(runtime_paths=runtime_paths, base_dir=self.base_dir)
             self._shell_path_prepend = shell_path_prepend
-            # Sandbox tool subprocesses delegate execution to the runner's
-            # long-lived shell supervisor so background handles survive the
-            # per-request process.
+            # Sandbox tool subprocesses delegate execution to the runner's long-lived shell supervisor,
+            # which stops the command when the per-request process dies.
             self._supervisor_socket = os.environ.get(SHELL_SUPERVISOR_SOCKET_ENV) or None
+
+        def offered_function(self, function: ToolFunction) -> ToolFunction:
+            """Describe ``run_shell_command`` with the working directory and the working method it runs under."""
+            notes = (
+                (_WORKSPACE_CWD_NOTE, _WORKING_METHOD_NOTE) if self.base_dir is not None else (_WORKING_METHOD_NOTE,)
+            )
+            return replace(
+                function,
+                description="\n\n".join((function.description or "", *notes)).strip(),
+                parameters=closed_parameters(self.run_shell_command, function.parameters),
+            )
+
+        def _command_env(self, process_environ: Mapping[str, str] | None = None) -> dict[str, str]:
+            """Return the environment a command runs with, from ``process_environ`` (by default this process's)."""
+            return _shell_subprocess_env(
+                self._runtime_env,
+                # The call's own environment: plugin hooks' changes and the response's CLI grant.
+                call_environment=current_tool_environment(),
+                base_process_env=self._base_process_env,
+                shell_path_prepend=self._shell_path_prepend,
+                workspace_dir=self.base_dir,
+                process_environ=process_environ,
+            )
+
+        def terminal_launch(
+            self,
+            cwd: str | None,
+            *,
+            process_environ: Mapping[str, str] | None,
+        ) -> TerminalLaunch:
+            """Return an interactive Bash in the environment and workspace this toolkit's commands get.
+
+            Not a function the agent calls: the sandbox runner starts it in a pty beside the commands it runs. It
+            reads no startup files, so it starts with exactly that environment, and no readline settings, so it
+            starts with Bash's built-in key bindings. ``process_environ`` is the environment of the process a
+            command runs from there, None for this one's.
+            The shell marks each prompt, which ``terminal_run`` waits for (``mindroom.terminal.lines``).
+            """
+            env = self._command_env(process_environ)
+            env.update(TERM="xterm-256color", PROMPT_COMMAND=PROMPT_COMMAND, INPUTRC="/dev/null")
+            return TerminalLaunch(
+                argv=("bash", "--noprofile", "--norc", "-i"),
+                env=env,
+                cwd=_terminal_cwd(self.base_dir, cwd),
+            )
 
         async def run_shell_command(
             self,
             args: list[str] | str,
             tail: int = 100,
-            timeout: int = DEFAULT_RUN_TIMEOUT_SECONDS,  # noqa: ASYNC109
-        ) -> str:
+            timeout: int | None = None,  # noqa: ASYNC109
+        ) -> str | ToolOutputFileHandled:
             """Runs a shell command and returns the output or error.
 
-            If the command completes within ``timeout`` seconds the last ``tail``
-            lines of stdout are returned (or the stderr on non-zero exit).  When
-            the timeout is exceeded the process keeps running in the background
-            and a handle string is returned that can be polled with
-            ``check_shell_command`` or stopped with ``kill_shell_command``.
+            The last ``tail`` lines of stdout are returned; on non-zero exit, useful
+            stdout is preserved together with stderr. A command still running after
+            ``timeout`` seconds is stopped with the processes it started, and its
+            output so far is returned. Without ``timeout``, a call that runs as part
+            of a background job has no time limit; that includes every call that
+            accepts ``background_after`` and, with background jobs on, a subagent's
+            calls for its delegated task, whether or not its caller waits for it. A
+            call that accepts ``background_after`` and leaves it unset returns a job
+            handle after 120 seconds while its command runs on. Any other command
+            stops after 120 seconds. Set ``timeout`` on a command that might not
+            end on its own, such as a watcher or a test run that can hang. Start a
+            server or anything else meant to keep running with
+            ``nohup cmd > out.log 2>&1 &``, which keeps running after the command
+            ends; in the foreground it would keep the call running until its job is
+            cancelled.
+
+            With ``mindroom_output_path``, capture the complete supported output
+            within the redirect byte limit instead of applying ``tail``; a stopped
+            command saves no file.
 
             Command strings use non-login Bash with the prepared execution environment.
             Use explicit ``["bash", "-lc", command]`` only when login startup is needed.
@@ -399,89 +499,68 @@ def shell_tools() -> type[Toolkit]:  # noqa: C901
             Args:
                 args: The command to run as a shell command string or a list of argv strings.
                 tail: The number of lines to return from the output.
-                timeout: Maximum seconds to wait before backgrounding the command.
+                timeout: Seconds after which the command is stopped; null uses the default limit.
 
             Returns:
-                The command output, an error message, or a background handle.
+                The command output or an error message.
 
             """
+            if self._refuse_commands:
+                return _NO_WORKER_ERROR
             try:
                 command_args = _normalize_shell_args(args)
             except ValueError as exc:
                 return f"Error: {exc}"
-            subprocess_env = _shell_subprocess_env(
-                self._runtime_env,
-                base_process_env=self._base_process_env,
-                shell_path_prepend=self._shell_path_prepend,
-                workspace_dir=self.base_dir,
-            )
+            if timeout is not None and timeout <= 0:
+                # A model may mean "no limit" or "run in the background"; either way, stopping at once helps nobody.
+                return "Error: timeout must be a positive number of seconds; omit it for the default limit."
+            subprocess_env = self._command_env()
             argv = _shell_subprocess_args(command_args, subprocess_env)
             cwd = str(self.base_dir) if self.base_dir else None
+            output_request = current_tool_output_file_request()
+            output_destination = (
+                ShellOutputDestination(
+                    workspace_root=str(output_request.policy.workspace_root),
+                    path=output_request.path.requested_path,
+                    max_bytes=output_request.policy.max_bytes,
+                )
+                if output_request is not None and output_request.path is not None
+                else None
+            )
+            stop_after = shell_call_timeout(timeout)
             if self._supervisor_socket is not None:
-                message = await run_command_via_supervisor(
+                result = await run_command_via_supervisor(
                     self._supervisor_socket,
-                    namespace=self._handle_namespace,
+                    namespace=_SHELL_NAMESPACE,
                     argv=argv,
                     env=subprocess_env,
                     cwd=cwd,
                     tail=tail,
-                    timeout=timeout,
+                    timeout=stop_after,
+                    on_timeout="kill",
+                    on_progress=report_tool_progress,
+                    output_destination=output_destination,
                 )
             else:
                 result = await run_command(
-                    _process_registry,
-                    namespace=self._handle_namespace,
+                    {},
+                    namespace=_SHELL_NAMESPACE,
                     argv=argv,
                     env=subprocess_env,
                     cwd=cwd,
+                    # Never the terminal MindRoom runs in, where a prompting command would wait forever.
+                    stdin=subprocess.DEVNULL,
                     tail=tail,
-                    timeout=timeout,
+                    timeout=stop_after,
+                    on_timeout="kill",
+                    on_progress=report_tool_progress,
+                    output_destination=output_destination,
                 )
-                message = result.message
+            message = result.message
+            if result.output_file_handled:
+                return ToolOutputFileHandled(message)
             if cwd is None:
                 return message
             return f"[cwd: {cwd}]\n{message}"
-
-        def check_shell_command(self, handle: str) -> str:
-            """Poll the status of a backgrounded shell command.
-
-            Safe to call multiple times — the record is kept until automatic
-            cleanup (~10 min after finish). Use ``kill_shell_command`` to stop
-            a running process.
-
-            Args:
-                handle: The ``shell:...`` identifier from the ``Handle:`` line returned by ``run_shell_command``.
-
-            Returns:
-                Output if the command finished, or a status summary if still running.
-
-            """
-            if self._supervisor_socket is not None:
-                return check_command_via_supervisor(
-                    self._supervisor_socket,
-                    namespace=self._handle_namespace,
-                    handle=handle,
-                )
-            return check_command(_process_registry, namespace=self._handle_namespace, handle=handle)
-
-        def kill_shell_command(self, handle: str, force: bool = False) -> str:
-            """Kill a backgrounded shell command.
-
-            Args:
-                handle: The ``shell:...`` identifier from the ``Handle:`` line returned by ``run_shell_command``.
-                force: If True send SIGKILL immediately instead of SIGTERM.
-
-            Returns:
-                Confirmation message or error.
-
-            """
-            if self._supervisor_socket is not None:
-                return kill_command_via_supervisor(
-                    self._supervisor_socket,
-                    namespace=self._handle_namespace,
-                    handle=handle,
-                    force=force,
-                )
-            return kill_command(_process_registry, namespace=self._handle_namespace, handle=handle, force=force)
 
     return MindRoomShellTools

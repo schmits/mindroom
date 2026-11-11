@@ -12,6 +12,7 @@ from mindroom.matrix.state import MatrixAccount, MatrixRoom, MatrixState
 from mindroom.thread_export.models import ThreadExportAccumulator
 from mindroom.thread_export.storage import _ROOT_MARKER_FILENAME, _ROOT_MARKER_TEXT
 from tests.conftest import bind_runtime_paths, test_runtime_paths
+from tests.matrix_state_helpers import save_matrix_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -60,12 +61,12 @@ def write_thread_export_matrix_state(
         )
         for account_key in account_keys
     }
-    state.save(test_runtime_paths(tmp_path))
+    save_matrix_state(state, test_runtime_paths(tmp_path))
 
 
 def write_invited_rooms(runtime_paths: RuntimePaths, entity_name: str, room_ids: list[str]) -> None:
     """Persist invited-room IDs for one managed entity."""
-    path = invited_rooms_path(runtime_paths.storage_root, entity_name)
+    path = invited_rooms_path(runtime_paths, entity_name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(room_ids), encoding="utf-8")
 

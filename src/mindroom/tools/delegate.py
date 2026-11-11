@@ -1,14 +1,16 @@
 """Delegate tool metadata registration.
 
-Registers the ``delegate`` tool in the metadata registry for UI display.
+Registers the ``delegate`` tool in the metadata registry.
 The actual toolkit (``mindroom.custom_tools.delegate.DelegateTools``) requires
-agent context and is instantiated directly in ``create_agent()``, so it
-is NOT added to ``TOOL_REGISTRY`` (no generic factory).
+agent context and is built in ``build_agent_toolkit()``, so it
+has no generic factory.
 """
 
+from mindroom.delegation.state import DELEGATION_FUNCTIONS
 from mindroom.tool_system.declarations import (
     SetupType,
     ToolCategory,
+    ToolFileAccess,
     ToolMetadata,
     ToolStatus,
 )
@@ -17,8 +19,10 @@ from mindroom.tool_system.registration import register_builtin_tool_metadata
 register_builtin_tool_metadata(
     ToolMetadata(
         name="delegate",
-        display_name="Agent Delegation",
-        description="Delegate tasks to other configured agents",
+        file_access=ToolFileAccess.NONE,
+        display_name="Subagents",
+        description="Start allowed subagents, continue their conversations, and return their results",
+        docs_url="https://docs.mindroom.chat/tools/agent-orchestration/#delegate",
         category=ToolCategory.PRODUCTIVITY,
         status=ToolStatus.AVAILABLE,
         setup_type=SetupType.NONE,
@@ -26,6 +30,6 @@ register_builtin_tool_metadata(
         icon_color="text-blue-500",
         config_fields=[],
         dependencies=[],
-        function_names=("delegate_task",),
+        function_names=DELEGATION_FUNCTIONS,
     ),
 )

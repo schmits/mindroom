@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 _MAX_LENGTH = 300
 
@@ -15,27 +18,32 @@ class _ErrorResponse(Protocol):
     def json(self) -> object: ...
 
 
-def error_detail_from_response(response: _ErrorResponse) -> str:
+def error_detail_from_response(response: _ErrorResponse, *, fallback: str = "unknown error") -> str:
     """Extract a compact, safe error detail from a JSON or plaintext error response.
 
     FastAPI validation errors carry ``detail`` as a list whose items echo the
     submitted request body under ``input``; only ``loc``/``msg`` are kept so
     secrets in the request body never reach error messages or logs. The raw
     body text is used only when the body is not JSON at all.
+    ``fallback`` is returned when the response carries no usable detail.
     """
     try:
         raw = response.json()
     except ValueError:
-        return response.text.strip()[:_MAX_LENGTH] or "unknown error"
+        return response.text.strip()[:_MAX_LENGTH] or fallback
     body = _json_object(raw)
     detail = body.get("detail") if body is not None else None
     if isinstance(detail, str) and detail.strip():
         return detail.strip()[:_MAX_LENGTH]
     if isinstance(detail, list):
-        parts = [part for part in map(_validation_error_part, detail) if part is not None]
-        if parts:
-            return "; ".join(parts)[:_MAX_LENGTH]
-    return "unknown error"
+        return validation_error_detail(detail, fallback=fallback)
+    return fallback
+
+
+def validation_error_detail(errors: Iterable[object], *, fallback: str) -> str:
+    """Name each rejected field and why, never its value, from FastAPI or pydantic validation errors."""
+    parts = [part for part in map(_validation_error_part, errors) if part is not None]
+    return "; ".join(parts)[:_MAX_LENGTH] if parts else fallback
 
 
 def _json_object(value: object) -> dict[str, object] | None:
@@ -50,5 +58,5 @@ def _validation_error_part(item: object) -> str | None:
         return None
     loc = entry.get("loc")
     msg = entry.get("msg")
-    field = ".".join(str(part) for part in loc) if isinstance(loc, list) and loc else "request"
+    field = ".".join(str(part) for part in loc) if isinstance(loc, list | tuple) and loc else "request"
     return f"{field}: {msg}" if isinstance(msg, str) else field

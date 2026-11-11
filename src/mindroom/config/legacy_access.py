@@ -3,21 +3,25 @@
 Delete this module after pre-membership configuration files are no longer expected to load.
 """
 
+# LEGACY_COMPAT: Agent reply permissions expressed as user lists.
 # Legacy format: `authorization.agent_reply_permissions` native values were user lists.
 # Last legacy release: v2026.8.71; structured reply policies introduced in v2026.8.72.
 # Handling: list shorthand remains accepted and is normalized before membership conversion.
 # Coverage: tests/test_access_migration.py::test_access_migration_splits_legacy_owner_permissions.
 
+# LEGACY_COMPAT: Authorization grants and reply policies before membership access.
 # Legacy format: authorization global/room grants, default access, and structured reply policies.
 # Last legacy release: v2026.8.127; membership schema introduced in v2026.8.128.
 # Handling: validated values are converted while explicit current grants are preserved.
 # Coverage: tests/test_access_migration.py::test_load_config_migrates_single_file_after_validation.
 
+# LEGACY_COMPAT: Root matrix_room_access defaults and room exceptions.
 # Legacy format: root `matrix_room_access` defaults and per-room exceptions.
 # Last legacy release: v2026.8.127; room membership defaults introduced in v2026.8.128.
 # Handling: validated defaults and managed-room references are converted without replacing current fields.
 # Coverage: tests/test_access_migration.py::test_access_migration_maps_room_permissions_and_matrix_defaults.
 
+# LEGACY_COMPAT: Unversioned access_model marker in external configuration.
 # Legacy format: unversioned `access_model` marker from external or pre-release input.
 # Last legacy release: no tagged native model; discard handling first released in v2026.8.128.
 # Handling: the marker is discarded and repeated normalization is inert.
@@ -37,7 +41,7 @@ from typing import Any, cast
 from pydantic import TypeAdapter, ValidationError
 
 from mindroom import yaml_io
-from mindroom.matrix_identifiers import split_concrete_matrix_user_ids
+from mindroom.matrix_identifiers import is_managed_room_key, split_concrete_matrix_user_ids
 
 _RETIRED_AUTHORIZATION_FIELDS = frozenset(
     {
@@ -76,11 +80,11 @@ def access_config_needs_migration(data: dict[str, Any]) -> bool:
 
 def validate_access_migration_source(
     data: dict[str, Any],
-    source_files: frozenset[Path],
-    config_path: Path,
+    *,
+    uses_includes: bool,
 ) -> None:
-    """Reject a legacy access migration composed from more than one source file."""
-    if access_config_needs_migration(data) and source_files != frozenset({config_path.resolve()}):
+    """Reject a legacy access migration that would erase authored include tags."""
+    if access_config_needs_migration(data) and uses_includes:
         msg = "Automatic access migration does not support !include configurations"
         raise AccessMigrationError(msg)
 
@@ -311,9 +315,7 @@ def _apply_reply_policy(
 
 def _managed_room_keys(config: dict[str, Any]) -> set[str]:
     room_keys = {
-        room_key
-        for room_key in config.get("rooms", {})
-        if isinstance(room_key, str) and not room_key.startswith(("!", "#"))
+        room_key for room_key in config.get("rooms", {}) if isinstance(room_key, str) and is_managed_room_key(room_key)
     }
     for section_name in ("agents", "teams"):
         entities = config.get(section_name)
@@ -325,7 +327,7 @@ def _managed_room_keys(config: dict[str, Any]) -> set[str]:
             room_keys.update(
                 room_key
                 for room_key in entity_data.get("rooms", [])
-                if isinstance(room_key, str) and not room_key.startswith(("!", "#"))
+                if isinstance(room_key, str) and is_managed_room_key(room_key)
             )
     return room_keys
 

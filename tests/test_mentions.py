@@ -4,21 +4,48 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import NoReturn
 
-if TYPE_CHECKING:
-    import pytest
+import pytest
 
 from mindroom import constants as constants_mod
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
-from mindroom.matrix.mentions import format_message_with_mentions, parse_mentions_in_text
+from mindroom.matrix import mentions as mentions_module
+from mindroom.matrix.mentions import (
+    format_message_with_mentions,
+    parse_mentions_in_text,
+    resolve_mentioned_user_ids_from_text,
+)
 from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.events import _TOOL_TRACE_KEY, ToolTraceEntry
-from tests.identity_helpers import actual_entity_usernames, persist_entity_accounts
+from tests.cpu_budget_helpers import cpu_budget
+from tests.identity_helpers import persist_actual_entity_accounts
+from tests.matrix_state_helpers import save_matrix_state
 
 _BOUND_RUNTIME_PATHS: dict[int, constants_mod.RuntimePaths] = {}
+
+
+def test_bulk_mentions_bound_overlap_and_deduplication_work() -> None:
+    """Bulk mention scanning and ordered deduplication finish within a bounded CPU budget."""
+    distinct_user_ids = [f"@a{index}:b" for index in range(10_000)]
+    for user_ids, expected_user_ids in (
+        (["@a:b"] * 12_000, ["@a:b"]),
+        ([*distinct_user_ids, *distinct_user_ids[:2]], distinct_user_ids),
+    ):
+        text = " ".join(user_ids) + " "
+        with cpu_budget(0.5):
+            tokens = mentions_module._scan_mention_tokens(text)
+        assert [token.explicit_user_id for token in tokens] == user_ids
+
+        replacements = [
+            mentions_module._MentionReplacement(start=0, end=0, plain_text="", markdown_text="", user_id=user_id)
+            for user_id in user_ids
+        ]
+        with cpu_budget(0.5):
+            mentioned_user_ids = mentions_module._mentioned_user_ids_from_replacements(replacements)
+        assert mentioned_user_ids == expected_user_ids
 
 
 def _default_runtime_paths() -> constants_mod.RuntimePaths:
@@ -44,18 +71,9 @@ def _bind_config(
         models={"default": ModelConfig(provider="ollama", id="test-model")},
     )
     bound = Config.validate_with_runtime(config.authored_model_dump(), runtime_paths)
-    _persist_mentions_accounts(bound, runtime_paths)
+    persist_actual_entity_accounts(bound, runtime_paths)
     _BOUND_RUNTIME_PATHS[id(bound)] = runtime_paths
     return bound
-
-
-def _persist_mentions_accounts(
-    config: Config,
-    runtime_paths: constants_mod.RuntimePaths,
-    *,
-    usernames: dict[str, str] | None = None,
-) -> None:
-    persist_entity_accounts(config, runtime_paths, usernames=usernames or actual_entity_usernames(config))
 
 
 def _make_config(runtime_paths: constants_mod.RuntimePaths) -> Config:
@@ -118,6 +136,52 @@ class TestMentionParsing:
         assert processed == "plain **markdown** text"
         assert markdown == "plain **markdown** text"
         assert mentions == []
+
+    def test_parse_validates_at_most_one_user_id_length_of_an_overlong_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 64 KiB single-token body validates only prefixes a Matrix user ID could be, not every prefix."""
+        config = _make_config(_default_runtime_paths())
+        validated: list[str] = []
+        original = mentions_module._is_valid_explicit_matrix_user_id
+
+        def counting_validation(candidate: str) -> bool:
+            validated.append(candidate)
+            return original(candidate)
+
+        monkeypatch.setattr(mentions_module, "_is_valid_explicit_matrix_user_id", counting_validation)
+        token = "@calculator:localhost" + "x" * (64 * 1024)
+
+        _parse_mentions_in_text(token, config)
+
+        assert len(validated) <= 255
+        assert max(map(len, validated)) <= 255
+
+    def test_resolving_a_2_mib_sidecar_body_stays_within_a_cpu_budget(self) -> None:
+        """A resolved long-text body full of mention-like tokens costs a bounded scan, and real mentions still resolve."""
+        config = _make_config(_default_runtime_paths())
+        runtime_paths = _runtime_paths_for(config)
+        for token in ("@" + "a" * 100 + ":!" + "b" * 150, "@a"):
+            body = "@calculator please ask @alice:example.org " + " ".join([token] * (2 * 1024 * 1024 // len(token)))
+            with cpu_budget(0.2):
+                user_ids = resolve_mentioned_user_ids_from_text(body, config, runtime_paths)
+            assert user_ids == ["@actual_calculator:localhost", "@alice:example.org"]
+
+    def test_resolving_an_overlong_body_drops_the_token_cut_by_the_scan_limit(self) -> None:
+        """A mention straddling the scan limit is dropped instead of resolving its cut-off prefix."""
+        config = _make_config(_default_runtime_paths())
+        runtime_paths = _runtime_paths_for(config)
+        limit = mentions_module._MAX_INBOUND_MENTION_SCAN_CHARS
+        for mention, kept_length, expected_user_ids in (
+            ("@calculator_notes", len("@calculator"), ["@actual_email:localhost"]),
+            ("@alice:example.org", len("@alice:example.o"), ["@actual_email:localhost"]),
+            ("@calculator ", len("@calculator"), ["@actual_email:localhost", "@actual_calculator:localhost"]),
+        ):
+            filler = "@email " + "x" * (limit - len("@email ") - kept_length - 1) + " "
+            body = filler + mention + " trailing"
+            assert body[:limit] == filler + mention[:kept_length]
+            assert resolve_mentioned_user_ids_from_text(body, config, runtime_paths) == expected_user_ids
 
     def test_parse_multiple_mentions(self) -> None:
         """Test parsing multiple agent mentions."""
@@ -314,103 +378,63 @@ class TestMentionParsing:
             "could you help with this?</p>\n"
         )
 
-    def test_format_message_with_mentions_uses_persisted_current_username_drift(self, tmp_path: Path) -> None:
-        """Mention formatting should target the live persisted Matrix account ID."""
-        runtime_paths = constants_mod.resolve_runtime_paths(
-            config_path=tmp_path / "config.yaml",
-            storage_path=tmp_path / "mindroom_data",
-            process_env={
-                "MATRIX_HOMESERVER": "http://localhost:8008",
-                "MINDROOM_NAMESPACE": "",
-            },
-        )
-        config = _make_config(runtime_paths)
-        state = MatrixState.load(runtime_paths=runtime_paths)
-        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
-
-        content = _format_message_with_mentions(
-            config,
-            "@general could you help with this?",
-        )
-
-        assert content["body"] == "@actual_general_live:localhost could you help with this?"
-        assert content["m.mentions"]["user_ids"] == ["@actual_general_live:localhost"]
-
-    def test_format_message_resolves_generated_alias_after_username_drift(self, tmp_path: Path) -> None:
-        """Generated aliases target the current account even after username drift."""
-        runtime_paths = constants_mod.resolve_runtime_paths(
-            config_path=tmp_path / "config.yaml",
-            storage_path=tmp_path / "mindroom_data",
-            process_env={
-                "MATRIX_HOMESERVER": "http://localhost:8008",
-                "MINDROOM_NAMESPACE": "",
-            },
-        )
-        config = _make_config(runtime_paths)
-        state = MatrixState.load(runtime_paths=runtime_paths)
-        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
-
-        content = _format_message_with_mentions(
-            config,
-            "@mindroom_general could you help with this?",
-        )
-
-        assert content["body"] == "@actual_general_live:localhost could you help with this?"
-        assert content["m.mentions"]["user_ids"] == ["@actual_general_live:localhost"]
-
-    def test_format_message_rejects_stale_generated_full_mxid_after_drift(self, tmp_path: Path) -> None:
-        """After username drift, stale generated full MXIDs should stay literal."""
-        runtime_paths = constants_mod.resolve_runtime_paths(
-            config_path=tmp_path / "config.yaml",
-            storage_path=tmp_path / "mindroom_data",
-            process_env={
-                "MATRIX_HOMESERVER": "http://localhost:8008",
-                "MINDROOM_NAMESPACE": "",
-            },
-        )
-        config = _make_config(runtime_paths)
-        state = MatrixState.load(runtime_paths=runtime_paths)
-        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
-
-        content = _format_message_with_mentions(
-            config,
-            "@mindroom_general:localhost could you help with this?",
-        )
-
-        assert content["body"] == "@mindroom_general:localhost could you help with this?"
-        assert content["m.mentions"]["user_ids"] == ["@mindroom_general:localhost"]
-
-    def test_format_message_rejects_stale_generated_router_full_mxid_after_drift(self, tmp_path: Path) -> None:
-        """After router username drift, stale generated full MXIDs should stay literal."""
-        runtime_paths = constants_mod.resolve_runtime_paths(
-            config_path=tmp_path / "config.yaml",
-            storage_path=tmp_path / "mindroom_data",
-            process_env={
-                "MATRIX_HOMESERVER": "http://localhost:8008",
-                "MINDROOM_NAMESPACE": "",
-            },
-        )
-        config = _make_config(runtime_paths)
-        state = MatrixState.load(runtime_paths=runtime_paths)
-        state.add_account("agent_router", "actual_router_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
-
-        content = _format_message_with_mentions(
-            config,
-            "@mindroom_router:localhost could you route this?",
-        )
-
-        assert content["body"] == "@mindroom_router:localhost could you route this?"
-        assert content["m.mentions"]["user_ids"] == ["@mindroom_router:localhost"]
-
-    def test_format_message_keeps_cross_domain_generated_full_mxid_literal_after_drift(
+    @pytest.mark.parametrize(
+        ("account_key", "username", "text", "expected_body", "expected_user_id"),
+        [
+            (
+                "agent_general",
+                "actual_general_live",
+                "@general could you help with this?",
+                "@actual_general_live:localhost could you help with this?",
+                "@actual_general_live:localhost",
+            ),
+            (
+                "agent_general",
+                "actual_general_live",
+                "@mindroom_general could you help with this?",
+                "@actual_general_live:localhost could you help with this?",
+                "@actual_general_live:localhost",
+            ),
+            (
+                "agent_general",
+                "actual_general_live",
+                "@mindroom_general:localhost could you help with this?",
+                "@mindroom_general:localhost could you help with this?",
+                "@mindroom_general:localhost",
+            ),
+            (
+                "agent_router",
+                "actual_router_live",
+                "@mindroom_router:localhost could you route this?",
+                "@mindroom_router:localhost could you route this?",
+                "@mindroom_router:localhost",
+            ),
+            (
+                "agent_general",
+                "actual_general_live",
+                "@mindroom_general:matrix.org could you help with this?",
+                "@mindroom_general:matrix.org could you help with this?",
+                "@mindroom_general:matrix.org",
+            ),
+        ],
+        ids=(
+            "agent-key-targets-live-account",
+            "generated-alias-targets-live-account",
+            "stale-generated-full-mxid-stays-literal",
+            "stale-generated-router-full-mxid-stays-literal",
+            "cross-domain-generated-full-mxid-stays-literal",
+        ),
+    )
+    def test_format_message_after_username_drift(
         self,
         tmp_path: Path,
+        account_key: str,
+        username: str,
+        text: str,
+        expected_body: str,
+        expected_user_id: str,
     ) -> None:
-        """Remote explicit MXIDs should stay literal even when their localpart looks stale locally."""
+        """After username drift, aliases target the live account and stale or remote full MXIDs stay literal."""
         runtime_paths = constants_mod.resolve_runtime_paths(
             config_path=tmp_path / "config.yaml",
             storage_path=tmp_path / "mindroom_data",
@@ -421,16 +445,13 @@ class TestMentionParsing:
         )
         config = _make_config(runtime_paths)
         state = MatrixState.load(runtime_paths=runtime_paths)
-        state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        state.add_account(account_key, username, "pw", domain="localhost")
+        save_matrix_state(state, runtime_paths)
 
-        content = _format_message_with_mentions(
-            config,
-            "@mindroom_general:matrix.org could you help with this?",
-        )
+        content = _format_message_with_mentions(config, text)
 
-        assert content["body"] == "@mindroom_general:matrix.org could you help with this?"
-        assert content["m.mentions"]["user_ids"] == ["@mindroom_general:matrix.org"]
+        assert content["body"] == expected_body
+        assert content["m.mentions"]["user_ids"] == [expected_user_id]
 
     def test_format_message_rejects_bare_persisted_current_localpart(self, tmp_path: Path) -> None:
         """Bare actual localparts are not runtime aliases."""
@@ -445,7 +466,7 @@ class TestMentionParsing:
         config = _make_config(runtime_paths)
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_account("agent_general", "actual_general_live", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
 
         content = _format_message_with_mentions(
             config,
@@ -813,7 +834,7 @@ class TestMentionParsing:
         )
         state = MatrixState.load(runtime_paths=runtime_paths)
         state.add_account("agent_mindroom_dev", "actual_mindroom_dev_oldns", "pw", domain="localhost")
-        state.save(runtime_paths=runtime_paths)
+        save_matrix_state(state, runtime_paths)
 
         text = "@mindroom_dev help"
         processed, mentions, _markdown = _parse_mentions_in_text(text, config)

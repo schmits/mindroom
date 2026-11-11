@@ -4,26 +4,42 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from mindroom.config.schema_hints import dashboard_hint
 from mindroom.config.validation import non_empty_stripped
 
 
 class HookOverrideConfig(BaseModel):
     """Per-hook deployer override configuration."""
 
-    enabled: bool = True
-    priority: int | None = None
-    timeout_ms: int | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, description="Run this hook; false disables it without removing the plugin")
+    priority: int | None = Field(default=None, description="Override the hook's default execution priority")
+    timeout_ms: int | None = Field(default=None, description="Override the hook's default timeout in milliseconds")
 
 
 class PluginEntryConfig(BaseModel):
     """Normalized plugin entry from the root config."""
 
-    path: str
-    enabled: bool = True
-    settings: dict[str, Any] = Field(default_factory=dict)
-    hooks: dict[str, HookOverrideConfig] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(description="Plugin directory, config-relative path, or Python package spec")
+    enabled: bool = Field(default=True, description="Load the plugin; false disables it without removing the entry")
+    required: bool = Field(
+        default=False,
+        description="Fail startup, and refuse a reload, when this plugin does not load, instead of running without it",
+    )
+    settings: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Free-form settings passed to the plugin at load time; may include credentials",
+        json_schema_extra=dashboard_hint(secret=True),
+    )
+    hooks: dict[str, HookOverrideConfig] = Field(
+        default_factory=dict,
+        description="Per-hook overrides keyed by hook function name",
+    )
 
     @field_validator("path")
     @classmethod

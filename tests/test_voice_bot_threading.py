@@ -11,12 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import nio
 import pytest
-from agno.media import Audio
 
 from mindroom import inbound_turn_normalizer
-from mindroom.attachments import _attachment_id_for_event, load_attachment
-from mindroom.coalescing import CoalescingGate
-from mindroom.coalescing_batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.attachments.storage import _attachment_id_for_event, load_attachment
+from mindroom.coalescing.batch import CoalescingKey, RequesterCoalescingOwner
+from mindroom.coalescing.gate import CoalescingGate
 from mindroom.config.main import Config
 from mindroom.constants import (
     ATTACHMENT_IDS_KEY,
@@ -29,45 +28,43 @@ from mindroom.constants import (
 from mindroom.conversation_resolver import MessageContext
 from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND, VOICE_SOURCE_KIND
+from mindroom.llm.media import Audio
 from mindroom.matrix.thread_membership import ThreadResolution
 from mindroom.matrix.users import AgentMatrixUser
+from mindroom.turns.dispatch import TurnDispatcher
 from tests.access_schema_support import with_current_room_member_access
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_ACCESS_TOKEN,
     TEST_PASSWORD,
     bind_runtime_paths,
-    dispatch_context_result,
     drain_coalescing,
     install_edit_message_mock,
     install_generate_response_mock,
     install_runtime_journal_support,
     install_send_response_mock,
-    replace_turn_controller_deps,
+    replace_turn_deps,
     runtime_paths_for,
     sync_bot_runtime_state,
     test_runtime_paths,
     unwrap_extracted_collaborator,
     wrap_extracted_collaborators,
 )
+from tests.runtime_fakes import ready_runtime
 from tests.turn_dispatch_helpers import prepared_turn_recorder
 
 if TYPE_CHECKING:
     from mindroom.bot import AgentBot
     from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
-    from mindroom.handled_turns import TurnRecord
+    from mindroom.turn_record import TurnRecord
 
 
-def _agent_bot(*, agent_user: AgentMatrixUser, storage_path: Path, config: Config, rooms: list[str]) -> AgentBot:
-    """Construct an agent bot with the explicit runtime bound to the test config."""
+def _agent_bot(*, agent_user: AgentMatrixUser, config: Config, rooms: list[str]) -> AgentBot:
+    """Construct an agent bot in a runtime whose router has not finished its first sync, so no voice echo is expected."""
+    runtime = ready_runtime(config, runtime_paths_for(config))
+    runtime.not_ready.add(ROUTER_AGENT_NAME)
     return install_runtime_journal_support(
-        make_test_agent_bot(
-            agent_user=agent_user,
-            storage_path=storage_path,
-            config=config,
-            runtime_paths=runtime_paths_for(config),
-            rooms=rooms,
-        ),
+        make_test_agent_bot(agent_user=agent_user, rooms=rooms, orchestrator=runtime),
     )
 
 
@@ -96,14 +93,14 @@ def mock_home_bot(generate_response_mock: AsyncMock) -> AgentBot:
         ),
     )
     config = bind_runtime_paths(config, test_runtime_paths(tmpdir))
-    bot = _agent_bot(agent_user=agent_user, storage_path=tmpdir, config=config, rooms=["!test:server"])
+    bot = _agent_bot(agent_user=agent_user, config=config, rooms=["!test:server"])
     wrap_extracted_collaborators(bot)
     bot.client = AsyncMock()
     bot.client.rooms = {}
     bot.client.user_id = "@mindroom_home:localhost"
     sync_bot_runtime_state(bot)
     bot.logger = MagicMock()
-    replace_turn_controller_deps(bot, logger=bot.logger)
+    replace_turn_deps(bot, logger=bot.logger)
     install_generate_response_mock(bot, generate_response_mock)
     return bot
 
@@ -268,7 +265,7 @@ def _threaded_prepared_text_event(
             "content": content,
         },
         server_timestamp=server_timestamp,
-        source_kind_override=source_kind,
+        payload_trusted=source_kind == VOICE_SOURCE_KIND,
     )
 
 
@@ -299,7 +296,7 @@ def _normalized_voice_result(
                 "content": content,
             },
             server_timestamp=event.server_timestamp,
-            source_kind_override=VOICE_SOURCE_KIND,
+            payload_trusted=True,
         ),
     )
 
@@ -330,12 +327,12 @@ def _assert_voice_fallback_dispatch(
 
 def _install_test_coalescing_gate(bot: AgentBot, *, debounce_seconds: float = 0.02) -> None:
     gate = CoalescingGate(
-        dispatch_turn=bot._dispatch_prepared_turn,
+        dispatch_turn=bot._turn_dispatcher.handle_prepared_turn,
         debounce_seconds=lambda: debounce_seconds,
         is_shutting_down=lambda: False,
     )
     bot._coalescing_gate = gate
-    replace_turn_controller_deps(bot, coalescing_gate=gate)
+    replace_turn_deps(bot, coalescing_gate=gate)
 
 
 @pytest.mark.asyncio
@@ -355,7 +352,7 @@ async def test_voice_message_in_main_room_creates_thread(
         requires_model_history_refresh=False,
     )
     bot._conversation_resolver.extract_dispatch_context = AsyncMock(
-        return_value=dispatch_context_result(mock_context),
+        return_value=mock_context,
     )
 
     room = MagicMock(spec=nio.MatrixRoom)
@@ -370,10 +367,9 @@ async def test_voice_message_in_main_room_creates_thread(
     voice_event = _make_voice_event(event_id="$voice123", source={"content": {}})
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 what is the weather"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 what is the weather"),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-        patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         await bot._on_media_message(room, voice_event)
@@ -404,7 +400,7 @@ async def test_voice_message_in_thread_continues_thread(
         requires_model_history_refresh=False,
     )
     bot._conversation_resolver.extract_dispatch_context = AsyncMock(
-        return_value=dispatch_context_result(mock_context),
+        return_value=mock_context,
     )
 
     room = MagicMock(spec=nio.MatrixRoom)
@@ -426,10 +422,9 @@ async def test_voice_message_in_thread_continues_thread(
     )
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 show me the forecast"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 show me the forecast"),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-        patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         await bot._on_media_message(room, voice_event)
@@ -476,19 +471,18 @@ async def test_voice_plain_reply_to_thread_message_stays_threaded_transitively(
         requires_model_history_refresh=False,
     )
     bot._conversation_resolver.extract_dispatch_context = AsyncMock(
-        return_value=dispatch_context_result(mock_context),
+        return_value=mock_context,
     )
 
     with (
-        patch("mindroom.voice_handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
-        patch("mindroom.voice_handler._handle_voice_message", return_value="🎤 continue the same thread"),
+        patch("mindroom.voice.handler._download_audio", new_callable=AsyncMock) as mock_download_audio,
+        patch("mindroom.voice.handler._handle_voice_message", return_value="🎤 continue the same thread"),
         patch.object(
-            bot._turn_controller.deps.resolver,
+            bot._turn_ingress.deps.resolver,
             "coalescing_thread_id",
             new=AsyncMock(return_value="$thread_root"),
         ),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
-        patch("mindroom.text_ingress_dispatch.is_dm_room", new_callable=AsyncMock, return_value=False),
     ):
         mock_download_audio.return_value = Audio(content=b"voice-bytes", mime_type="audio/ogg")
         await bot._on_media_message(room, voice_event)
@@ -534,7 +528,6 @@ async def test_voice_plain_reply_unproven_thread_candidate_is_not_admitted(
             new=AsyncMock(
                 return_value=ThreadResolution._indeterminate(
                     RuntimeError("proof unavailable"),
-                    candidate_thread_root_id="$maybe-thread-root",
                 ),
             ),
         ),
@@ -564,13 +557,13 @@ async def test_voice_message_signals_active_turn_before_stt(mock_home_bot: Agent
             },
         },
     )
-    target = bot._turn_controller.deps.resolver.build_message_target(
+    target = bot._turn_ingress.deps.resolver.build_message_target(
         room_id=room.room_id,
         thread_id="$thread_root",
         reply_to_event_id=voice_event.event_id,
         event_source=voice_event.source,
     )
-    lifecycle = unwrap_extracted_collaborator(bot._response_runner)._lifecycle_coordinator
+    lifecycle = unwrap_extracted_collaborator(bot._response_runner).lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     prepare_started = asyncio.Event()
     allow_prepare = asyncio.Event()
@@ -589,7 +582,7 @@ async def test_voice_message_signals_active_turn_before_stt(mock_home_bot: Agent
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
@@ -612,7 +605,7 @@ async def test_voice_message_signals_active_turn_before_stt(mock_home_bot: Agent
             queued_signal.finish_response_turn()
 
     assert queued_signal.pending_human_messages == 0
-    assert not queued_signal.is_set()
+    assert not queued_signal.has_pending_human_messages()
 
 
 @pytest.mark.parametrize(
@@ -646,13 +639,13 @@ async def test_voice_message_clears_active_turn_signal_when_post_stt_echo_fails(
             },
         },
     )
-    target = bot._turn_controller.deps.resolver.build_message_target(
+    target = bot._turn_ingress.deps.resolver.build_message_target(
         room_id=room.room_id,
         thread_id="$thread_root",
         reply_to_event_id=voice_event.event_id,
         event_source=voice_event.source,
     )
-    lifecycle = unwrap_extracted_collaborator(bot._response_runner)._lifecycle_coordinator
+    lifecycle = unwrap_extracted_collaborator(bot._response_runner).lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     normalized_voice = inbound_turn_normalizer._VoiceNormalizationResult(
         event=PreparedIngress(
@@ -661,7 +654,7 @@ async def test_voice_message_clears_active_turn_signal_when_post_stt_echo_fails(
             body="🎤 continue",
             source={"content": {"body": "🎤 continue", SOURCE_KIND_KEY: "voice"}},
             server_timestamp=voice_event.server_timestamp,
-            source_kind_override="voice",
+            payload_trusted=True,
         ),
     )
 
@@ -669,7 +662,7 @@ async def test_voice_message_clears_active_turn_signal_when_post_stt_echo_fails(
         assert queued_signal.pending_human_messages == 1
         raise echo_error
 
-    replace_turn_controller_deps(bot, agent_name=ROUTER_AGENT_NAME)
+    replace_turn_deps(bot, agent_name=ROUTER_AGENT_NAME)
     install_send_response_mock(bot, AsyncMock(return_value="$voice-placeholder"))
     install_edit_message_mock(bot, AsyncMock(side_effect=fail_visible_echo))
     turn_active = True
@@ -677,7 +670,7 @@ async def test_voice_message_clears_active_turn_signal_when_post_stt_echo_fails(
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(return_value=normalized_voice),
             ),
@@ -692,7 +685,7 @@ async def test_voice_message_clears_active_turn_signal_when_post_stt_echo_fails(
             queued_signal.finish_response_turn()
 
     assert queued_signal.pending_human_messages == 0
-    assert not queued_signal.is_set()
+    assert not queued_signal.has_pending_human_messages()
 
 
 @pytest.mark.asyncio
@@ -711,22 +704,20 @@ async def test_non_router_skips_visible_echo_and_dispatches_canonical_voice(
         thread_id="$thread_root",
     )
     bot._conversation_resolver.extract_dispatch_context = AsyncMock(
-        return_value=dispatch_context_result(
-            MessageContext(
-                am_i_mentioned=True,
-                is_thread=True,
-                thread_id="$thread_root",
-                thread_history=[],
-                mentioned_agents=[bot.matrix_id],
-                has_non_agent_mentions=False,
-                requires_model_history_refresh=False,
-            ),
+        return_value=MessageContext(
+            am_i_mentioned=True,
+            is_thread=True,
+            thread_id="$thread_root",
+            thread_history=[],
+            mentioned_agents=[bot.matrix_id],
+            has_non_agent_mentions=False,
+            requires_model_history_refresh=False,
         ),
     )
 
     with (
         patch.object(
-            bot._turn_controller.deps.normalizer,
+            bot._turn_ingress.deps.normalizer,
             "prepare_voice_event",
             new=AsyncMock(return_value=normalized_voice),
         ),
@@ -737,7 +728,7 @@ async def test_non_router_skips_visible_echo_and_dispatches_canonical_voice(
 
     generate_response_mock.assert_called_once()
     assert generate_response_mock.call_args.kwargs["prompt"].startswith("canonical voice transcript")
-    assert bot._turn_store.visible_echo_for_source(voice_event.event_id) is None
+    assert await bot._turn_store.visible_echo(voice_event.event_id) is None
 
 
 @pytest.mark.asyncio
@@ -769,24 +760,24 @@ async def test_voice_message_uses_canonical_target_for_queued_notice_before_stt(
         body="🎤 continue somewhere else",
         source={"content": {"body": "🎤 continue somewhere else", SOURCE_KIND_KEY: "voice"}},
         server_timestamp=voice_event.server_timestamp,
-        source_kind_override="voice",
+        payload_trusted=True,
     )
     normalized_voice = inbound_turn_normalizer._VoiceNormalizationResult(
         event=normalized_event,
     )
-    pre_stt_target = bot._turn_controller.deps.resolver.build_message_target(
+    pre_stt_target = bot._turn_ingress.deps.resolver.build_message_target(
         room_id=room.room_id,
         thread_id="$pre_stt_thread",
         reply_to_event_id=voice_event.event_id,
         event_source=voice_event.source,
     )
-    alternate_target = bot._turn_controller.deps.resolver.build_message_target(
+    alternate_target = bot._turn_ingress.deps.resolver.build_message_target(
         room_id=room.room_id,
         thread_id="$post_stt_thread",
         reply_to_event_id=normalized_event.event_id,
         event_source=normalized_event.source,
     )
-    lifecycle = unwrap_extracted_collaborator(bot._response_runner)._lifecycle_coordinator
+    lifecycle = unwrap_extracted_collaborator(bot._response_runner).lifecycle_coordinator
     pre_stt_signal = lifecycle._get_or_create_queued_signal(pre_stt_target)
     alternate_signal = lifecycle._get_or_create_queued_signal(alternate_target)
     dispatch_count = 0
@@ -804,17 +795,18 @@ async def test_voice_message_uses_canonical_target_for_queued_notice_before_stt(
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.resolver,
+                bot._turn_ingress.deps.resolver,
                 "coalescing_thread_id",
                 new=AsyncMock(return_value="$pre_stt_thread"),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(return_value=normalized_voice),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(capture_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -834,8 +826,8 @@ async def test_voice_message_uses_canonical_target_for_queued_notice_before_stt(
     assert dispatch_count == 1
     assert pre_stt_signal.pending_human_messages == 0
     assert alternate_signal.pending_human_messages == 0
-    assert not pre_stt_signal.is_set()
-    assert not alternate_signal.is_set()
+    assert not pre_stt_signal.has_pending_human_messages()
+    assert not alternate_signal.has_pending_human_messages()
 
 
 @pytest.mark.asyncio
@@ -869,16 +861,16 @@ async def test_room_mode_voice_notice_survives_until_queued_dispatch_owns_it(
             body="🎤 room mode follow-up",
             source={"content": {"body": "🎤 room mode follow-up", SOURCE_KIND_KEY: "voice"}},
             server_timestamp=voice_event.server_timestamp,
-            source_kind_override="voice",
+            payload_trusted=True,
         ),
     )
-    target = bot._turn_controller.deps.resolver.build_message_target(
+    target = bot._turn_ingress.deps.resolver.build_message_target(
         room_id=room.room_id,
         thread_id=None,
         reply_to_event_id=voice_event.event_id,
         event_source=voice_event.source,
     )
-    lifecycle = unwrap_extracted_collaborator(bot._response_runner)._lifecycle_coordinator
+    lifecycle = unwrap_extracted_collaborator(bot._response_runner).lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     dispatch_count = 0
     prepare_started = asyncio.Event()
@@ -903,12 +895,13 @@ async def test_room_mode_voice_notice_survives_until_queued_dispatch_owns_it(
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(capture_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -931,7 +924,7 @@ async def test_room_mode_voice_notice_survives_until_queued_dispatch_owns_it(
 
     assert dispatch_count == 1
     assert queued_signal.pending_human_messages == 0
-    assert not queued_signal.is_set()
+    assert not queued_signal.has_pending_human_messages()
 
 
 @pytest.mark.asyncio
@@ -997,28 +990,28 @@ async def test_voice_and_text_followups_during_streaming_coalesce_in_receive_ord
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "resolve_text_event",
                 new=AsyncMock(side_effect=resolve_text_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
         ):
-            reservation_owner = bot._turn_controller.reserve_prompt_ingress_order(room, "@user:example.com")
-            await bot._turn_controller._enqueue_for_dispatch(
+            ticket = bot._turn_ingress.reserve_prompt_ingress_order(room, "@user:example.com")
+            await bot._turn_ingress._enqueue_for_dispatch(
                 streaming_event,
                 room,
-                source_kind="message",
-                requester_user_id="@user:example.com",
-                reservation_owner=reservation_owner,
+                facts=bot._ingress_validator.classify(streaming_event, room_id=room.room_id),
+                ticket=ticket,
                 coalescing_key=CoalescingKey(
                     room.room_id,
                     "$thread_root",
@@ -1108,17 +1101,18 @@ async def test_voice_first_text_second_uses_receive_order_when_stt_finishes_late
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "resolve_text_event",
                 new=AsyncMock(side_effect=resolve_text_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1200,22 +1194,23 @@ async def test_voice_first_text_second_waits_for_slow_thread_resolution(
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.resolver,
+                bot._turn_ingress.deps.resolver,
                 "coalescing_thread_id",
                 new=AsyncMock(side_effect=coalescing_thread_id),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "resolve_text_event",
                 new=AsyncMock(side_effect=resolve_text_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1306,22 +1301,23 @@ async def test_root_voice_and_root_text_share_room_scope_while_stt_pending(
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.resolver,
+                bot._turn_ingress.deps.resolver,
                 "coalescing_thread_id",
                 new=AsyncMock(return_value=None),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "resolve_text_event",
                 new=AsyncMock(side_effect=resolve_text_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1394,12 +1390,13 @@ async def test_room_mode_voice_burst_dispatches_as_one_turn(mock_home_bot: Agent
     try:
         with (
             patch.object(
-                bot._turn_controller.deps.normalizer,
+                bot._turn_ingress.deps.normalizer,
                 "prepare_voice_event",
                 new=AsyncMock(side_effect=prepare_voice_event),
             ),
-            patch(
-                "mindroom.turn_controller.dispatch_text_message",
+            patch.object(
+                TurnDispatcher,
+                "dispatch_turn",
                 new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
             ),
             patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1427,7 +1424,7 @@ async def test_room_mode_voice_burst_dispatches_as_one_turn(mock_home_bot: Agent
 
 @pytest.mark.asyncio
 async def test_trusted_router_visible_voice_echo_is_display_only(mock_home_bot: AgentBot) -> None:
-    """Trusted router voice echoes should be skipped without growing target turn ledgers."""
+    """Trusted router voice echoes should be skipped without recording target turns."""
     bot = mock_home_bot
     room = _threaded_room()
     echo_event = _threaded_prepared_text_event(
@@ -1443,25 +1440,25 @@ async def test_trusted_router_visible_voice_echo_is_display_only(mock_home_bot: 
 
     with (
         patch.object(
-            bot._turn_controller.deps.resolver,
+            bot._turn_ingress.deps.resolver,
             "coalescing_thread_id",
             new=AsyncMock(return_value="$thread_root"),
         ),
-        patch("mindroom.turn_controller.dispatch_text_message", new=AsyncMock()) as mock_dispatch,
+        patch.object(TurnDispatcher, "dispatch_turn", new=AsyncMock()) as mock_dispatch,
     ):
-        reservation_owner = bot._turn_controller.reserve_prompt_ingress_order(room, "@user:example.com")
-        await bot._turn_controller._dispatch_prepared_text_like_ingress(
+        ticket = bot._turn_ingress.reserve_prompt_ingress_order(room, "@user:example.com")
+        await bot._turn_ingress._dispatch_prepared_text_like_ingress(
             room=room,
             prepared_event=echo_event,
-            requester_user_id="@user:example.com",
-            reservation_owner=reservation_owner,
+            facts=bot._ingress_validator.classify(echo_event, room_id=room.room_id),
+            ticket=ticket,
             coalescing_thread_id="$thread_root",
         )
-        await reservation_owner.release()
+        ticket.close()
         await drain_coalescing(bot)
 
     mock_dispatch.assert_not_awaited()
-    assert not bot._turn_store.is_handled("$echo")
+    assert not await bot._turn_store.is_handled(room.room_id, "$echo")
 
 
 @pytest.mark.asyncio
@@ -1481,25 +1478,25 @@ async def test_forged_visible_voice_echo_marker_still_dispatches(mock_home_bot: 
 
     with (
         patch.object(
-            bot._turn_controller.deps.resolver,
+            bot._turn_ingress.deps.resolver,
             "coalescing_thread_id",
             new=AsyncMock(return_value="$thread_root"),
         ),
-        patch("mindroom.turn_controller.dispatch_text_message", new=AsyncMock()) as mock_dispatch,
+        patch.object(TurnDispatcher, "dispatch_turn", new=AsyncMock()) as mock_dispatch,
     ):
-        reservation_owner = bot._turn_controller.reserve_prompt_ingress_order(room, "@user:example.com")
-        await bot._turn_controller._dispatch_prepared_text_like_ingress(
+        ticket = bot._turn_ingress.reserve_prompt_ingress_order(room, "@user:example.com")
+        await bot._turn_ingress._dispatch_prepared_text_like_ingress(
             room=room,
             prepared_event=forged_event,
-            requester_user_id="@user:example.com",
-            reservation_owner=reservation_owner,
+            facts=bot._ingress_validator.classify(forged_event, room_id=room.room_id),
+            ticket=ticket,
             coalescing_thread_id="$thread_root",
         )
-        await reservation_owner.release()
+        ticket.close()
         await drain_coalescing(bot)
 
     mock_dispatch.assert_awaited_once()
-    assert not bot._turn_store.is_handled("$forged-echo")
+    assert not await bot._turn_store.is_handled(room.room_id, "$forged-echo")
 
 
 @pytest.mark.asyncio
@@ -1522,13 +1519,14 @@ async def test_raw_voice_normalization_exception_dispatches_audio_fallback(mock_
 
     with (
         patch.object(
-            bot._turn_controller.deps.normalizer,
+            bot._turn_ingress.deps.normalizer,
             "prepare_voice_event",
             new=AsyncMock(side_effect=RuntimeError("stt failed")),
         ),
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=b"raw audio bytes")),
-        patch(
-            "mindroom.turn_controller.dispatch_text_message",
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=b"raw audio bytes")),
+        patch.object(
+            TurnDispatcher,
+            "dispatch_turn",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
         ),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1569,9 +1567,10 @@ async def test_raw_voice_download_failure_dispatches_text_only_fallback(mock_hom
         dispatches.append((dispatched_event, _handled_source_event_ids(handled_turn)))
 
     with (
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=None)),
-        patch(
-            "mindroom.turn_controller.dispatch_text_message",
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=None)),
+        patch.object(
+            TurnDispatcher,
+            "dispatch_turn",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
         ),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1582,6 +1581,51 @@ async def test_raw_voice_download_failure_dispatches_text_only_fallback(mock_hom
     dispatched_event = _assert_voice_fallback_dispatch(
         dispatches,
         source_event_id="$audio-download-fails",
+        thread_id="$thread_root",
+    )
+    assert ATTACHMENT_IDS_KEY not in dispatched_event.source["content"]
+
+
+@pytest.mark.asyncio
+async def test_text_only_voice_fallback_drops_sender_supplied_attachment_ids(mock_home_bot: AgentBot) -> None:
+    """The fallback registers no audio, so attachment IDs the sender wrote must not become trusted metadata."""
+    bot = mock_home_bot
+    room = _threaded_room()
+    voice_event = _make_threaded_voice_event(event_id="$audio-preparers-fail")
+    voice_event.source["content"][ATTACHMENT_IDS_KEY] = ["att_other_room"]
+    dispatches: list[tuple[PreparedIngress | nio.RoomMessageText, list[str]]] = []
+
+    async def record_dispatch(
+        _room: nio.MatrixRoom,
+        dispatched_event: PreparedIngress | nio.RoomMessageText,
+        _requester_user_id: str,
+        *,
+        handled_turn: TurnRecord | None = None,
+        **_metadata: object,
+    ) -> None:
+        dispatches.append((dispatched_event, _handled_source_event_ids(handled_turn)))
+
+    normalizer = bot._turn_ingress.deps.normalizer
+    with (
+        patch.object(normalizer, "prepare_voice_event", new=AsyncMock(side_effect=RuntimeError("stt failed"))),
+        patch.object(
+            normalizer,
+            "prepare_raw_voice_fallback_event",
+            new=AsyncMock(side_effect=RuntimeError("registration failed")),
+        ),
+        patch.object(
+            TurnDispatcher,
+            "dispatch_turn",
+            new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
+        ),
+        patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
+    ):
+        await bot._on_media_message(room, voice_event)
+        await drain_coalescing(bot)
+
+    dispatched_event = _assert_voice_fallback_dispatch(
+        dispatches,
+        source_event_id="$audio-preparers-fail",
         thread_id="$thread_root",
     )
     assert ATTACHMENT_IDS_KEY not in dispatched_event.source["content"]
@@ -1609,13 +1653,14 @@ async def test_raw_voice_thread_resolution_exception_does_not_dispatch_guessed_f
 
     with (
         patch.object(
-            bot._turn_controller.deps.resolver,
+            bot._turn_ingress.deps.resolver,
             "coalescing_thread_id",
             new=AsyncMock(side_effect=RuntimeError("thread lookup failed")),
         ),
-        patch.object(bot._turn_controller.deps.normalizer, "prepare_voice_event", new=AsyncMock()),
-        patch(
-            "mindroom.turn_controller.dispatch_text_message",
+        patch.object(bot._turn_ingress.deps.normalizer, "prepare_voice_event", new=AsyncMock()),
+        patch.object(
+            TurnDispatcher,
+            "dispatch_turn",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
         ),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),
@@ -1671,14 +1716,15 @@ async def test_raw_voice_root_target_failures_do_not_dispatch_guessed_fallbacks(
 
     with (
         patch.object(
-            bot._turn_controller.deps.resolver,
+            bot._turn_ingress.deps.resolver,
             "coalescing_thread_id",
             new=AsyncMock(side_effect=RuntimeError("thread lookup failed")),
         ),
-        patch("mindroom.voice_handler.download_media_bytes", new=AsyncMock(return_value=None)),
-        patch.object(bot._turn_controller.deps.normalizer, "prepare_voice_event", new=AsyncMock()),
-        patch(
-            "mindroom.turn_controller.dispatch_text_message",
+        patch("mindroom.voice.handler.download_media_bytes", new=AsyncMock(return_value=None)),
+        patch.object(bot._turn_ingress.deps.normalizer, "prepare_voice_event", new=AsyncMock()),
+        patch.object(
+            TurnDispatcher,
+            "dispatch_turn",
             new=AsyncMock(side_effect=prepared_turn_recorder(record_dispatch)),
         ),
         patch("mindroom.turn_policy.TurnPolicy.can_reply_to_sender_in_room", return_value=True),

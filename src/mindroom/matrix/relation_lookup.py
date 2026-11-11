@@ -2,8 +2,7 @@
 
 Thread resolution needs relation facts about events the conversation refers to:
 what a reply points at, what an edit replaces, which thread an arbitrary event
-belongs to. The old answer was a durable cache of raw event JSON, filled on
-demand and kept forever, which is most of the machinery this cutover removes.
+belongs to.
 
 Almost all of those questions are about events this bot already admitted, and
 the journal recorded their thread when it accepted them. The rest -- an event
@@ -12,7 +11,7 @@ homeserver, once, and are remembered only for the turn that asked.
 
 Nothing here is durable. A per-turn memo exists so one turn resolving the same
 event from three places pays for one round trip; it is deliberately not a cache
-that outlives the turn, because that is the thing being deleted.
+that outlives the turn.
 """
 
 from __future__ import annotations
@@ -23,9 +22,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import nio
+from aiohttp import ClientResponse
 
 from mindroom.logging_config import get_logger
 from mindroom.matrix.event_info import EventInfo
+from mindroom.matrix.thread_membership import RelatedEventUnavailableError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -87,11 +88,12 @@ class RelationLookup:
         so local state is the whole answer.
 
         Not knowing is reported as not in a thread. That is the conservative
-        direction for the room scan that asks: an event it cannot place stays
-        where it is rather than being reattached to a thread on a guess.
+        direction for the tool thread normalization that asks: an event it
+        cannot place stays where it is rather than being reattached to a thread
+        on a guess.
         """
         try:
-            admitted, thread_id = await self.store.admitted_thread_id(room_id=room_id, event_id=event_id)
+            return await self.strict_thread_id(room_id, event_id)
         except Exception:
             logger.warning(
                 "Failed to read the admitted thread for an event; treating it as unproven",
@@ -100,7 +102,6 @@ class RelationLookup:
                 exc_info=True,
             )
             return None
-        return thread_id if admitted else None
 
     async def strict_thread_id(self, room_id: str, event_id: str) -> str | None:
         """Return the thread one event belongs to, raising if that cannot be established.
@@ -108,16 +109,14 @@ class RelationLookup:
         The fail-closed sibling of `thread_id`. A caller classifying an
         outbound mutation -- deciding whether a send or a redaction lands in a
         thread or at room level -- must not be told "no thread" by a lookup
-        that simply failed. Degrading there silently reclassifies threaded work
-        as room-level, which is how the cache-backed index behaved before it
-        was replaced: it propagated its failures, and the tool turned them into
+        that simply failed. Degrading there would silently reclassify threaded
+        work as room-level; propagating the failure lets the tool turn it into
         an explicit error rather than a wrong send.
 
-        Journal-only, and deliberately so. This stands in for the cache index
-        the mutation path used to consult, which answered from local rows or
-        not at all. The access object that calls this already fetches the
-        event's own relation metadata separately, so falling back to the
-        homeserver here would fetch the same event twice per classification.
+        Journal-only, and deliberately so. The access object that calls this
+        already fetches the event's own relation metadata separately, so
+        falling back to the homeserver here would fetch the same event twice
+        per classification.
         """
         admitted, thread_id = await self.store.admitted_thread_id(room_id=room_id, event_id=event_id)
         return thread_id if admitted else None
@@ -149,10 +148,9 @@ class RelationLookup:
             info = await self.event_info(room_id, event_id)
         except Exception:
             # Asking which thread an event is in is advisory: a caller that
-            # cannot find out treats the event as unthreaded and degrades,
-            # which is what the index this replaced did. `event_info` still
-            # raises for callers resolving a specific event, where guessing
-            # would attach the turn to the wrong conversation.
+            # cannot find out treats the event as unthreaded and degrades.
+            # `event_info` still raises for callers resolving a specific event,
+            # where guessing would attach the turn to the wrong conversation.
             logger.warning(
                 "Failed to resolve the thread of a related event; treating it as unthreaded",
                 room_id=room_id,
@@ -169,7 +167,8 @@ class RelationLookup:
         existing. A caller resolving a reply target cannot tell an event that
         was deleted from one the homeserver merely refused to serve, and
         silently treating the second as the first would attach the turn to the
-        wrong conversation.
+        wrong conversation. A refusal no retry can change raises
+        ``RelatedEventUnavailableError``.
         """
         memo = _TURN_EVENT_INFO.get()
         key = (room_id, event_id.strip())
@@ -191,4 +190,24 @@ class RelationLookup:
             return None
         detail = response.message if isinstance(response, nio.RoomGetEventError) else "unknown error"
         msg = f"Failed to resolve related Matrix event {event_id}: {detail}"
+        if isinstance(response, nio.RoomGetEventError) and _refuses_event(response):
+            raise RelatedEventUnavailableError(msg)
         raise RuntimeError(msg)
+
+
+def _refuses_event(response: nio.RoomGetEventError) -> bool:
+    """Return whether the homeserver's refusal holds for every later request for this event.
+
+    Only two answers are about the event itself: ``M_FORBIDDEN`` (hidden
+    from this account, for example history from before it joined) and a
+    plain 400 for an event ID the server rejects as malformed. A missing
+    event (404 ``M_NOT_FOUND``) never reaches here. Every other answer --
+    another 403 or 404 errcode such as ``M_CONSENT_NOT_GIVEN`` or
+    ``M_UNRECOGNIZED``, 401, 408, 429, a server error -- is about the
+    account, the deployment, or the moment, and may change on retry.
+    """
+    if response.status_code == "M_FORBIDDEN":
+        return True
+    transport = response.transport_response
+    status = transport.status if isinstance(transport, ClientResponse) else None
+    return status == 400 and response.status_code != "M_UNRECOGNIZED"

@@ -6,23 +6,26 @@ export default {
     extend: {
       fontFamily: {
         sans: [
-          "Rubik",
+          '"Hanken Grotesk Variable"',
           "system-ui",
           "-apple-system",
           "BlinkMacSystemFont",
           "Segoe UI",
-          "Roboto",
           "sans-serif",
         ],
-        display: [
-          "Rubik",
-          "system-ui",
-          "-apple-system",
-          "BlinkMacSystemFont",
-          "Segoe UI",
-          "Roboto",
-          "sans-serif",
+        mono: [
+          '"JetBrains Mono Variable"',
+          "ui-monospace",
+          "SFMono-Regular",
+          "Menlo",
+          "monospace",
         ],
+      },
+      borderRadius: {
+        md: "var(--radius)",
+        lg: "calc(var(--radius) + 4px)",
+        xl: "calc(var(--radius) + 8px)",
+        "2xl": "calc(var(--radius) + 14px)",
       },
       colors: {
         border: "hsl(var(--border))",
@@ -58,6 +61,7 @@ export default {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        active: "hsl(var(--active))",
       },
       animation: {
         "fade-in": "fadeIn 300ms ease-in-out",

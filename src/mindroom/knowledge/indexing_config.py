@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple, cast
 
-from mindroom.embeddings import effective_knowledge_embedder_signature
+from mindroom.embeddings.signatures import effective_knowledge_embedder_signature
 from mindroom.knowledge.legacy_metadata import normalize_legacy_indexing_settings
 from mindroom.knowledge.redaction import credential_free_url_identity
 
@@ -24,6 +23,8 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
 
 _INDEXING_MODES: set[str] = {"semantic", "files"}
+#: Storage format semantic indexes are written in; a change rebuilds every semantic index.
+_VECTOR_STORE_FORMAT = "sqlite-1"
 
 
 class _QueryCompatibilityKey(NamedTuple):
@@ -37,6 +38,7 @@ class _QueryCompatibilityKey(NamedTuple):
     embedder_model: str
     embedder_host: str
     embedder_dimensions: str
+    vector_store: str
 
 
 class _CorpusCompatibilityKey(NamedTuple):
@@ -95,6 +97,10 @@ class IndexingSettings:
     #: created before content-aware publication existed. False stays empty so
     #: ordinary authored knowledge indexes retain their existing identity.
     require_content_before_publish: str = ""
+    #: Storage format of a semantic index's vectors; "" for indexes Chroma held, which the owned store cannot read.
+    vector_store: str = ""
+    #: Model that writes each chunk's context before indexing; "" when chunks are indexed as read.
+    chunk_context_model: str = ""
 
     @classmethod
     def from_metadata(cls, settings: Mapping[str, str]) -> IndexingSettings | None:
@@ -125,6 +131,8 @@ class IndexingSettings:
             "extra_extensions",
             "skip_hidden",
             "require_content_before_publish",
+            "vector_store",
+            "chunk_context_model",
         }
         if not required_keys.issubset(settings) or set(settings) - required_keys - optional_keys:
             return None
@@ -157,6 +165,8 @@ class IndexingSettings:
             extra_extensions=settings["extra_extensions"],
             skip_hidden=settings["skip_hidden"],
             require_content_before_publish=settings["require_content_before_publish"],
+            vector_store=settings["vector_store"],
+            chunk_context_model=settings["chunk_context_model"],
         )
 
     def to_metadata(self) -> dict[str, str]:
@@ -185,9 +195,11 @@ class IndexingSettings:
             "extra_extensions": self.extra_extensions,
             "skip_hidden": self.skip_hidden,
             "require_content_before_publish": self.require_content_before_publish,
+            "vector_store": self.vector_store,
+            "chunk_context_model": self.chunk_context_model,
         }
 
-    def query_compatibility_key(self) -> _QueryCompatibilityKey:
+    def _query_compatibility_key(self) -> _QueryCompatibilityKey:
         """Return fields that must match for safe vector queries."""
         return _QueryCompatibilityKey(
             base_id=self.base_id,
@@ -198,9 +210,10 @@ class IndexingSettings:
             embedder_model=self.embedder_model,
             embedder_host=self.embedder_host,
             embedder_dimensions=self.embedder_dimensions,
+            vector_store=self.vector_store,
         )
 
-    def corpus_compatibility_key(self) -> _CorpusCompatibilityKey:
+    def _corpus_compatibility_key(self) -> _CorpusCompatibilityKey:
         """Return fields that must match for safe source-corpus reuse."""
         return _CorpusCompatibilityKey(
             base_id=self.base_id,
@@ -223,11 +236,15 @@ class IndexingSettings:
         )
 
 
-def chroma_collection_exists(storage_path: Path, collection_name: str) -> bool:
-    """Check collection existence without constructing Agno Knowledge."""
-    from mindroom.knowledge.read_proxy import collection_exists  # noqa: PLC0415
-
-    return collection_exists(str(storage_path), collection_name)
+def published_index_settings_compatible(
+    published_settings: IndexingSettings,
+    current_settings: IndexingSettings,
+) -> bool:
+    """Return whether a published index can be queried under the current config."""
+    return (
+        published_settings._query_compatibility_key() == current_settings._query_compatibility_key()
+        and published_settings._corpus_compatibility_key() == current_settings._corpus_compatibility_key()
+    )
 
 
 def _safe_identifier(value: str) -> str:
@@ -235,17 +252,34 @@ def _safe_identifier(value: str) -> str:
     return sanitized or "default"
 
 
-@lru_cache(maxsize=64)
 def storage_key_for_base(base_id: str, knowledge_path: Path) -> str:
     """Return the persisted storage-directory key for one knowledge base binding.
 
-    Cached because this runs on the event loop for every agent turn while
-    ``Path.resolve`` is a blocking syscall against the knowledge source root,
-    which can be a network mount.
+    ``knowledge_path`` is the binding's already-canonical path and is hashed as given: resolving it again would follow
+    a link swapped onto it since.
     """
-    digest_source = f"{base_id}:{knowledge_path.resolve()}"
+    digest_source = f"{base_id}:{knowledge_path}"
     digest = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:8]
     return f"{_safe_identifier(base_id)}_{digest}"
+
+
+#: Primary-owned directory holding the Git directory of every Git-backed base.
+#: It sits beside the ``agents/`` and private-instance state roots that workers
+#: mount, never inside one, because a Git directory chooses the programs Git runs.
+_KNOWLEDGE_GIT_DIRNAME = "knowledge_git"
+
+
+def knowledge_git_dir(storage_root: Path, knowledge_path: Path) -> Path:
+    """Return the MindRoom-owned Git directory behind one knowledge checkout.
+
+    Keyed by the resolved checkout path rather than by base: bases that share a
+    folder share its worktree and source lock, so they share one repository.
+    Changing a base's path therefore starts a new repository, and the old one
+    is left behind holding repository content but no credentials.
+    """
+    resolved = knowledge_path.resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
+    return storage_root.resolve() / _KNOWLEDGE_GIT_DIRNAME / f"{_safe_identifier(resolved.name)}_{digest}"
 
 
 def _filter_settings_key(values: Iterable[str]) -> str:
@@ -266,6 +300,8 @@ def indexing_settings_key(config: Config, storage_path: Path, base_id: str, know
             embedder_config.model,
             host=embedder_config.host,
             dimensions=embedder_config.dimensions,
+            query_prefix=embedder_config.query_prefix,
+            document_prefix=embedder_config.document_prefix,
         )
         chunk_size = str(base_config.chunk_size)
         chunk_overlap = str(base_config.chunk_overlap)
@@ -274,6 +310,8 @@ def indexing_settings_key(config: Config, storage_path: Path, base_id: str, know
         )
         exclude_extensions = _filter_settings_key(base_config.exclude_extensions)
         extra_extensions = _filter_settings_key(base_config.extra_extensions)
+        vector_store = _VECTOR_STORE_FORMAT
+        chunk_context_model = base_config.chunk_context_model or ""
     else:
         embedder_provider = ""
         embedder_model = ""
@@ -284,6 +322,8 @@ def indexing_settings_key(config: Config, storage_path: Path, base_id: str, know
         include_extensions = ""
         exclude_extensions = ""
         extra_extensions = ""
+        vector_store = ""
+        chunk_context_model = ""
     return IndexingSettings(
         base_id=base_id,
         storage_root=str(storage_path.resolve()),
@@ -308,4 +348,6 @@ def indexing_settings_key(config: Config, storage_path: Path, base_id: str, know
         extra_extensions=extra_extensions,
         skip_hidden=str(base_config.skip_hidden) if git_config is None else "",
         require_content_before_publish="True" if base_config.require_content_before_publish else "",
+        vector_store=vector_store,
+        chunk_context_model=chunk_context_model,
     )

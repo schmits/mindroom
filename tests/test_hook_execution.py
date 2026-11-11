@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import nio
 import pytest
+from structlog.testing import capture_logs
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
@@ -20,17 +22,25 @@ from mindroom.hooks import (
     EVENT_MESSAGE_ENRICH,
     EVENT_MESSAGE_FINAL_RESPONSE_TRANSFORM,
     EVENT_MESSAGE_RECEIVED,
+    EVENT_REACTION_RECEIVED,
+    EVENT_SYSTEM_ENRICH,
     BeforeResponseContext,
     CustomEventContext,
+    EnrichmentItem,
     FinalResponseDraft,
     FinalResponseTransformContext,
+    HookBindings,
     HookRegistry,
     HookRegistryState,
     MessageEnrichContext,
     MessageEnvelope,
     MessageReceivedContext,
+    ReactionReceivedContext,
     ResponseDraft,
+    SystemEnrichContext,
     build_hook_matrix_admin,
+    build_hook_room_state_putter,
+    build_hook_room_state_querier,
     hook,
 )
 from mindroom.hooks.execution import emit, emit_collect, emit_final_response_transform, emit_transform
@@ -66,14 +76,15 @@ def _config(tmp_path: Path) -> Config:
     )
 
 
-def _plugin(name: str, callbacks: list[object]) -> object:
+def _plugin(name: str, callbacks: list[object], settings: dict[str, object] | None = None) -> object:
     return type(
         "PluginStub",
         (),
         {
             "name": name,
             "discovered_hooks": tuple(callbacks),
-            "entry_config": PluginEntryConfig(path=f"./plugins/{name}"),
+            "discovered_automations": (),
+            "entry_config": PluginEntryConfig(path=f"./plugins/{name}", settings=settings or {}),
             "plugin_order": 0,
         },
     )()
@@ -337,6 +348,58 @@ async def test_emit_collect_merges_in_hook_order_and_isolates_per_hook_state(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_name", [EVENT_MESSAGE_ENRICH, EVENT_SYSTEM_ENRICH])
+@pytest.mark.parametrize("failure", ["exception", "timeout"])
+async def test_emit_collect_discards_failed_hook_items(
+    tmp_path: Path,
+    event_name: str,
+    failure: str,
+) -> None:
+    """A failed collector contributes nothing while successful collectors survive."""
+
+    @hook(event_name, priority=10, timeout_ms=10)
+    async def failing(ctx: MessageEnrichContext | SystemEnrichContext) -> None:
+        if isinstance(ctx, MessageEnrichContext):
+            ctx.add_metadata("partial", "must be discarded")
+            ctx.add_metadata("transient", "must also be discarded", persist=False)
+        else:
+            ctx.add_instruction("partial", "must be discarded")
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        message = "collector failed after appending items"
+        raise RuntimeError(message)
+
+    @hook(event_name, priority=20)
+    async def healthy(ctx: MessageEnrichContext | SystemEnrichContext) -> EnrichmentItem:
+        if isinstance(ctx, MessageEnrichContext):
+            ctx.add_metadata("healthy", "keep appended item")
+        else:
+            ctx.add_instruction("healthy", "keep appended item")
+        return EnrichmentItem(key="returned", text="keep returned item")
+
+    registry = HookRegistry.from_plugins([_plugin("collectors", [failing, healthy])])
+    config = _config(tmp_path)
+    context_type = MessageEnrichContext if event_name == EVENT_MESSAGE_ENRICH else SystemEnrichContext
+    context = context_type(
+        event_name=event_name,
+        plugin_name="",
+        settings={},
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        logger=get_logger("tests.hooks").bind(event_name=event_name),
+        correlation_id="corr-failed-collector",
+        envelope=_envelope(),
+        target_entity_name="code",
+        target_member_names=None,
+    )
+
+    items = await emit_collect(registry, event_name, context)
+
+    assert [item.key for item in items] == ["healthy", "returned"]
+    assert context._items == []
+
+
+@pytest.mark.asyncio
 async def test_emit_transform_keeps_previous_draft_when_one_hook_fails(tmp_path: Path) -> None:
     """Transformer failures should not discard changes from earlier hooks."""
 
@@ -482,6 +545,42 @@ async def test_emit_final_response_transform_respects_agent_and_room_scope(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_emit_runs_reaction_hooks_only_in_their_rooms(tmp_path: Path) -> None:
+    """Reaction hooks should honor their room filters."""
+    seen: list[str] = []
+
+    @hook(EVENT_REACTION_RECEIVED, rooms=["!other:localhost"])
+    async def wrong_room(ctx: ReactionReceivedContext) -> None:
+        seen.append(f"room:{ctx.reaction_key}")
+
+    @hook(EVENT_REACTION_RECEIVED, rooms=["!room:localhost"])
+    async def in_room(ctx: ReactionReceivedContext) -> None:
+        seen.append(ctx.reaction_key)
+
+    config = _config(tmp_path)
+    context = ReactionReceivedContext(
+        event_name=EVENT_REACTION_RECEIVED,
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+        correlation_id="corr-reaction",
+        room_id="!room:localhost",
+        event_id="$reaction",
+        sender_id="@user:localhost",
+        reaction_key="+1",
+        target_event_id="$event",
+        thread_id=None,
+    )
+
+    await emit(
+        HookRegistry.from_plugins([_plugin("reaction-plugin", [wrong_room, in_room])]),
+        EVENT_REACTION_RECEIVED,
+        context,
+    )
+
+    assert seen == ["+1"]
+
+
+@pytest.mark.asyncio
 async def test_emit_final_response_transform_preserves_send_requester_and_depth(tmp_path: Path) -> None:
     """Final-response transform hooks should preserve requester and synthetic depth on sends."""
     sent: list[tuple[str, str, str | None, str, dict[str, object] | None, bool]] = []
@@ -494,7 +593,10 @@ async def test_emit_final_response_transform_preserves_send_requester_and_depth(
         extra_content: dict[str, object] | None,
         *,
         trigger_dispatch: bool = False,
+        mentions: list[str] | None = None,
+        wake_mentioned: bool = True,
     ) -> str | None:
+        del mentions, wake_mentioned
         sent.append((room_id, body, thread_id, source_hook, extra_content, trigger_dispatch))
         return "$hook-event"
 
@@ -554,6 +656,44 @@ async def test_emit_recursion_guard_drops_nested_custom_events_after_depth_three
 
 
 @pytest.mark.asyncio
+async def test_emit_gives_each_hook_its_plugin_name_settings_and_logger(tmp_path: Path) -> None:
+    """Each hook gets its plugin's name, its own copy of its settings, and a logger naming its plugin and hook.
+
+    A hook's write to a setting, nested or not, reaches neither the plugin's config entry nor a later call.
+    """
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    @hook("todo:item_added", priority=10)
+    async def audit(ctx: CustomEventContext) -> None:
+        seen.append((ctx.plugin_name, deepcopy(ctx.settings)))
+        ctx.settings["mode"] = "changed"
+        ctx.settings["nested"]["rooms"].append("!changed")
+        ctx.logger.info("audited")
+
+    @hook("todo:item_added", priority=20)
+    async def notify(ctx: CustomEventContext) -> None:
+        seen.append((ctx.plugin_name, deepcopy(ctx.settings)))
+
+    audit_plugin = _plugin("audit-plugin", [audit], settings={"mode": "fast", "nested": {"rooms": ["!a"]}})
+    registry = HookRegistry.from_plugins(
+        [audit_plugin, _plugin("notify-plugin", [notify], settings={"mode": "slow"})],
+    )
+    context = _custom_event_context(tmp_path)
+
+    with capture_logs() as logs:
+        await emit(registry, "todo:item_added", context)
+        await emit(registry, "todo:item_added", context)
+
+    audit_settings = {"mode": "fast", "nested": {"rooms": ["!a"]}}
+    assert seen == [("audit-plugin", audit_settings), ("notify-plugin", {"mode": "slow"})] * 2
+    assert audit_plugin.entry_config.settings == audit_settings
+    audited = [entry for entry in logs if entry["event"] == "audited"]
+    assert [(entry["plugin_name"], entry["hook_name"], entry["event_name"]) for entry in audited] == [
+        ("audit-plugin", "audit", "todo:item_added"),
+    ] * 2
+
+
+@pytest.mark.asyncio
 async def test_emit_custom_event_uses_runtime_context_and_plugin_state_root(tmp_path: Path) -> None:
     """Tool-side custom events should flow through the hook registry and shared storage root."""
     seen: list[tuple[str, str, Path, dict[str, object] | None, bool, str | None]] = []
@@ -600,9 +740,13 @@ async def test_emit_custom_event_uses_runtime_context_and_plugin_state_root(tmp_
         runtime_paths=runtime_paths,
         relations=make_relation_lookup(),
         conversation_reader=make_conversation_reader_mock(),
-        hook_registry=registry,
+        hooks=HookBindings(
+            registry=registry,
+            matrix_admin=build_hook_matrix_admin(client, runtime_paths),
+            room_state_querier=build_hook_room_state_querier(client),
+            room_state_putter=build_hook_room_state_putter(client),
+        ),
         correlation_id="corr-tool",
-        matrix_admin=build_hook_matrix_admin(client, runtime_paths),
     )
 
     with tool_runtime_context(tool_context):

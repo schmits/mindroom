@@ -10,7 +10,6 @@ from pydantic import (
     ConfigDict,
     Field,
     SerializerFunctionWrapHandler,
-    ValidationInfo,
     field_validator,
     model_serializer,
     model_validator,
@@ -18,25 +17,74 @@ from pydantic import (
 
 from mindroom.config.access import (
     InviteAcceptancePolicy,
+    OwnerPlaceholderUserIds,
     ResponderAccessConfig,
     RoomJoinPolicy,
     validate_concrete_matrix_user_ids,
 )
+from mindroom.config.automations import AutomationList  # noqa: TC001
+from mindroom.config.cold_cache import ColdCacheConfig  # noqa: TC001
+from mindroom.config.contacts import ContactsConfig  # noqa: TC001
 from mindroom.config.knowledge import KnowledgeGitConfig  # noqa: TC001
 from mindroom.config.legacy_fields import reject_legacy_agent_fields
+from mindroom.config.listening import ListenConfig  # noqa: TC001
 from mindroom.config.memory import AgentMemorySearchConfig, MemoryBackend  # noqa: TC001
+from mindroom.config.mid_turn import MidTurnConfig  # noqa: TC001
 from mindroom.config.models import (
-    AgentLearningMode,
     CompactionOverrideConfig,
+    FileAccess,
     ToolConfigEntry,
     validate_unique_tool_entries,
 )
-from mindroom.config.validation import duplicate_items, validate_history_limit_choice
-from mindroom.constants import OWNER_MATRIX_USER_ID_PLACEHOLDER
+from mindroom.config.participation import ParticipationConfig  # noqa: TC001
+from mindroom.config.schema_hints import dashboard_hint
+from mindroom.config.skill_learning import SkillLearningConfig
+from mindroom.config.validation import (
+    OptionalNonBlankStr,
+    TimezoneName,
+    duplicate_items,
+    non_empty_stripped,
+    validate_history_limit_choice,
+    validate_matrix_localpart,
+    validate_unique_entries,
+)
 from mindroom.tool_system.worker_routing import WorkerScope, agent_workspace_relative_path
 
 _PrivateWorkerScope = Literal["user", "user_agent"]
-_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset({"sessions", "learning", "knowledge_db", "chroma"})
+# `auto` lets the router and a room's only responder answer a message that mentions no one; `mentions` does not.
+RoomReplyMode = Literal["auto", "mentions"]
+# Everything the primary writes beside a private workspace in its private state root;
+# tests/test_private_root_reservations.py enumerates the writers. Workers mount only
+# the private workspace, so it must never be, or contain, one of these.
+# LEGACY_COMPAT: Agno Learning databases left in private state roots.
+# Legacy format: `learning/<agent>.db` holding requester profiles and memories, written while Learning was enabled.
+# Last legacy release: v2026.10.498; replacement: v2026.10.499 retired Learning and writes no learning databases.
+# Handling: Nothing reads or removes these databases, so `learning` stays reserved and a worker never mounts a leftover
+#   learning database as a private workspace.
+# Coverage: tests/test_private_root_reservations.py::test_primary_state_written_beside_a_private_workspace_is_reserved.
+# LEGACY_COMPAT: File memory left in `memory_files/` beside a private workspace.
+# Legacy format: `memory_files/<scope>/`, the file-memory root of a scope whose agent had no workspace file-memory path,
+#   which the primary could write into a private state root.
+# Last legacy release: v2026.10.732; replacement: unreleased; file memory lives only in workspaces and team roots.
+# Handling: Nothing reads or removes these files, so `memory_files` stays reserved and a worker never mounts leftover
+#   primary-written memory as a private workspace.
+# Coverage: tests/test_private_root_reservations.py::test_primary_state_written_beside_a_private_workspace_is_reserved.
+_RESERVED_PRIVATE_ROOT_FIRST_PARTS = frozenset(
+    {
+        ".sessions-recovery.lock",
+        "agent_modes.json",
+        "agent_modes.lock",
+        "browser",
+        "browser-profiles",
+        "calls",
+        "chroma",
+        "knowledge_db",
+        "learning",
+        "mem0",
+        "memory_files",
+        "sessions",
+    },
+)
 
 
 def _validate_safe_relative_path(
@@ -46,11 +94,7 @@ def _validate_safe_relative_path(
     allow_current_dir: bool = False,
     reserved_first_parts: frozenset[str] = frozenset(),
 ) -> str:
-    stripped = value.strip()
-    if not stripped:
-        msg = f"{field_name} must not be empty"
-        raise ValueError(msg)
-
+    stripped = non_empty_stripped(value, field_name=field_name)
     path = Path(stripped)
     if path.is_absolute():
         msg = f"{field_name} must be a relative path"
@@ -72,6 +116,8 @@ def _validate_safe_relative_path(
 
 class AgentPrivateKnowledgeConfig(BaseModel):
     """PrivateAgentKnowledge indexed from the agent's private root."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = Field(
         default=True,
@@ -128,6 +174,8 @@ class AgentPrivateKnowledgeConfig(BaseModel):
 class AgentPrivateConfig(BaseModel):
     """Requester-private materialized state for one shared agent definition."""
 
+    model_config = ConfigDict(extra="forbid")
+
     per: _PrivateWorkerScope = Field(
         description="Worker boundary that gets its own private copy of this agent's state",
     )
@@ -166,11 +214,7 @@ class AgentPrivateConfig(BaseModel):
         """Normalize configured template directories."""
         if value is None:
             return None
-        stripped = value.strip()
-        if not stripped:
-            msg = "private.template_dir must not be empty"
-            raise ValueError(msg)
-        return stripped
+        return non_empty_stripped(value, field_name="private.template_dir")
 
     @field_validator("context_files")
     @classmethod
@@ -209,10 +253,22 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     display_name: str = Field(description="Human-readable name for the agent")
-    role: str = Field(default="", description="Description of the agent's purpose")
+    matrix_username: str | None = Field(
+        default=None,
+        description=(
+            "Matrix localpart for the account MindRoom creates for this agent, instead of mindroom_<agent key>; "
+            "set it before the agent's first start"
+        ),
+    )
+    role: str = Field(
+        default="",
+        description="Description of the agent's purpose",
+        json_schema_extra=dashboard_hint(multiline=True),
+    )
     tools: list[ToolConfigEntry] = Field(
         default_factory=list,
         description="List of tool entries with optional inline per-agent overrides",
+        json_schema_extra=dashboard_hint(reference="tool"),
     )
     include_default_tools: bool = Field(
         default=True,
@@ -220,7 +276,35 @@ class AgentConfig(BaseModel):
     )
     skills: list[str] = Field(default_factory=list, description="List of skill names")
     instructions: list[str] = Field(default_factory=list, description="Agent instructions")
-    rooms: list[str] = Field(default_factory=list, description="List of room IDs or names to auto-join")
+    minimal_instructions: list[str] = Field(
+        default_factory=list,
+        description="Always-present minimal mode instructions",
+    )
+    rooms: list[str] = Field(
+        default_factory=list,
+        description="Room keys or Matrix room IDs to join",
+        json_schema_extra=dashboard_hint(reference="room"),
+    )
+    participation: ParticipationConfig | None = Field(
+        default=None,
+        description="Opt-in adaptive participation in existing multi-human threads across all rooms",
+    )
+    listen: ListenConfig | None = Field(
+        default=None,
+        description="Opt-in listening: hear chosen rooms and act silently, through an allowlist of tools, after a quiet period",
+    )
+    contacts: ContactsConfig | None = Field(
+        default=None,
+        description="Opt-in contacts: approved relationships with other personal agents and people",
+    )
+    mid_turn: MidTurnConfig | None = Field(
+        default=None,
+        description="Opt-in judgments for messages queued during this agent's response across all rooms",
+    )
+    cold_cache: ColdCacheConfig | None = Field(
+        default=None,
+        description="Opt-in switch of an idle thread to cheap_model for the rest of the thread",
+    )
     access: ResponderAccessConfig | None = Field(
         default=None,
         description="Optional membership-based conversation access policy",
@@ -229,17 +313,50 @@ class AgentConfig(BaseModel):
         default_factory=list,
         description="Concrete Matrix user IDs allowed to manage this agent's credentials",
     )
+    mcp_gateway_shared_credentials: bool = Field(
+        default=False,
+        description=(
+            "Let users who may use this agent call its tools through the MCP gateway even though its worker scope "
+            "is shared or unset, so every caller runs them with the agent's shared credentials and worker, "
+            "without the agent's instructions; agents with per-user scopes are available without it"
+        ),
+    )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
-        description="Whether this agent accepts all, no, or matching inviter room invites",
+        description=(
+            "true accepts every room invite to this agent, false accepts none, and a list accepts only "
+            "invites from matching inviter Matrix IDs or glob patterns"
+        ),
     )
-    markdown: bool | None = Field(default=None, description="Whether to use markdown formatting")
-    learning: bool | None = Field(default=None, description="Enable Agno Learning (defaults to true when omitted)")
-    learning_mode: AgentLearningMode | None = Field(
+    markdown: bool | None = Field(
         default=None,
-        description="Learning mode for Agno Learning: always (automatic) or agentic (tool-driven)",
+        description="Whether the system prompt tells the agent its replies are shown as Markdown",
     )
-    model: str = Field(default="default", description="Model name")
+    knowledge_graph: bool | None = Field(
+        default=None,
+        description="Build a knowledge graph from this agent's conversations and give it the knowledge_graph tool",
+    )
+    knowledge_graph_edits: bool | None = Field(
+        default=None,
+        description=(
+            "Let this agent delete wrong facts and entities from its knowledge graph, merge duplicate entities, and "
+            "rewrite entity summaries"
+        ),
+    )
+    model: str = Field(
+        default="default",
+        description="Configured model alias used for this agent's replies",
+        json_schema_extra=dashboard_hint(reference="model"),
+    )
+    cheap_model: str | None = Field(
+        default=None,
+        description="Cheaper model alias this agent may switch to, used by cold_cache",
+        json_schema_extra=dashboard_hint(reference="model"),
+    )
+    timezone: TimezoneName | None = Field(
+        default=None,
+        description="IANA timezone for this agent's dates, times, and schedules; inherits the top-level timezone",
+    )
     memory_backend: MemoryBackend | None = Field(
         default=None,
         description=(
@@ -279,77 +396,85 @@ class AgentConfig(BaseModel):
     )
     room_thread_modes: dict[str, Literal["thread", "room"]] = Field(
         default_factory=dict,
-        description="Per-room thread mode overrides keyed by room alias/name or Matrix room ID",
+        description="Per-room thread mode overrides keyed by room key or Matrix room ID",
+        json_schema_extra=dashboard_hint(key_reference="room"),
     )
     num_history_runs: int | None = Field(
         default=None,
         ge=1,
-        description="Number of prior Agno runs to include as history context (per-agent override)",
+        description="Number of prior runs to include as history context (per-agent override)",
     )
     num_history_messages: int | None = Field(
         default=None,
         ge=1,
         description="Max messages from history (mutually exclusive with num_history_runs)",
     )
-    compress_tool_results: bool | None = Field(
-        default=None,
-        description=(
-            "Compress tool results in history to save context (per-agent override). On Anthropic/Vertex Claude, "
-            "setting this to true can mutate replayed tool messages and invalidate prompt-cache prefixes."
-        ),
-    )
     max_tool_calls_from_history: int | None = Field(
         default=None,
         ge=0,
         description="Max tool call messages replayed from history (per-agent override)",
     )
+    max_tool_calls_per_turn: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum tool calls one turn may execute (per-agent override)",
+    )
     show_tool_calls: bool | None = Field(
         default=None,
         description="Whether to show tool call details inline in responses (per-agent override)",
     )
+    show_reasoning: bool | None = Field(
+        default=None,
+        description="Whether streamed replies show the model's reasoning to the room (per-agent override)",
+    )
     worker_tools: list[str] | None = Field(
         default=None,
         description="Tool names to route through scoped workers (overrides defaults; None = use the built-in default routing policy)",
+        json_schema_extra=dashboard_hint(reference="tool"),
     )
     worker_scope: WorkerScope | None = Field(
         default=None,
         description="Worker runtime reuse mode for routed tools: shared, user, or user_agent. user reuses one runtime per requester across agents and is not an agent-level filesystem isolation boundary",
     )
+    file_access: FileAccess | None = Field(
+        default=None,
+        description="Per-agent override of defaults.file_access (None = inherit the default)",
+    )
+    terminals: Literal["none", "watch", "type"] = Field(
+        default="none",
+        description="What people in the agent's rooms may do with its terminals: none, watch, or type",
+    )
     allow_self_config: bool | None = Field(
         default=None,
         description="Allow this agent to modify its own configuration via a tool",
     )
+    created_agents_per_owner: int = Field(
+        default=0,
+        ge=0,
+        description="How many agents each person may create through this agent with create_agent; 0 turns create_agent off",
+    )
+    automations: AutomationList | None = Field(
+        default=None,
+        description="Automations for this agent, built-in such as prompt_curation or from a plugin; omitted inherits defaults.automations",
+    )
+    skill_learning: SkillLearningConfig = Field(
+        default_factory=SkillLearningConfig,
+        description="Opt-in background reviews that create and maintain learned skills in this agent's workspace",
+    )
     delegate_to: list[str] = Field(
         default_factory=list,
-        description="List of agent names this agent can delegate tasks to via tool calls",
+        description="Allowed agents for run_subagent and continue_subagent, including this agent when explicitly listed",
+        json_schema_extra=dashboard_hint(reference="agent"),
+    )
+    dedicated_subagent_workers: bool = Field(
+        default=False,
+        description="Allow run_subagent to run a subagent in its own dedicated worker on the docker or kubernetes worker backend",
     )
 
     @property
     def tool_names(self) -> list[str]:
         """Return authored tool names without inline override details."""
         return [entry.name for entry in self.tools]
-
-    def get_tool_overrides(self, tool_name: str) -> dict[str, object] | None:
-        """Return normalized per-agent runtime overrides for one configured tool."""
-        # why-lazy: config.agent is imported by config.main; the tool catalog loads hook/runtime helpers.
-        from mindroom.tool_system.catalog import TOOL_METADATA, normalize_authored_tool_overrides  # noqa: PLC0415
-
-        for entry in self.tools:
-            if entry.name == tool_name and entry.overrides:
-                metadata = TOOL_METADATA.get(tool_name)
-                allowed_fields = {field.name for field in metadata.agent_override_fields or []} if metadata else set()
-                if not allowed_fields:
-                    return None
-                overrides = {name: value for name, value in entry.overrides.items() if name in allowed_fields}
-                if not overrides:
-                    return None
-                normalized = normalize_authored_tool_overrides(tool_name, overrides)
-                return normalized or None
-        return None
-
-    def authored_model_dump(self) -> dict[str, object]:
-        """Serialize the authored agent config."""
-        return self.model_dump(exclude_unset=True)
 
     @model_validator(mode="after")
     def _check_history_config(self) -> Self:
@@ -359,6 +484,9 @@ class AgentConfig(BaseModel):
         )
         if self.private is not None and self.worker_scope is not None:
             msg = "Private agents derive their execution scope from private.per; configure private or worker_scope, not both"
+            raise ValueError(msg)
+        if self.private is not None and self.listen is not None:
+            msg = "Private agents run one instance per requester, so none can listen; configure private or listen, not both"
             raise ValueError(msg)
         return self
 
@@ -378,6 +506,12 @@ class AgentConfig(BaseModel):
             return None
         return value
 
+    @field_validator("matrix_username")
+    @classmethod
+    def _validate_matrix_username(cls, value: str | None) -> str | None:
+        """Require a bare Matrix localpart."""
+        return None if value is None else validate_matrix_localpart(value, field_name="matrix_username")
+
     @field_validator("tools")
     @classmethod
     def validate_unique_tools(cls, tools: list[ToolConfigEntry]) -> list[ToolConfigEntry]:
@@ -388,11 +522,7 @@ class AgentConfig(BaseModel):
     @classmethod
     def validate_unique_knowledge_bases(cls, knowledge_bases: list[str]) -> list[str]:
         """Ensure each knowledge base assignment appears at most once per agent."""
-        duplicates = duplicate_items(knowledge_bases)
-        if duplicates:
-            msg = f"Duplicate knowledge bases are not allowed: {', '.join(duplicates)}"
-            raise ValueError(msg)
-        return knowledge_bases
+        return validate_unique_entries(knowledge_bases, field_name="knowledge bases")
 
     @field_validator("context_files")
     @classmethod
@@ -410,20 +540,43 @@ class AgentConfig(BaseModel):
 class TeamConfig(BaseModel):
     """Configuration for a team of agents."""
 
+    model_config = ConfigDict(extra="forbid")
+
     display_name: str = Field(description="Human-readable name for the team")
-    role: str = Field(description="Description of the team's purpose")
-    agents: list[str] = Field(min_length=1, description="List of agent names that compose this team")
-    rooms: list[str] = Field(default_factory=list, description="List of room IDs or names to auto-join")
+    role: str = Field(
+        description="Description of the team's purpose",
+        json_schema_extra=dashboard_hint(multiline=True),
+    )
+    agents: list[str] = Field(
+        min_length=1,
+        description="List of agent names that compose this team",
+        json_schema_extra=dashboard_hint(reference="agent"),
+    )
+    rooms: list[str] = Field(
+        default_factory=list,
+        description="Room keys or Matrix room IDs to join",
+        json_schema_extra=dashboard_hint(reference="room"),
+    )
     access: ResponderAccessConfig | None = Field(
         default=None,
         description="Optional membership-based conversation access policy",
     )
     accept_invites: InviteAcceptancePolicy = Field(
         default=True,
-        description="Whether this team accepts all, no, or matching inviter room invites",
+        description=(
+            "true accepts every room invite to this team, false accepts none, and a list accepts only "
+            "invites from matching inviter Matrix IDs or glob patterns"
+        ),
     )
-    model: str | None = Field(default="default", description="Default model for this team (optional)")
-    mode: str = Field(default="coordinate", description="Team collaboration mode: coordinate or collaborate")
+    model: str = Field(
+        default="default",
+        description="Configured model alias used for this team's replies",
+        json_schema_extra=dashboard_hint(reference="model"),
+    )
+    mode: Literal["coordinate", "collaborate"] = Field(
+        default="coordinate",
+        description="Team collaboration mode: coordinate or collaborate",
+    )
     compaction: CompactionOverrideConfig | None = Field(
         default=None,
         description="Per-team required-compaction overrides",
@@ -442,6 +595,11 @@ class TeamConfig(BaseModel):
         default=None,
         ge=0,
         description="Max tool call messages replayed from team history",
+    )
+    max_tool_calls_per_turn: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum tool calls the team coordinator may execute in one turn, delegations included (per-team override)",
     )
 
     @field_validator("agents")
@@ -469,8 +627,11 @@ class RoomConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    display_name: str | None = Field(default=None, description="Human-readable Matrix room name")
-    description: str = Field(default="", description="Dashboard-facing room purpose")
+    display_name: OptionalNonBlankStr = Field(default=None, description="Human-readable Matrix room name")
+    description: str = Field(
+        default="",
+        description="Room purpose shown in the dashboard and used as the topic of a new room or a room without one",
+    )
     join_policy: RoomJoinPolicy | None = Field(default=None, description="Room-specific join-policy override")
     listed: bool | None = Field(default=None, description="Room-specific directory-listing override")
     encrypted: bool | None = Field(
@@ -481,38 +642,28 @@ class RoomConfig(BaseModel):
             "Enabling encryption on a Matrix room is irreversible; MindRoom never disables it."
         ),
     )
-    invite_users: list[str] | None = Field(default=None, description="Room-specific invitation roster override")
-    admins: list[str] | None = Field(default=None, description="Room-specific Matrix administrator override")
-
-    @field_validator("invite_users", "admins")
-    @classmethod
-    def validate_unique_access_entries(cls, values: list[str] | None, info: ValidationInfo) -> list[str] | None:
-        """Require concrete room-policy identities while preserving omitted lists."""
-        if values is None:
-            return None
-        assert info.field_name is not None
-        return validate_concrete_matrix_user_ids(
-            values,
-            field_name=info.field_name,
-            allowed_placeholders=frozenset({OWNER_MATRIX_USER_ID_PLACEHOLDER}),
-        )
-
-    @field_validator("display_name")
-    @classmethod
-    def normalize_display_name(cls, value: str | None) -> str | None:
-        """Keep room display names absent or trimmed non-empty strings."""
-        stripped = value.strip() if value is not None else ""
-        return stripped or None
+    invite_users: OwnerPlaceholderUserIds | None = Field(
+        default=None,
+        description="Room-specific invitation roster override",
+    )
+    admins: OwnerPlaceholderUserIds | None = Field(
+        default=None,
+        description="Room-specific Matrix administrator override",
+    )
+    reply_mode: RoomReplyMode = Field(
+        default="auto",
+        description=(
+            "'auto' lets the router and the room's only agent or team answer a message that mentions no one; "
+            "'mentions' answers only messages that mention an agent or team, and follow-ups in threads an agent or "
+            "team already replied in or is still answering"
+        ),
+    )
 
     @model_serializer(mode="wrap")
     def serialize_model(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         """Omit empty room metadata from authored serialization."""
         data = handler(self)
-        if data.get("display_name") is None:
-            data.pop("display_name", None)
-        if data.get("encrypted") is None:
-            data.pop("encrypted", None)
-        for field_name in ("join_policy", "listed", "invite_users", "admins"):
+        for field_name in ("display_name", "encrypted", "join_policy", "listed", "invite_users", "admins"):
             if data.get(field_name) is None:
                 data.pop(field_name, None)
         return data

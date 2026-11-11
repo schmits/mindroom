@@ -2,46 +2,71 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path  # noqa: TC003 - tool config sync evaluates constructor type hints at runtime.
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import nio
 
-from mindroom.constants import ORIGINAL_SENDER_KEY, SKIP_MENTIONS_KEY, SOURCE_KIND_KEY
-from mindroom.custom_tools.attachment_helpers import resolve_context_thread_id
+from mindroom.attachments.storage import AttachmentRecord
+from mindroom.constants import (
+    ACTING_REQUESTER_KEY,
+    ATTACHMENT_IDS_KEY,
+    ORIGINAL_SENDER_KEY,
+    SKIP_MENTIONS_KEY,
+    SOURCE_KIND_KEY,
+    STREAM_VISIBLE_BODY_KEY,
+)
+from mindroom.contacts.policy import ContactVerdict, check_contact_message
+from mindroom.contacts.turns import contact_room
 from mindroom.custom_tools.attachments import (
-    resolve_send_attachments,
-    send_context_attachments,
+    resolve_send_attachment,
     send_resolved_attachments,
 )
 from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND
 from mindroom.interactive import parse_and_format_interactive
-from mindroom.logging_config import get_logger
 from mindroom.matrix.client_delivery import edit_message_result, send_message_result, send_room_event_result
 from mindroom.matrix.client_visible_messages import (
     is_visible_room_message,
     message_preview,
     resolve_latest_visible_messages,
-    thread_root_body_preview,
     trusted_visible_sender_ids,
 )
 from mindroom.matrix.conversation_reads import complete_thread_history
+from mindroom.matrix.guarded_rooms import allowed_send
 from mindroom.matrix.mentions import format_message_with_mentions
 from mindroom.matrix.message_builder import build_reaction_content
 from mindroom.matrix.message_extras import build_message_extras_content
-from mindroom.matrix.room_history_reads import RoomThreadsPageError, get_room_threads_page
 from mindroom.requester_identity import is_human_requester_id
+from mindroom.tool_system.events import body_without_tool_markers, has_tool_trace, strip_visible_tool_markers
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from contextlib import AbstractContextManager
+    from pathlib import Path
 
+    from mindroom.config.models import FileAccess
+    from mindroom.custom_tools.matrix_message_idempotency import MatrixMessageSendClaim
     from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
-    from mindroom.matrix.message_extras import MessageExtraSection
+    from mindroom.matrix.message_extras import MatrixMessageExtra
+    from mindroom.matrix.runtime_media import RuntimeEncryptedMediaAttachment
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
-logger = get_logger(__name__)
 _DIRECT_INTERACTIVE_ERROR = "Interactive prompts are only supported in normal agent responses."
+_CONTACT_TEXT_ONLY_ERROR = "Error: contact rooms accept text only"
+
+
+def _message_payload(message: ResolvedVisibleMessage) -> dict[str, object]:
+    """Return one message for the agent, with its text free of tool display markers."""
+    payload = message.to_dict()
+    if not has_tool_trace(message.content):
+        return payload
+    body = strip_visible_tool_markers(message.body)
+    # The rendered HTML and the streaming canonical body repeat the markers, and the plain body carries the text.
+    dropped = {"format", "formatted_body", STREAM_VISIBLE_BODY_KEY}
+    content = {key: value for key, value in message.content.items() if key not in dropped}
+    content["body"] = strip_visible_tool_markers(str(content.get("body", "")))
+    return {**payload, "body": body, "content": content}
 
 
 @dataclass(frozen=True)
@@ -50,6 +75,30 @@ class MatrixMessageOperationResult:
 
     status: Literal["ok", "error"]
     fields: dict[str, object]
+
+
+@dataclass
+class _MessageSendState:
+    """Delivered event IDs retained even when a later part of one send fails."""
+
+    room_id: str
+    thread_id: str | None
+    event_id: str | None = None
+    attachment_event_ids: list[str] = field(default_factory=list)
+    resolved_attachment_ids: list[str] = field(default_factory=list)
+    newly_registered_attachment_ids: list[str] = field(default_factory=list)
+
+
+def _contact_policy_fields(verdict: ContactVerdict | None, done: str) -> dict[str, str]:
+    """Return the result fields that tell the agent the contact policy changed what went out, and to what."""
+    if verdict is None or not verdict.rewritten:
+        return {}
+    return {"note": f"{done} (changed by the contact policy)", "sent_text": verdict.text}
+
+
+def _policy_approved(verdict: ContactVerdict | None) -> AbstractContextManager[None]:
+    """Return the scope a send runs in: one that reaches the turn's guarded contact room once the policy approved it."""
+    return allowed_send() if verdict is not None else nullcontext()
 
 
 def _format_direct_text(text: str) -> str | None:
@@ -61,12 +110,65 @@ def _format_direct_text(text: str) -> str | None:
 class MatrixMessageOperations:
     """Run Matrix message operations below the model-facing tool adapter."""
 
-    def __init__(self, *, tool_output_workspace_root: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        tool_output_workspace_root: Path | None = None,
+        file_access: FileAccess = "workspace",
+    ) -> None:
         self._tool_output_workspace_root = tool_output_workspace_root
+        self._file_access = file_access
 
     @staticmethod
     def _result(status: Literal["ok", "error"], **kwargs: object) -> MatrixMessageOperationResult:
         return MatrixMessageOperationResult(status=status, fields=kwargs)
+
+    async def _contact_gate(
+        self,
+        context: ToolRuntimeContext,
+        *,
+        action: Literal["send", "edit", "react"],
+        room_id: str,
+        thread_id: str | None,
+        text: str | None,
+        text_only: bool,
+    ) -> ContactVerdict | MatrixMessageOperationResult | None:
+        """Run the contact policy on a message into a contact room of this agent, before anything is sent or stored.
+
+        Return None for any other room, the verdict whose text to send, or the result that stops the message.
+        A removed contact's room takes nothing more, even from a turn that started before the removal or a message
+        whose policy check was still running.
+        """
+        contact = contact_room(context.current_config, context.runtime_paths, room_id, context.agent_name)
+        if contact is None:
+            return None
+        record, side = contact
+        removed = self._result(
+            "error",
+            action=action,
+            room_id=room_id,
+            message=f"Error: contact {record.id} was removed, so nothing more can be sent into its room",
+        )
+        if record.status != "active":
+            return removed
+        if text is None or not text_only:
+            return self._result("error", action=action, room_id=room_id, message=_CONTACT_TEXT_ONLY_ERROR)
+        verdict = await check_contact_message(
+            context,
+            record,
+            side,
+            room_id=room_id,
+            thread_id=thread_id,
+            text=text,
+            adds_message=action == "send",
+        )
+        current = contact_room(context.current_config, context.runtime_paths, room_id, context.agent_name)
+        if current is None or current[0].status != "active":
+            return removed
+        if verdict.action == "send":
+            return verdict
+        retry = " Revise the message and send it again." if verdict.action == "revise" else ""
+        return self._result("error", action=action, room_id=room_id, message=f"Not sent: {verdict.feedback}{retry}")
 
     async def _send_matrix_text(
         self,
@@ -75,15 +177,21 @@ class MatrixMessageOperations:
         room_id: str,
         text: str,
         thread_id: str | None,
-        ignore_mentions: bool,
-        message_extras: list[MessageExtraSection] | None,
+        recipient_user_id: str | None,
+        message_extras: list[MatrixMessageExtra] | None,
+        known_latest_thread_event_id: str | None = None,
+        attachment_ids: list[str] | None = None,
+        send_claim: MatrixMessageSendClaim | None = None,
+        recipient_name: str | None = None,
+        starts_thread: bool = False,
     ) -> str | None:
         latest_thread_event_id = await context.conversation_reader.latest_thread_event_id(
             room_id=room_id,
             thread_id=thread_id,
+            known_latest_thread_event_id=known_latest_thread_event_id,
         )
         extra_content: dict[str, Any] = {}
-        if ignore_mentions:
+        if recipient_user_id is None:
             extra_content[SKIP_MENTIONS_KEY] = True
         elif context.requester_id != context.client.user_id and is_human_requester_id(
             context.requester_id,
@@ -92,211 +200,208 @@ class MatrixMessageOperations:
         ):
             extra_content[ORIGINAL_SENDER_KEY] = context.requester_id
             extra_content[SOURCE_KIND_KEY] = TRUSTED_INTERNAL_RELAY_SOURCE_KIND
+        elif context.requester_id in context.config.bot_accounts:
+            # Name a bot-account requester the way ordinary agent replies do, so the recipient checks its access.
+            extra_content[ACTING_REQUESTER_KEY] = context.requester_id
+        if attachment_ids:
+            extra_content[ATTACHMENT_IDS_KEY] = attachment_ids
         if message_extras:
             extra_content.update(build_message_extras_content(message_extras))
         content = format_message_with_mentions(
             context.config,
             context.runtime_paths,
-            text,
+            f"{recipient_user_id} {text}".strip() if recipient_user_id else text,
             thread_event_id=thread_id,
             latest_thread_event_id=latest_thread_event_id,
             extra_content=extra_content or None,
         )
+        if recipient_user_id is not None:
+            # Formatting also finds names in quoted task text. Only the explicit
+            # recipient should dispatch, regardless of those incidental mentions.
+            content["m.mentions"] = {"user_ids": [recipient_user_id]}
+        if send_claim is not None:
+            await send_claim.prepare(
+                content,
+                recipient=recipient_name,
+                recipient_user_id=recipient_user_id,
+                thread_id=thread_id,
+                starts_thread=starts_thread,
+            )
+            event_id, _ = await send_claim.deliver()
+            return event_id
         delivered = await send_message_result(context.client, room_id, content)
         return delivered.event_id if delivered is not None else None
 
-    async def _message_send_or_reply(  # noqa: C901, PLR0911, PLR0912
+    async def _send_message_attachments(
+        self,
+        context: ToolRuntimeContext,
+        state: _MessageSendState,
+        attachments: list[AttachmentRecord | RuntimeEncryptedMediaAttachment],
+        *,
+        room_mode: bool,
+        needs_thread: bool,
+    ) -> str | None:
+        thread_id = state.thread_id
+        if thread_id is None and not room_mode:
+            if state.event_id is not None:
+                thread_id = state.event_id
+            elif needs_thread or len(attachments) > 1:
+                first_ids, error = await send_resolved_attachments(
+                    context,
+                    room_id=state.room_id,
+                    thread_id=None,
+                    attachments=attachments[:1],
+                )
+                state.attachment_event_ids.extend(first_ids)
+                if error is not None or not first_ids:
+                    return error or "Failed to send the first attachment."
+                thread_id = first_ids[0]
+                attachments = attachments[1:]
+        state.thread_id = thread_id
+        if attachments:
+            sent_ids, error = await send_resolved_attachments(
+                context,
+                room_id=state.room_id,
+                thread_id=thread_id,
+                attachments=attachments,
+                known_latest_thread_event_id=(
+                    state.attachment_event_ids[-1] if state.attachment_event_ids else state.event_id
+                ),
+            )
+            state.attachment_event_ids.extend(sent_ids)
+            return error
+        return None
+
+    async def _message_send(  # noqa: C901, PLR0911, PLR0912
         self,
         context: ToolRuntimeContext,
         *,
-        action: str,
         message: str | None,
-        attachment_ids: list[str],
-        attachment_file_paths: list[str],
+        attachments: list[str],
         room_id: str,
-        effective_thread_id: str | None,
-        ignore_mentions: bool,
-        message_extras: list[MessageExtraSection] | None,
+        thread_id: str | None,
+        recipient_user_id: str | None,
+        room_mode: bool,
+        new_thread: bool,
+        message_extras: list[MatrixMessageExtra] | None,
+        send_claim: MatrixMessageSendClaim | None = None,
+        recipient_name: str | None = None,
     ) -> MatrixMessageOperationResult:
-        if action in {"thread-reply", "reply"} and effective_thread_id is None:
-            return self._result("error", action=action, message="thread_id is required for replies.")
-
-        text = message.strip() if isinstance(message, str) and message.strip() else None
+        if send_claim is not None and send_claim.intent is not None:
+            event_id, resolved_thread_id = await send_claim.deliver()
+            return self._result(
+                "ok",
+                action="send",
+                **asdict(
+                    _MessageSendState(
+                        room_id=room_id,
+                        thread_id=resolved_thread_id,
+                        event_id=event_id,
+                    ),
+                ),
+            )
+        text = (message or "").strip() or None
         if text is None and message_extras:
-            return self._result(
-                "error",
-                action=action,
-                room_id=room_id,
-                message="message_extras requires a non-empty message body.",
-            )
-        if text is None and not attachment_ids and not attachment_file_paths:
-            return self._result(
-                "error",
-                action=action,
-                room_id=room_id,
-                message="At least one of message, attachment_ids, or attachment_file_paths must be provided.",
-            )
+            return self._result("error", action="send", message="message_extras requires a non-empty message body.")
+        if text is None and not attachments:
+            return self._result("error", action="send", message="Provide message, attachments, or both.")
         if text is not None:
             text = _format_direct_text(text)
             if text is None:
-                return self._result("error", action=action, room_id=room_id, message=_DIRECT_INTERACTIVE_ERROR)
+                return self._result("error", action="send", room_id=room_id, message=_DIRECT_INTERACTIVE_ERROR)
+        contact_verdict = await self._contact_gate(
+            context,
+            action="send",
+            room_id=room_id,
+            thread_id=thread_id,
+            text=text,
+            text_only=not attachments and not message_extras,
+        )
+        if isinstance(contact_verdict, MatrixMessageOperationResult):
+            return contact_verdict
+        if contact_verdict is not None:
+            text = contact_verdict.text
 
-        event_id: str | None = None
-        if text is not None:
-            event_id = await self._send_matrix_text(
+        state = _MessageSendState(room_id=room_id, thread_id=thread_id)
+        resolved: list[AttachmentRecord | RuntimeEncryptedMediaAttachment] = []
+        for reference in attachments:
+            resolution = resolve_send_attachment(
                 context,
-                room_id=room_id,
-                text=text,
-                thread_id=effective_thread_id,
-                ignore_mentions=ignore_mentions,
-                message_extras=message_extras,
+                reference,
+                workspace_root=self._tool_output_workspace_root,
+                file_access=self._file_access,
             )
-        if text is not None and event_id is None:
+            if isinstance(resolution, str):
+                return self._result("error", action="send", message=resolution, **asdict(state))
+            attachment, newly_registered = resolution
+            resolved.append(attachment)
+            state.resolved_attachment_ids.append(attachment.attachment_id)
+            if newly_registered:
+                state.newly_registered_attachment_ids.append(attachment.attachment_id)
+
+        if (
+            recipient_user_id is not None
+            and room_mode
+            and any(not isinstance(file, AttachmentRecord) for file in resolved)
+        ):
             return self._result(
                 "error",
-                action=action,
-                room_id=room_id,
-                message="Failed to send message to Matrix.",
+                action="send",
+                message="Turn-scoped media requires a threaded recipient conversation. Use new_thread=True with a thread-mode recipient, or send a registered local file.",
+                **asdict(state),
             )
-        attachment_event_ids: list[str] = []
-        resolved_attachment_ids: list[str] = []
-        newly_registered_attachment_ids: list[str] = []
-        attachment_thread_id: str | None = None
-        if attachment_ids or attachment_file_paths:
-            room_mode = (
-                context.config.get_entity_thread_mode(
-                    context.agent_name,
-                    context.runtime_paths,
-                    room_id=room_id,
-                )
-                == "room"
+
+        # An agent must receive the files before the message that dispatches it.
+        if recipient_user_id is not None and resolved:
+            error = await self._send_message_attachments(
+                context,
+                state,
+                resolved,
+                room_mode=room_mode,
+                needs_thread=True,
             )
-            attachment_count = len(attachment_ids) + len(attachment_file_paths)
-            if text is None and attachment_count > 1 and effective_thread_id is None and not room_mode:
-                attachments, resolved_attachment_ids, newly_registered_attachment_ids, resolve_error = (
-                    resolve_send_attachments(
-                        context,
-                        attachment_ids=attachment_ids,
-                        attachment_file_paths=attachment_file_paths,
-                        workspace_root=self._tool_output_workspace_root,
-                    )
-                )
-                if resolve_error is not None:
-                    return self._result(
-                        "error",
-                        action=action,
-                        room_id=room_id,
-                        thread_id=effective_thread_id,
-                        attachment_thread_id=attachment_thread_id,
-                        event_id=event_id,
-                        message=resolve_error,
-                    )
-
-                first_attachment = attachments[0]
-                remaining_attachments = attachments[1:]
-                first_attachment_event_ids, send_error = await send_resolved_attachments(
+            if error is not None:
+                return self._result("error", action="send", message=error, **asdict(state))
+        if text is not None or recipient_user_id is not None:
+            with _policy_approved(contact_verdict):
+                state.event_id = await self._send_matrix_text(
                     context,
                     room_id=room_id,
-                    thread_id=effective_thread_id,
-                    attachments=[first_attachment],
+                    text=text or "",
+                    send_claim=send_claim,
+                    recipient_name=recipient_name,
+                    starts_thread=state.thread_id is None
+                    and (new_thread or (not room_mode and recipient_user_id is not None)),
+                    thread_id=state.thread_id,
+                    recipient_user_id=recipient_user_id,
+                    attachment_ids=state.resolved_attachment_ids if recipient_user_id is not None else None,
+                    message_extras=message_extras,
+                    known_latest_thread_event_id=(
+                        state.attachment_event_ids[-1] if state.attachment_event_ids else None
+                    ),
                 )
-                if send_error is not None or not first_attachment_event_ids:
-                    return self._result(
-                        "error",
-                        action=action,
-                        room_id=room_id,
-                        thread_id=effective_thread_id,
-                        attachment_thread_id=attachment_thread_id,
-                        event_id=event_id,
-                        attachment_event_ids=[],
-                        resolved_attachment_ids=resolved_attachment_ids,
-                        newly_registered_attachment_ids=newly_registered_attachment_ids,
-                        message=send_error or "Failed to send the first attachment.",
-                    )
-
-                first_attachment_event_id = first_attachment_event_ids[0]
-                attachment_event_ids = first_attachment_event_ids
-                attachment_thread_id = first_attachment_event_id
-                remaining_attachment_event_ids, send_error = await send_resolved_attachments(
-                    context,
-                    room_id=room_id,
-                    thread_id=attachment_thread_id,
-                    attachments=remaining_attachments,
+            if state.event_id is None:
+                return self._result(
+                    "error",
+                    action="send",
+                    message="Failed to send message to Matrix.",
+                    **asdict(state),
                 )
-                attachment_event_ids.extend(remaining_attachment_event_ids)
-                if send_error is not None:
-                    return self._result(
-                        "error",
-                        action=action,
-                        room_id=room_id,
-                        thread_id=effective_thread_id,
-                        attachment_thread_id=attachment_thread_id,
-                        event_id=event_id,
-                        attachment_event_ids=attachment_event_ids,
-                        resolved_attachment_ids=resolved_attachment_ids,
-                        newly_registered_attachment_ids=newly_registered_attachment_ids,
-                        message=send_error,
-                    )
-            else:
-                attachment_thread_id = effective_thread_id
-                if event_id is not None and not room_mode:
-                    attachment_thread_id = effective_thread_id or event_id
-
-                send_result, send_error = await send_context_attachments(
-                    context,
-                    attachment_ids=attachment_ids,
-                    attachment_file_paths=attachment_file_paths,
-                    room_id=room_id,
-                    thread_id=attachment_thread_id,
-                    require_joined_room=False,
-                    inherit_context_thread=False,
-                    workspace_root=self._tool_output_workspace_root,
-                    # The text this call just sent is the newest event in the
-                    # thread. Its echo has not come back yet, so the projection
-                    # would answer with whatever preceded it.
-                    known_latest_thread_event_id=event_id,
-                )
-                if send_result is not None:
-                    attachment_thread_id = send_result.thread_id
-                if send_error is not None:
-                    if send_result is None:
-                        return self._result(
-                            "error",
-                            action=action,
-                            room_id=room_id,
-                            thread_id=effective_thread_id,
-                            attachment_thread_id=attachment_thread_id,
-                            event_id=event_id,
-                            message=send_error,
-                        )
-                    return self._result(
-                        "error",
-                        action=action,
-                        room_id=send_result.room_id,
-                        thread_id=effective_thread_id,
-                        attachment_thread_id=attachment_thread_id,
-                        event_id=event_id,
-                        attachment_event_ids=send_result.attachment_event_ids,
-                        resolved_attachment_ids=send_result.resolved_attachment_ids,
-                        newly_registered_attachment_ids=send_result.newly_registered_attachment_ids,
-                        message=send_error,
-                    )
-                assert send_result is not None
-                attachment_event_ids = send_result.attachment_event_ids
-                resolved_attachment_ids = send_result.resolved_attachment_ids
-                newly_registered_attachment_ids = send_result.newly_registered_attachment_ids
-
-        return self._result(
-            "ok",
-            action=action,
-            room_id=room_id,
-            thread_id=effective_thread_id,
-            attachment_thread_id=attachment_thread_id,
-            event_id=event_id,
-            attachment_event_ids=attachment_event_ids,
-            resolved_attachment_ids=resolved_attachment_ids,
-            newly_registered_attachment_ids=newly_registered_attachment_ids,
-        )
+            if state.thread_id is None and (new_thread or (not room_mode and recipient_user_id is not None)):
+                state.thread_id = state.event_id
+        if recipient_user_id is None and resolved:
+            error = await self._send_message_attachments(
+                context,
+                state,
+                resolved,
+                room_mode=room_mode,
+                needs_thread=new_thread,
+            )
+            if error is not None:
+                return self._result("error", action="send", message=error, **asdict(state))
+        if state.event_id is None and state.attachment_event_ids:
+            state.event_id = state.attachment_event_ids[0]
+        return self._result("ok", action="send", **asdict(state), **_contact_policy_fields(contact_verdict, "Sent"))
 
     async def _message_react(
         self,
@@ -304,33 +409,48 @@ class MatrixMessageOperations:
         *,
         message: str | None,
         room_id: str,
-        target: str | None,
+        thread_id: str | None,
+        event_id: str | None,
     ) -> MatrixMessageOperationResult:
-        if target is None:
-            return self._result("error", action="react", message="target event_id is required.")
+        if event_id is None:
+            return self._result("error", action="react", message="event_id is required.")
 
-        reaction = message.strip() if message and message.strip() else "👍"
-        response = await send_room_event_result(
-            context.client,
-            room_id,
-            "m.reaction",
-            build_reaction_content(target, reaction),
-            operation="matrix_message_react",
+        reaction = (message or "").strip() or "👍"
+        contact_verdict = await self._contact_gate(
+            context,
+            action="react",
+            room_id=room_id,
+            thread_id=thread_id,
+            text=reaction,
+            text_only=True,
         )
+        if isinstance(contact_verdict, MatrixMessageOperationResult):
+            return contact_verdict
+        if contact_verdict is not None:
+            reaction = contact_verdict.text
+        with _policy_approved(contact_verdict):
+            response = await send_room_event_result(
+                context.client,
+                room_id,
+                "m.reaction",
+                build_reaction_content(event_id, reaction),
+                operation="matrix_message_react",
+            )
         if isinstance(response, nio.RoomSendResponse):
             return self._result(
                 "ok",
                 action="react",
                 room_id=room_id,
-                target=target,
+                reacted_event_id=event_id,
                 reaction=reaction,
                 event_id=response.event_id,
+                **_contact_policy_fields(contact_verdict, "Reacted"),
             )
         return self._result(
             "error",
             action="react",
             room_id=room_id,
-            target=target,
+            reacted_event_id=event_id,
             reaction=reaction,
             response=str(response),
         )
@@ -346,17 +466,18 @@ class MatrixMessageOperations:
         if effective_thread_id is not None:
             return await self._thread_read_payload(
                 context,
-                action="read",
                 room_id=room_id,
                 thread_id=effective_thread_id,
                 read_limit=read_limit,
             )
 
+        # Include encrypted wire events so the owned client can decrypt them
+        # before visible-message projection and edit folding.
         response = await context.client.room_messages(
             room_id,
             limit=read_limit,
             direction=nio.MessageDirection.back,
-            message_filter={"types": ["m.room.message"]},
+            message_filter={"types": ["m.room.message", "m.room.encrypted"]},
         )
         if not isinstance(response, nio.RoomMessagesResponse):
             return self._result(
@@ -384,7 +505,7 @@ class MatrixMessageOperations:
             action="read",
             room_id=room_id,
             limit=read_limit,
-            messages=[message.to_dict() for message in messages],
+            messages=[_message_payload(message) for message in messages],
         )
 
     @staticmethod
@@ -403,142 +524,17 @@ class MatrixMessageOperations:
                 "event_id": event_id,
                 "sender": sender,
                 "can_edit": can_edit,
-                "body_preview": message_preview(message.body),
+                "body_preview": message_preview(body_without_tool_markers(message.body, message.content)),
             }
             if can_edit:
-                option["edit_action"] = {"action": "edit", "target": event_id}
+                option["edit_action"] = {"action": "edit", "event_id": event_id}
             options.append(option)
         return options
-
-    @staticmethod
-    def _thread_reply_count(event: nio.Event) -> int:
-        unsigned = event.source.get("unsigned", {})
-        if not isinstance(unsigned, dict):
-            return 0
-        relations = unsigned.get("m.relations", {})
-        if not isinstance(relations, dict):
-            return 0
-        thread_metadata = relations.get("m.thread", {})
-        if not isinstance(thread_metadata, dict):
-            return 0
-        count = thread_metadata.get("count")
-        return count if isinstance(count, int) and not isinstance(count, bool) else 0
-
-    @staticmethod
-    def _thread_latest_activity_ts(event: nio.Event) -> int | None:
-        unsigned = event.source.get("unsigned", {})
-        if not isinstance(unsigned, dict):
-            return None
-        relations = unsigned.get("m.relations", {})
-        if not isinstance(relations, dict):
-            return None
-        thread_metadata = relations.get("m.thread", {})
-        if not isinstance(thread_metadata, dict):
-            return None
-        latest_event = thread_metadata.get("latest_event")
-        if not isinstance(latest_event, dict):
-            return None
-        latest_activity_ts = latest_event.get("origin_server_ts")
-        if not isinstance(latest_activity_ts, int) or isinstance(latest_activity_ts, bool):
-            return None
-        return latest_activity_ts
-
-    async def _serialize_thread_root(
-        self,
-        context: ToolRuntimeContext,
-        *,
-        event: nio.Event,
-        trusted_sender_ids: frozenset[str],
-    ) -> dict[str, object] | None:
-        event_id = event.event_id
-        sender = event.sender
-        timestamp = event.server_timestamp
-        source = event.source
-        if (
-            not isinstance(event_id, str)
-            or not isinstance(sender, str)
-            or not isinstance(timestamp, int)
-            or isinstance(timestamp, bool)
-            or not isinstance(source, dict)
-        ):
-            logger.warning(
-                "Skipping malformed room thread root",
-                room_id=context.room_id,
-                event_type=type(event).__name__,
-            )
-            return None
-        body_preview = await thread_root_body_preview(
-            event,
-            client=context.client,
-            config=context.config,
-            runtime_paths=context.runtime_paths,
-            trusted_sender_ids=trusted_sender_ids,
-        )
-
-        payload: dict[str, object] = {
-            "thread_id": event_id,
-            "sender": sender,
-            "timestamp": timestamp,
-            "body_preview": body_preview,
-            "reply_count": self._thread_reply_count(event),
-        }
-        latest_activity_ts = self._thread_latest_activity_ts(event)
-        if latest_activity_ts is not None:
-            payload["latest_activity_ts"] = latest_activity_ts
-        return payload
-
-    async def _room_threads(
-        self,
-        context: ToolRuntimeContext,
-        *,
-        room_id: str,
-        read_limit: int,
-        page_token: str | None,
-    ) -> MatrixMessageOperationResult:
-        try:
-            thread_roots, next_token = await get_room_threads_page(
-                context.client,
-                room_id,
-                limit=read_limit,
-                page_token=page_token,
-            )
-        except RoomThreadsPageError as exc:
-            error_payload: dict[str, object] = {
-                "action": "room-threads",
-                "response": exc.response,
-                "room_id": room_id,
-            }
-            if exc.errcode is not None:
-                error_payload["errcode"] = exc.errcode
-            if exc.retry_after_ms is not None:
-                error_payload["retry_after_ms"] = exc.retry_after_ms
-            return self._result("error", **error_payload)
-
-        threads: list[dict[str, object]] = []
-        trusted_sender_ids = trusted_visible_sender_ids(context.config, context.runtime_paths)
-        for event in thread_roots:
-            thread = await self._serialize_thread_root(
-                context,
-                event=event,
-                trusted_sender_ids=trusted_sender_ids,
-            )
-            if thread is not None:
-                threads.append(thread)
-        return self._result(
-            "ok",
-            action="room-threads",
-            room_id=room_id,
-            count=len(threads),
-            threads=threads,
-            next_token=next_token,
-            has_more=next_token is not None,
-        )
 
     async def _thread_read_payload(
         self,
         context: ToolRuntimeContext,
         *,
-        action: str,
         room_id: str,
         thread_id: str,
         read_limit: int,
@@ -547,35 +543,12 @@ class MatrixMessageOperations:
         recent_messages = thread_messages[-read_limit:]
         return self._result(
             "ok",
-            action=action,
+            action="read",
             room_id=room_id,
             thread_id=thread_id,
             limit=read_limit,
-            messages=[message.to_dict() for message in recent_messages],
+            messages=[_message_payload(message) for message in recent_messages],
             edit_options=self._build_edit_options(context, messages=recent_messages),
-        )
-
-    async def _message_thread_list(
-        self,
-        context: ToolRuntimeContext,
-        *,
-        room_id: str,
-        thread_id: str | None,
-        read_limit: int,
-    ) -> MatrixMessageOperationResult:
-        if thread_id is None:
-            return self._result(
-                "error",
-                action="thread-list",
-                room_id=room_id,
-                message="thread_id is required for thread-list when no thread context is active.",
-            )
-        return await self._thread_read_payload(
-            context,
-            action="thread-list",
-            room_id=room_id,
-            thread_id=thread_id,
-            read_limit=read_limit,
         )
 
     async def _message_edit(
@@ -584,19 +557,31 @@ class MatrixMessageOperations:
         *,
         room_id: str,
         thread_id: str | None,
-        target: str | None,
+        event_id: str | None,
         message: str | None,
-        message_extras: list[MessageExtraSection] | None,
+        message_extras: list[MatrixMessageExtra] | None,
     ) -> MatrixMessageOperationResult:
-        if target is None:
-            return self._result("error", action="edit", message="target event_id is required for edit.")
-        new_text = message.strip() if isinstance(message, str) and message.strip() else None
-        if new_text is None:
+        if event_id is None:
+            return self._result("error", action="edit", message="event_id is required for edit.")
+        new_text = (message or "").strip()
+        if not new_text:
             return self._result("error", action="edit", message="message is required for edit.")
 
         formatted_text = _format_direct_text(new_text)
         if formatted_text is None:
             return self._result("error", action="edit", room_id=room_id, message=_DIRECT_INTERACTIVE_ERROR)
+        contact_verdict = await self._contact_gate(
+            context,
+            action="edit",
+            room_id=room_id,
+            thread_id=thread_id,
+            text=formatted_text,
+            text_only=not message_extras,
+        )
+        if isinstance(contact_verdict, MatrixMessageOperationResult):
+            return contact_verdict
+        if contact_verdict is not None:
+            formatted_text = contact_verdict.text
         extras_content = build_message_extras_content(message_extras) if message_extras else {}
         content = format_message_with_mentions(
             context.config,
@@ -604,21 +589,22 @@ class MatrixMessageOperations:
             formatted_text,
             extra_content=extras_content or None,
         )
-        delivered = await edit_message_result(
-            context.client,
-            room_id,
-            target,
-            content,
-            formatted_text,
-            extra_content=extras_content or None,
-        )
+        with _policy_approved(contact_verdict):
+            delivered = await edit_message_result(
+                context.client,
+                room_id,
+                event_id,
+                content,
+                formatted_text,
+                extra_content=extras_content or None,
+            )
         if delivered is None:
             return self._result(
                 "error",
                 action="edit",
                 room_id=room_id,
                 thread_id=thread_id,
-                target=target,
+                edited_event_id=event_id,
                 message="Failed to edit message in Matrix.",
             )
         return self._result(
@@ -626,107 +612,64 @@ class MatrixMessageOperations:
             action="edit",
             room_id=room_id,
             thread_id=thread_id,
-            target=target,
+            edited_event_id=event_id,
             event_id=delivered.event_id,
+            **_contact_policy_fields(contact_verdict, "Edited"),
         )
 
-    async def dispatch_action(  # noqa: PLR0911
+    async def dispatch_action(
         self,
         context: ToolRuntimeContext,
         *,
         action: str,
         message: str | None,
-        attachment_ids: list[str],
-        attachment_file_paths: list[str],
+        attachments: list[str],
         room_id: str,
-        target: str | None,
+        event_id: str | None,
         thread_id: str | None,
-        ignore_mentions: bool,
-        message_extras: list[MessageExtraSection] | None,
+        recipient_user_id: str | None,
+        room_mode: bool,
+        new_thread: bool,
+        message_extras: list[MatrixMessageExtra] | None,
         read_limit: int,
-        page_token: str | None,
-        room_timeline_sentinel: str,
+        send_claim: MatrixMessageSendClaim | None = None,
+        recipient_name: str | None = None,
     ) -> MatrixMessageOperationResult:
-        """Dispatch one normalized Matrix message tool action."""
-        if action in {"send", "thread-reply", "reply"}:
-            allow_context_fallback = action in {"thread-reply", "reply"}
-            effective_thread_id = resolve_context_thread_id(
+        """Dispatch one authorized action with an already resolved conversation."""
+        if action == "send":
+            return await self._message_send(
                 context,
+                message=message,
+                attachments=attachments,
+                send_claim=send_claim,
+                recipient_name=recipient_name,
                 room_id=room_id,
                 thread_id=thread_id,
-                allow_context_fallback=allow_context_fallback,
-                room_timeline_sentinel=room_timeline_sentinel,
-            )
-            return await self._message_send_or_reply(
-                context,
-                action=action,
-                message=message,
-                attachment_ids=attachment_ids,
-                attachment_file_paths=attachment_file_paths,
-                room_id=room_id,
-                effective_thread_id=effective_thread_id,
-                ignore_mentions=ignore_mentions,
+                recipient_user_id=recipient_user_id,
+                room_mode=room_mode,
+                new_thread=new_thread,
                 message_extras=message_extras,
+            )
+        if action == "read":
+            return await self._message_read(
+                context,
+                room_id=room_id,
+                effective_thread_id=thread_id,
+                read_limit=read_limit,
             )
         if action == "react":
             return await self._message_react(
                 context,
                 message=message,
                 room_id=room_id,
-                target=target,
-            )
-        if action == "read":
-            safe_thread = resolve_context_thread_id(
-                context,
-                room_id=room_id,
                 thread_id=thread_id,
-                room_timeline_sentinel=room_timeline_sentinel,
+                event_id=event_id,
             )
-            return await self._message_read(
-                context,
-                room_id=room_id,
-                effective_thread_id=safe_thread,
-                read_limit=read_limit,
-            )
-        if action == "room-threads":
-            return await self._room_threads(
-                context,
-                room_id=room_id,
-                read_limit=read_limit,
-                page_token=page_token,
-            )
-        if action == "thread-list":
-            safe_thread = resolve_context_thread_id(
-                context,
-                room_id=room_id,
-                thread_id=thread_id,
-                room_timeline_sentinel=room_timeline_sentinel,
-            )
-            return await self._message_thread_list(
-                context,
-                room_id=room_id,
-                thread_id=safe_thread,
-                read_limit=read_limit,
-            )
-        if action == "edit":
-            safe_thread = resolve_context_thread_id(
-                context,
-                room_id=room_id,
-                thread_id=thread_id,
-                room_timeline_sentinel=room_timeline_sentinel,
-            )
-            return await self._message_edit(
-                context,
-                room_id=room_id,
-                thread_id=safe_thread,
-                target=target,
-                message=message,
-                message_extras=message_extras,
-            )
-        return self._result(
-            "error",
-            action=action,
-            message=(
-                "Unsupported action. Use send, reply, thread-reply, react, read, room-threads, thread-list, edit, or context."
-            ),
+        return await self._message_edit(
+            context,
+            room_id=room_id,
+            thread_id=thread_id,
+            event_id=event_id,
+            message=message,
+            message_extras=message_extras,
         )
